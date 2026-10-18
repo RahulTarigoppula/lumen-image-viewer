@@ -12,6 +12,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub const TILE: u32 = 1024;
+/// Texels of neighbouring image content copied around every tile texture.
+/// Linear filtering (and the first mip level that trilinear sampling blends in
+/// between pyramid levels) then reads real neighbour pixels at tile edges
+/// instead of clamping to the tile's own border, which removed visible seams
+/// at 30-70% zoom. The level chosen for a zoom keeps the GPU LOD below 1, so
+/// 2 texels at mip 0 (= 1 texel at mip 1) are enough.
+pub const GUTTER: u32 = 2;
 /// The coarsest level is at most this big so it fits in one texture.
 pub const TOP_MAX: u32 = 1024;
 
@@ -47,25 +54,55 @@ pub struct GpuImage {
     name: String,
 }
 
-fn to_color_image(img: &RgbaImage, x0: u32, y0: u32, w: u32, h: u32) -> ColorImage {
-    let stride = img.width() as usize * 4;
-    let raw = img.as_raw();
-    let mut pixels: Vec<Color32> = Vec::with_capacity((w * h) as usize);
-    for y in y0..y0 + h {
-        let start = y as usize * stride + x0 as usize * 4;
-        let row = &raw[start..start + w as usize * 4];
-        // Opaque rows (the common case) need no premultiplication: copy bytes directly.
-        if row.iter().skip(3).step_by(4).all(|&a| a == 255) {
-            pixels.extend_from_slice(bytemuck::cast_slice::<u8, Color32>(row));
-        } else {
-            pixels.extend(row.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])));
-        }
+fn push_row(pixels: &mut Vec<Color32>, row: &[u8]) {
+    // Opaque rows (the common case) need no premultiplication: copy bytes directly.
+    if row.iter().skip(3).step_by(4).all(|&a| a == 255) {
+        pixels.extend_from_slice(bytemuck::cast_slice::<u8, Color32>(row));
+    } else {
+        pixels.extend(row.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])));
     }
-    ColorImage::new([w as usize, h as usize], pixels)
+}
+
+/// Copy the `w`x`h` region at (`x0`, `y0`) plus `g` texels on every side. Gutter
+/// texels outside the image repeat the nearest edge pixel (like ClampToEdge).
+fn to_color_image_gutter(img: &RgbaImage, x0: u32, y0: u32, w: u32, h: u32, g: u32) -> ColorImage {
+    let (iw, ih) = (img.width() as i64, img.height() as i64);
+    let stride = iw as usize * 4;
+    let raw = img.as_raw();
+    let (ow, oh) = (w + 2 * g, h + 2 * g);
+    let mut pixels: Vec<Color32> = Vec::with_capacity(ow as usize * oh as usize);
+    // Columns [xa, xb) are inside the image; the rest of the row is edge-clamped.
+    let xa = (x0 as i64 - g as i64).max(0);
+    let xb = (x0 as i64 + w as i64 + g as i64).min(iw);
+    let left = (xa - (x0 as i64 - g as i64)) as usize;
+    let right = ((x0 as i64 + w as i64 + g as i64) - xb) as usize;
+    for oy in 0..oh as i64 {
+        let y = (y0 as i64 - g as i64 + oy).clamp(0, ih - 1) as usize;
+        let row = &raw[y * stride..(y + 1) * stride];
+        let px = |x: i64| {
+            let p = &row[x as usize * 4..x as usize * 4 + 4];
+            Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
+        };
+        pixels.extend(std::iter::repeat_n(px(xa), left));
+        push_row(&mut pixels, &row[xa as usize * 4..xb as usize * 4]);
+        pixels.extend(std::iter::repeat_n(px(xb - 1), right));
+    }
+    ColorImage::new([ow as usize, oh as usize], pixels)
+}
+
+fn to_color_image(img: &RgbaImage, x0: u32, y0: u32, w: u32, h: u32) -> ColorImage {
+    to_color_image_gutter(img, x0, y0, w, h, 0)
 }
 
 pub fn color_image_from_rgba(img: &RgbaImage) -> ColorImage {
     to_color_image(img, 0, 0, img.width(), img.height())
+}
+
+/// UV rectangle of the real tile content inside a texture of `w`x`h` texels
+/// surrounded by a `g`-texel gutter.
+pub fn gutter_uv(w: u32, h: u32, g: u32) -> Rect {
+    let (tw, th) = ((w + 2 * g) as f32, (h + 2 * g) as f32);
+    Rect::from_min_max(Pos2::new(g as f32 / tw, g as f32 / th), Pos2::new((g + w) as f32 / tw, (g + h) as f32 / th))
 }
 
 fn tex_options(nearest: bool) -> TextureOptions {
@@ -188,12 +225,12 @@ impl GpuImage {
                 Pos2::new(dest.min.x + (tx + tw) as f32 * sx, dest.min.y + (ty + th) as f32 * sy),
             );
             if level.tiles[idx].is_none() && (started.elapsed() < budget || meshes.is_empty() && li == self.pyramid.len() - 1) {
-                let ci = to_color_image(&level_img, tx, ty, tw, th);
+                let ci = to_color_image_gutter(&level_img, tx, ty, tw, th, GUTTER);
                 level.tiles[idx] = Some(ctx.load_texture(format!("{}#{li}/{idx}", self.name), ci, opts));
             }
             level.last_used[idx] = self.frame_counter;
             match &level.tiles[idx] {
-                Some(t) => meshes.push((t.id(), screen, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)))),
+                Some(t) => meshes.push((t.id(), screen, gutter_uv(tw, th, GUTTER))),
                 None => {
                     pending = true;
                     if let Some(top) = top_tex {
@@ -283,4 +320,64 @@ pub fn paint_checkerboard(painter: &egui::Painter, rect: Rect, cell: f32, dark: 
         }
     }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_fn(w, h, |x, y| image::Rgba([x as u8, y as u8, 7, 255]))
+    }
+
+    #[test]
+    fn gutter_copies_neighbours_inside_the_image() {
+        let img = numbered(40, 30);
+        let ci = to_color_image_gutter(&img, 10, 8, 12, 9, 2);
+        assert_eq!(ci.size, [16, 13]);
+        // Texel (0,0) is image pixel (8,6); the content starts at (2,2) = (10,8).
+        assert_eq!(ci.pixels[0], Color32::from_rgb(8, 6, 7));
+        assert_eq!(ci.pixels[2 * 16 + 2], Color32::from_rgb(10, 8, 7));
+        // Last texel = image (10+12+1, 8+9+1).
+        assert_eq!(*ci.pixels.last().unwrap(), Color32::from_rgb(23, 18, 7));
+    }
+
+    #[test]
+    fn gutter_clamps_at_image_borders() {
+        let img = numbered(5, 4);
+        let ci = to_color_image_gutter(&img, 0, 0, 5, 4, 2);
+        assert_eq!(ci.size, [9, 8]);
+        assert_eq!(ci.pixels.len(), 72);
+        for oy in 0..8usize {
+            for ox in 0..9usize {
+                let x = (ox as i32 - 2).clamp(0, 4) as u8;
+                let y = (oy as i32 - 2).clamp(0, 3) as u8;
+                assert_eq!(ci.pixels[oy * 9 + ox], Color32::from_rgb(x, y, 7), "at {ox},{oy}");
+            }
+        }
+        // Without a gutter it is a plain copy.
+        let plain = to_color_image(&img, 1, 1, 3, 2);
+        assert_eq!(plain.size, [3, 2]);
+        assert_eq!(plain.pixels[0], Color32::from_rgb(1, 1, 7));
+    }
+
+    #[test]
+    fn gutter_keeps_premultiplication() {
+        let mut img = numbered(4, 4);
+        img.put_pixel(0, 0, image::Rgba([200, 100, 50, 128]));
+        let ci = to_color_image_gutter(&img, 0, 0, 2, 2, 1);
+        let expect = Color32::from_rgba_unmultiplied(200, 100, 50, 128);
+        assert_eq!(ci.pixels[0], expect); // clamped corner
+        assert_eq!(ci.pixels[4 + 1], expect);
+    }
+
+    #[test]
+    fn gutter_uv_maps_content() {
+        let uv = gutter_uv(1024, 1000, 2);
+        assert!((uv.min.x - 2.0 / 1028.0).abs() < 1e-7);
+        assert!((uv.max.x - 1026.0 / 1028.0).abs() < 1e-7);
+        assert!((uv.min.y - 2.0 / 1004.0).abs() < 1e-7);
+        assert!((uv.max.y - 1002.0 / 1004.0).abs() < 1e-7);
+        assert_eq!(gutter_uv(10, 10, 0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+    }
 }

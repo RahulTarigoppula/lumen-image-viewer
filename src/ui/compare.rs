@@ -309,6 +309,44 @@ struct Pane {
     error: Option<String>,
     hist: Option<Histogram>,
     hist_rx: Option<Receiver<Histogram>>,
+    exif: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
+}
+
+// ---------------------------------------------------------------- culling
+
+/// Colour label used to mark rejected images ("Red").
+pub const REJECT_LABEL: u8 = 1;
+
+/// "Keep this, reject others": the kept image gets flagged (and loses a reject
+/// label), every other image gets the red "rejected" label and loses its flag.
+pub fn keep_reject(tags: &[crate::tags::Tag], keep: usize) -> Vec<crate::tags::Tag> {
+    tags.iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut t = *t;
+            if i == keep {
+                t.flagged = true;
+                if t.label == REJECT_LABEL {
+                    t.label = 0;
+                }
+            } else {
+                t.flagged = false;
+                t.label = REJECT_LABEL;
+            }
+            t
+        })
+        .collect()
+}
+
+/// One-line camera summary: camera, lens, exposure, aperture, ISO, focal length.
+pub fn exif_line(e: &crate::meta::ExifSummary) -> String {
+    let iso = e.iso.as_ref().map(|v| if v.to_ascii_uppercase().starts_with("ISO") { v.clone() } else { format!("ISO {v}") });
+    [e.camera.clone(), e.lens.clone(), e.exposure.clone(), e.aperture.clone(), iso, e.focal.clone()].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
+}
+
+/// Index of the rect containing `pos`.
+pub fn pane_at(rects: &[Rect], pos: Pos2) -> Option<usize> {
+    rects.iter().position(|r| r.contains(pos))
 }
 
 impl Pane {
@@ -336,6 +374,13 @@ pub struct Compare {
     help: bool,
     exit: bool,
     last_area: Rect,
+    /// Pane under the pointer this frame (culling keys act on it, else on `selected`).
+    hover_pane: Option<usize>,
+    show_exif: bool,
+    /// Pane waiting for "move to Recycle Bin" confirmation.
+    confirm_delete: Option<usize>,
+    /// Files moved to the Recycle Bin from compare mode (the app refreshes views).
+    deleted: Vec<PathBuf>,
 }
 
 fn name_of(p: &std::path::Path) -> String {
@@ -360,7 +405,7 @@ const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
 impl Compare {
     pub fn new(paths: Vec<PathBuf>, _core: &Core) -> Self {
         let paths: Vec<PathBuf> = paths.into_iter().take(4).collect();
-        let panes = paths.iter().map(|p| Pane { path: p.clone(), loaded: None, gpu: None, error: None, hist: None, hist_rx: None }).collect();
+        let panes = paths.iter().map(|p| Pane { path: p.clone(), loaded: None, gpu: None, error: None, hist: None, hist_rx: None, exif: Default::default() }).collect();
         let views = vec![View::fitted(Basis::Relative); paths.len()];
         Compare {
             paths,
@@ -381,6 +426,75 @@ impl Compare {
             help: false,
             exit: false,
             last_area: Rect::NOTHING,
+            hover_pane: None,
+            show_exif: false,
+            confirm_delete: None,
+            deleted: Vec::new(),
+        }
+    }
+
+    /// Files moved to the Recycle Bin while comparing, since the last call.
+    pub fn take_deleted(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.deleted)
+    }
+
+    /// The pane culling actions apply to: under the pointer, else the selected one.
+    fn action_pane(&self) -> Option<usize> {
+        if self.panes.is_empty() {
+            return None;
+        }
+        Some(self.hover_pane.filter(|&i| i < self.panes.len()).unwrap_or(self.selected.min(self.panes.len() - 1)))
+    }
+
+    fn rate(&mut self, core: &mut Core, i: usize, r: u8) {
+        let Some(pane) = self.panes.get(i) else { return };
+        core.tags.update(&pane.path, |t| t.rating = r);
+        let msg = if r == 0 { format!("{}: rating cleared", LETTERS[i]) } else { format!("{}: {} star{}", LETTERS[i], r, if r == 1 { "" } else { "s" }) };
+        core.toasts.info(msg);
+    }
+
+    fn toggle_flag(&mut self, core: &mut Core, i: usize) {
+        let Some(pane) = self.panes.get(i) else { return };
+        core.tags.update(&pane.path, |t| t.flagged = !t.flagged);
+        let on = core.tags.get(&pane.path).flagged;
+        core.toasts.info(format!("{}: {}", LETTERS[i], if on { "flagged" } else { "flag removed" }));
+    }
+
+    fn keep_only(&mut self, core: &mut Core, keep: usize) {
+        if keep >= self.panes.len() || self.panes.len() < 2 {
+            return;
+        }
+        let tags: Vec<crate::tags::Tag> = self.panes.iter().map(|p| core.tags.get(&p.path)).collect();
+        for (pane, t) in self.panes.iter().zip(keep_reject(&tags, keep)) {
+            core.tags.update(&pane.path, |x| *x = t);
+        }
+        core.toasts.success(format!("Kept {} (flagged), marked {} other{} as rejected (red label)", LETTERS[keep], self.panes.len() - 1, if self.panes.len() == 2 { "" } else { "s" }));
+    }
+
+    fn delete_pane(&mut self, core: &mut Core, i: usize) {
+        let Some(path) = self.panes.get(i).map(|p| p.path.clone()) else { return };
+        match crate::fileops::delete_to_trash(std::slice::from_ref(&path)) {
+            Ok(()) => {
+                core.loader.invalidate(&path);
+                core.thumbs.forget(&path);
+                core.meta.forget(&path);
+                core.tags.removed(&path);
+                self.panes.remove(i);
+                self.views.remove(i);
+                self.paths.remove(i);
+                self.deleted.push(path.clone());
+                self.diff = DiffState::default();
+                if self.panes.len() != 2 {
+                    self.mode = CmpMode::SideBySide;
+                }
+                self.selected = self.selected.min(self.panes.len().saturating_sub(1));
+                self.hover_pane = None;
+                core.toasts.success(format!("Moved {} to the Recycle Bin", name_of(&path)));
+                if self.panes.is_empty() {
+                    self.exit = true;
+                }
+            }
+            Err(e) => core.toasts.error(format!("Could not delete {}: {e}", name_of(&path))),
         }
     }
 
@@ -628,13 +742,33 @@ impl Compare {
 
     // ------------------------------------------------------------ input
 
-    fn keys(&mut self, ui: &Ui, rects: &[Rect], ppp: f32) {
+    fn keys(&mut self, ui: &Ui, core: &mut Core, rects: &[Rect], ppp: f32) {
         let take = |k: Key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        if self.confirm_delete.is_some() || ui.ctx().egui_wants_keyboard_input() {
+            return; // the confirmation modal (or a text field) owns the keyboard
+        }
         if take(Key::Escape) {
             if self.help {
                 self.help = false;
             } else if !egui::Popup::is_any_open(ui.ctx()) {
                 self.exit = true;
+            }
+        }
+        // Culling: act on the pane under the pointer (else the selected one).
+        if let Some(t) = self.action_pane() {
+            for (r, k) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
+                if take(k) {
+                    self.rate(core, t, r as u8);
+                }
+            }
+            if take(Key::Q) || take(Key::Backtick) {
+                self.toggle_flag(core, t);
+            }
+            if take(Key::K) {
+                self.keep_only(core, t);
+            }
+            if take(Key::Delete) {
+                self.confirm_delete = Some(t);
             }
         }
         if take(Key::Tab) || take(Key::Space) {
@@ -652,10 +786,10 @@ impl Compare {
         if take(Key::Minus) {
             self.zoom_step(src, rects, ppp, 0.8, None);
         }
-        if take(Key::Num0) || take(Key::Slash) {
+        if take(Key::Slash) {
             self.fit_all();
         }
-        if take(Key::Num1) {
+        if take(Key::Z) {
             self.actual_size(rects, ppp);
         }
         if let Some(r) = rects.get(src) {
@@ -679,6 +813,9 @@ impl Compare {
             }
         }
         if take(Key::H) {
+            self.show_exif = !self.show_exif;
+        }
+        if take(Key::G) {
             self.show_hist = !self.show_hist;
         }
         if take(Key::L) {
@@ -712,7 +849,14 @@ impl Compare {
         ui.painter().rect_filled(area, 0.0, Color32::from_rgb(bgc[0], bgc[1], bgc[2]));
         ui.painter().line_segment([area.left_top(), area.right_top()], Stroke::new(1.0, p.border));
         let rects = self.layout(area);
-        self.keys(ui, &rects, ppp);
+        let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p));
+        self.hover_pane = pointer.and_then(|pos| match self.mode {
+            _ if !self.pair_mode() => pane_at(&rects, pos),
+            CmpMode::Split => Some(if pos.x < area.min.x + area.width() * self.split { 0 } else { 1 }),
+            CmpMode::Flicker => Some(if self.flicker_b { 1 } else { 0 }),
+            _ => None,
+        });
+        self.keys(ui, core, &rects, ppp);
         if self.exit {
             return false;
         }
@@ -729,7 +873,42 @@ impl Compare {
         if self.help {
             self.help_overlay(ui, area);
         }
+        self.delete_dialog(ui.ctx(), core);
         !self.exit
+    }
+
+    fn delete_dialog(&mut self, ctx: &egui::Context, core: &mut Core) {
+        let Some(i) = self.confirm_delete else { return };
+        let Some(path) = self.panes.get(i).map(|p| p.path.clone()) else {
+            self.confirm_delete = None;
+            return;
+        };
+        let p = core.pal;
+        let mut decision = None;
+        egui::Modal::new(egui::Id::NULL.with("cmp-delete")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.heading("Move to Recycle Bin?");
+            ui.add_space(6.0);
+            ui.label(format!("{}  {}", LETTERS[i.min(3)], name_of(&path)));
+            ui.label(RichText::new("The image is removed from the comparison. You can restore it from the Recycle Bin.").size(12.0).color(p.muted));
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new(RichText::new(format!("{}  Move to Recycle Bin", I::TRASH)).color(Color32::WHITE)).fill(Color32::from_rgb(200, 70, 60))).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                self.confirm_delete = None;
+                self.delete_pane(core, i);
+            }
+            Some(false) => self.confirm_delete = None,
+            None => {}
+        }
     }
 
     fn view_input(&mut self, ui: &Ui, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32) {
@@ -752,7 +931,9 @@ impl Compare {
                 let anchor = ui.input(|i| i.pointer.hover_pos());
                 self.zoom_step(src, rects, ppp, factor, anchor);
             }
-            let pinch = ui.input(|i| i.zoom_delta());
+            // Touch / gesture pinch only: egui's zoom_delta() also contains the
+            // (smoothed) ctrl+wheel, which the wheel branch already handled.
+            let pinch = ui.input(|i| super::viewer::scroll_input(i).pinch);
             if wd == 0.0 && (pinch - 1.0).abs() > 1e-4 {
                 let anchor = ui.input(|i| i.pointer.hover_pos());
                 self.zoom_step(src, rects, ppp, pinch, anchor);
@@ -846,8 +1027,10 @@ impl Compare {
             let text = self.caption_text(i, zoom);
             Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))));
             if self.show_hist {
-                self.paint_hist(ui, core, i, rect);
+                let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
+                self.paint_hist(ui, core, i, hr);
             }
+            self.pane_overlays(ui, core, i, rect);
             if self.panes.len() > 2 {
                 let br = Rect::from_min_size(Pos2::new(rect.max.x - 34.0, rect.min.y + 8.0), Vec2::splat(26.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
@@ -877,6 +1060,83 @@ impl Compare {
         }
         if let Some(i) = remove {
             self.remove_pane(i);
+        }
+    }
+
+    /// Culling overlays for pane `i` drawn inside `rect`: reject frame, rating /
+    /// flag / reject status, the optional EXIF strip and the "Keep" button.
+    fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect) {
+        if i >= self.panes.len() || !rect.is_positive() {
+            return;
+        }
+        let path = self.panes[i].path.clone();
+        let tag = core.tags.get(&path);
+        let rejected = tag.label == REJECT_LABEL;
+        let red = Color32::from_rgb(235, 87, 87);
+        let painter = ui.painter().with_clip_rect(rect);
+        if rejected {
+            painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(70));
+            // Inset so the selection outline does not hide it.
+            painter.rect_stroke(rect.shrink(3.5), CornerRadius::ZERO, Stroke::new(3.0, red), egui::StrokeKind::Inside);
+        }
+        let mut bottom = rect.max.y - 10.0;
+        if self.show_exif {
+            let p2 = path.clone();
+            let line = self.panes[i].exif.get(&path, ui.ctx(), move || crate::meta::read_exif(&p2)).map(|e| e.as_ref().map(exif_line).unwrap_or_default());
+            let fresh = self.panes[i].exif.is_current(&path);
+            let text = match line {
+                Some(l) if fresh && !l.is_empty() => l,
+                Some(_) if fresh => "No camera data".to_string(),
+                _ => "Reading EXIF...".to_string(),
+            };
+            let strip = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 26.0), rect.max);
+            painter.rect_filled(strip, CornerRadius::ZERO, Color32::from_black_alpha(175));
+            painter.text(Pos2::new(strip.min.x + 10.0, strip.center().y), Align2::LEFT_CENTER, format!("{}  {text}", I::CAMERA), FontId::proportional(12.0), Color32::from_white_alpha(235));
+            bottom = strip.min.y - 8.0;
+        }
+        // Status pill.
+        let mut parts: Vec<(String, Color32)> = Vec::new();
+        if rejected {
+            parts.push((format!("{} REJECTED", I::X_CIRCLE), red));
+        }
+        if tag.flagged {
+            parts.push((format!("{} Flagged", I::FLAG), Color32::from_rgb(80, 200, 120)));
+        }
+        if tag.rating > 0 {
+            parts.push((format!("{} {}", I::STAR, tag.rating), Color32::from_rgb(242, 201, 76)));
+        }
+        if tag.label > 0 && !rejected {
+            let c = crate::tags::LABEL_COLORS[tag.label as usize % 6];
+            parts.push((crate::tags::LABEL_NAMES[tag.label as usize % 6].to_string(), Color32::from_rgb(c[0], c[1], c[2])));
+        }
+        if !parts.is_empty() {
+            let font = super::theme::semibold(12.5);
+            let galleys: Vec<_> = parts.into_iter().map(|(t, c)| painter.layout_no_wrap(t, font.clone(), c)).collect();
+            let w: f32 = galleys.iter().map(|g| g.size().x).sum::<f32>() + 14.0 * (galleys.len() as f32 - 1.0) + 22.0;
+            let r = Rect::from_min_size(Pos2::new(rect.min.x + 10.0, bottom - 26.0), Vec2::new(w, 26.0));
+            painter.rect_filled(r, CornerRadius::same(13), Color32::from_black_alpha(170));
+            let mut x = r.min.x + 11.0;
+            for g in galleys {
+                let gw = g.size().x;
+                painter.galley(Pos2::new(x, r.center().y - g.size().y / 2.0), g, Color32::WHITE);
+                x += gw + 14.0;
+            }
+        }
+        // "Keep this, reject others" on the hovered / selected pane.
+        let active = self.hover_pane == Some(i) || self.selected == i;
+        if active && self.panes.len() >= 2 && rect.width() > 260.0 {
+            let size = Vec2::new(196.0, 28.0);
+            let top = rect.min.y + 42.0; // below the caption pill and the remove button
+            let br = Rect::from_min_size(Pos2::new(rect.max.x - size.x - 10.0, top), size);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
+            let b = egui::Button::new(RichText::new(format!("{}  Keep, reject others", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5))
+                .fill(Color32::from_rgba_unmultiplied(39, 150, 90, 230))
+                .corner_radius(CornerRadius::same(14))
+                .min_size(size);
+            if child.add(b).on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
+                self.selected = i;
+                self.keep_only(core, i);
+            }
         }
     }
 
@@ -936,10 +1196,13 @@ impl Compare {
                 Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))));
                 Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))));
                 if self.show_hist {
-                    self.paint_hist(ui, core, 1, area);
-                    let left_hist = Rect::from_min_max(area.min, Pos2::new(area.min.x + 240.0, area.max.y));
+                    let ha = if self.show_exif { Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 30.0)) } else { area };
+                    self.paint_hist(ui, core, 1, ha);
+                    let left_hist = Rect::from_min_max(ha.min, Pos2::new(ha.min.x + 240.0, ha.max.y));
                     self.paint_hist(ui, core, 0, left_hist);
                 }
+                self.pane_overlays(ui, core, 0, left);
+                self.pane_overlays(ui, core, 1, right);
                 if !hresp.dragged() {
                     self.view_input(ui, &resp, 0, rects, ppp);
                 }
@@ -962,10 +1225,11 @@ impl Compare {
                 let t = self.caption_text(i, z);
                 Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))));
                 let hint = if self.flicker_auto { format!("Auto flicker every {:.1} s", self.flicker_secs) } else { "Tab / Space to switch".to_string() };
-                Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &hint, None);
+                Self::pill(ui, Pos2::new(area.center().x, area.max.y - if self.show_exif { 40.0 } else { 14.0 }), Align2::CENTER_BOTTOM, &hint, None);
                 if self.show_hist {
                     self.paint_hist(ui, core, i, area);
                 }
+                self.pane_overlays(ui, core, i, area);
                 self.view_input(ui, &resp, i, rects, ppp);
             }
             CmpMode::Difference => {
@@ -1073,8 +1337,30 @@ impl Compare {
                 self.fit_all();
             }
             widgets::separator_v(ui);
-            if widgets::icon_button(ui, I::CHART_BAR, "Histograms  (H)", self.show_hist).clicked() {
+            if widgets::icon_button(ui, I::CHART_BAR, "Histograms  (G)", self.show_hist).clicked() {
                 self.show_hist = !self.show_hist;
+            }
+            if widgets::icon_button(ui, I::CAMERA, "Camera info strip  (H)", self.show_exif).clicked() {
+                self.show_exif = !self.show_exif;
+            }
+            widgets::separator_v(ui);
+            // Culling on the selected pane (keys act on the pane under the pointer).
+            let sel = self.selected.min(self.panes.len().saturating_sub(1));
+            let letter = LETTERS[sel.min(3)];
+            if self.panes.len() >= 2 {
+                let b = egui::Button::new(RichText::new(format!("{}  Keep {letter}", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5)).fill(Color32::from_rgb(39, 150, 90)).corner_radius(CornerRadius::same(6));
+                if ui.add(b).on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
+                    self.keep_only(core, sel);
+                }
+            }
+            if !self.panes.is_empty() {
+                let flagged = core.tags.get(&self.panes[sel].path).flagged;
+                if widgets::icon_button(ui, I::FLAG, &format!("Flag {letter}  (Q or `)"), flagged).clicked() {
+                    self.toggle_flag(core, sel);
+                }
+                if widgets::icon_button(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin  (Del)"), false).clicked() {
+                    self.confirm_delete = Some(sel);
+                }
             }
             if pair && widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B  (X)", false).clicked() {
                 self.swap_ab();
@@ -1110,17 +1396,22 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 12] = [
+        let rows: [(&str, &str); 17] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
             ("Drag", "Pan"),
-            ("Double-click / 0", "Fit"),
-            ("1", "100% (selected pane)"),
+            ("Double-click  or  /", "Fit"),
+            ("Z", "100% (selected pane)"),
             ("+ / −  arrows", "Zoom / pan"),
             ("B  W  F  D", "Side by side · Split · Flicker · Difference"),
             ("Tab / Space", "Flicker A ↔ B (Split: jump divider)"),
             ("X", "Swap A and B"),
             ("L", "Link / unlink zoom & pan"),
-            ("H", "Histograms"),
+            ("0 - 5", "Rate the image under the pointer"),
+            ("Q  or  `", "Flag / unflag it"),
+            ("K", "Keep it, reject the others (red label)"),
+            ("Del", "Move it to the Recycle Bin"),
+            ("H", "Camera info strip"),
+            ("G", "Histograms"),
             ("?", "This help"),
             ("Esc", "Back"),
         ];
@@ -1285,6 +1576,49 @@ mod tests {
         assert!((s2.changed_pct - 50.0).abs() < 1e-9);
         assert_eq!(s2.max, 100);
         assert!((psnr_from_mse(65025.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keep_reject_flags_one_and_labels_the_rest() {
+        use crate::tags::Tag;
+        let tags = [
+            Tag { rating: 3, flagged: false, label: REJECT_LABEL },
+            Tag { rating: 0, flagged: true, label: 0 },
+            Tag { rating: 5, flagged: false, label: 4 },
+        ];
+        let out = keep_reject(&tags, 0);
+        assert_eq!(out[0], Tag { rating: 3, flagged: true, label: 0 });
+        assert_eq!(out[1], Tag { rating: 0, flagged: false, label: REJECT_LABEL });
+        assert_eq!(out[2], Tag { rating: 5, flagged: false, label: REJECT_LABEL });
+        // A non-red label on the kept image survives.
+        let out = keep_reject(&tags, 2);
+        assert_eq!(out[2], Tag { rating: 5, flagged: true, label: 4 });
+        assert!(out[0].label == REJECT_LABEL && !out[1].flagged);
+    }
+
+    #[test]
+    fn exif_line_joins_known_fields() {
+        let mut e = crate::meta::ExifSummary::default();
+        assert_eq!(exif_line(&e), "");
+        e.camera = Some("Canon EOS R5".into());
+        e.exposure = Some("1/250 s".into());
+        e.aperture = Some("f/4.0".into());
+        e.iso = Some("400".into());
+        e.focal = Some("50 mm".into());
+        assert_eq!(exif_line(&e), "Canon EOS R5  ·  1/250 s  ·  f/4.0  ·  ISO 400  ·  50 mm");
+        e.iso = Some("ISO 800".into());
+        e.lens = Some("RF24-70mm".into());
+        assert_eq!(exif_line(&e), "Canon EOS R5  ·  RF24-70mm  ·  1/250 s  ·  f/4.0  ·  ISO 800  ·  50 mm");
+    }
+
+    #[test]
+    fn pane_at_finds_the_pane() {
+        let rects = pane_rects(4, area(), 1.0);
+        assert_eq!(pane_at(&rects, Pos2::new(10.0, 50.0)), Some(0));
+        assert_eq!(pane_at(&rects, Pos2::new(1190.0, 50.0)), Some(1));
+        assert_eq!(pane_at(&rects, Pos2::new(10.0, 830.0)), Some(2));
+        assert_eq!(pane_at(&rects, Pos2::new(1190.0, 830.0)), Some(3));
+        assert_eq!(pane_at(&rects, Pos2::new(10.0, 10.0)), None);
     }
 
     #[test]
