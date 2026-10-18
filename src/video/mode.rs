@@ -394,6 +394,8 @@ pub struct VideoMode {
     snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
     /// (index entries, columns, per-column (max size, kind, has key), p98 size, built at)
     timeline_cache: Option<(usize, usize, Vec<(u32, u8, bool)>, f32, Instant)>,
+    /// Frame number most recently requested by stepping (until it arrives).
+    pending_step: Option<usize>,
 }
 
 impl VideoMode {
@@ -442,6 +444,7 @@ impl VideoMode {
             pending_swap: None,
             snap_rx: None,
             timeline_cache: None,
+            pending_step: None,
         };
         for p in paths.into_iter().take(2) {
             vm.add_source(&p, &core.ctx, &mut None);
@@ -560,8 +563,11 @@ impl VideoMode {
             self.pause();
         }
         let cur = self.sources[0].pts();
-        let cur_frame = self.sources[0].frame_of(cur) as i64;
+        // Rapid key presses: step from the frame already requested, not from
+        // the frame still on screen, so every press counts.
+        let cur_frame = self.pending_step.filter(|_| self.sources[0].awaiting).unwrap_or(self.sources[0].frame_of(cur)) as i64;
         let target_frame = (cur_frame + delta).max(0) as usize;
+        self.pending_step = Some(target_frame);
         let target = self.sources[0].pts_of(target_frame);
         let off = self.offset_secs();
         for (i, s) in self.sources.iter_mut().enumerate() {
