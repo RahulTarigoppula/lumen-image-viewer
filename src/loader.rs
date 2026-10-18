@@ -39,11 +39,20 @@ struct Job {
     path: PathBuf,
     priority: u32, // lower = more urgent
     preview_side: Option<u32>,
+    /// Generation of the cache entry this job fills; results for an older
+    /// generation (the entry was invalidated while decoding) are dropped.
+    generation: u64,
 }
 
 enum Msg {
-    Preview(PathBuf, image::RgbaImage),
-    Done(PathBuf, Result<LoadedImage, String>),
+    Preview(PathBuf, u64, image::RgbaImage),
+    Done(PathBuf, u64, Result<LoadedImage, String>),
+}
+
+struct Entry {
+    state: LoadState,
+    touched: Instant,
+    generation: u64,
 }
 
 struct Queue {
@@ -54,7 +63,8 @@ struct Queue {
 pub struct Loader {
     queue: Arc<Queue>,
     rx: Receiver<Msg>,
-    entries: HashMap<PathBuf, (LoadState, Instant)>,
+    entries: HashMap<PathBuf, Entry>,
+    next_generation: u64,
     pub budget_bytes: u64,
     pub opts: Arc<Mutex<DecodeOptions>>,
 }
@@ -74,52 +84,64 @@ impl Loader {
                 .spawn(move || worker(q, tx, ctx, opts))
                 .expect("spawn loader");
         }
-        Loader { queue, rx, entries: HashMap::new(), budget_bytes: 1536 << 20, opts }
+        Loader { queue, rx, entries: HashMap::new(), next_generation: 1, budget_bytes: 1536 << 20, opts }
     }
 
     /// Request `path`. `priority` 0 = the image on screen.
     pub fn request(&mut self, path: &Path, priority: u32, preview_side: Option<u32>) {
-        if let Some((_, t)) = self.entries.get_mut(path) {
+        if let Some(e) = self.entries.get_mut(path) {
             // Already loading/loaded/failed (use `invalidate` to retry); bump priority if queued.
-            *t = Instant::now();
-            let mut jobs = self.queue.jobs.lock();
-            if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
-                j.priority = j.priority.min(priority);
+            // Called every frame for the image on screen, so only touch the queue lock
+            // while the job can still be waiting in it.
+            e.touched = Instant::now();
+            if matches!(e.state, LoadState::Loading) {
+                let mut jobs = self.queue.jobs.lock();
+                if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
+                    j.priority = j.priority.min(priority);
+                }
             }
             return;
         }
-        self.entries.insert(path.to_path_buf(), (LoadState::Loading, Instant::now()));
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation });
         let mut jobs = self.queue.jobs.lock();
-        jobs.push(Job { path: path.to_path_buf(), priority, preview_side });
+        jobs.push(Job { path: path.to_path_buf(), priority, preview_side, generation });
         self.queue.cv.notify_one();
     }
 
     /// Drop queued (not yet started) jobs except those listed.
     pub fn retain_queued(&mut self, keep: &[PathBuf]) {
         let mut jobs = self.queue.jobs.lock();
-        let removed: Vec<PathBuf> = jobs.iter().filter(|j| !keep.contains(&j.path)).map(|j| j.path.clone()).collect();
+        if jobs.iter().all(|j| keep.contains(&j.path)) {
+            return; // common case (every frame): nothing to drop, no allocation
+        }
+        let removed: Vec<(PathBuf, u64)> = jobs.iter().filter(|j| !keep.contains(&j.path)).map(|j| (j.path.clone(), j.generation)).collect();
         jobs.retain(|j| keep.contains(&j.path));
         drop(jobs);
-        for p in removed {
-            if matches!(self.entries.get(&p), Some((LoadState::Loading, _))) {
+        for (p, g) in removed {
+            if matches!(self.entries.get(&p), Some(e) if matches!(e.state, LoadState::Loading) && e.generation == g) {
                 self.entries.remove(&p);
             }
         }
     }
 
     pub fn state(&self, path: &Path) -> Option<&LoadState> {
-        self.entries.get(path).map(|(s, _)| s)
+        self.entries.get(path).map(|e| &e.state)
     }
 
     pub fn get_ready(&self, path: &Path) -> Option<Arc<LoadedImage>> {
         match self.entries.get(path) {
-            Some((LoadState::Ready(img), _)) => Some(img.clone()),
+            Some(Entry { state: LoadState::Ready(img), .. }) => Some(img.clone()),
             _ => None,
         }
     }
 
+    /// Forget `path` so the next `request` decodes it again. A decode of the old
+    /// version that is still running is ignored when it finishes.
     pub fn invalidate(&mut self, path: &Path) {
         self.entries.remove(path);
+        self.queue.jobs.lock().retain(|j| j.path != path);
     }
 
     /// Drop every decoded image except `keep` (e.g. after the color management setting changed).
@@ -135,7 +157,9 @@ impl Loader {
 
     /// Insert an already-decoded image (e.g. pasted from clipboard / edited result).
     pub fn insert(&mut self, path: &Path, img: LoadedImage) {
-        self.entries.insert(path.to_path_buf(), (LoadState::Ready(Arc::new(img)), Instant::now()));
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation });
     }
 
     /// Drain finished jobs. Returns paths whose state changed.
@@ -143,23 +167,25 @@ impl Loader {
         let mut changed = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Preview(p, img) => {
-                    if let Some((state, _)) = self.entries.get_mut(&p) {
-                        if matches!(state, LoadState::Loading) {
-                            *state = LoadState::Preview(Arc::new(img));
+                Msg::Preview(p, g, img) => {
+                    if let Some(e) = self.entries.get_mut(&p) {
+                        if e.generation == g && matches!(e.state, LoadState::Loading) {
+                            e.state = LoadState::Preview(Arc::new(img));
                             changed.push(p);
                         }
                     }
                 }
-                Msg::Done(p, res) => {
-                    // Ignore results for entries that were dropped meanwhile.
-                    if let Some((state, t)) = self.entries.get_mut(&p) {
-                        *state = match res {
-                            Ok(img) => LoadState::Ready(Arc::new(img)),
-                            Err(e) => LoadState::Failed(e),
-                        };
-                        *t = Instant::now();
-                        changed.push(p);
+                Msg::Done(p, g, res) => {
+                    // Ignore results for entries that were dropped or invalidated meanwhile.
+                    if let Some(e) = self.entries.get_mut(&p) {
+                        if e.generation == g {
+                            e.state = match res {
+                                Ok(img) => LoadState::Ready(Arc::new(img)),
+                                Err(err) => LoadState::Failed(err),
+                            };
+                            e.touched = Instant::now();
+                            changed.push(p);
+                        }
                     }
                 }
             }
@@ -174,7 +200,7 @@ impl Loader {
         let mut total: u64 = self
             .entries
             .values()
-            .map(|(s, _)| if let LoadState::Ready(i) = s { i.bytes() } else { 0 })
+            .map(|e| if let LoadState::Ready(i) = &e.state { i.bytes() } else { 0 })
             .sum();
         if total <= self.budget_bytes {
             return;
@@ -182,8 +208,8 @@ impl Loader {
         let mut ready: Vec<(PathBuf, Instant, u64)> = self
             .entries
             .iter()
-            .filter_map(|(p, (s, t))| match s {
-                LoadState::Ready(i) if !protect.contains(p) => Some((p.clone(), *t, i.bytes())),
+            .filter_map(|(p, e)| match &e.state {
+                LoadState::Ready(i) if !protect.contains(p) => Some((p.clone(), e.touched, i.bytes())),
                 _ => None,
             })
             .collect();
@@ -221,7 +247,7 @@ fn worker(q: Arc<Queue>, tx: Sender<Msg>, ctx: egui::Context, opts: Arc<Mutex<De
         if let Some(side) = job.preview_side {
             if file_size > 6 << 20 {
                 if let Ok(prev) = decode::decode_thumbnail(&job.path, side) {
-                    let _ = tx.send(Msg::Preview(job.path.clone(), prev));
+                    let _ = tx.send(Msg::Preview(job.path.clone(), job.generation, prev));
                     ctx.request_repaint();
                 }
             }
@@ -242,7 +268,7 @@ fn worker(q: Arc<Queue>, tx: Sender<Msg>, ctx: egui::Context, opts: Arc<Mutex<De
             Ok(Err(e)) => Err(format!("{e:#}")),
             Err(_) => Err("The decoder crashed on this file (it may be corrupt).".into()),
         };
-        let _ = tx.send(Msg::Done(job.path, res));
+        let _ = tx.send(Msg::Done(job.path, job.generation, res));
         ctx.request_repaint();
     }
 }

@@ -15,10 +15,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quick-check:
+    # Fast feedback without FFmpeg: unit tests and text checks for the image features.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-quick-${{ hashFiles('Cargo.lock') }}
+      - name: Check UI text uses plain punctuation
+        run: python tools/scrub_text.py --check src
+      - name: Unit tests (image features)
+        run: cargo test --no-default-features
+
   windows:
     runs-on: windows-latest
     env:
-      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_ROOT: C:\vcpkg-lumen
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-bincache,readwrite
       VCPKGRS_TRIPLET: x64-windows-static-md-rel
     steps:

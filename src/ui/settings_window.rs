@@ -540,6 +540,7 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= toggle_row(ui, p, "Loop at folder end", "Going past the last image wraps to the first.", &mut s.loop_navigation);
         changed |= toggle_row(ui, p, "Preload neighbours", "Decode the next and previous images in the background for instant switching.", &mut s.preload_neighbors);
         changed |= toggle_row(ui, p, "Show info overlay", "File name, size and EXIF summary over the image.", &mut s.show_info_overlay);
+        changed |= toggle_row(ui, p, "Show panels when the mouse touches a screen edge", "Edit tools on the left, file info on the right, thumbnails at the bottom.", &mut s.edge_panels);
     });
 
     section_title(ui, p, "Zoom");

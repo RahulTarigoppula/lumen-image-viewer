@@ -161,6 +161,7 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("/", ZoomFit),
             ("Shift+W", FitWidth),
             ("Shift+H", FitHeight),
+            ("Ctrl+Shift+L", ToggleLockZoom),
             ("L", RotateLeft),
             ("R", RotateRight),
             ("H", FlipHorizontal),

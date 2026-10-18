@@ -362,6 +362,7 @@ pub struct VideoMode {
     last_out_req: Instant,
     message: Option<String>,
     pending_swap: Option<(PathBuf, PathBuf, f64)>,
+    snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
 }
 
 impl VideoMode {
@@ -408,6 +409,7 @@ impl VideoMode {
             last_out_req: Instant::now(),
             message: None,
             pending_swap: None,
+            snap_rx: None,
         };
         for p in paths.into_iter().take(2) {
             vm.add_source(&p, &core.ctx, &mut None);
@@ -472,7 +474,7 @@ impl VideoMode {
         }
     }
 
-    fn pause(&mut self) {
+    pub fn pause(&mut self) {
         self.playing = false;
         self.clock.stop();
         for s in &mut self.sources {
@@ -553,35 +555,50 @@ impl VideoMode {
         }
     }
 
-    fn snapshot(&mut self, copy: bool, core: &mut Core) {
+    /// Save (or copy) the displayed frame of A at native resolution. The decode
+    /// runs on a background thread; the result is reported by `poll_snapshot`.
+    fn snapshot(&mut self, copy: bool, _core: &mut Core) {
         let Some(s) = self.sources.first() else { return };
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        s.player.send(Cmd::Snapshot(tx));
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(img)) => {
-                let img = engine::rotate_img(img, s.info.rotation);
-                if copy {
-                    match crate::fileops::copy_image_to_clipboard(&img) {
-                        Ok(()) => core.toasts.info("Frame copied to clipboard"),
-                        Err(e) => core.toasts.error(e.to_string()),
-                    }
-                } else {
-                    let frame = s.frame_of(s.pts());
-                    let stem = s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let mut dlg = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{stem}_frame{frame:06}.png"));
-                    if let Some(d) = s.path.parent() {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(p) = dlg.save_file() {
-                        match img.save(&p) {
-                            Ok(()) => core.toasts.success(format!("Saved {}", p.display())),
-                            Err(e) => core.toasts.error(e.to_string()),
-                        }
-                    }
-                }
+        let pts = s.pts();
+        let target = if copy {
+            None
+        } else {
+            let frame = s.frame_of(pts);
+            let stem = s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let mut dlg = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{stem}_frame{frame:06}.png"));
+            if let Some(d) = s.path.parent() {
+                dlg = dlg.set_directory(d);
             }
-            Ok(Err(e)) => core.toasts.error(e),
-            Err(_) => core.toasts.error("Snapshot timed out"),
+            match dlg.save_file() {
+                Some(p) => Some(p),
+                None => return,
+            }
+        };
+        let path = s.path.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let res = engine::frame_at(&path, pts).map_err(|e| e.to_string()).and_then(|img| match &target {
+                Some(p) => img.save(p).map(|_| format!("Saved {}", p.display())).map_err(|e| e.to_string()),
+                None => crate::fileops::copy_image_to_clipboard(&img).map(|_| "Frame copied to clipboard".to_string()).map_err(|e| e.to_string()),
+            });
+            let _ = tx.send(res);
+        });
+        self.snap_rx = Some(rx);
+    }
+
+    fn poll_snapshot(&mut self, core: &mut Core) {
+        let Some(rx) = &self.snap_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                core.toasts.success(msg);
+                self.snap_rx = None;
+            }
+            Ok(Err(e)) => {
+                core.toasts.error(e);
+                self.snap_rx = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => self.snap_rx = None,
+            Err(_) => core.ctx.request_repaint_after(Duration::from_millis(100)),
         }
     }
 
@@ -646,6 +663,7 @@ impl VideoMode {
             }
         }
 
+        self.poll_snapshot(core);
         // Poll decoders.
         let playing = self.playing;
         for s in &mut self.sources {
@@ -1242,6 +1260,10 @@ impl VideoMode {
             self.pause();
         }
         self.speed = s;
+        // Re-seek so queued audio/video from the old speed is discarded and A/V stays in sync.
+        if let Some(t) = self.sources.first().map(|x| x.pts()) {
+            self.seek_all(t, true);
+        }
         if was {
             self.play();
         }
@@ -1315,8 +1337,12 @@ impl VideoMode {
             painter.add(egui::Shape::mesh(mesh));
         } else {
             let prog = f32::from_bits(a.index_progress.load(Ordering::Relaxed));
-            painter.text(rect.center(), Align2::CENTER_CENTER, format!("Indexing frames... {:.0}%", prog * 100.0), FontId::proportional(11.5), p.faint);
-            ui.ctx().request_repaint_after(Duration::from_millis(200));
+            if prog >= 1.0 {
+                painter.text(rect.center(), Align2::CENTER_CENTER, "Frame index unavailable for this file", FontId::proportional(11.5), p.faint);
+            } else {
+                painter.text(rect.center(), Align2::CENTER_CENTER, format!("Indexing frames... {:.0}%", prog * 100.0), FontId::proportional(11.5), p.faint);
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
         }
         drop(idx_guard);
         // Metric graph (PSNR-Y) from analysis.
@@ -1583,7 +1609,7 @@ impl VideoMode {
     // ---------------------------------------------------------------- keys
 
     fn keys(&mut self, ctx: &egui::Context, core: &mut Core) -> bool {
-        if self.goto.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.goto.is_some() || ctx.text_edit_focused() {
             return true;
         }
         let mut keep = true;

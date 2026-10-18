@@ -90,6 +90,11 @@ impl ThumbService {
             min_seq: AtomicU64::new(0),
         });
         let _ = std::fs::create_dir_all(&cache_dir);
+        {
+            // Keep the persistent cache bounded: prune oldest files beyond 1.5 GB, off-thread.
+            let dir = cache_dir.clone();
+            std::thread::spawn(move || prune_disk_cache(&dir, 1536 << 20));
+        }
         let (tx, rx) = unbounded();
         for i in 0..threads.max(1) {
             let s = shared.clone();
@@ -104,7 +109,8 @@ impl ThumbService {
         ThumbService {
             shared,
             rx,
-            textures: LruCache::new(NonZeroUsize::new(1500).unwrap()),
+            // ~400 x (384 px RGBA + mips) is about 300 MB of VRAM: plenty for any grid.
+            textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
             pending: HashSet::new(),
             failed: HashSet::new(),
             seq: 0,
@@ -294,4 +300,29 @@ fn write_cached(file: &Path, img: &image::RgbaImage, dims: Option<(u32, u32)>) -
     std::fs::write(&tmp, &out)?;
     std::fs::rename(tmp, file)?;
     Ok(())
+}
+
+/// Delete the oldest cache files until the folder is under `limit` bytes.
+pub fn prune_disk_cache(dir: &Path, limit: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().unwrap_or(UNIX_EPOCH), m.len(), e.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= limit {
+        return;
+    }
+    files.sort_by_key(|f| f.0);
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
