@@ -10,11 +10,36 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Accumulated per-section timings while a `bench` command runs (dev only).
+static PROF: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+static BENCH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the time spent in a UI section since `start` (no-op unless benchmarking).
+pub fn prof(name: &'static str, start: Instant) {
+    if BENCH_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(mut v) = PROF.lock() {
+            v.push((name, start.elapsed().as_secs_f64() * 1000.0));
+        }
+    }
+}
+
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static MARKS: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a startup milestone (ms since process start). Cheap; always on.
+pub fn mark(label: &'static str) {
+    let t0 = *PROCESS_START.get_or_init(Instant::now);
+    if let Ok(mut m) = MARKS.lock() {
+        m.push((label, t0.elapsed().as_secs_f64() * 1000.0));
+    }
+}
+
 pub struct DevHook {
     dir: Option<PathBuf>,
     last_check: Instant,
     queue: Vec<String>,
     wait_until: Option<Instant>,
+    bench_left: u32,
 }
 
 pub enum DevAction {
@@ -25,7 +50,7 @@ pub enum DevAction {
 
 impl DevHook {
     pub fn new() -> Self {
-        DevHook { dir: std::env::var_os("LUMEN_DEV_DIR").map(PathBuf::from), last_check: Instant::now(), queue: Vec::new(), wait_until: None }
+        DevHook { dir: std::env::var_os("LUMEN_DEV_DIR").map(PathBuf::from), last_check: Instant::now(), queue: Vec::new(), wait_until: None, bench_left: 0 }
     }
 
     pub fn dir(&self) -> Option<&PathBuf> {
@@ -35,6 +60,27 @@ impl DevHook {
     pub fn tick(&mut self, ctx: &egui::Context) -> Vec<DevAction> {
         let Some(dir) = self.dir.clone() else { return Vec::new() };
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        if self.bench_left > 0 {
+            self.bench_left -= 1;
+            ctx.request_repaint();
+            if self.bench_left == 0 {
+                BENCH_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+                let v = PROF.lock().map(|v| v.clone()).unwrap_or_default();
+                let mut names: Vec<&str> = v.iter().map(|(n, _)| *n).collect();
+                names.sort();
+                names.dedup();
+                let mut out = String::from("bench:");
+                for n in names {
+                    let xs: Vec<f64> = v.iter().filter(|(m, _)| *m == n).map(|(_, t)| *t).collect();
+                    let avg = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+                    let max = xs.iter().cloned().fold(0.0, f64::max);
+                    out += &format!(" {n}=avg {avg:.2}ms max {max:.2}ms;");
+                }
+                self.write_state(&out);
+            } else {
+                return Vec::new();
+            }
+        }
         if let Some(w) = self.wait_until {
             if Instant::now() < w {
                 return Vec::new();
@@ -83,6 +129,15 @@ impl DevHook {
                 "run" => out.push(DevAction::Run(arg.to_string())),
                 "open" => out.push(DevAction::Open(PathBuf::from(arg))),
                 "state" => out.push(DevAction::State),
+                "bench" => {
+                    self.bench_left = arg.parse().unwrap_or(60);
+                    if let Ok(mut v) = PROF.lock() {
+                        v.clear();
+                    }
+                    BENCH_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ctx.request_repaint();
+                    break;
+                }
                 "__done" => {
                     let _ = std::fs::write(dir.join("done.txt"), "done");
                 }
@@ -90,6 +145,10 @@ impl DevHook {
             }
         }
         out
+    }
+
+    pub fn startup_report() -> String {
+        MARKS.lock().map(|m| m.iter().map(|(l, t)| format!("{l}={t:.0}ms")).collect::<Vec<_>>().join(" ")).unwrap_or_default()
     }
 
     pub fn write_state(&self, text: &str) {

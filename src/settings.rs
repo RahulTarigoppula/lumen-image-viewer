@@ -183,6 +183,8 @@ pub struct Settings {
     pub key_overrides: Vec<KeyOverride>,
     /// Text under thumbnails in the browser grid.
     pub thumb_caption: ThumbCaption,
+    /// Viewer: slide-in panels when the mouse touches a screen edge.
+    pub edge_panels: bool,
 }
 
 /// "In `mode`, `command` uses exactly `keys`" (empty = unbound). Plain strings so a
@@ -270,6 +272,7 @@ impl Default for Settings {
             keymap_preset: "lumen".into(),
             key_overrides: Vec::new(),
             thumb_caption: ThumbCaption::NameDetails,
+            edge_panels: true,
         }
     }
 }

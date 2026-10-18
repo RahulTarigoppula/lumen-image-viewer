@@ -234,7 +234,6 @@ pub enum Cmd {
     Step { gen: u64 },
     OutputSize(u32, u32),
     Native(bool),
-    Snapshot(Sender<Result<RgbaImage, String>>),
     Quit,
 }
 
@@ -443,16 +442,6 @@ impl Worker {
             }
             Cmd::OutputSize(w, h) => self.out_size = (w.max(2), h.max(2)),
             Cmd::Native(on) => self.want_native = on,
-            Cmd::Snapshot(reply) => {
-                let res = match &self.last_frame {
-                    Some(f) => {
-                        let (w, h) = (f.width(), f.height());
-                        self.convert_rgba(f, w, h).map_err(|e| e.to_string())
-                    }
-                    None => Err("No frame decoded yet".into()),
-                };
-                let _ = reply.send(res);
-            }
         }
         false
     }
@@ -471,7 +460,11 @@ impl Worker {
         match pkt.read(&mut self.input) {
             Ok(()) => {
                 if pkt.stream() == self.vidx {
+                    // Bound the backlog when nothing consumes video frames.
                     self.pending_vpkts.push_back(pkt);
+                    if self.pending_vpkts.len() > 600 {
+                        self.pending_vpkts.pop_front();
+                    }
                 } else if Some(pkt.stream()) == self.aidx {
                     self.decode_audio(&pkt);
                 }
@@ -892,4 +885,73 @@ impl SeqDecoder {
         }
         Some(y)
     }
+}
+
+/// Decode the frame displayed at `pts` at native resolution (for snapshots).
+/// Runs independently of playback so it never stalls or disturbs the player.
+pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
+    init();
+    let mut input = ff::format::input(path)?;
+    let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
+    let vidx = vs.index();
+    let tb = q2f(vs.time_base());
+    let start = if vs.start_time() != ff::ffi::AV_NOPTS_VALUE { vs.start_time() as f64 * tb } else { 0.0 };
+    let rotation = stream_rotation(&vs);
+    let mut ctx = ff::codec::context::Context::from_parameters(vs.parameters())?;
+    ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: 0 });
+    let mut dec = ctx.decoder().video()?;
+    let ts = ((pts.max(0.0) + start) / tb) as i64;
+    unsafe {
+        ff::ffi::av_seek_frame(input.as_mut_ptr(), vidx as i32, ts, ff::ffi::AVSEEK_FLAG_BACKWARD as i32);
+    }
+    let mut frame = ff::frame::Video::empty();
+    let mut best: Option<ff::frame::Video> = None;
+    let mut pkt = ff::Packet::empty();
+    let mut eof = false;
+    'outer: loop {
+        while dec.receive_frame(&mut frame).is_ok() {
+            let fp = frame.timestamp().or(frame.pts()).unwrap_or(0) as f64 * tb - start;
+            let done = fp >= pts - 1e-4;
+            best = Some(frame.clone());
+            if done {
+                break 'outer;
+            }
+        }
+        if eof {
+            break;
+        }
+        match pkt.read(&mut input) {
+            Ok(()) => {
+                if pkt.stream() == vidx {
+                    let _ = dec.send_packet(&pkt);
+                }
+            }
+            Err(_) => {
+                eof = true;
+                let _ = dec.send_eof();
+            }
+        }
+    }
+    let f = best.ok_or_else(|| anyhow!("Could not decode the frame"))?;
+    let (w, h) = (f.width(), f.height());
+    let mut sc = ff::software::scaling::Context::get(
+        f.format(),
+        w,
+        h,
+        ff::format::Pixel::RGBA,
+        w,
+        h,
+        ff::software::scaling::Flags::BICUBIC | ff::software::scaling::Flags::ACCURATE_RND | ff::software::scaling::Flags::FULL_CHR_H_INT,
+    )?;
+    set_colorspace(&mut sc, &f);
+    let mut out = ff::frame::Video::empty();
+    sc.run(&f, &mut out)?;
+    let stride = out.stride(0);
+    let data = out.data(0);
+    let mut buf = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h as usize {
+        buf.extend_from_slice(&data[y * stride..y * stride + w as usize * 4]);
+    }
+    let img = RgbaImage::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad frame"))?;
+    Ok(rotate_img(img, rotation))
 }

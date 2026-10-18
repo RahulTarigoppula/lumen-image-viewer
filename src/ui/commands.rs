@@ -100,6 +100,8 @@ pub enum Command {
     FitHeight,
     /// Open the photo's GPS position in OpenStreetMap.
     OpenGpsMap,
+    /// Keep the zoom ratio when moving to the next image.
+    ToggleLockZoom,
 }
 
 use Command::*;
@@ -201,6 +203,7 @@ impl Command {
             FitWidth => "Fit width".into(),
             FitHeight => "Fit height".into(),
             OpenGpsMap => "Show GPS location on map".into(),
+            ToggleLockZoom => "Lock zoom ratio".into(),
         }
     }
 
@@ -304,6 +307,7 @@ impl Command {
             FitWidth => I::ARROWS_OUT_LINE_HORIZONTAL,
             FitHeight => I::ARROWS_OUT_LINE_VERTICAL,
             OpenGpsMap => I::MAP_PIN,
+            ToggleLockZoom => I::LOCK_SIMPLE,
         }
     }
 
@@ -319,7 +323,7 @@ impl Command {
             CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance, AddText, AddBorder,
             Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
-            FitHeight, OpenGpsMap, Exit,
+            FitHeight, OpenGpsMap, ToggleLockZoom, Exit,
         ];
         for n in 0..=5 {
             v.push(Rate(n));
@@ -343,7 +347,7 @@ impl Command {
         v.extend((0..=5).map(Label));
         v.extend([
             ShowFlaggedOnly, OpenVideoMode, OpenViewer, CloseViewer, NextImage, PrevImage, FirstImage, LastImage, ZoomIn,
-            ZoomOut, ZoomActual, ZoomFit, CycleFit, FitWidth, FitHeight, RotateLeft, RotateRight, FlipHorizontal,
+            ZoomOut, ZoomActual, ZoomFit, CycleFit, FitWidth, FitHeight, ToggleLockZoom, RotateLeft, RotateRight, FlipHorizontal,
             FlipVertical, Crop, Resize, CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance,
             AddText, AddBorder, Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper,
             Print, ToggleInfo, ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, NextFrame, PrevFrame,

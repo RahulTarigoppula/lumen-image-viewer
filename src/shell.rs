@@ -457,7 +457,13 @@ const ACK: u8 = 0x06;
 
 /// Pipe name unique per user: `\\.\pipe\lumen-<user>`.
 pub fn pipe_name() -> String {
-    format!(r"\\.\pipe\lumen-{}", sanitize_user(&std::env::var("USERNAME").unwrap_or_default()))
+    // Include the Windows session id so separate logon sessions (fast user
+    // switching, RDP) never talk to each other's instances.
+    let mut session = 0u32;
+    unsafe {
+        let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut session);
+    }
+    format!(r"\\.\pipe\lumen-{}-s{session}", sanitize_user(&std::env::var("USERNAME").unwrap_or_default()))
 }
 
 /// Make a user name safe for a pipe name (ASCII alnum, `-_.`; others hex-escaped).
@@ -514,27 +520,10 @@ static SERVER: OnceLock<Server> = OnceLock::new();
 /// Claim the instance pipe and serve forwarded paths on a background thread.
 /// Returns false when another Lumen already owns it (or on any error).
 pub fn start_instance_server() -> bool {
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
-    use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT};
     if SERVER.get().is_some() {
         return true;
     }
-    let name = wide(&pipe_name());
-    let h = unsafe {
-        CreateNamedPipeW(
-            PCWSTR(name.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
-            4096,
-            4096,
-            0,
-            None,
-        )
-    };
-    if h.is_invalid() {
-        return false;
-    }
+    let Some(h) = create_pipe_instance(true) else { return false };
     let (tx, rx) = crossbeam_channel::unbounded();
     let ctx = std::sync::Arc::new(OnceLock::new());
     let ctx2 = ctx.clone();
@@ -548,6 +537,35 @@ pub fn start_instance_server() -> bool {
     }
     let _ = SERVER.set(Server { rx, ctx });
     true
+}
+
+/// Create one instance of the server pipe. The first call claims the name
+/// exclusively (FILE_FLAG_FIRST_PIPE_INSTANCE) so a second Lumen can detect us.
+fn create_pipe_instance(first: bool) -> Option<HANDLE> {
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
+    let name = wide(&pipe_name());
+    let mut flags = PIPE_ACCESS_DUPLEX;
+    if first {
+        flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+    let h = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            flags,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    if h.is_invalid() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 /// Paths forwarded by other launches since the last call. Call once per frame.
@@ -570,52 +588,69 @@ fn pipe_read_exact(h: HANDLE, buf: &mut [u8]) -> bool {
     true
 }
 
-fn serve(h: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: std::sync::Arc<OnceLock<egui::Context>>) {
-    use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
-    use windows::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
-    let mut failures = 0;
+/// Accept loop: every connected client is handled on its own short-lived
+/// thread, and a fresh pipe instance is created for the next client, so a
+/// slow or hung client can never block other launches.
+fn serve(first: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: std::sync::Arc<OnceLock<egui::Context>>) {
+    use windows::Win32::System::Pipes::ConnectNamedPipe;
+    let mut h = first;
+    let mut backoff = 50u64;
     loop {
         let connected = match unsafe { ConnectNamedPipe(h, None) } {
             Ok(()) => true,
             Err(e) => e.code() == ERROR_PIPE_CONNECTED.to_hresult(),
         };
         if connected {
-            failures = 0;
-            let mut len = [0u8; 4];
-            if pipe_read_exact(h, &mut len) {
-                let n = u32::from_le_bytes(len) as usize;
-                if n <= MAX_MESSAGE {
-                    let mut body = vec![0u8; n];
-                    if pipe_read_exact(h, &mut body) {
-                        if let Some(paths) = decode_body(&body) {
-                            if !paths.is_empty() {
-                                if tx.send(paths).is_err() {
-                                    break;
-                                }
-                                if let Some(c) = ctx.get() {
-                                    c.request_repaint();
-                                }
-                            }
-                            unsafe {
-                                let _ = WriteFile(h, Some(&[ACK]), None, None);
-                                let _ = FlushFileBuffers(h);
-                            }
-                        }
+            backoff = 50;
+            let raw = h.0 as isize;
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            let _ = std::thread::Builder::new().name("lumen-instance-client".into()).spawn(move || handle_client(HANDLE(raw as _), tx, ctx));
+            match create_pipe_instance(false) {
+                Some(n) => h = n,
+                None => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    match create_pipe_instance(false) {
+                        Some(n) => h = n,
+                        None => return,
                     }
                 }
             }
         } else {
-            failures += 1;
-            if failures > 50 {
-                break;
+            // Transient failure: back off instead of giving up for good.
+            std::thread::sleep(Duration::from_millis(backoff));
+            backoff = (backoff * 2).min(2000);
+            unsafe {
+                let _ = windows::Win32::System::Pipes::DisconnectNamedPipe(h);
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
-        unsafe {
-            let _ = DisconnectNamedPipe(h);
+    }
+}
+
+fn handle_client(h: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: std::sync::Arc<OnceLock<egui::Context>>) {
+    use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
+    use windows::Win32::System::Pipes::DisconnectNamedPipe;
+    let mut len = [0u8; 4];
+    if pipe_read_exact(h, &mut len) {
+        let n = u32::from_le_bytes(len) as usize;
+        if n <= MAX_MESSAGE {
+            let mut body = vec![0u8; n];
+            if pipe_read_exact(h, &mut body) {
+                if let Some(paths) = decode_body(&body) {
+                    if !paths.is_empty() && tx.send(paths).is_ok() {
+                        if let Some(c) = ctx.get() {
+                            c.request_repaint();
+                        }
+                    }
+                    unsafe {
+                        let _ = WriteFile(h, Some(&[ACK]), None, None);
+                        let _ = FlushFileBuffers(h);
+                    }
+                }
+            }
         }
     }
     unsafe {
+        let _ = DisconnectNamedPipe(h);
         let _ = CloseHandle(h);
     }
 }
@@ -640,7 +675,7 @@ pub fn forward_to_running(paths: &[PathBuf]) -> bool {
 fn try_forward(name: &str, msg: &[u8]) -> bool {
     use std::io::{Read, Write};
     let mut file = None;
-    for _ in 0..20 {
+    for _ in 0..50 {
         match std::fs::OpenOptions::new().read(true).write(true).open(name) {
             Ok(f) => {
                 file = Some(f);
