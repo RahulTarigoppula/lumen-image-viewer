@@ -1,6 +1,95 @@
-//! Tonal mapping: Levels and Curves lookup tables (per channel + master).
+//! Tonal mapping: Levels and Curves lookup tables (per channel + master), and
+//! Shadows / Highlights local tone mapping.
 
 use image::RgbaImage;
+use rayon::prelude::*;
+
+/// Cells along the long side of the low-resolution luminance grid used by
+/// [`shadows_highlights`]. Being relative to the image size, the downscaled
+/// preview and the full-resolution render produce the same look.
+const SH_GRID: f32 = 256.0;
+
+/// Shadows / Highlights: lift dark areas (`shadows` > 0) and recover bright
+/// ones (`highlights` > 0), each -1..1. Brightness is judged from a heavily
+/// blurred luminance map (local, not per pixel), so local contrast and colour
+/// ratios are kept. Cost: one pass over the image plus a tiny grid.
+pub fn shadows_highlights(img: &RgbaImage, shadows: f32, highlights: f32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let (sh, hi) = (shadows.clamp(-1.0, 1.0), highlights.clamp(-1.0, 1.0));
+    if w == 0 || h == 0 || (sh == 0.0 && hi == 0.0) {
+        return img.clone();
+    }
+    let long = w.max(h) as f32;
+    let gw = ((w as f32 * SH_GRID / long).round() as usize).max(1);
+    let gh = ((h as f32 * SH_GRID / long).round() as usize).max(1);
+    let (cw, ch) = (w as f32 / gw as f32, h as f32 / gh as f32);
+    let raw = img.as_raw();
+    // Mean luma per grid cell (sampled sparsely inside big cells).
+    let mut grid: Vec<f32> = (0..gw * gh)
+        .into_par_iter()
+        .map(|i| {
+            let (gx, gy) = (i % gw, i / gw);
+            let (x0, x1) = ((gx as f32 * cw) as u32, (((gx + 1) as f32 * cw).ceil() as u32).min(w).max((gx as f32 * cw) as u32 + 1));
+            let (y0, y1) = ((gy as f32 * ch) as u32, (((gy + 1) as f32 * ch).ceil() as u32).min(h).max((gy as f32 * ch) as u32 + 1));
+            let step = ((x1 - x0).max(y1 - y0) / 16).max(1);
+            let (mut s, mut n) = (0f32, 0f32);
+            let mut y = y0;
+            while y < y1.min(h) {
+                let mut x = x0;
+                while x < x1.min(w) {
+                    let j = (y as usize * w as usize + x as usize) * 4;
+                    s += luma8(raw[j], raw[j + 1], raw[j + 2]);
+                    n += 1.0;
+                    x += step;
+                }
+                y += step;
+            }
+            if n > 0.0 {
+                s / n
+            } else {
+                0.5
+            }
+        })
+        .collect();
+    super::mask::blur_plane(&mut grid, gw, gh, SH_GRID * 0.03);
+    let stride = w as usize * 4;
+    let mut out = img.clone();
+    out.as_mut().par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
+        let gyf = ((y as f32 + 0.5) / ch - 0.5).clamp(0.0, (gh - 1) as f32);
+        let gy0 = gyf.floor() as usize;
+        let gy1 = (gy0 + 1).min(gh - 1);
+        let fy = gyf - gy0 as f32;
+        for x in 0..w as usize {
+            let gxf = ((x as f32 + 0.5) / cw - 0.5).clamp(0.0, (gw - 1) as f32);
+            let gx0 = gxf.floor() as usize;
+            let gx1 = (gx0 + 1).min(gw - 1);
+            let fx = gxf - gx0 as f32;
+            let top = grid[gy0 * gw + gx0] * (1.0 - fx) + grid[gy0 * gw + gx1] * fx;
+            let bot = grid[gy1 * gw + gx0] * (1.0 - fx) + grid[gy1 * gw + gx1] * fx;
+            let local = top * (1.0 - fy) + bot * fy;
+            let p = &mut row[x * 4..x * 4 + 4];
+            let own = luma8(p[0], p[1], p[2]);
+            // Mostly the local average, a little of the pixel itself (fewer halos).
+            let l = local * 0.6 + own * 0.4;
+            let ws = (1.0 - l / 0.55).clamp(0.0, 1.0);
+            let wh = ((l - 0.45) / 0.55).clamp(0.0, 1.0);
+            let ev = sh * ws * ws * 1.6 - hi * wh * wh * 1.3;
+            if ev.abs() < 1e-4 {
+                continue;
+            }
+            let gain = ev.exp2();
+            for c in &mut p[..3] {
+                *c = (*c as f32 * gain).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    out
+}
+
+#[inline]
+fn luma8(r: u8, g: u8, b: u8) -> f32 {
+    (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
+}
 
 /// Channel index used by Levels/Curves: 0 = composite RGB, 1..=3 = R, G, B.
 pub const CHANNEL_NAMES: [&str; 4] = ["RGB", "Red", "Green", "Blue"];
@@ -166,6 +255,29 @@ pub fn apply_curves(img: &RgbaImage, curves: &[Vec<[f32; 2]>; 4]) -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadows_highlights_basic() {
+        // Left half dark, right half bright.
+        let img = RgbaImage::from_fn(200, 100, |x, _| if x < 100 { image::Rgba([30, 25, 20, 255]) } else { image::Rgba([235, 230, 220, 255]) });
+        assert_eq!(shadows_highlights(&img, 0.0, 0.0), img);
+        let lifted = shadows_highlights(&img, 1.0, 0.0);
+        assert!(lifted.get_pixel(20, 50)[0] > 45, "shadows lifted");
+        assert!((lifted.get_pixel(180, 50)[0] as i32 - 235).abs() <= 2, "highlights untouched");
+        // Colour ratios are kept (gain multiplies all channels).
+        let p = lifted.get_pixel(20, 50);
+        assert!(p[0] > p[1] && p[1] > p[2]);
+        let rec = shadows_highlights(&img, 0.0, 1.0);
+        assert!(rec.get_pixel(180, 50)[0] < 225, "highlights recovered");
+        assert!((rec.get_pixel(20, 50)[0] as i32 - 30).abs() <= 1);
+        // Preview (downscaled) and full render agree on the look.
+        let small = crate::imaging::resize_to_fit(&img, 50, 50);
+        let ls = shadows_highlights(&small, 1.0, 0.0);
+        assert!((ls.get_pixel(5, 12)[0] as i32 - lifted.get_pixel(20, 50)[0] as i32).abs() <= 4);
+        // Tiny images are fine.
+        let one = RgbaImage::from_pixel(1, 1, image::Rgba([10, 10, 10, 255]));
+        assert_eq!(shadows_highlights(&one, 1.0, 1.0).dimensions(), (1, 1));
+    }
 
     fn sample() -> RgbaImage {
         RgbaImage::from_fn(17, 9, |x, y| image::Rgba([(x * 15) as u8, (y * 28) as u8, (x * y) as u8, 200]))
