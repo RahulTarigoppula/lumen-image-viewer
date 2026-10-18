@@ -284,6 +284,23 @@ impl Default for ResizeSpec {
     }
 }
 
+/// Largest output side the batch tools will produce.
+pub const MAX_OUTPUT_SIDE: u32 = 65_535;
+/// Largest output area (one RGBA image this size is about 1.6 GB).
+pub const MAX_OUTPUT_PIXELS: u64 = 400_000_000;
+
+/// Refuse output sizes that would need an unreasonable amount of memory.
+pub fn check_output_size(w: u32, h: u32) -> Result<(), String> {
+    if w > MAX_OUTPUT_SIDE || h > MAX_OUTPUT_SIDE || w as u64 * h as u64 > MAX_OUTPUT_PIXELS {
+        return Err(format!(
+            "Output would be {w} x {h} px ({:.0} MP). The limit is {MAX_OUTPUT_SIDE} px per side and {} MP; choose a smaller size",
+            w as f64 * h as f64 / 1e6,
+            MAX_OUTPUT_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
 /// Compute the output size for an input of `w` x `h` (aspect ratio preserved).
 pub fn output_size(w: u32, h: u32, spec: &ResizeSpec) -> (u32, u32) {
     if w == 0 || h == 0 {
@@ -761,6 +778,10 @@ mod tests {
         assert_eq!(output_size(3000, 4000, &spec(ResizeMode::LongEdge, 2000, 0)), (1500, 2000));
         assert_eq!(output_size(4000, 3000, &spec(ResizeMode::ShortEdge, 1500, 0)), (2000, 1500));
         assert_eq!(output_size(4000, 3000, &spec(ResizeMode::Width, 1000, 0)), (1000, 750));
+        assert!(check_output_size(20_000, 20_000).is_ok());
+        assert!(check_output_size(40_000, 40_000).is_err());
+        assert!(check_output_size(65_536, 10).is_err());
+        assert!(check_output_size(60_000, 6_000).is_ok());
         assert_eq!(output_size(4000, 3000, &spec(ResizeMode::Height, 600, 0)), (800, 600));
         assert_eq!(output_size(4000, 3000, &spec(ResizeMode::Percent, 0, 0)), (2000, 1500));
         assert_eq!(output_size(4000, 3000, &spec(ResizeMode::Fit, 1920, 1080)), (1440, 1080));
