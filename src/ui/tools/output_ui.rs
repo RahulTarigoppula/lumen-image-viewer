@@ -354,6 +354,11 @@ impl MultiPageWindow {
                     ui.label("");
                     hint(ui, p, "Loops forever. Every frame is fitted to the first image's shape.");
                     ui.end_row();
+                    if s.format == MultiFormat::WebP {
+                        ui.label("");
+                        hint(ui, p, &format!("Animated WebP holds every frame in memory: at most {} MP in total (frames x frame size).", mp::MAX_WEBP_ANIM_PIXELS / 1_000_000));
+                        ui.end_row();
+                    }
                 }
             });
         });
@@ -470,7 +475,8 @@ impl StripWindow {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         mp::render_strip(&l, s.bg, &OutProgress::default(), |i| {
                             let (_, _, w, h) = l.cells[i];
-                            Ok(crate::decode::decode_thumbnail(&files[i], w.max(h).max(16)).unwrap_or_else(|_| image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 200, 200, 255]))))
+                            let t = std::panic::catch_unwind(|| crate::decode::decode_thumbnail(&files[i], w.max(h).max(16)).ok()).ok().flatten();
+                            Ok(t.unwrap_or_else(|| image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 200, 200, 255]))))
                         })
                     }));
                     if let Ok(Ok(img)) = r {

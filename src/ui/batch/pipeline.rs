@@ -162,6 +162,13 @@ pub fn canvas_size(w: u32, h: u32, c: &CanvasStep, scale: f32) -> (u32, u32) {
     }
 }
 
+fn resize_dims(r: &ResizeStep, w: u32, h: u32, cx: &StepCtx) -> (u32, u32) {
+    let s = cx.scale.max(1e-3);
+    let (lw, lh) = (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1));
+    let (nw, nh) = logic::output_size(lw, lh, &r.spec);
+    (((nw as f32 * s).round() as u32).clamp(1, geom::MAX_DIM), ((nh as f32 * s).round() as u32).clamp(1, geom::MAX_DIM))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RotateWhen {
     Always,
@@ -638,6 +645,36 @@ impl Step {
         }
     }
 
+    /// The size this step will produce for a `w` x `h` input, for the steps
+    /// that can grow the image (checked before any memory is allocated).
+    pub fn planned_size(&self, w: u32, h: u32, cx: &StepCtx) -> Option<(u32, u32)> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        match self {
+            Step::Resize(r) => Some(resize_dims(r, w, h, cx)),
+            Step::Canvas(c) => Some(canvas_size(w, h, c, cx.scale)),
+            Step::Rotate(r) => {
+                let applies = match r.when {
+                    RotateWhen::Always => true,
+                    RotateWhen::Portrait => h > w,
+                    RotateWhen::Landscape => w > h,
+                };
+                if !applies {
+                    return None;
+                }
+                let (w, h) = if r.quarter % 2 == 1 { (h, w) } else { (w, h) };
+                Some(if r.angle.abs() > 0.001 { geom::rotated_size(w, h, r.angle, r.crop) } else { (w, h) })
+            }
+            Step::Border(b) => {
+                let b = b.spec(cx.scale.max(1e-3));
+                let (bw, bb) = (b.width.max(0.0).round() as f64, b.bottom.max(0.0).round() as f64);
+                Some((geom::clamp_dim(w as f64 + 2.0 * bw), geom::clamp_dim(h as f64 + bw + bb)))
+            }
+            _ => None,
+        }
+    }
+
     pub fn apply(&self, img: RgbaImage, cx: &StepCtx) -> RgbaImage {
         let (w, h) = img.dimensions();
         if w == 0 || h == 0 {
@@ -645,10 +682,7 @@ impl Step {
         }
         match self {
             Step::Resize(r) => {
-                let s = cx.scale.max(1e-3);
-                let (lw, lh) = (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1));
-                let (nw, nh) = logic::output_size(lw, lh, &r.spec);
-                let (nw, nh) = (((nw as f32 * s).round() as u32).clamp(1, geom::MAX_DIM), ((nh as f32 * s).round() as u32).clamp(1, geom::MAX_DIM));
+                let (nw, nh) = resize_dims(r, w, h, cx);
                 if (nw, nh) == (w, h) {
                     img
                 } else {
@@ -766,9 +800,21 @@ impl Pipeline {
         self.active().filter_map(|s| if let Step::Dpi { dpi } = s { Some(*dpi) } else { None }).last()
     }
 
-    /// Run every enabled step in order.
+    /// Run every enabled step in order (no size limits; tests only).
+    #[cfg(test)]
     pub fn apply(&self, img: RgbaImage, cx: &StepCtx) -> RgbaImage {
         self.active().fold(img, |img, s| s.apply(img, cx))
+    }
+
+    /// Like `apply`, but refuses (before allocating) any step whose output
+    /// would exceed the batch size limits.
+    pub fn try_apply(&self, img: RgbaImage, cx: &StepCtx) -> Result<RgbaImage, String> {
+        self.active().try_fold(img, |img, s| {
+            if let Some((nw, nh)) = s.planned_size(img.width(), img.height(), cx) {
+                logic::check_output_size(nw, nh).map_err(|e| format!("{}: {e}", s.label()))?;
+            }
+            Ok(s.apply(img, cx))
+        })
     }
 }
 
