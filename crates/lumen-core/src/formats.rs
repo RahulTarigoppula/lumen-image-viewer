@@ -6,7 +6,7 @@ use std::path::Path;
 pub const NATIVE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "ico", "cur", "tif",
     "tiff", "tga", "pbm", "pgm", "ppm", "pnm", "pam", "hdr", "exr", "qoi", "dds", "ff",
-    // Lumen's own decoders (src/decode): Photoshop, vector, PCX, metafiles.
+    // Lumen's own decoders (decode/): Photoshop, vector, PCX, metafiles.
     "psd", "psb", "svg", "svgz", "pcx", "wmf", "emf",
 ];
 

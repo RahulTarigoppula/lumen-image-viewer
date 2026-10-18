@@ -2,7 +2,7 @@
 
 Status: architectural plan, October 2026. Target: Rust 1.99 MSVC, eframe/egui 0.37 (glow), single portable `lumen.exe`, offline by default. This document makes decisions; it contains no code beyond payload and signature sketches.
 
-Builds on: `docs/VIDEO-RESEARCH.md` (metric math sections 2.1 to 2.5), `src/video/metrics.rs` (PSNR and FFmpeg-style SSIM on native YUV planes), `src/video/analyze.rs` (whole-file A/B job over `SeqDecoder`), `src/video/scopes.rs`, `src/edit/mod.rs` (`Histogram`), `src/ui/compare.rs` (RGBA difference and `DiffStats`), `src/ui/viewer.rs` (`CropState` with drag handles).
+Builds on: `docs/VIDEO-RESEARCH.md` (metric math sections 2.1 to 2.5), `crates/lumen-core/src/video/metrics.rs` (PSNR and FFmpeg-style SSIM on native YUV planes), `src/video/analyze.rs` (whole-file A/B job over `SeqDecoder`), `crates/lumen-core/src/video/scopes.rs`, `crates/lumen-core/src/edit/mod.rs` (`Histogram`), `src/ui/compare.rs` (RGBA difference and `DiffStats`), `src/ui/viewer.rs` (`CropState` with drag handles).
 
 ---
 
@@ -433,7 +433,7 @@ crates/lumen-ai/           deps: ureq, serde, serde_json, base64, image (png), j
 src/analysis_ui/           panel.rs roi.rs plots.rs heatmap_view.rs ai_view.rs send_preview.rs (app crate; adapters from LoadedImage/YuvFrame)
 ```
 
-`src/video/metrics.rs` becomes a thin re-export of `lumen_analysis::metrics::reference::{psnr, ssim}` so existing callers keep compiling; `analyze.rs` becomes a `JobSpec` producer.
+`crates/lumen-core/src/video/metrics.rs` becomes a thin re-export of `lumen_analysis::metrics::reference::{psnr, ssim}` so existing callers keep compiling; `analyze.rs` becomes a `JobSpec` producer.
 
 ### 5.2 Core traits and types (signatures only)
 
