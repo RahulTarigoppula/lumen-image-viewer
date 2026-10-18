@@ -609,7 +609,9 @@ impl Browser {
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut double: Option<usize> = None;
         let mut ctx_menu_for: Option<usize> = None;
-        let out = scroll.show_rows(ui, cell.y, rows, |ui, range| {
+        // Registered before the cells so cells take precedence for clicks.
+        let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("grid-bg"), Sense::click());
+        scroll.show_rows(ui, cell.y, rows, |ui, range| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for row in range {
                 ui.horizontal(|ui| {
@@ -659,7 +661,6 @@ impl Browser {
             }
         });
         // Clicking empty space clears the selection.
-        let bg = ui.interact(out.inner_rect, ui.id().with("grid-bg"), Sense::click());
         if bg.clicked() && clicked.is_none() && !ui.input(|i| i.modifiers.ctrl || i.modifiers.shift) {
             self.selected.clear();
         }
@@ -802,6 +803,7 @@ impl Browser {
         let mut double = None;
         let mut ctx_for = None;
         let mut sort_click: Option<SortKey> = None;
+        let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("details-bg"), Sense::click());
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -927,7 +929,6 @@ impl Browser {
                 self.focus = Some(i);
             }
         }
-        let bg = ui.interact(ui.min_rect(), ui.id().with("details-bg"), Sense::click());
         self.context_menu(ui, &bg, core, ev, ctx_for.is_some());
     }
 
