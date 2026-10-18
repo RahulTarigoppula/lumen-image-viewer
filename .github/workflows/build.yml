@@ -20,6 +20,7 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-bincache,readwrite
+      VCPKGRS_TRIPLET: x64-windows-static-md-rel
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +28,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg-bincache
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-ffmpeg-core-avcodec-avformat-swscale-swresample-dav1d-x64-windows-static-md
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg/**') }}-ffmpeg-x64-windows-static-md-rel
 
       - name: Install FFmpeg (static, LGPL) via vcpkg
         shell: pwsh
@@ -36,7 +37,7 @@ jobs:
           git clone https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
           git -C $env:VCPKG_ROOT checkout $env:VCPKG_COMMIT
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md"
+          & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md-rel" --overlay-ports=vcpkg/overlay-ports --overlay-triplets=vcpkg/triplets
 
       - uses: dtolnay/rust-toolchain@stable
 
