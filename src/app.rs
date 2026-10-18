@@ -714,6 +714,23 @@ impl App {
                     self.core.toasts.info("Image is still loading");
                 }
             }
+            DrawBoard | CloneStamp | HealingBrush | RedEye | BlurRegion | Selection => {
+                if !self.ensure_viewer() {
+                    return;
+                }
+                let name = match cmd {
+                    DrawBoard => "draw_board",
+                    CloneStamp => "clone_stamp",
+                    HealingBrush => "heal",
+                    RedEye => "red_eye",
+                    BlurRegion => "blur_region",
+                    _ => "selection",
+                };
+                match edit_tools::make_tool_by_name(name) {
+                    Some(tool) => self.viewer.open_tool(tool, &self.core),
+                    None => self.core.toasts.info(format!("{} is not available", cmd.label())),
+                }
+            }
             Resize | CanvasSize | AdjustColors | Levels | Curves | Sharpen | Blur | Effects | AddText | AddBorder | Watermark | FreeRotate => {
                 if !self.ensure_viewer() {
                     return;
@@ -724,7 +741,10 @@ impl App {
                 }
             }
             Undo if self.mode == Mode::Browser => self.undo_file_op(),
-            Undo | Redo if self.viewer.has_tool() => {}
+            // With an edit tool open, Ctrl+Z / Ctrl+Y step through the tool's own strokes.
+            Undo | Redo if self.viewer.has_tool() => {
+                let _ = if cmd == Undo { self.viewer.tool_undo() } else { self.viewer.tool_redo() };
+            }
             Undo => {
                 if let Some(e) = &mut self.viewer.edit {
                     if let Some(w) = e.undo() {
@@ -1381,10 +1401,11 @@ impl App {
         }
         let km = keymap::active();
         let typing = ctx.egui_wants_keyboard_input();
+        // Edit tools own Enter / Escape and most keys; only undo / redo (of the tool) pass.
+        let tool_only = self.mode == Mode::Viewer && self.viewer.has_tool();
         let mode_map = match self.mode {
             Mode::Browser => Some(KeyMode::Browser),
-            // Edit tools own Enter / Escape and their preview base would go stale on undo.
-            Mode::Viewer if !self.viewer.has_tool() => Some(KeyMode::Viewer),
+            Mode::Viewer => Some(KeyMode::Viewer),
             _ => None,
         };
         // Mode shortcuts are off while typing or while a tool window has the user's attention.
@@ -1399,7 +1420,9 @@ impl App {
                 }
                 if let Some(m) = mode_map {
                     if let Some(c) = km.lookup(m, key, mods) {
-                        return Some(c);
+                        if !tool_only || matches!(c, Command::Undo | Command::Redo) {
+                            return Some(c);
+                        }
                     }
                 }
                 km.bindings(KeyMode::Global)
@@ -1415,7 +1438,7 @@ impl App {
         match mode_map {
             Some(KeyMode::Viewer) => {
                 let star = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*")));
-                if star {
+                if star && !tool_only {
                     fire.push(Command::CycleFit);
                 }
             }
@@ -1828,6 +1851,10 @@ impl App {
             });
             ui.menu_button(format!("{}   Image", I::IMAGE), |ui| {
                 for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::Crop, Command::Resize, Command::CanvasSize, Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::AddText, Command::AddBorder, Command::Watermark, Command::SetWallpaper, Command::Print] {
+                    item(ui, c, &mut fire);
+                }
+                ui.separator();
+                for c in [Command::DrawBoard, Command::CloneStamp, Command::HealingBrush, Command::RedEye, Command::BlurRegion, Command::Selection] {
                     item(ui, c, &mut fire);
                 }
             });

@@ -384,6 +384,25 @@ impl Viewer {
         self.tool.is_some() || self.crop.is_some()
     }
 
+    /// Undo inside the open edit tool (strokes, points). False when nothing changed.
+    pub fn tool_undo(&mut self) -> bool {
+        let Some(t) = &mut self.tool else { return false };
+        let changed = t.tool.undo();
+        if changed {
+            t.version += 1;
+        }
+        changed
+    }
+
+    pub fn tool_redo(&mut self) -> bool {
+        let Some(t) = &mut self.tool else { return false };
+        let changed = t.tool.redo();
+        if changed {
+            t.version += 1;
+        }
+        changed
+    }
+
     /// Navigate by `delta` images. Returns false if blocked by unsaved edits.
     pub fn step(&mut self, delta: isize, wrap: bool, fit: FitMode) -> bool {
         if self.list.is_empty() {
@@ -977,7 +996,7 @@ impl Viewer {
                 menu_item(ui, c, ev);
             }
             ui.menu_button(format!("{}   Adjust", I::SLIDERS_HORIZONTAL), |ui| {
-                for c in [Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::CanvasSize, Command::AddBorder, Command::AddText, Command::Watermark] {
+                for c in [Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::CanvasSize, Command::AddBorder, Command::AddText, Command::Watermark, Command::DrawBoard, Command::CloneStamp, Command::HealingBrush, Command::RedEye, Command::BlurRegion, Command::Selection] {
                     menu_item(ui, c, ev);
                 }
             });
