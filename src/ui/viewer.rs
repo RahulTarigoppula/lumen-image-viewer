@@ -751,8 +751,8 @@ impl Viewer {
                         view,
                         zoom: self.zoom,
                         pixels_per_point: ppp,
-                        preview: Some(&t.base),
-                        preview_scale: t.scale,
+                        preview: t.base.as_ref().map(|b| &*b.image),
+                        preview_scale: t.scale(),
                         preview_current: t.preview_version >= t.version,
                         interactive: !ui.input(|i| i.key_down(Key::Space)),
                     };
