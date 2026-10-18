@@ -5,14 +5,17 @@
 pub mod effects;
 pub mod filters;
 pub mod geom;
+pub mod mask;
 pub mod ops;
+pub mod raster;
+pub mod retouch;
 pub mod text;
 pub mod tone;
 pub mod tools;
 
 use image::RgbaImage;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
@@ -52,21 +55,47 @@ pub struct EditSession {
     pub current: Arc<RgbaImage>,
     undo: Vec<(Arc<RgbaImage>, String)>,
     redo: Vec<(Arc<RgbaImage>, String)>,
-    /// Increments on every change so views know to re-upload.
+    /// Increments on every change so views know to re-upload (cache key only;
+    /// dirtiness is tracked by image identity, see [`is_dirty`](Self::is_dirty)).
     pub version: u64,
+    /// Legacy: hosts may still set `saved_version = version` after saving;
+    /// it is honoured lazily. Prefer [`mark_saved`](Self::mark_saved).
     pub saved_version: u64,
+    /// The image that matches the file on disk (loaded or last saved). Weak so
+    /// it never keeps pixels alive; the allocation is pinned so identity is safe.
+    saved: Weak<RgbaImage>,
 }
 
 impl EditSession {
     pub fn new(path: PathBuf, img: Arc<RgbaImage>) -> Self {
-        EditSession { path, current: img, undo: Vec::new(), redo: Vec::new(), version: 0, saved_version: 0 }
+        let saved = Arc::downgrade(&img);
+        EditSession { path, current: img, undo: Vec::new(), redo: Vec::new(), version: 0, saved_version: 0, saved }
     }
 
+    /// True when the current image differs from the loaded / last saved one.
+    /// Undoing back to the saved state makes the session clean again.
     pub fn is_dirty(&self) -> bool {
-        self.version != self.saved_version
+        if self.saved_version == self.version {
+            return false;
+        }
+        !std::ptr::eq(self.saved.as_ptr(), Arc::as_ptr(&self.current))
+    }
+
+    /// Record that the current image has been written to disk.
+    pub fn mark_saved(&mut self) {
+        self.saved = Arc::downgrade(&self.current);
+        self.saved_version = self.version;
+    }
+
+    /// Pick up a legacy `saved_version = version` assignment before mutating.
+    fn sync_saved(&mut self) {
+        if self.saved_version == self.version {
+            self.saved = Arc::downgrade(&self.current);
+        }
     }
 
     pub fn push(&mut self, img: RgbaImage, what: &str) {
+        self.sync_saved();
         let prev = std::mem::replace(&mut self.current, Arc::new(img));
         self.undo.push((prev, what.to_string()));
         self.redo.clear();
@@ -80,6 +109,7 @@ impl EditSession {
     }
 
     pub fn undo(&mut self) -> Option<String> {
+        self.sync_saved();
         let (img, what) = self.undo.pop()?;
         let cur = std::mem::replace(&mut self.current, img);
         self.redo.push((cur, what.clone()));
@@ -88,6 +118,7 @@ impl EditSession {
     }
 
     pub fn redo(&mut self) -> Option<String> {
+        self.sync_saved();
         let (img, what) = self.redo.pop()?;
         let cur = std::mem::replace(&mut self.current, img);
         self.undo.push((cur, what.clone()));
@@ -121,6 +152,67 @@ pub struct ToolUiCtx<'a> {
     pub preview: Option<&'a RgbaImage>,
 }
 
+/// Context passed to [`EditTool::canvas`]: where the image is on screen and
+/// how to map between image pixels (full resolution) and screen points.
+pub struct CanvasCtx<'a> {
+    pub palette: &'a crate::ui::theme::Palette,
+    /// Full-resolution size of the image being edited.
+    pub image_size: (u32, u32),
+    /// Screen rect (points) the whole image is drawn into (may exceed `view`).
+    pub dest: egui::Rect,
+    /// Visible viewport (points).
+    pub view: egui::Rect,
+    /// Physical screen pixels per image pixel.
+    pub zoom: f32,
+    pub pixels_per_point: f32,
+    /// The preview-sized copy the live preview renders from, and its scale
+    /// (preview size / full size).
+    pub preview: Option<&'a RgbaImage>,
+    pub preview_scale: f32,
+    /// True when the displayed preview reflects the tool's latest parameters.
+    pub preview_current: bool,
+    /// False while the user holds Space to pan: draw overlays only.
+    pub interactive: bool,
+}
+
+impl CanvasCtx<'_> {
+    /// Screen points per image pixel.
+    pub fn pts_per_px(&self) -> f32 {
+        if self.image_size.0 == 0 {
+            1.0
+        } else {
+            (self.dest.width() / self.image_size.0 as f32).max(1e-6)
+        }
+    }
+    /// Image pixel (full resolution) to screen point.
+    pub fn to_screen(&self, p: [f32; 2]) -> egui::Pos2 {
+        let s = self.pts_per_px();
+        egui::pos2(self.dest.min.x + p[0] * s, self.dest.min.y + p[1] * s)
+    }
+    /// Screen point to image pixel (full resolution, unclamped).
+    pub fn to_image(&self, p: egui::Pos2) -> [f32; 2] {
+        let s = self.pts_per_px();
+        [(p.x - self.dest.min.x) / s, (p.y - self.dest.min.y) / s]
+    }
+    /// A screen distance (points) expressed in image pixels.
+    pub fn screen_to_px(&self, d: f32) -> f32 {
+        d / self.pts_per_px()
+    }
+    pub fn clamp_to_image(&self, p: [f32; 2]) -> [f32; 2] {
+        [p[0].clamp(0.0, self.image_size.0 as f32), p[1].clamp(0.0, self.image_size.1 as f32)]
+    }
+    /// Sample the preview image at a full-resolution image position.
+    pub fn sample(&self, p: [f32; 2]) -> Option<[u8; 4]> {
+        let img = self.preview?;
+        let x = (p[0] * self.preview_scale).floor();
+        let y = (p[1] * self.preview_scale).floor();
+        if x < 0.0 || y < 0.0 || x >= img.width() as f32 || y >= img.height() as f32 {
+            return None;
+        }
+        Some(img.get_pixel(x as u32, y as u32).0)
+    }
+}
+
 /// An adjustment dialog. Implementations hold their own parameters.
 pub trait EditTool: Send {
     fn title(&self) -> String;
@@ -135,6 +227,26 @@ pub trait EditTool: Send {
     fn reset(&mut self) {}
     /// Whether the output size differs from the input (resize, canvas, border ...).
     fn changes_size(&self) -> bool {
+        false
+    }
+    /// Whether the tool works directly on the image (draws overlays and takes
+    /// primary-button clicks/drags; the viewer then pans only while Space is held).
+    fn wants_canvas(&self) -> bool {
+        false
+    }
+    /// Interactive canvas hook, called every frame after the image is painted
+    /// when [`wants_canvas`](Self::wants_canvas) is true. `resp` is the image
+    /// area's click-and-drag response. Return true when parameters changed
+    /// (triggers a new preview render).
+    fn canvas(&mut self, _cx: &CanvasCtx, _painter: &egui::Painter, _resp: &egui::Response) -> bool {
+        false
+    }
+    /// Tool-local undo / redo (e.g. Draw Board objects). Return true when
+    /// handled, so the host does not undo the image history instead.
+    fn undo(&mut self) -> bool {
+        false
+    }
+    fn redo(&mut self) -> bool {
         false
     }
 }
@@ -210,5 +322,47 @@ impl Histogram {
             }
             painter.add(egui::Shape::mesh(mesh));
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn img(v: u8) -> RgbaImage {
+        RgbaImage::from_pixel(2, 2, image::Rgba([v, v, v, 255]))
+    }
+
+    #[test]
+    fn undo_to_original_is_clean() {
+        let mut s = EditSession::new(PathBuf::from("a.png"), Arc::new(img(1)));
+        assert!(!s.is_dirty());
+        s.push(img(2), "x");
+        assert!(s.is_dirty());
+        s.undo();
+        assert!(!s.is_dirty());
+        s.redo();
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn saved_state_tracking() {
+        let mut s = EditSession::new(PathBuf::from("a.png"), Arc::new(img(1)));
+        s.push(img(2), "x");
+        s.mark_saved();
+        assert!(!s.is_dirty());
+        s.push(img(3), "y");
+        assert!(s.is_dirty());
+        s.undo();
+        assert!(!s.is_dirty());
+        s.undo();
+        assert!(s.is_dirty(), "original differs from the saved file now");
+        // Legacy assignment still works.
+        s.saved_version = s.version;
+        assert!(!s.is_dirty());
+        s.redo();
+        assert!(s.is_dirty());
+        s.undo();
+        assert!(!s.is_dirty());
     }
 }

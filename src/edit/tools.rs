@@ -1,8 +1,12 @@
 //! Concrete adjustment tools (dialogs). `make_tool` maps a command to its tool.
 //! Shared UI helpers live here; the tools themselves are grouped in submodules.
 
+mod canvas;
+mod draw;
 mod filter;
 mod geometry;
+mod region;
+mod retouch;
 mod text;
 mod tone;
 
@@ -28,6 +32,33 @@ pub fn make_tool(cmd: Command) -> Option<Box<dyn EditTool>> {
         _ => return None,
     })
 }
+
+/// Interactive (on-canvas) tools by stable name, so commands can be wired
+/// without this module depending on new `Command` variants:
+///
+/// | name           | tool                                   |
+/// |----------------|----------------------------------------|
+/// | `draw_board`   | Draw board (annotations)               |
+/// | `clone_stamp`  | Clone stamp                            |
+/// | `heal`         | Healing brush                          |
+/// | `red_eye`      | Red-eye removal                        |
+/// | `blur_region`  | Blur / pixelate region                 |
+/// | `selection`    | Selection (adjust inside an area)      |
+#[allow(dead_code)] // Wired to commands by the app (see the table above).
+pub fn make_tool_by_name(name: &str) -> Option<Box<dyn EditTool>> {
+    Some(match name {
+        "draw_board" => Box::new(draw::DrawBoard::default()),
+        "clone_stamp" => Box::new(retouch::CloneStamp::new(false)),
+        "heal" => Box::new(retouch::CloneStamp::new(true)),
+        "red_eye" => Box::new(region::RedEye::default()),
+        "blur_region" => Box::new(region::ObscureRegion::default()),
+        "selection" => Box::new(region::Selection::default()),
+        _ => return None,
+    })
+}
+
+/// Names accepted by [`make_tool_by_name`].
+pub const TOOL_NAMES: [&str; 6] = ["draw_board", "clone_stamp", "heal", "red_eye", "blur_region", "selection"];
 
 /// Width of the label column used by every tool row.
 pub const LABEL_W: f32 = 96.0;
@@ -227,11 +258,15 @@ pub struct AdjustColors {
     pub temperature: f32,
     pub tint: f32,
     pub exposure: f32,
+    /// -100..100: lift (+) or deepen (-) dark areas.
+    pub shadows: f32,
+    /// -100..100: recover (+) or brighten (-) bright areas.
+    pub highlights: f32,
 }
 
 impl Default for AdjustColors {
     fn default() -> Self {
-        AdjustColors { brightness: 0.0, contrast: 0.0, gamma: 1.0, saturation: 0.0, vibrance: 0.0, hue: 0.0, temperature: 0.0, tint: 0.0, exposure: 0.0 }
+        AdjustColors { brightness: 0.0, contrast: 0.0, gamma: 1.0, saturation: 0.0, vibrance: 0.0, hue: 0.0, temperature: 0.0, tint: 0.0, exposure: 0.0, shadows: 0.0, highlights: 0.0 }
     }
 }
 
@@ -246,6 +281,9 @@ impl EditTool for AdjustColors {
         c |= slider(ui, "Contrast", &mut self.contrast, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Gamma", &mut self.gamma, 0.2..=3.0, 1.0, "");
         ui.separator();
+        c |= slider(ui, "Shadows", &mut self.shadows, -100.0..=100.0, 0.0, "");
+        c |= slider(ui, "Highlights", &mut self.highlights, -100.0..=100.0, 0.0, "");
+        ui.separator();
         c |= slider(ui, "Saturation", &mut self.saturation, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Vibrance", &mut self.vibrance, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Hue", &mut self.hue, -180.0..=180.0, 0.0, "°");
@@ -256,6 +294,16 @@ impl EditTool for AdjustColors {
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {
         let s = self.clone();
+        // Local tone mapping first (it judges brightness from the original);
+        // its luminance grid is relative to the image size, so preview and
+        // final match without needing `scale`.
+        let toned;
+        let img = if s.shadows != 0.0 || s.highlights != 0.0 {
+            toned = crate::edit::tone::shadows_highlights(img, s.shadows / 100.0, s.highlights / 100.0);
+            &toned
+        } else {
+            img
+        };
         let exp = 2f32.powf(s.exposure);
         let bright = s.brightness / 100.0 * 0.5;
         let contrast = if s.contrast >= 0.0 { 1.0 + s.contrast / 100.0 * 2.0 } else { 1.0 + s.contrast / 100.0 };
@@ -368,5 +416,36 @@ mod tests {
             t2.reset();
             assert!(!t2.title().is_empty());
         }
+    }
+
+    #[test]
+    fn named_tools_defaults_safe() {
+        for name in TOOL_NAMES {
+            let mut tool = make_tool_by_name(name).expect("tool registered");
+            assert!(tool.wants_canvas(), "{name}");
+            assert!(!tool.undo(), "{name}: nothing to undo yet");
+            for (w, h) in [(1, 1), (3, 2), (40, 25)] {
+                let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x * 9) as u8, (y * 5) as u8, 77, 255]));
+                for scale in [1.0, 0.25] {
+                    let out = tool.apply(&img, scale);
+                    assert_eq!(out.dimensions(), img.dimensions(), "{name}");
+                    assert_eq!(out, img, "{name}: defaults change nothing");
+                }
+            }
+            let mut t2 = tool.clone_box();
+            t2.reset();
+            assert!(!t2.title().is_empty());
+        }
+        assert!(make_tool_by_name("nope").is_none());
+    }
+
+    #[test]
+    fn adjust_colors_shadows_highlights() {
+        let img = RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([25, 25, 25, 255]) } else { image::Rgba([240, 240, 240, 255]) });
+        let t = AdjustColors { shadows: 80.0, highlights: 60.0, ..Default::default() };
+        let out = t.apply(&img, 1.0);
+        assert!(out.get_pixel(4, 16)[0] > 35);
+        assert!(out.get_pixel(60, 16)[0] < 235);
+        assert_eq!(AdjustColors::default().apply(&img, 0.3), img);
     }
 }
