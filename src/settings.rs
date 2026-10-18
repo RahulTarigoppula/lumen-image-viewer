@@ -168,6 +168,9 @@ pub struct Settings {
     pub first_run_done: bool,
     pub copy_move_targets: Vec<PathBuf>,
     pub external_editors: Vec<ExternalEditor>,
+    /// Hand files opened from Explorer to the already running Lumen window
+    /// instead of starting a second instance.
+    pub reuse_window: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -220,6 +223,7 @@ impl Default for Settings {
             first_run_done: false,
             copy_move_targets: Vec::new(),
             external_editors: Vec::new(),
+            reuse_window: true,
         }
     }
 }

@@ -14,6 +14,7 @@ mod loader;
 mod meta;
 mod render;
 mod settings;
+mod shell;
 mod tags;
 mod thumbs;
 mod ui;
@@ -33,6 +34,20 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial: Option<PathBuf> = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
+    let settings = settings::Settings::load();
+
+    // Single instance: if Lumen is already running, hand it the file and exit.
+    // Any failure falls through to a normal start (see shell.rs).
+    let force_new = args.iter().any(|a| a == "--new-window") || std::env::var_os("LUMEN_DEV_DIR").is_some();
+    if settings.reuse_window && !force_new {
+        if let Some(p) = &initial {
+            if shell::forward_to_running(std::slice::from_ref(p)) {
+                return Ok(());
+            }
+        }
+    }
+    shell::start_instance_server();
+
     let icon = image::load_from_memory(include_bytes!("../assets/lumen-256.png"))
         .ok()
         .map(|img| {
@@ -41,7 +56,6 @@ fn main() -> eframe::Result {
             egui::IconData { rgba: rgba.into_raw(), width: w, height: h }
         });
 
-    let settings = settings::Settings::load();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Lumen")
         .with_inner_size([1360.0, 860.0])
