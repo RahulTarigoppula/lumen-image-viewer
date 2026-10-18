@@ -64,7 +64,13 @@ pub const TOOL_NAMES: [&str; 6] = ["draw_board", "clone_stamp", "heal", "red_eye
 pub const LABEL_W: f32 = 96.0;
 
 fn row_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized([LABEL_W, 18.0], egui::Label::new(label).truncate().sense(Sense::click()))
+    // Fixed-width column, text left-aligned (add_sized would centre it).
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(Vec2::new(LABEL_W, 18.0), layout, |ui| {
+        ui.set_min_width(LABEL_W);
+        ui.add(egui::Label::new(label).truncate().sense(Sense::click()))
+    })
+    .inner
 }
 
 /// Labeled slider with a double-click-to-reset affordance. Returns true if changed.

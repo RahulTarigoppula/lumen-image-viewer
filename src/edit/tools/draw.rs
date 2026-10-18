@@ -60,6 +60,9 @@ pub struct DrawBoard {
     drag: Option<Drag>,
     history: Vec<Vec<DrawObj>>,
     future: Vec<Vec<DrawObj>>,
+    /// Redo stack set aside while an object is being drawn: restored when the
+    /// new object is discarded as too small, so a stray click keeps redo.
+    tentative_future: Option<Vec<Vec<DrawObj>>>,
     /// Coalesces a run of style edits on one object into one undo step.
     style_edit: Option<usize>,
     next_number: u32,
@@ -80,6 +83,7 @@ impl Default for DrawBoard {
             drag: None,
             history: Vec::new(),
             future: Vec::new(),
+            tentative_future: None,
             style_edit: None,
             next_number: 1,
             focus_text: false,
@@ -111,7 +115,23 @@ impl DrawBoard {
             self.history.remove(0);
         }
         self.future.clear();
+        self.tentative_future = None;
         self.style_edit = None;
+    }
+
+    /// Like `snapshot`, but the redo stack comes back if the step is dropped
+    /// with `discard_tentative`.
+    fn snapshot_tentative(&mut self) {
+        let future = std::mem::take(&mut self.future);
+        self.snapshot();
+        self.tentative_future = Some(future);
+    }
+
+    fn discard_tentative(&mut self) {
+        self.history.pop();
+        if let Some(f) = self.tentative_future.take() {
+            self.future = f;
+        }
     }
 
     fn delete_selected(&mut self) -> bool {
@@ -179,7 +199,7 @@ impl DrawBoard {
         let color_label = match kind {
             Kind::Text => "Border",
             Kind::Number => "Disc",
-            _ => "Colour",
+            _ => "Color",
         };
         ui.horizontal(|ui| {
             ui.add_sized([super::LABEL_W, 18.0], egui::Label::new(color_label));
@@ -238,7 +258,7 @@ impl DrawBoard {
                 }
                 slider_ex(ui, "Text size", &mut st.font_px, 6.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
                 ui.horizontal(|ui| {
-                    ui.add_sized([super::LABEL_W, 18.0], egui::Label::new("Text colour"));
+                    ui.add_sized([super::LABEL_W, 18.0], egui::Label::new("Text color"));
                     color_button(ui, &mut st.text_color, false);
                     if ui.selectable_label(st.bold, egui::RichText::new(I::TEXT_B).size(15.0)).on_hover_text("Bold").clicked() {
                         st.bold = !st.bold;
@@ -528,7 +548,11 @@ impl EditTool for DrawBoard {
                         _ => pt.drag_started,
                     };
                     if create {
-                        self.snapshot();
+                        if pt.drag_started && !matches!(kind, Kind::Text | Kind::Number) {
+                            self.snapshot_tentative();
+                        } else {
+                            self.snapshot();
+                        }
                         self.objs.push(o);
                         self.selected = Some(self.objs.len() - 1);
                         if pt.drag_started && matches!(kind, Kind::Text | Kind::Number) {
@@ -584,7 +608,9 @@ impl EditTool for DrawBoard {
                     if !keep {
                         self.objs.remove(i);
                         self.selected = None;
-                        self.history.pop();
+                        self.discard_tentative();
+                    } else {
+                        self.tentative_future = None;
                     }
                 }
             }
@@ -634,6 +660,7 @@ impl EditTool for DrawBoard {
     }
     fn undo(&mut self) -> bool {
         let Some(prev) = self.history.pop() else { return false };
+        self.tentative_future = None;
         self.future.push(std::mem::replace(&mut self.objs, prev));
         self.selected = None;
         self.drag = None;
