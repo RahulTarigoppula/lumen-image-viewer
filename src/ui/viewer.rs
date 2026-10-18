@@ -962,7 +962,12 @@ impl Viewer {
         let size = self.edit.as_ref().map(|e| e.current.dimensions()).or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions())).unwrap_or((t.base.width(), t.base.height()));
         let changed = {
             let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &t.histogram };
-            egui::ScrollArea::vertical().max_height(ui.available_height() - 90.0).show(ui, |ui| t.tool.ui(ui, &cx)).inner
+            let w = ui.available_width();
+            egui::ScrollArea::vertical().max_height(ui.available_height() - 90.0).show(ui, |ui| {
+                ui.set_max_width(w);
+                t.tool.ui(ui, &cx)
+            })
+            .inner
         };
         if changed {
             t.version += 1;

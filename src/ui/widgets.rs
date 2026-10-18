@@ -56,7 +56,10 @@ pub fn section_title(ui: &mut Ui, p: &Palette, text: &str) {
 
 pub fn kv_row(ui: &mut Ui, p: &Palette, key: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.add_sized([96.0, 16.0], egui::Label::new(egui::RichText::new(key).color(p.muted).size(12.0)).truncate());
+        ui.allocate_ui_with_layout(Vec2::new(96.0, 16.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(96.0);
+            ui.add(egui::Label::new(egui::RichText::new(key).color(p.muted).size(12.0)).truncate());
+        });
         ui.add(egui::Label::new(egui::RichText::new(value).size(12.5)).wrap());
     });
 }
