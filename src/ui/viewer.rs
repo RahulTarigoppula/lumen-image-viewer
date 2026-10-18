@@ -969,7 +969,7 @@ impl Viewer {
         if self.anim.as_ref().map(|a| a.path != path || a.frame_tex.len() != frames.len()).unwrap_or(true) {
             let total: u64 = frames.iter().map(|f| f.image.width() as u64 * f.image.height() as u64).sum();
             let frame_tex = if total <= ANIM_CACHE_PIXELS { vec![None; frames.len()] } else { Vec::new() };
-            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + frame_delay(frames, 0), playing: true, frame_tex, tex: None, shown_frame: usize::MAX });
+            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + frame_delay(frames, 0), playing: !frames.iter().all(|f| f.delay_ms == 0), frame_tex, tex: None, shown_frame: usize::MAX });
         }
         let a = self.anim.as_mut().unwrap();
         if a.frame >= frames.len() {
@@ -998,8 +998,12 @@ impl Viewer {
         };
         {
             let t = tex_id;
+            // Pages of a document can differ in size: fit each one inside `dest`.
+            let (fw, fh) = (frames[a.frame].image.width().max(1) as f32, frames[a.frame].image.height().max(1) as f32);
+            let k = (dest.width() / fw).min(dest.height() / fh);
+            let r = Rect::from_center_size(dest.center(), Vec2::new(fw * k, fh * k));
             let mut mesh = egui::Mesh::with_texture(t);
-            mesh.add_rect_with_uv(dest, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             painter.add(egui::Shape::mesh(mesh));
         }
         if a.playing {
