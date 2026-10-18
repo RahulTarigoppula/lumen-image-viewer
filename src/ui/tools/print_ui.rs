@@ -156,10 +156,10 @@ impl PrintWindow {
         let mut close = false;
         egui::Window::new(format!("{}  Print", I::PRINTER))
             .open(&mut open)
-            .default_size(window_size(ctx, 820.0, 600.0))
+            .default_size(window_size(ctx, 820.0, 600.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .min_size([560.0, 420.0])
+            .min_size(crate::ui::batch::window_size(ctx, 560.0, 420.0))
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {

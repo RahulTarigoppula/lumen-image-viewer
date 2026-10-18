@@ -291,10 +291,10 @@ impl ContactSheet {
         let mut close = false;
         egui::Window::new(format!("{}  Contact sheet", I::GRID_NINE))
             .open(&mut open)
-            .default_size(window_size(ctx, 980.0, 680.0))
+            .default_size(window_size(ctx, 980.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .min_size([600.0, 400.0])
+            .min_size(crate::ui::batch::window_size(ctx, 600.0, 400.0))
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -868,10 +868,10 @@ impl Duplicates {
         let mut close = false;
         egui::Window::new(format!("{}  Find duplicate & similar images", I::COPY_SIMPLE))
             .open(&mut open)
-            .default_size(window_size(ctx, 900.0, 680.0))
+            .default_size(window_size(ctx, 900.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .min_size([560.0, 380.0])
+            .min_size(crate::ui::batch::window_size(ctx, 560.0, 380.0))
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -1015,8 +1015,10 @@ impl Duplicates {
                 })
                 .sum();
             let mut mark_all = false;
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("{} groups · {files_in_groups} files · up to {} reclaimable", self.groups.len(), human_size(reclaim))).strong());
+            let ng = self.groups.len();
+            ui.label(RichText::new(format!("{ng} group{} · {files_in_groups} files · up to {} reclaimable", if ng == 1 { "" } else { "s" }, human_size(reclaim))).strong());
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!self.marked.is_empty(), egui::Button::new("Clear marks")).clicked() {
                         self.marked.clear();
