@@ -306,18 +306,26 @@ impl Browser {
             }
             ui.add_space(6.0);
 
+            // Adapt to the room left (points, so UI scale is included): first drop
+            // the size slider, then shrink the filter box, then fold the mode
+            // buttons into a "..." menu and the sort label into its icon.
+            let room = ui.available_width();
+            let show_slider = room >= 1050.0;
+            let filter_w = if room >= 860.0 { 150.0 } else if room >= 700.0 { 110.0 } else { 80.0 };
+            let overflow = room < 800.0;
+            let sort_icon_only = room < 640.0;
+
             // Address bar: breadcrumbs, click to edit.
-            let addr_w = (ui.available_width() - self.right_w - 14.0).max(180.0);
+            let addr_w = (ui.available_width() - self.right_w - 14.0).max(120.0);
             self.address_bar(ui, addr_w, &p, ev);
             ui.add_space(6.0);
             let right_start = ui.cursor().min.x;
-            let compact = ui.available_width() < 560.0;
 
             // Filter
             let filter_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text(format!("{}  Filter (Ctrl+F)", I::FUNNEL))
-                    .desired_width(150.0),
+                    .desired_width(filter_w),
             );
             if self.focus_filter {
                 filter_resp.request_focus();
@@ -333,7 +341,8 @@ impl Browser {
             }
 
             // Sort menu
-            let sort_label = format!("{} {}", if core.settings.sort_desc { I::SORT_DESCENDING } else { I::SORT_ASCENDING }, core.settings.sort_key.label());
+            let sort_icon = if core.settings.sort_desc { I::SORT_DESCENDING } else { I::SORT_ASCENDING };
+            let sort_label = if sort_icon_only { sort_icon.to_string() } else { format!("{sort_icon} {}", core.settings.sort_key.label()) };
             ui.menu_button(sort_label, |ui| {
                 for k in SortKey::ALL {
                     if ui.radio(core.settings.sort_key == k, k.label()).clicked() {
@@ -382,7 +391,7 @@ impl Browser {
             });
 
             // Thumbnail size
-            if !compact {
+            if show_slider {
                 let mut ts = core.settings.thumb_size;
                 ui.add_space(4.0);
                 ui.label(RichText::new(I::IMAGE).color(p.muted).size(12.0));
@@ -398,17 +407,29 @@ impl Browser {
                 ev.push(BrowserEvent::Command(Command::ToggleDetails));
             }
             widgets::separator_v(ui);
-            if widgets::icon_button(ui, I::PLAY_CIRCLE, "Slideshow (S)", false).clicked() {
-                ev.push(BrowserEvent::Command(Command::Slideshow));
-            }
-            if widgets::icon_button(ui, I::COLUMNS, "Compare selected (P)", false).clicked() {
-                ev.push(BrowserEvent::Command(Command::Compare));
-            }
-            if widgets::icon_button(ui, I::FILM_STRIP, "Video mode", false).clicked() {
-                ev.push(BrowserEvent::Command(Command::OpenVideoMode));
-            }
-            if widgets::icon_button(ui, I::STACK, "Batch convert / resize (F3)", false).clicked() {
-                ev.push(BrowserEvent::Command(Command::BatchConvert));
+            let modes = [
+                (I::PLAY_CIRCLE, "Slideshow (S)", Command::Slideshow),
+                (I::COLUMNS, "Compare selected (P)", Command::Compare),
+                (I::FILM_STRIP, "Video mode", Command::OpenVideoMode),
+                (I::STACK, "Batch convert / resize (F3)", Command::BatchConvert),
+            ];
+            if overflow {
+                ui.menu_button(I::DOTS_THREE, |ui| {
+                    for (icon, tip, cmd) in modes {
+                        if ui.button(format!("{icon}  {tip}")).clicked() {
+                            ev.push(BrowserEvent::Command(cmd));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("More");
+            } else {
+                for (icon, tip, cmd) in modes {
+                    if widgets::icon_button(ui, icon, tip, false).clicked() {
+                        ev.push(BrowserEvent::Command(cmd));
+                    }
+                }
             }
             let used = ui.cursor().min.x - right_start;
             if (used - self.right_w).abs() > 1.0 {
@@ -484,12 +505,15 @@ impl Browser {
         let p = core.pal;
         let favs = core.settings.favorites.clone();
         let show_preview = core.settings.show_preview_pane;
+        let mut tree_bottom: Option<f32> = None;
         if show_preview {
-            let preview_h = core.settings.preview_height.clamp(140.0, 600.0);
-            egui::Panel::bottom("preview-pane")
+            // Never let the preview take more than ~60% of a short sidebar.
+            let max_h = (ui.available_height() * 0.6).clamp(140.0, 640.0);
+            let preview_h = core.settings.preview_height.clamp(140.0, max_h);
+            let r = egui::Panel::bottom("preview-pane")
                 .resizable(true)
                 .default_size(preview_h)
-                .size_range(140.0..=640.0)
+                .size_range(140.0..=max_h)
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| {
                     // Content must never ask for more than the panel has, or a
@@ -498,8 +522,19 @@ impl Browser {
                     ui.set_max_height(h);
                     self.preview_pane(ui, core);
                 });
+            tree_bottom = Some(r.response.rect.min.y);
         }
-        if let Some(a) = self.tree.ui(ui, &self.folder.clone(), &favs, &p) {
+        // The tree gets exactly the space above the preview pane (a bottom panel
+        // only moves the cursor, which a scroll area would ignore).
+        let mut rect = ui.available_rect_before_wrap();
+        if let Some(b) = tree_bottom {
+            rect.max.y = rect.max.y.min(b - 2.0).max(rect.min.y);
+        }
+        let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+        tree_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let tree_action = self.tree.ui(&mut tree_ui, &self.folder.clone(), &favs, &p);
+        ui.advance_cursor_after_rect(rect);
+        if let Some(a) = tree_action {
             ev.push(match a {
                 TreeAction::Navigate(path) => BrowserEvent::Navigate(path),
                 TreeAction::AddFavorite(path) => BrowserEvent::AddFavorite(path),
@@ -528,7 +563,7 @@ impl Browser {
             match core.thumbs.get(&key) {
                 Thumb::Ready(t) => {
                     let ts = t.tex.size_vec2();
-                    let s = ((rect.width() - 12.0) / ts.x).min((rect.height() - 12.0) / ts.y).min(2.0);
+                    let s = cap_upscale(((rect.width() - 12.0) / ts.x).min((rect.height() - 12.0) / ts.y).min(2.0), ts, t.source_dims);
                     let r = Rect::from_center_size(rect.center(), ts * s);
                     if dims.is_none() {
                         dims = t.source_dims;
@@ -790,7 +825,7 @@ impl Browser {
                     Thumb::Ready(t) => {
                         dims = t.source_dims;
                         let tsz = t.tex.size_vec2();
-                        let s = (ts / tsz.x).min(ts / tsz.y);
+                        let s = cap_upscale((ts / tsz.x).min(ts / tsz.y), tsz, t.source_dims);
                         let r = Rect::from_center_size(img_area.center(), tsz * s);
                         // Subtle drop shadow makes thumbnails pop off the background.
                         painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)).expand(1.0), CornerRadius::same(3), Color32::from_black_alpha(if p.dark { 90 } else { 30 }));
@@ -858,9 +893,23 @@ impl Browser {
                 }
             } else {
                 let d = dims.or_else(|| core.meta.get(&entry.path).and_then(|m| m.dims));
+                let size = catalog::human_size(entry.size);
                 match d {
-                    Some((w, h)) => format!("{w}×{h}  ·  {}", catalog::human_size(entry.size)),
-                    None => catalog::human_size(entry.size),
+                    Some((w, h)) => {
+                        // Narrow cells: drop the file size, then the dimensions.
+                        let font = FontId::proportional(10.5);
+                        let fits = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.faint).size().x <= name_rect.width();
+                        let full = format!("{w}×{h}  ·  {size}");
+                        let dims_only = format!("{w}×{h}");
+                        if fits(&full) {
+                            full
+                        } else if fits(&dims_only) {
+                            dims_only
+                        } else {
+                            size
+                        }
+                    }
+                    None => size,
                 }
             };
             ui.painter().with_clip_rect(name_rect).text(Pos2::new(name_rect.center().x, name_rect.min.y + 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.5), p.faint);
@@ -1192,6 +1241,15 @@ fn seg_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().trim_end_matches('\\').to_string())
 }
 
+/// Never show a thumbnail larger than twice its source image (a 1x1 or 64x64
+/// picture is not blown up to fill the cell). `fit` scales the texture `tex`.
+fn cap_upscale(fit: f32, tex: Vec2, source: Option<(u32, u32)>) -> f32 {
+    match source {
+        Some((w, h)) if w > 0 && h > 0 && tex.x > 0.0 && tex.y > 0.0 => fit.min((2.0 * w as f32 / tex.x).min(2.0 * h as f32 / tex.y)),
+        _ => fit,
+    }
+}
+
 /// The Shift-selection anchor as a valid index into a list of `len` items:
 /// a missing or out-of-range anchor (stale after a filter or reload) falls
 /// back to `fallback`, itself clamped.
@@ -1206,6 +1264,18 @@ fn clamp_anchor(anchor: Option<usize>, fallback: usize, len: usize) -> usize {
 #[cfg(test)]
 mod anchor_tests {
     use super::clamp_anchor;
+
+    #[test]
+    fn tiny_thumbnails_are_not_blown_up() {
+        use super::{cap_upscale, Vec2};
+        // 1x1 source in a 1x1 texture, cell would scale it 200x: capped at 2x.
+        assert_eq!(cap_upscale(200.0, Vec2::splat(1.0), Some((1, 1))), 2.0);
+        // 64x64 source upscaled into a 256 texture: at most 128 px on screen.
+        assert_eq!(cap_upscale(1.0, Vec2::splat(256.0), Some((64, 64))), 0.5);
+        // Big sources are unaffected.
+        assert_eq!(cap_upscale(0.5, Vec2::splat(256.0), Some((4000, 3000))), 0.5);
+        assert_eq!(cap_upscale(3.0, Vec2::splat(10.0), None), 3.0);
+    }
 
     #[test]
     fn anchor_is_clamped_into_range() {

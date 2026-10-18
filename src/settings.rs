@@ -252,7 +252,7 @@ impl Default for Settings {
             browser_view: BrowserView::Thumbnails,
             show_folders_in_grid: true,
             confirm_delete: true,
-            jpeg_quality: 92,
+            jpeg_quality: 90,
             keep_exif_on_save: true,
             lossless_jpeg_rotate: true,
             color_manage: true,
