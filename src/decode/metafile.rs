@@ -56,7 +56,14 @@ fn load(b: &[u8]) -> Result<(Emf, f32, f32, &'static str)> {
             let pict = METAFILEPICT { mm: MM_ANISOTROPIC.0, xExt: w * 2540 / inch, yExt: h * 2540 / inch, hMF: HMETAFILE::default() };
             (&b[22..], Some(pict))
         } else {
-            (b, None)
+            // Without a placeable header GDI would stretch the picture to the
+            // reference device (screen) aspect: use the metafile's own window
+            // extent instead, or a 4:3 default when it sets none.
+            let (w, h) = wmf_window_ext(b).unwrap_or((1024, 768));
+            let (w, h) = sane_wmf_size(w, h);
+            // Extents in HIMETRIC at 96 DPI.
+            let pict = METAFILEPICT { mm: MM_ANISOTROPIC.0, xExt: w * 2540 / 96, yExt: h * 2540 / 96, hMF: HMETAFILE::default() };
+            (b, Some(pict))
         };
         let h = SetWinMetaFileBits(data, None, pict.as_ref().map(|p| p as *const METAFILEPICT));
         if h.is_invalid() {
@@ -66,6 +73,40 @@ fn load(b: &[u8]) -> Result<(Emf, f32, f32, &'static str)> {
         let (w, hh) = emf_size(&emf);
         Ok((emf, w, hh, "WMF"))
     }
+}
+
+/// The first META_SETWINDOWEXT record of a plain (non-placeable) WMF, as
+/// (width, height) in logical units.
+fn wmf_window_ext(b: &[u8]) -> Option<(i32, i32)> {
+    let header_words = u16::from_le_bytes([*b.get(2)?, *b.get(3)?]) as usize;
+    let mut pos = header_words * 2;
+    // Bounded scan: the extent is set near the start of real files.
+    for _ in 0..4096 {
+        let rec = b.get(pos..pos + 6)?;
+        let size_words = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+        let func = u16::from_le_bytes([rec[4], rec[5]]);
+        if func == 0 || size_words < 3 {
+            return None; // META_EOF or corrupt
+        }
+        if func == 0x020C {
+            let p = b.get(pos + 6..pos + 10)?;
+            let (h, w) = (i16::from_le_bytes([p[0], p[1]]) as i32, i16::from_le_bytes([p[2], p[3]]) as i32);
+            return (w != 0 && h != 0).then_some((w.abs(), h.abs()));
+        }
+        pos = pos.checked_add(size_words.checked_mul(2)?)?;
+    }
+    None
+}
+
+/// Map logical window extents to a natural pixel size: kept as is when it
+/// looks like pixels, otherwise scaled so the long side is 1024 (aspect kept,
+/// extreme aspects limited to 16:1).
+fn sane_wmf_size(w: i32, h: i32) -> (i32, i32) {
+    let (w, h) = (w.max(1) as f64, h.max(1) as f64);
+    let (w, h) = (w.min(h * 16.0), h.min(w * 16.0));
+    let long = w.max(h);
+    let k = if (64.0..=4096.0).contains(&long) { 1.0 } else { 1024.0 / long };
+    (((w * k).round() as i32).max(1), ((h * k).round() as i32).max(1))
 }
 
 fn emf_size(emf: &Emf) -> (f32, f32) {
@@ -230,6 +271,21 @@ mod tests {
         assert_eq!(d.format, "EMF");
         let (w, h) = d.image.dimensions();
         assert!(d.image.get_pixel(w / 4, h / 2).0[1] < 60);
+    }
+
+    #[test]
+    fn plain_wmf_uses_its_own_aspect() {
+        // Strip the placeable header: the window extent (2880 x 1440) sets a 2:1 aspect.
+        let f = sample_wmf();
+        let plain = f[22..].to_vec();
+        assert!(is_wmf(&plain));
+        assert_eq!(wmf_window_ext(&plain), Some((2880, 1440)));
+        let d = decode(&plain).expect("plain wmf decode");
+        let (w, h) = d.image.dimensions();
+        assert!((w as f32 / h as f32 - 2.0).abs() < 0.05, "{w}x{h}");
+        assert_eq!(sane_wmf_size(100, 50), (100, 50));
+        assert_eq!(sane_wmf_size(20000, 10000), (1024, 512));
+        assert_eq!(sane_wmf_size(1, 100000), (64, 1024));
     }
 
     #[test]

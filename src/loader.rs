@@ -8,7 +8,12 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+/// A preload (priority > 0) of a path evicted for the memory budget less than
+/// this long ago is ignored, so images larger than the budget cannot cause a
+/// decode / evict / re-request loop.
+pub const EVICT_COOLDOWN: Duration = Duration::from_millis(4000);
 
 pub struct LoadedImage {
     pub decoded: Decoded,
@@ -53,6 +58,8 @@ struct Entry {
     state: LoadState,
     touched: Instant,
     generation: u64,
+    /// Priority of the latest request (0 = on screen).
+    priority: u32,
 }
 
 struct Queue {
@@ -67,6 +74,12 @@ pub struct Loader {
     next_generation: u64,
     pub budget_bytes: u64,
     pub opts: Arc<Mutex<DecodeOptions>>,
+    /// The last set passed to `retain_queued` (what the active view wants:
+    /// the image on screen first, then its neighbours). Never evicted ahead
+    /// of other entries.
+    keep: Vec<PathBuf>,
+    /// Paths evicted for the budget, and when.
+    evicted: HashMap<PathBuf, Instant>,
 }
 
 impl Loader {
@@ -84,7 +97,7 @@ impl Loader {
                 .spawn(move || worker(q, tx, ctx, opts))
                 .expect("spawn loader");
         }
-        Loader { queue, rx, entries: HashMap::new(), next_generation: 1, budget_bytes: 1536 << 20, opts }
+        Loader { queue, rx, entries: HashMap::new(), next_generation: 1, budget_bytes: 1536 << 20, opts, keep: Vec::new(), evicted: HashMap::new() }
     }
 
     /// Request `path`. `priority` 0 = the image on screen.
@@ -94,6 +107,7 @@ impl Loader {
             // Called every frame for the image on screen, so only touch the queue lock
             // while the job can still be waiting in it.
             e.touched = Instant::now();
+            e.priority = priority;
             if matches!(e.state, LoadState::Loading) {
                 let mut jobs = self.queue.jobs.lock();
                 if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
@@ -102,16 +116,37 @@ impl Loader {
             }
             return;
         }
+        if priority > 0 && self.recently_evicted(path) {
+            return;
+        }
         let generation = self.next_generation;
         self.next_generation += 1;
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation });
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation, priority });
         let mut jobs = self.queue.jobs.lock();
         jobs.push(Job { path: path.to_path_buf(), priority, preview_side, generation });
         self.queue.cv.notify_one();
     }
 
-    /// Drop queued (not yet started) jobs except those listed.
+    /// Whether `path` was evicted for the memory budget within [`EVICT_COOLDOWN`].
+    pub fn recently_evicted(&self, path: &Path) -> bool {
+        self.evicted.get(path).is_some_and(|t| t.elapsed() < EVICT_COOLDOWN)
+    }
+
+    /// Bytes held by `path` once decoded (None while loading / not cached).
+    pub fn bytes_of(&self, path: &Path) -> Option<u64> {
+        match self.entries.get(path) {
+            Some(Entry { state: LoadState::Ready(i), .. }) => Some(i.bytes()),
+            _ => None,
+        }
+    }
+
+    /// Drop queued (not yet started) jobs except those listed. `keep` is also
+    /// remembered as the protected set for the memory budget (most important
+    /// first: the image on screen, then its neighbours).
     pub fn retain_queued(&mut self, keep: &[PathBuf]) {
+        if self.keep.as_slice() != keep {
+            self.keep = keep.to_vec();
+        }
         let mut jobs = self.queue.jobs.lock();
         if jobs.iter().all(|j| keep.contains(&j.path)) {
             return; // common case (every frame): nothing to drop, no allocation
@@ -159,7 +194,7 @@ impl Loader {
     pub fn insert(&mut self, path: &Path, img: LoadedImage) {
         let generation = self.next_generation;
         self.next_generation += 1;
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation });
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation, priority: u32::MAX });
     }
 
     /// Drain finished jobs. Returns paths whose state changed.
@@ -196,6 +231,10 @@ impl Loader {
         changed
     }
 
+    /// Evict least recently used entries until the cache fits the budget.
+    /// Never evicted: `protect` and kept paths last requested at priority 0
+    /// (on screen). Other kept paths (preloaded neighbours) go only after
+    /// every unprotected entry, least urgent first.
     fn enforce_budget(&mut self, protect: &[PathBuf]) {
         let mut total: u64 = self
             .entries
@@ -205,20 +244,40 @@ impl Loader {
         if total <= self.budget_bytes {
             return;
         }
+        let mut order: Vec<PathBuf> = Vec::new();
+        for p in protect.iter().chain(self.keep.iter()) {
+            if !order.contains(p) {
+                order.push(p.clone());
+            }
+        }
         let mut ready: Vec<(PathBuf, Instant, u64)> = self
             .entries
             .iter()
             .filter_map(|(p, e)| match &e.state {
-                LoadState::Ready(i) if !protect.contains(p) => Some((p.clone(), e.touched, i.bytes())),
+                LoadState::Ready(i) if !order.contains(p) => Some((p.clone(), e.touched, i.bytes())),
                 _ => None,
             })
             .collect();
         ready.sort_by_key(|(_, t, _)| *t);
+        // Then the kept neighbours, least urgent first.
+        let mut neighbours: Vec<(u32, PathBuf, u64)> = order
+            .iter()
+            .filter(|p| !protect.contains(p))
+            .filter_map(|p| match self.entries.get(p) {
+                Some(Entry { state: LoadState::Ready(i), priority, .. }) if *priority > 0 => Some((*priority, p.clone(), i.bytes())),
+                _ => None,
+            })
+            .collect();
+        neighbours.sort_by_key(|n| std::cmp::Reverse(n.0));
+        let now = Instant::now();
+        ready.extend(neighbours.into_iter().map(|(_, p, b)| (p, now, b)));
+        self.evicted.retain(|_, t| now.duration_since(*t) < EVICT_COOLDOWN);
         for (p, _, b) in ready {
             if total <= self.budget_bytes {
                 break;
             }
             self.entries.remove(&p);
+            self.evicted.insert(p, now);
             total -= b;
         }
     }
@@ -265,10 +324,64 @@ fn worker(q: Arc<Queue>, tx: Sender<Msg>, ctx: egui::Context, opts: Arc<Mutex<De
                     modified: meta.and_then(|m| m.modified().ok()),
                 })
             }
-            Ok(Err(e)) => Err(format!("{e:#}")),
+            Ok(Err(e)) => Err(decode::friendly_error(&e)),
             Err(_) => Err("The decoder crashed on this file (it may be corrupt).".into()),
         };
         let _ = tx.send(Msg::Done(job.path, job.generation, res));
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(side: u32) -> LoadedImage {
+        let rgba = image::RgbaImage::new(side, side);
+        let pyramid = vec![Arc::new(rgba.clone())];
+        LoadedImage { decoded: Decoded::from_rgba(rgba, "test"), pyramid, load_ms: 0, file_size: 0, modified: None }
+    }
+
+    #[test]
+    fn budget_protects_keep_set_and_cools_down_evicted() {
+        let mut l = Loader::new(egui::Context::default(), 1);
+        // 10x10 RGBA = 400 bytes each; room for 2.5 of them.
+        l.budget_bytes = 1000;
+        let p = |n: &str| PathBuf::from(format!("Z:/lumen-test/{n}.png"));
+        let (cur, next, prev, old) = (p("cur"), p("next"), p("prev"), p("old"));
+        for q in [&old, &prev, &next, &cur] {
+            l.insert(q, img(10));
+        }
+        // What the viewer does every frame: request with priorities, then keep.
+        l.request(&cur, 0, None);
+        l.request(&next, 1, None);
+        l.request(&prev, 2, None);
+        l.retain_queued(&[cur.clone(), next.clone(), prev.clone()]);
+        l.enforce_budget(std::slice::from_ref(&cur));
+        // Unprotected first, then the least urgent neighbour; never the current.
+        assert!(l.get_ready(&old).is_none());
+        assert!(l.get_ready(&prev).is_none());
+        assert!(l.get_ready(&cur).is_some());
+        assert!(l.get_ready(&next).is_some());
+        // Evicted neighbours are not re-queued right away (no decode loop) ...
+        assert!(l.recently_evicted(&prev));
+        l.request(&prev, 2, None);
+        assert!(l.state(&prev).is_none());
+        // ... but an explicit on-screen request always goes through.
+        l.request(&prev, 0, None);
+        assert!(matches!(l.state(&prev), Some(LoadState::Loading)));
+        l.clear();
+    }
+
+    #[test]
+    fn explicit_protect_list_is_never_evicted() {
+        let mut l = Loader::new(egui::Context::default(), 1);
+        l.budget_bytes = 100; // smaller than any single image
+        let (a, b) = (PathBuf::from("Z:/lumen-test/a.png"), PathBuf::from("Z:/lumen-test/b.png"));
+        l.insert(&a, img(10));
+        l.insert(&b, img(10));
+        l.enforce_budget(&[a.clone(), b.clone()]);
+        assert!(l.get_ready(&a).is_some() && l.get_ready(&b).is_some());
+        assert_eq!(l.bytes_of(&a), Some(400));
     }
 }
