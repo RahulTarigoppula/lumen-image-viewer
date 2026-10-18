@@ -2,7 +2,12 @@
 //! `EditTool` interface used by every adjustment dialog (live preview runs on a
 //! screen-sized copy in the background; "Apply" runs on full resolution).
 
+pub mod effects;
+pub mod filters;
+pub mod geom;
 pub mod ops;
+pub mod text;
+pub mod tone;
 pub mod tools;
 
 use image::RgbaImage;
@@ -111,6 +116,9 @@ pub struct ToolUiCtx<'a> {
     pub image_size: (u32, u32),
     /// 256-bin luminance + RGB histograms of the current image.
     pub histogram: &'a Histogram,
+    /// The screen-sized preview copy the live preview is rendered from (for
+    /// tools that show their own thumbnails).
+    pub preview: Option<&'a RgbaImage>,
 }
 
 /// An adjustment dialog. Implementations hold their own parameters.
