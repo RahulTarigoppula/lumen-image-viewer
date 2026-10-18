@@ -175,6 +175,9 @@ const EFFECTS: [&str; 14] = [
     "Duotone",
 ];
 
+/// `Effects::kind` before the user picks one: the preview is the original.
+const NO_EFFECT: usize = usize::MAX;
+
 const BW_FILTERS: [&str; 6] = ["Neutral", "Red", "Orange", "Yellow", "Green", "Blue"];
 
 #[derive(Clone)]
@@ -201,7 +204,7 @@ pub struct Effects {
 impl Default for Effects {
     fn default() -> Self {
         Effects {
-            kind: 0,
+            kind: NO_EFFECT,
             strength: 100.0,
             levels: 5.0,
             threshold: 128.0,
@@ -339,7 +342,11 @@ impl EditTool for Effects {
             });
             ui.add_space(gap);
         }
-        section(ui, cx, EFFECTS[self.kind.min(EFFECTS.len() - 1)]);
+        if self.kind >= EFFECTS.len() {
+            info(ui, cx, "Pick an effect above to preview it.");
+            return c;
+        }
+        section(ui, cx, EFFECTS[self.kind]);
         let strength_label = match self.kind {
             9 | 10 => "Amount",
             _ => "Strength",
@@ -415,6 +422,15 @@ pub mod tests {
         pub fn sample(kind: usize) -> Self {
             Effects { kind, strength: Self::default_strength(kind), ..Default::default() }
         }
+    }
+
+    #[test]
+    fn effects_start_with_no_effect() {
+        let img = RgbaImage::from_pixel(4, 4, image::Rgba([200, 30, 30, 255]));
+        assert_eq!(Effects::default().apply(&img, 1.0), img);
+        let mut e = Effects::sample(0);
+        e.reset();
+        assert_eq!(e.apply(&img, 1.0), img);
     }
 
     impl Blur {

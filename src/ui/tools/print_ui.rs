@@ -63,7 +63,9 @@ impl PrintWindow {
                 .iter()
                 .map(|s| {
                     let meta = if let PrintSource::File(p) = s { std::fs::metadata(p).ok() } else { None };
-                    SourceInfo { dims: s.dims().unwrap_or((1, 1)), dpi: s.dpi(), size: meta.as_ref().map(|m| m.len()).unwrap_or(0), modified: meta.and_then(|m| m.modified().ok()) }
+                    let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (s.dims(), s.dpi())));
+                    let (dims, dpi) = probe.unwrap_or((None, None));
+                    SourceInfo { dims: dims.unwrap_or((1, 1)), dpi, size: meta.as_ref().map(|m| m.len()).unwrap_or(0), modified: meta.and_then(|m| m.modified().ok()) }
                 })
                 .collect();
             let _ = tx.send(infos);

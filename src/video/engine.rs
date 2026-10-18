@@ -185,7 +185,7 @@ pub fn build_index(path: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> 
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("cancelled"));
         }
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {}
             Err(ff::Error::Eof) => break,
             Err(e) => {
@@ -253,17 +253,34 @@ impl Player {
         init();
         let (ctx_tx, ctx_rx) = unbounded::<Cmd>();
         let (ev_tx, ev_rx) = bounded::<Event>(6);
-        let mut worker = Worker::new(path, audio)?;
+        // FFmpeg contexts are not Send: build the worker on its own thread and
+        // report whether opening succeeded.
+        let (init_tx, init_rx) = bounded::<Result<(), String>>(1);
+        let path = path.to_path_buf();
         std::thread::Builder::new()
             .name("lumen-video".into())
             .spawn(move || {
+                let mut worker = match Worker::new(&path, audio) {
+                    Ok(w) => {
+                        let _ = init_tx.send(Ok(()));
+                        w
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(ctx_rx, ev_tx.clone(), ctx.clone())));
                 if r.is_err() {
                     let _ = ev_tx.send(Event::Error("The video decoder crashed".into()));
                     ctx.request_repaint();
                 }
             })?;
-        Ok(Player { tx: ctx_tx, rx: ev_rx })
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Player { tx: ctx_tx, rx: ev_rx }),
+            Ok(Err(e)) => Err(anyhow!(e)),
+            Err(_) => Err(anyhow!("The video decoder failed to start")),
+        }
     }
 
     pub fn send(&self, c: Cmd) {
@@ -410,7 +427,9 @@ impl Worker {
                             self.playing = false;
                         }
                     }
-                } else if audio_low {
+                } else if audio_low && self.pending_vpkts.len() < 600 {
+                    // Read ahead for audio, but never let undisplayed video
+                    // packets pile up without bound (e.g. while minimized).
                     self.read_packet();
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(3));
@@ -460,11 +479,7 @@ impl Worker {
         match pkt.read(&mut self.input) {
             Ok(()) => {
                 if pkt.stream() == self.vidx {
-                    // Bound the backlog when nothing consumes video frames.
                     self.pending_vpkts.push_back(pkt);
-                    if self.pending_vpkts.len() > 600 {
-                        self.pending_vpkts.pop_front();
-                    }
                 } else if Some(pkt.stream()) == self.aidx {
                     self.decode_audio(&pkt);
                 }
@@ -753,7 +768,7 @@ pub fn thumbnail(path: &Path, max_side: u32) -> Result<RgbaImage> {
     let mut reads = 0;
     while !got && reads < 4000 {
         reads += 1;
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {
                 if pkt.stream() != vidx {
                     continue;
@@ -920,7 +935,7 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
         if eof {
             break;
         }
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {
                 if pkt.stream() == vidx {
                     let _ = dec.send_packet(&pkt);

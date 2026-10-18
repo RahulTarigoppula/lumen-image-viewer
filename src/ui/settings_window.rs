@@ -128,13 +128,23 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     let mut st: State = ctx.data_mut(|d| d.get_temp(state_id)).unwrap_or_else(initial_state);
     let mut changed = false;
 
+    // Esc closes Settings unless a text field is being edited (or a key is being captured).
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.text_edit_focused() && st.capture.is_none() {
+        *open = false;
+    }
+    // Always fit inside the app window, even at 150% scale on a small screen.
+    let screen = ctx.content_rect();
+    let max_w = (screen.width() - 24.0).max(320.0);
+    let max_h = (screen.height() - 24.0).max(260.0);
     egui::Window::new("Settings")
         .id(egui::Id::unique("settings-window"))
         .open(open)
-        .default_size([760.0, 560.0])
+        .default_size([760.0f32.min(max_w), 560.0f32.min(max_h)])
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
-        .min_size([640.0, 420.0])
+        .default_pos(screen.center())
+        .min_size([520.0f32.min(max_w), 320.0f32.min(max_h)])
+        .max_size([max_w, max_h])
+        .constrain(true)
         .resizable(true)
         .collapsible(false)
         .scroll(false)
@@ -1415,3 +1425,4 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     }
     changed
 }
+

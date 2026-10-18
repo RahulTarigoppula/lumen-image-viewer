@@ -96,7 +96,7 @@ fn for_mask_rows(img: &mut RgbaImage, m: &Mask, f: impl Fn(u32, u32, f32, &mut [
     img.as_mut().par_chunks_mut(stride).enumerate().skip(y0 as usize).take((y1 - y0) as usize).for_each(|(y, row)| {
         let y = y as u32;
         for x in x0..x1.min(iw) {
-            let c = m.data[((y - y0) * m.w + (x - x0)) as usize];
+            let c = m.data[(y - y0) as usize * m.w as usize + (x - x0) as usize];
             if c > 0 {
                 f(x, y, c as f32 / 255.0, &mut row[x as usize * 4..x as usize * 4 + 4]);
             }
@@ -120,59 +120,106 @@ fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
     let Some(sb) = mask::clip_box([wb.0 as f32 + dx - 2.0, wb.1 as f32 + dy - 2.0, (wb.0 + wb.2) as f32 + dx + 2.0, (wb.1 + wb.3) as f32 + dy + 2.0], iw, ih) else { return };
     let src = patch(img, sb);
     let (ww, wh) = (wb.2 as usize, wb.3 as usize);
-    let n = ww * wh;
-    // Source colour per work pixel (None when the source falls off the image).
-    let mut srcv: Vec<Option<[f32; 4]>> = vec![None; n];
-    srcv.par_chunks_mut(ww).enumerate().for_each(|(ry, row)| {
-        for (rx, v) in row.iter_mut().enumerate() {
-            let (x, y) = ((wb.0 as usize + rx) as f32 + 0.5, (wb.1 as usize + ry) as f32 + 0.5);
-            *v = sample_patch(&src, sb.0 as f32, sb.1 as f32, x + dx, y + dy);
-        }
-    });
-    // Boundary samples: destination minus source just outside the stroke.
+    let sigma = (s.radius * 0.7).max(1.5);
+    // The colour offset field is very smooth (Gaussian of `sigma`), so it is
+    // built on a grid coarsened by `f` (f = 1 for small brushes: exact). Source
+    // colours are sampled on the fly rather than stored, so memory is about
+    // 16 bytes per coarse cell instead of ~48 bytes per pixel of the stroke's
+    // bounding box (a long diagonal stroke on a large photo would otherwise
+    // need gigabytes).
+    let f = heal_grid_factor(sigma, ww, wh);
+    let (cw, ch) = (ww.div_ceil(f), wh.div_ceil(f));
+    let sample_src = |x: u32, y: u32| sample_patch(&src, sb.0 as f32, sb.1 as f32, x as f32 + 0.5 + dx, y as f32 + 0.5 + dy);
+    // Boundary samples: destination minus source just outside the stroke,
+    // summed per coarse cell (one band of coarse rows per task).
     let raw = img.as_raw();
-    let mut wgt = vec![0f32; n];
-    let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; n]);
-    let (mut acc, mut cnt) = ([0f64; 3], 0f64);
-    for ry in 0..wh {
-        for rx in 0..ww {
-            let (x, y) = (wb.0 + rx as u32, wb.1 + ry as u32);
-            let i = ry * ww + rx;
-            if m.at(x, y) > 0.0 {
-                continue;
-            }
-            if let Some(sv) = srcv[i] {
-                let di = (y as usize * iw as usize + x as usize) * 4;
-                wgt[i] = 1.0;
-                for c in 0..3 {
-                    let d = raw[di + c] as f32 - sv[c];
-                    diff[c][i] = d;
-                    acc[c] += d as f64;
+    let band_rows: Vec<(Vec<f32>, [Vec<f32>; 3], [f64; 3], f64)> = (0..ch)
+        .into_par_iter()
+        .map(|cy| {
+            let mut wgt = vec![0f32; cw];
+            let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; cw]);
+            let (mut acc, mut cnt) = ([0f64; 3], 0f64);
+            for ry in cy * f..((cy + 1) * f).min(wh) {
+                for rx in 0..ww {
+                    let (x, y) = (wb.0 + rx as u32, wb.1 + ry as u32);
+                    if m.at(x, y) > 0.0 {
+                        continue;
+                    }
+                    if let Some(sv) = sample_src(x, y) {
+                        let di = (y as usize * iw as usize + x as usize) * 4;
+                        let cx = rx / f;
+                        wgt[cx] += 1.0;
+                        for c in 0..3 {
+                            let d = raw[di + c] as f32 - sv[c];
+                            diff[c][cx] += d;
+                            acc[c] += d as f64;
+                        }
+                        cnt += 1.0;
+                    }
                 }
-                cnt += 1.0;
             }
+            (wgt, diff, acc, cnt)
+        })
+        .collect();
+    let n = cw * ch;
+    let mut wsum = Vec::with_capacity(n);
+    let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(n));
+    let (mut acc, mut cnt) = ([0f64; 3], 0f64);
+    for (w, d, a, c) in band_rows {
+        wsum.extend_from_slice(&w);
+        for k in 0..3 {
+            diff[k].extend_from_slice(&d[k]);
+            acc[k] += a[k];
         }
+        cnt += c;
     }
     let mean = if cnt > 0.0 { acc.map(|a| (a / cnt) as f32) } else { [0.0; 3] };
-    let sigma = (s.radius * 0.7).max(1.5);
-    let mut wsum = wgt.clone();
-    mask::blur_plane(&mut wsum, ww, wh, sigma);
+    let cs = sigma / f as f32;
+    mask::blur_plane(&mut wsum, cw, ch, cs);
     for d in diff.iter_mut() {
-        mask::blur_plane(d, ww, wh, sigma);
+        mask::blur_plane(d, cw, ch, cs);
     }
+    // Cell sums hold up to f^2 samples: scale the "no boundary nearby" threshold.
+    let ws_min = 1e-3 * (f * f) as f32;
     let op = s.opacity.clamp(0.0, 1.0);
     for_mask_rows(img, &m, |x, y, c, d| {
-        let i = (y - wb.1) as usize * ww + (x - wb.0) as usize;
-        let Some(sv) = srcv[i] else { return };
-        let ws = wsum[i];
+        let Some(sv) = sample_src(x, y) else { return };
+        let (rx, ry) = ((x - wb.0) as f32, (y - wb.1) as f32);
+        let (gx, gy) = ((rx + 0.5) / f as f32 - 0.5, (ry + 0.5) / f as f32 - 0.5);
+        let ws = sample_plane(&wsum, cw, ch, gx, gy);
         let t = c * op;
         for k in 0..3 {
-            let off = if ws > 1e-3 { diff[k][i] / ws } else { mean[k] };
+            let off = if ws > ws_min { sample_plane(&diff[k], cw, ch, gx, gy) / ws } else { mean[k] };
             let v = sv[k] + off;
             d[k] = (d[k] as f32 + (v - d[k] as f32) * t).round().clamp(0.0, 255.0) as u8;
         }
         d[3] = (d[3] as f32 + (sv[3] - d[3] as f32) * t).round().clamp(0.0, 255.0) as u8;
     });
+}
+
+/// Coarsening factor for the healing offset field: exact (1) for small
+/// brushes, otherwise about sigma / 3 (the field has no detail finer than
+/// that), raised further so the grid never exceeds ~4 M cells.
+fn heal_grid_factor(sigma: f32, ww: usize, wh: usize) -> usize {
+    const MAX_CELLS: usize = 4 << 20;
+    let mut f = ((sigma / 3.0).floor() as usize).max(1);
+    while ww.div_ceil(f) * wh.div_ceil(f) > MAX_CELLS {
+        f += 1;
+    }
+    f
+}
+
+/// Bilinear sample of a single-channel plane with edge clamping.
+#[inline]
+fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+    let x = x.max(0.0).min((w - 1) as f32);
+    let y = y.max(0.0).min((h - 1) as f32);
+    let (x0, y0) = (x as usize, y as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let top = p[y0 * w + x0] * (1.0 - fx) + p[y0 * w + x1] * fx;
+    let bot = p[y1 * w + x0] * (1.0 - fx) + p[y1 * w + x1] * fx;
+    top * (1.0 - fy) + bot * fy
 }
 
 // ---------------------------------------------------------------- red eye
@@ -278,7 +325,9 @@ pub fn obscure(img: &mut RgbaImage, shapes: &[Shape], mode: Obscure, feather: f3
             });
         }
         Obscure::Pixelate(cell) => {
-            let cell = (cell * scale).round().clamp(2.0, 4096.0) as u32;
+            // No 2 px floor: on a downscaled preview a small cell must stay
+            // proportionally small, or the preview looks coarser than the result.
+            let cell = (cell * scale).round().clamp(1.0, 4096.0) as u32;
             // Average every grid cell (aligned to the image origin) that touches the mask.
             let (gx0, gy0) = (m.x0 / cell, m.y0 / cell);
             let (gx1, gy1) = ((m.x0 + m.w).div_ceil(cell), (m.y0 + m.h).div_ceil(cell));
@@ -386,6 +435,22 @@ mod tests {
         let mut img2 = img.clone();
         apply_strokes(&mut img2, &[BrushStroke { heal: false, ..s }], 1.0);
         assert!(img2.get_pixel(90, 30)[0] < 80);
+    }
+
+    #[test]
+    fn heal_with_coarse_offset_grid() {
+        // A big brush uses the coarsened offset field (f > 1); the result must
+        // still adopt the destination brightness.
+        assert_eq!(heal_grid_factor(3.0, 100, 100), 1);
+        assert!(heal_grid_factor(21.0, 100, 100) >= 7);
+        // A huge work box is bounded to ~4 M cells.
+        let f = heal_grid_factor(2.0, 10_000, 8_000);
+        assert!(10_000usize.div_ceil(f) * 8_000usize.div_ceil(f) <= 4 << 20);
+        let mut img = RgbaImage::from_fn(400, 200, |x, _| if x < 200 { image::Rgba([50, 50, 50, 255]) } else { image::Rgba([210, 210, 210, 255]) });
+        let s = BrushStroke { pts: vec![[260.0, 60.0], [340.0, 140.0]], radius: 30.0, hardness: 0.6, opacity: 1.0, offset: [-200.0, 0.0], heal: true };
+        apply_strokes(&mut img, &[s], 1.0);
+        let c = img.get_pixel(300, 100)[0] as i32;
+        assert!((c - 210).abs() < 25, "healed centre {c}");
     }
 
     #[test]

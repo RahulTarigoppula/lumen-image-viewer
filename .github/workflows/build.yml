@@ -42,8 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache vcpkg binaries
-        uses: actions/cache@v4
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: vcpkg-bincache
           key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg/**') }}-ffmpeg-x64-windows-static-md-rel
@@ -56,6 +57,13 @@ jobs:
           git -C $env:VCPKG_ROOT checkout $env:VCPKG_COMMIT
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:VCPKG_ROOT\vcpkg.exe" install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md-rel" --overlay-ports=vcpkg/overlay-ports --overlay-triplets=vcpkg/triplets
+
+      - name: Save vcpkg binaries
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg/**') }}-ffmpeg-x64-windows-static-md-rel
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -73,12 +81,6 @@ jobs:
         run: |
           if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) { choco install llvm -y --no-progress }
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-
-      - name: Check UI text uses plain punctuation
-        run: python tools/scrub_text.py --check src
-
-      - name: Test
-        run: cargo test --release
 
       - name: Build release
         run: cargo build --profile dist

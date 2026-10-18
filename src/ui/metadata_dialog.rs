@@ -104,6 +104,9 @@ impl MetadataDialog {
         self.poll(core);
         let mut open = true;
         let mut close = false;
+        // A text field focused at the start of the frame consumes Esc (it only
+        // drops focus), so typing in the comment field never closes the dialog.
+        let typing = ctx.egui_wants_keyboard_input();
         let title = if self.paths.len() == 1 {
             format!("{}  Edit metadata - {}", I::NOTE_PENCIL, self.paths[0].file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
         } else {
@@ -119,7 +122,7 @@ impl MetadataDialog {
             .show(ctx, |ui| {
                 close = self.ui(ui, &p, core);
             });
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.job.is_none() {
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.job.is_none() {
             close = true;
         }
         open && !close
@@ -153,6 +156,10 @@ impl MetadataDialog {
 
     fn run(&mut self, ctx: &egui::Context, label: &str, op: impl Fn(&std::path::Path) -> anyhow::Result<String> + Send + 'static) {
         let paths = self.paths.clone();
+        self.run_on(ctx, label, paths, op);
+    }
+
+    fn run_on(&mut self, ctx: &egui::Context, label: &str, paths: Vec<PathBuf>, op: impl Fn(&std::path::Path) -> anyhow::Result<String> + Send + 'static) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let c = ctx.clone();
         std::thread::spawn(move || {
@@ -347,15 +354,18 @@ impl MetadataDialog {
     }
 
     fn sidecar_ui(&mut self, ui: &mut Ui, p: &Palette, core: &mut Core) {
-        ui.label("Writes the Lumen rating, color label and flag to an XMP sidecar (name.xmp) next to each file, so Lightroom, Bridge and darktable can read them. Existing sidecars are updated in place.");
+        ui.label("Writes the Lumen rating, color label and flag to an XMP sidecar (name.xmp) next to each file, so Lightroom, Bridge and darktable can read them. Existing sidecars are updated in place; files without a rating, label or flag are skipped so existing ratings are not cleared.");
         ui.add_space(4.0);
         let tagged = self.paths.iter().filter(|path| !core.tags.get(path).is_empty()).count();
         ui.label(RichText::new(format!("{tagged} of {} file(s) have a rating, label or flag.", self.paths.len())).color(p.muted));
         ui.horizontal(|ui| {
-            if ui.button("Export sidecars").clicked() {
-                let tags: Vec<(PathBuf, crate::tags::Tag)> = self.paths.iter().map(|path| (path.clone(), core.tags.get(path))).collect();
+            if ui.add_enabled(tagged > 0, egui::Button::new("Export sidecars")).clicked() {
+                // Untagged files are left alone: writing Rating=0 / Label=""
+                // would wipe ratings another program stored in the sidecar.
+                let tags: Vec<(PathBuf, crate::tags::Tag)> = self.paths.iter().map(|path| (path.clone(), core.tags.get(path))).filter(|(_, t)| !t.is_empty()).collect();
+                let paths: Vec<PathBuf> = tags.iter().map(|t| t.0.clone()).collect();
                 let ctx = ui.ctx().clone();
-                self.run(&ctx, "XMP sidecar", move |path| {
+                self.run_on(&ctx, "XMP sidecar", paths, move |path| {
                     let tag = tags.iter().find(|(q, _)| q == path).map(|t| t.1).unwrap_or_default();
                     metaedit::export_xmp_sidecar(path, tag)?;
                     Ok(String::new())

@@ -77,7 +77,7 @@ impl EditTool for ObscureRegion {
         c |= row(ui, "Effect", |ui| segmented(ui, &mut self.mode, &["Pixelate", "Blur", "Solid"]));
         match self.mode {
             1 => c |= slider_ex(ui, "Strength", &mut self.blur, 1.0..=(short / 4.0).max(10.0), (short / 70.0).round().max(4.0), " px", 1.0, 0, true),
-            2 => c |= color_row(ui, "Colour", &mut self.color, false),
+            2 => c |= color_row(ui, "Color", &mut self.color, false),
             _ => c |= slider_ex(ui, "Cell size", &mut self.cell, 2.0..=(short / 4.0).max(10.0), (short / 45.0).round().max(6.0), " px", 1.0, 0, true),
         }
         c |= slider_ex(ui, "Feather", &mut self.feather, 0.0..=(short / 20.0).max(5.0), 0.0, " px", 0.5, 1, false);

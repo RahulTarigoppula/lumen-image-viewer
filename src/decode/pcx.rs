@@ -32,13 +32,19 @@ pub fn decode(b: &[u8]) -> Result<Decoded> {
     let planes = b[65] as usize;
     let bpl = le16(b, 66) as usize;
     let rle = b[2] == 1;
-    if planes == 0 || planes > 4 || bpl == 0 || bpl * 8 < w as usize * bpp {
+    // Bytes per plane line must cover the row and may only carry a little
+    // padding (the spec pads to an even size); a huge value in a crafted
+    // header would otherwise size the scanline buffer far beyond the image.
+    let min_bpl = (w as usize * bpp).div_ceil(8);
+    if planes == 0 || planes > 4 || bpl < min_bpl.max(1) || bpl > min_bpl + 2 {
         bail!("Unsupported or corrupt PCX header");
     }
     check_alloc(w, h)?;
     let line = bpl * planes;
     // Decode all scanlines (tolerating truncation: missing data stays black).
-    let total = line * h as usize;
+    let total64 = (line as u64).checked_mul(h as u64).filter(|&t| t <= super::MAX_DECODE_BYTES);
+    let Some(total64) = total64 else { bail!("{}", super::too_large_msg(w, h)) };
+    let total = usize::try_from(total64).map_err(|_| anyhow::anyhow!("PCX image is too large"))?;
     let mut data = vec![0u8; total];
     let src = &b[128..];
     let (mut i, mut o) = (0usize, 0usize);
@@ -217,5 +223,22 @@ pub(crate) mod tests {
         bad[66] = 0;
         bad[67] = 0;
         assert!(decode(&bad).is_err());
+    }
+
+    #[test]
+    fn crafted_huge_bytes_per_line_is_rejected_quickly() {
+        // 65535 x 65535 would be rejected by check_alloc; use a size that
+        // passes it but claims an enormous scanline (64K bytes x 4 planes).
+        let mut f = encode(8, 1, 8, 4, 8, &[vec![1; 32]], None);
+        f[8..10].copy_from_slice(&999u16.to_le_bytes());
+        f[10..12].copy_from_slice(&65000u16.to_le_bytes());
+        f[66..68].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let t = std::time::Instant::now();
+        assert!(decode(&f).is_err());
+        assert!(t.elapsed().as_secs() < 2);
+        // Too small for the row width is also rejected.
+        let mut f = encode(8, 1, 8, 1, 8, &[vec![1; 8]], None);
+        f[66..68].copy_from_slice(&4u16.to_le_bytes());
+        assert!(decode(&f).is_err());
     }
 }

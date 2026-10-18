@@ -58,6 +58,15 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
             .flatten()
             .filter(|e| {
                 let Ok(mut m) = e.metadata() else { return false };
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    // Check the link itself first: legacy junctions such as
+                    // "Application Data" or "My Documents" are hidden+system.
+                    if m.file_attributes() & 0x6 != 0 {
+                        return false;
+                    }
+                }
                 // Follow folder symlinks / junctions (DirEntry::metadata does not on Windows).
                 if m.file_type().is_symlink() {
                     match std::fs::metadata(e.path()) {
@@ -345,7 +354,24 @@ impl FolderTree {
             let icon_color = if selected { p.accent } else if is_favorite { Color32::from_rgb(250, 196, 60) } else { p.muted };
             ui.painter().text(Pos2::new(x0 + 22.0, cy), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), icon_color);
             let text_rect = Rect::from_min_max(Pos2::new(x0 + 34.0, rect.min.y), Pos2::new(rect.max.x - 8.0, rect.max.y));
-            let galley = ui.painter().layout_no_wrap(name.to_string(), FontId::proportional(13.0), if selected { p.text } else { p.text.gamma_multiply(0.92) });
+            let color = if selected { p.text } else { p.text.gamma_multiply(0.92) };
+            let font = FontId::proportional(13.0);
+            let mut galley = ui.painter().layout_no_wrap(name.to_string(), font.clone(), color);
+            if galley.size().x > text_rect.width() && text_rect.width() > 20.0 {
+                // Truncate with a plain "..." so long names stay readable (full path in the tooltip).
+                let chars: Vec<char> = name.chars().collect();
+                let (mut lo, mut hi) = (0usize, chars.len());
+                while lo < hi {
+                    let mid = (lo + hi + 1) / 2;
+                    let t: String = chars[..mid].iter().collect::<String>() + "...";
+                    if ui.painter().layout_no_wrap(t, font.clone(), color).size().x <= text_rect.width() {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                galley = ui.painter().layout_no_wrap(chars[..lo].iter().collect::<String>() + "...", font, color);
+            }
             let painter = ui.painter().with_clip_rect(text_rect);
             painter.galley(Pos2::new(text_rect.min.x, cy - galley.size().y / 2.0), galley, p.text);
         }
