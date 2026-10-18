@@ -498,11 +498,18 @@ fn draw_shape(pm: &mut Pixmap, o: &DrawObj) {
 
 /// Premultiplied pixmap to a straight-alpha image.
 fn pixmap_to_rgba(pm: &Pixmap) -> RgbaImage {
+    use rayon::prelude::*;
     let mut out = RgbaImage::new(pm.width(), pm.height());
-    for (d, s) in out.as_mut().chunks_exact_mut(4).zip(pm.pixels()) {
-        let c = s.demultiply();
-        d.copy_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-    }
+    let w = pm.width().max(1) as usize;
+    out.as_mut().par_chunks_mut(w * 4).zip(pm.pixels().par_chunks(w)).for_each(|(row, src)| {
+        for (d, s) in row.chunks_exact_mut(4).zip(src) {
+            if s.alpha() == 0 {
+                continue;
+            }
+            let c = s.demultiply();
+            d.copy_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+    });
     out
 }
 

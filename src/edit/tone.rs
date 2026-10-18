@@ -51,7 +51,7 @@ pub fn shadows_highlights(img: &RgbaImage, shadows: f32, highlights: f32) -> Rgb
             }
         })
         .collect();
-    super::mask::blur_plane(&mut grid, gw, gh, SH_GRID * 0.022);
+    super::mask::blur_plane(&mut grid, gw, gh, SH_GRID * 0.03);
     let stride = w as usize * 4;
     let mut out = img.clone();
     out.as_mut().par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
@@ -70,7 +70,7 @@ pub fn shadows_highlights(img: &RgbaImage, shadows: f32, highlights: f32) -> Rgb
             let p = &mut row[x * 4..x * 4 + 4];
             let own = luma8(p[0], p[1], p[2]);
             // Mostly the local average, a little of the pixel itself (fewer halos).
-            let l = local * 0.75 + own * 0.25;
+            let l = local * 0.6 + own * 0.4;
             let ws = (1.0 - l / 0.55).clamp(0.0, 1.0);
             let wh = ((l - 0.45) / 0.55).clamp(0.0, 1.0);
             let ev = sh * ws * ws * 1.6 - hi * wh * wh * 1.3;

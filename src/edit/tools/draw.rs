@@ -3,7 +3,7 @@
 //! editable until Apply rasterizes them with anti-aliasing.
 
 use super::canvas::{self, Pointer, HANDLE_HIT};
-use super::{color_button, info, row, section, segmented, slider, slider_ex};
+use super::{color_button, info, row, section, segmented, slider_ex};
 use crate::edit::raster::{self, DrawObj, Kind, CALLOUT_BUBBLE, CALLOUT_PLAIN};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
 use crate::ui::icons as I;
@@ -202,7 +202,7 @@ impl DrawBoard {
             slider_ex(ui, label, &mut st.width, min..=self.max_width, before.width, " px", 1.0, 0, true);
         }
         let mut op = st.opacity * 100.0;
-        if slider(ui, "Opacity", &mut op, 5.0..=100.0, 100.0, " %") {
+        if slider_ex(ui, "Opacity", &mut op, 5.0..=100.0, 100.0, " %", 1.0, 0, false) {
             st.opacity = op / 100.0;
         }
         if kind.has_fill() {
