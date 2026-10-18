@@ -37,6 +37,11 @@ pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool, conflict: Con
     let mut errors = Vec::new();
     for src in paths {
         let Some(name) = src.file_name() else { continue };
+        // A folder copied or moved into itself (or a sub-folder) would recurse forever.
+        if src.is_dir() && is_within(dest_dir, src) {
+            errors.push(format!("{}: cannot copy or move a folder into itself", src.display()));
+            continue;
+        }
         let mut dst = dest_dir.join(name);
         if dst == *src {
             if do_move {
@@ -64,6 +69,26 @@ pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool, conflict: Con
         }
     }
     (done, errors)
+}
+
+/// Move (or rename) one file or folder to an exact destination, never overwriting.
+pub fn move_path(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        return Err(anyhow!("{} already exists", dst.display()));
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.is_dir() {
+            return Err(anyhow!("folder {} no longer exists", parent.display()));
+        }
+    }
+    std::fs::rename(src, dst).or_else(|_| copy_any(src, dst).and_then(|_| remove_any(src))).with_context(|| format!("{}", src.display()))
+}
+
+/// `path` is `dir` or lies below it (case-insensitive, as on NTFS).
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (p, d) = (norm(path), norm(dir));
+    p == d || p.starts_with(&format!("{d}\\"))
 }
 
 fn copy_any(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -275,4 +300,94 @@ pub fn quick_access() -> Vec<(String, PathBuf, &'static str)> {
     push("Videos", dirs::video_dir(), I::FILM_STRIP);
     push("Home", dirs::home_dir(), I::HOUSE);
     v
+}
+
+/// Result of dragging files out of Lumen onto another program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragOutcome {
+    Cancelled,
+    Copied,
+    /// The target moved the files (e.g. Shift-drag onto an Explorer folder).
+    Moved,
+    Linked,
+}
+
+/// The shell's modal drag loop swallows the button-up: tell the window (and so
+/// winit / egui) that the left button is no longer held.
+fn release_mouse_button(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, PostMessageW, WM_LBUTTONUP};
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            let _ = ScreenToClient(hwnd, &mut pt);
+        }
+        let lp = ((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF);
+        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(lp as isize));
+    }
+}
+
+/// Start a Windows shell drag-and-drop of `files` (all in one folder), so they can be
+/// dropped on Explorer, the desktop, a mail client, an editor ... Blocks until the drop
+/// ends (the shell runs its own modal loop). Uses the shell's own data object (the same
+/// one Explorer uses, CF_HDROP + shell IDList formats) and the default drop source.
+pub fn drag_out(files: &[PathBuf]) -> Result<DragOutcome> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{ILFindLastID, ILFree, SHCreateDataObject, SHDoDragDrop, SHParseDisplayName};
+
+    let Some(first) = files.first() else { return Ok(DragOutcome::Cancelled) };
+    let parent = first.parent().ok_or_else(|| anyhow!("no parent folder"))?;
+    let files: Vec<&PathBuf> = files.iter().filter(|f| f.parent() == Some(parent)).collect();
+
+    unsafe {
+        let parse = |p: &Path| -> Result<*mut ITEMIDLIST> {
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            SHParseDisplayName(&HSTRING::from(p.as_os_str()), None, &mut pidl, 0, None).with_context(|| format!("{}", p.display()))?;
+            Ok(pidl)
+        };
+        // Full PIDLs of the files; the parent PIDL is the first one minus its last id.
+        let mut full: Vec<*mut ITEMIDLIST> = Vec::new();
+        let result = (|| -> Result<DragOutcome> {
+            for f in &files {
+                full.push(parse(f)?);
+            }
+            let folder = parse(parent)?;
+            let children: Vec<*const ITEMIDLIST> = full.iter().map(|p| ILFindLastID(*p) as *const ITEMIDLIST).collect();
+            let data: windows::core::Result<IDataObject> = SHCreateDataObject(Some(folder as *const _), Some(&children), None);
+            let data = match data {
+                Ok(d) => d,
+                Err(e) => {
+                    ILFree(Some(folder as *const _));
+                    return Err(anyhow!("could not start dragging: {e}"));
+                }
+            };
+            let hwnd = GetActiveWindow();
+            let hwnd = if hwnd.0.is_null() { None } else { Some(hwnd) };
+            let effect = SHDoDragDrop(hwnd, &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK);
+            ILFree(Some(folder as *const _));
+            if let Some(h) = hwnd {
+                release_mouse_button(h);
+            }
+            let effect = effect.map_err(|e| anyhow!("drag and drop failed: {e}"))?;
+            Ok(if effect.0 & DROPEFFECT_MOVE.0 != 0 {
+                DragOutcome::Moved
+            } else if effect.0 & DROPEFFECT_COPY.0 != 0 {
+                DragOutcome::Copied
+            } else if effect.0 & DROPEFFECT_LINK.0 != 0 {
+                DragOutcome::Linked
+            } else {
+                DragOutcome::Cancelled
+            })
+        })();
+        for p in full {
+            ILFree(Some(p as *const _));
+        }
+        // DRAGDROP_S_CANCEL / DRAGDROP_S_DROP are success codes; only real failures are Err.
+        result
+    }
 }

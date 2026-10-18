@@ -93,7 +93,13 @@ pub enum Command {
     NextFrame,
     PrevFrame,
     OpenWithEditor,
+    /// External editor number 2..=9 from Settings > External editors.
+    OpenWithEditorN(u8),
     Properties,
+    FitWidth,
+    FitHeight,
+    /// Open the photo's GPS position in OpenStreetMap.
+    OpenGpsMap,
 }
 
 use Command::*;
@@ -190,101 +196,18 @@ impl Command {
             NextFrame => "Next frame".into(),
             PrevFrame => "Previous frame".into(),
             OpenWithEditor => "Open in external editor".into(),
+            OpenWithEditorN(n) => format!("Open in external editor {n}"),
             Properties => "File properties".into(),
+            FitWidth => "Fit width".into(),
+            FitHeight => "Fit height".into(),
+            OpenGpsMap => "Show GPS location on map".into(),
         }
     }
 
-    pub fn shortcut(self) -> &'static str {
-        match self {
-            OpenFile => "Ctrl+O",
-            OpenFolder => "Ctrl+Shift+O",
-            CommandPalette => "Ctrl+K",
-            Settings => "Ctrl+,",
-            ShortcutsHelp => "F1",
-            ToggleFullscreen => "F11",
-            ToggleTheme => "Ctrl+Shift+T",
-            Exit => "Alt+F4",
-            Refresh => "F5",
-            GoUp => "Backspace",
-            GoBack => "Alt+Left",
-            GoForward => "Alt+Right",
-            SelectAll => "Ctrl+A",
-            SelectNone => "Ctrl+D",
-            InvertSelection => "Ctrl+I",
-            CopyTo => "F7",
-            MoveTo => "F8",
-            Delete => "Del",
-            Rename => "F2",
-            NewFolder => "Ctrl+Shift+N",
-            CopyPath => "Ctrl+Shift+C",
-            CopyFiles => "Ctrl+C",
-            PasteFiles => "Ctrl+V",
-            ThumbBigger => "Ctrl++",
-            ThumbSmaller => "Ctrl+-",
-            ToggleDetails => "Ctrl+Shift+D",
-            TogglePreviewPane => "Ctrl+Shift+P",
-            FocusFilter => "Ctrl+F",
-            BatchConvert => "F3",
-            BatchRename => "Ctrl+F2",
-            Slideshow => "S",
-            Compare => "P",
-            ToggleFlag => "Space",
-            Rate(0) => "0",
-            Rate(1) => "1",
-            Rate(2) => "2",
-            Rate(3) => "3",
-            Rate(4) => "4",
-            Rate(5) => "5",
-            Label(1) => "6",
-            Label(2) => "7",
-            Label(3) => "8",
-            Label(4) => "9",
-            OpenVideoMode => "Ctrl+Shift+V",
-            OpenViewer => "Enter",
-            CloseViewer => "Esc",
-            NextImage => "→ / PgDn",
-            PrevImage => "← / PgUp",
-            FirstImage => "Home",
-            LastImage => "End",
-            ZoomIn => "+",
-            ZoomOut => "−",
-            ZoomActual => "1 (viewer) / Ctrl+0",
-            ZoomFit => "/",
-            CycleFit => "*",
-            RotateLeft => "L",
-            RotateRight => "R",
-            FlipHorizontal => "H",
-            FlipVertical => "V",
-            Crop => "X",
-            Resize => "Ctrl+R",
-            CanvasSize => "Ctrl+Shift+R",
-            AdjustColors => "Ctrl+E",
-            Levels => "Ctrl+L",
-            Curves => "Ctrl+M",
-            Sharpen => "Ctrl+J",
-            Blur => "Ctrl+B",
-            Effects => "Ctrl+Shift+E",
-            AutoEnhance => "Ctrl+Shift+A",
-            AddText => "T",
-            Undo => "Ctrl+Z",
-            Redo => "Ctrl+Y",
-            Save => "Ctrl+S",
-            SaveAs => "Ctrl+Shift+S",
-            CopyImage => "Ctrl+C",
-            PasteImage => "Ctrl+V",
-            SetWallpaper => "Ctrl+W",
-            Print => "Ctrl+P",
-            ToggleInfo => "I",
-            ToggleHistogram => "Ctrl+H",
-            ToggleMagnifier => "M",
-            ToggleFilmstrip => "F",
-            PlayPause => "Space",
-            NextFrame => ".",
-            PrevFrame => ",",
-            OpenWithEditor => "E",
-            Properties => "Alt+Enter",
-            _ => "",
-        }
+    /// Shortcut text for menus and help, generated from the active keymap
+    /// (bindings of the current mode first, then global ones).
+    pub fn shortcut(self) -> String {
+        crate::ui::keymap::shortcut_text(self)
     }
 
     pub fn icon(self) -> &'static str {
@@ -376,8 +299,11 @@ impl Command {
             PlayPause => I::PLAY_PAUSE,
             NextFrame => I::SKIP_FORWARD,
             PrevFrame => I::SKIP_BACK,
-            OpenWithEditor => I::ARROW_SQUARE_OUT,
+            OpenWithEditor | OpenWithEditorN(_) => I::ARROW_SQUARE_OUT,
             Properties => I::FILE_TEXT,
+            FitWidth => I::ARROWS_OUT_LINE_HORIZONTAL,
+            FitHeight => I::ARROWS_OUT_LINE_VERTICAL,
+            OpenGpsMap => I::MAP_PIN,
         }
     }
 
@@ -392,7 +318,8 @@ impl Command {
             ZoomActual, ZoomFit, CycleFit, RotateLeft, RotateRight, FlipHorizontal, FlipVertical, Crop, Resize,
             CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance, AddText, AddBorder,
             Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
-            ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, Exit,
+            ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
+            FitHeight, OpenGpsMap, Exit,
         ];
         for n in 0..=5 {
             v.push(Rate(n));
@@ -401,5 +328,38 @@ impl Command {
             v.push(Label(n));
         }
         v
+    }
+
+    /// Every command, including each numbered variant (keymap editor, dev hook).
+    pub fn all() -> Vec<Command> {
+        let mut v = vec![
+            OpenFile, OpenFolder, CommandPalette, Settings, ShortcutsHelp, About, ToggleFullscreen, ToggleTheme, Exit,
+            Refresh, GoUp, GoBack, GoForward, SelectAll, SelectNone, InvertSelection, CopyTo, MoveTo, Delete, Rename,
+            NewFolder, AddFavorite, ShowInExplorer, CopyPath, CopyFiles, PasteFiles, ThumbBigger, ThumbSmaller,
+            ToggleDetails, TogglePreviewPane, FocusFilter, BatchConvert, BatchRename, ContactSheet, FindDuplicates,
+            Slideshow, Compare, ToggleFlag,
+        ];
+        v.extend((0..=5).map(Rate));
+        v.extend((0..=5).map(Label));
+        v.extend([
+            ShowFlaggedOnly, OpenVideoMode, OpenViewer, CloseViewer, NextImage, PrevImage, FirstImage, LastImage, ZoomIn,
+            ZoomOut, ZoomActual, ZoomFit, CycleFit, FitWidth, FitHeight, RotateLeft, RotateRight, FlipHorizontal,
+            FlipVertical, Crop, Resize, CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance,
+            AddText, AddBorder, Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper,
+            Print, ToggleInfo, ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, NextFrame, PrevFrame,
+            OpenWithEditor,
+        ]);
+        v.extend((2..=9).map(OpenWithEditorN));
+        v.extend([Properties, OpenGpsMap]);
+        v
+    }
+
+    /// Stable identifier used in settings.json and by the dev hook, e.g. `ZoomIn` or `Rate(3)`.
+    pub fn id(self) -> String {
+        format!("{self:?}")
+    }
+
+    pub fn from_id(id: &str) -> Option<Command> {
+        Command::all().into_iter().find(|c| c.id() == id)
     }
 }

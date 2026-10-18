@@ -83,7 +83,15 @@ pub fn list_folder(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>>
     for item in std::fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
         let path = item.path();
-        let Ok(meta) = item.metadata() else { continue };
+        let Ok(mut meta) = item.metadata() else { continue };
+        // DirEntry::metadata does not follow symlinks / junctions on Windows:
+        // ask for the target so linked folders and files still show up.
+        if meta.file_type().is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(m) => meta = m,
+                Err(_) => continue,
+            }
+        }
         let is_dir = meta.is_dir();
         if !is_dir {
             let ext = formats::ext_of(&path);
@@ -168,6 +176,9 @@ pub struct SortContext<'a> {
     pub dims: &'a dyn Fn(&Path) -> Option<(u32, u32)>,
     pub taken: &'a dyn Fn(&Path) -> Option<i64>,
     pub rating: &'a dyn Fn(&Path) -> u8,
+    pub flagged: &'a dyn Fn(&Path) -> bool,
+    /// Color label 0..=5 (0 = none).
+    pub label: &'a dyn Fn(&Path) -> u8,
 }
 
 pub fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_first: bool, cx: &SortContext) {
@@ -193,6 +204,13 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_fir
                 ta.cmp(&tb)
             }
             SortKey::Rating => (cx.rating)(&a.path).cmp(&(cx.rating)(&b.path)),
+            // Ascending puts flagged files first, like a "picks" view.
+            SortKey::Flagged => (cx.flagged)(&b.path).cmp(&(cx.flagged)(&a.path)),
+            // Ascending: red, yellow, green, blue, purple, then unlabeled files.
+            SortKey::ColorLabel => {
+                let k = |l: u8| if l == 0 { u8::MAX } else { l };
+                k((cx.label)(&a.path)).cmp(&k((cx.label)(&b.path)))
+            }
         }
         .then_with(|| natural_cmp(&a.name, &b.name));
         if desc { ord.reverse() } else { ord }

@@ -61,6 +61,8 @@ pub enum SortKey {
     Dimensions,
     DateTaken,
     Rating,
+    Flagged,
+    ColorLabel,
 }
 
 impl SortKey {
@@ -74,9 +76,11 @@ impl SortKey {
             SortKey::Dimensions => "Dimensions",
             SortKey::DateTaken => "Date taken (EXIF)",
             SortKey::Rating => "Rating",
+            SortKey::Flagged => "Flagged",
+            SortKey::ColorLabel => "Color label",
         }
     }
-    pub const ALL: [SortKey; 8] = [
+    pub const ALL: [SortKey; 10] = [
         SortKey::Name,
         SortKey::Size,
         SortKey::Modified,
@@ -85,6 +89,8 @@ impl SortKey {
         SortKey::Dimensions,
         SortKey::DateTaken,
         SortKey::Rating,
+        SortKey::Flagged,
+        SortKey::ColorLabel,
     ];
 }
 
@@ -171,6 +177,43 @@ pub struct Settings {
     /// Hand files opened from Explorer to the already running Lumen window
     /// instead of starting a second instance.
     pub reuse_window: bool,
+    /// Keyboard preset id ("lumen" or "faststone"); see `ui::keymap::Preset`.
+    pub keymap_preset: String,
+    /// User changes on top of the preset: per mode and command, the exact keys.
+    pub key_overrides: Vec<KeyOverride>,
+    /// Text under thumbnails in the browser grid.
+    pub thumb_caption: ThumbCaption,
+}
+
+/// "In `mode`, `command` uses exactly `keys`" (empty = unbound). Plain strings so a
+/// renamed command or unknown key never makes the whole settings file unreadable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyOverride {
+    pub mode: String,
+    pub command: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThumbCaption {
+    None,
+    Name,
+    #[default]
+    NameDetails,
+    NameDate,
+}
+
+impl ThumbCaption {
+    pub const ALL: [ThumbCaption; 4] = [ThumbCaption::None, ThumbCaption::Name, ThumbCaption::NameDetails, ThumbCaption::NameDate];
+    pub fn label(self) -> &'static str {
+        match self {
+            ThumbCaption::None => "None",
+            ThumbCaption::Name => "File name",
+            ThumbCaption::NameDetails => "Name, dimensions and size",
+            ThumbCaption::NameDate => "Name and date",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -224,6 +267,9 @@ impl Default for Settings {
             copy_move_targets: Vec::new(),
             external_editors: Vec::new(),
             reuse_window: true,
+            keymap_preset: "lumen".into(),
+            key_overrides: Vec::new(),
+            thumb_caption: ThumbCaption::NameDetails,
         }
     }
 }
@@ -278,6 +324,22 @@ impl Settings {
             if std::fs::write(&tmp, text).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
             }
+        }
+    }
+
+    /// Caption shown under thumbnails (`None` also clears the legacy on/off switch).
+    pub fn caption(&self) -> ThumbCaption {
+        if self.show_thumb_captions {
+            self.thumb_caption
+        } else {
+            ThumbCaption::None
+        }
+    }
+
+    pub fn set_thumb_caption(&mut self, c: ThumbCaption) {
+        self.show_thumb_captions = c != ThumbCaption::None;
+        if c != ThumbCaption::None {
+            self.thumb_caption = c;
         }
     }
 

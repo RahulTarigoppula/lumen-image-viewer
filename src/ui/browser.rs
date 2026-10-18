@@ -7,7 +7,7 @@ use super::tree::{DragFiles, FolderTree, TreeAction};
 use super::widgets;
 use crate::app::Core;
 use crate::catalog::{self, Entry, EntryKind, MediaFilter};
-use crate::settings::{BrowserView, SortKey};
+use crate::settings::{BrowserView, SortKey, ThumbCaption};
 use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -20,6 +20,8 @@ pub enum BrowserEvent {
     Open(usize),
     Command(Command),
     DropFiles { target: PathBuf, files: Vec<PathBuf>, copy: bool },
+    /// Thumbnails were dragged past the window edge: hand them to Windows drag and drop.
+    DragOut(Vec<PathBuf>),
     NewFolderIn(PathBuf),
     AddFavorite(PathBuf),
     RemoveFavorite(PathBuf),
@@ -53,6 +55,8 @@ pub struct Browser {
     pub pending_select: Option<PathBuf>,
     resort_needed: bool,
     right_w: f32,
+    /// Set by the app while a modal dialog or tool window owns the keyboard.
+    pub suppress_keys: bool,
 }
 
 impl Browser {
@@ -83,6 +87,7 @@ impl Browser {
             pending_select: None,
             resort_needed: false,
             right_w: 600.0,
+            suppress_keys: false,
         }
     }
 
@@ -151,6 +156,15 @@ impl Browser {
         self.items.iter().map(|&e| &self.entries[e]).filter(|e| e.is_media()).map(|e| e.path.clone()).collect()
     }
 
+    /// Like [`Self::targets`] but without folders (uses the listing, no disk access).
+    pub fn media_targets(&self) -> Vec<PathBuf> {
+        let sel: Vec<&Entry> = self.items.iter().map(|&e| &self.entries[e]).filter(|e| self.selected.contains(&e.path)).collect();
+        if sel.is_empty() {
+            return self.focus.and_then(|i| self.item(i)).filter(|e| !e.is_folder()).map(|e| e.path.clone()).into_iter().collect();
+        }
+        sel.into_iter().filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect()
+    }
+
     pub fn image_paths(&self) -> Vec<PathBuf> {
         self.items.iter().map(|&e| &self.entries[e]).filter(|e| e.kind == EntryKind::Image).map(|e| e.path.clone()).collect()
     }
@@ -180,7 +194,9 @@ impl Browser {
         let dims = |p: &Path| core.meta.get(p).and_then(|m| m.dims);
         let taken = |p: &Path| core.meta.get(p).and_then(|m| m.taken);
         let rating = |p: &Path| core.tags.get(p).rating;
-        let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating };
+        let flagged = |p: &Path| core.tags.get(p).flagged;
+        let label = |p: &Path| core.tags.get(p).label;
+        let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label };
         catalog::sort_entries(&mut self.entries, s.sort_key, s.sort_desc, s.folders_first, &cx);
         self.items = (0..self.entries.len())
             .filter(|&i| {
@@ -201,7 +217,10 @@ impl Browser {
             })
             .collect();
         self.focus = focus_path.and_then(|p| self.index_of(&p)).or(if self.items.is_empty() { None } else { self.focus.map(|f| f.min(self.items.len() - 1)) });
-        self.selected.retain(|p| self.entries.iter().any(|e| &e.path == p));
+        if !self.selected.is_empty() {
+            let present: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
+            self.selected.retain(|p| present.contains(p.as_path()));
+        }
     }
 
     /// Called every frame: receive listings, poll for folder changes.
@@ -392,7 +411,8 @@ impl Browser {
                 r.request_focus();
             }
             if r.lost_focus() {
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                // Consume Enter so the grid does not also open the focused item.
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
                     let path = PathBuf::from(text.trim().trim_matches('"'));
                     if path.is_dir() {
                         ev.push(BrowserEvent::Navigate(path));
@@ -564,14 +584,19 @@ impl Browser {
             BrowserView::Thumbnails => self.grid(ui, core, ev),
             BrowserView::Details => self.details(ui, core, ev),
         }
+        self.drag_out_check(ui, ev);
         self.keyboard(ui, core, ev);
     }
 
     fn grid(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
         let ts = core.settings.thumb_size.clamp(64.0, 512.0);
-        let captions = core.settings.show_thumb_captions;
-        let caption_h = if captions { 36.0 } else { 0.0 };
+        let captions = core.settings.caption();
+        let caption_h = match captions {
+            ThumbCaption::None => 0.0,
+            ThumbCaption::Name => 22.0,
+            ThumbCaption::NameDetails | ThumbCaption::NameDate => 36.0,
+        };
         let pad = 8.0;
         let cell = Vec2::new(ts + pad * 2.0, ts + pad * 2.0 + caption_h);
         let avail_w = ui.available_width() - 12.0;
@@ -676,6 +701,23 @@ impl Browser {
         self.context_menu(ui, &bg, core, ev, ctx_menu_for.is_some());
     }
 
+    /// An in-app file drag (onto tree folders) that leaves the window becomes a
+    /// Windows drag, so files can be dropped on Explorer or other programs.
+    fn drag_out_check(&mut self, ui: &mut Ui, ev: &mut Vec<BrowserEvent>) {
+        let ctx = ui.ctx().clone();
+        let Some(files) = egui::DragAndDrop::payload::<DragFiles>(&ctx) else { return };
+        let rect = ctx.content_rect();
+        let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+        let outside = match pos {
+            Some(p) => !rect.shrink(3.0).contains(p),
+            None => true,
+        };
+        if down && outside && !files.0.is_empty() {
+            egui::DragAndDrop::clear_payload(&ctx);
+            ev.push(BrowserEvent::DragOut(files.0.clone()));
+        }
+    }
+
     fn handle_clicks(&mut self, clicked: Option<(usize, egui::Modifiers)>, double: Option<usize>, ev: &mut Vec<BrowserEvent>) {
         if let Some((i, m)) = clicked {
             let path = self.entries[self.items[i]].path.clone();
@@ -705,7 +747,7 @@ impl Browser {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: bool, selected: bool, focused: bool, hovered: bool, p: &Palette) {
+    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: ThumbCaption, selected: bool, focused: bool, hovered: bool, p: &Palette) {
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -776,20 +818,32 @@ impl Browser {
                 painter.galley(Pos2::new(bg_r.min.x + 4.0, bg_r.min.y + 2.0), galley, Color32::WHITE);
             }
         }
-        if captions {
+        if captions != ThumbCaption::None {
             let name_rect = Rect::from_min_max(Pos2::new(rect.min.x + 8.0, img_area.max.y + 4.0), Pos2::new(rect.max.x - 8.0, rect.max.y - 4.0));
             let galley = ui.painter().layout(entry.name.clone(), FontId::proportional(12.0), if selected { p.text } else { p.text.gamma_multiply(0.9) }, name_rect.width());
             let painter = ui.painter().with_clip_rect(Rect::from_min_max(name_rect.min, Pos2::new(name_rect.max.x, name_rect.min.y + 16.0)));
             let first_w = galley.rows.first().map(|r| r.rect().width()).unwrap_or(0.0);
             painter.galley(Pos2::new(name_rect.center().x - first_w / 2.0, name_rect.min.y), galley, p.text);
-            let sub = if entry.is_media() {
+            if captions == ThumbCaption::Name {
+                return;
+            }
+            let sub = if !entry.is_media() {
+                "Folder".into()
+            } else if captions == ThumbCaption::NameDate {
+                if entry.kind == EntryKind::Image {
+                    core.meta.request(&entry.path);
+                }
+                let taken = core.meta.get(&entry.path).and_then(|m| m.taken);
+                match taken.and_then(|t| chrono::DateTime::from_timestamp(t, 0)) {
+                    Some(dt) => dt.naive_utc().format("%Y-%m-%d %H:%M").to_string(),
+                    None => catalog::format_time(entry.modified),
+                }
+            } else {
                 let d = dims.or_else(|| core.meta.get(&entry.path).and_then(|m| m.dims));
                 match d {
                     Some((w, h)) => format!("{w}×{h}  ·  {}", catalog::human_size(entry.size)),
                     None => catalog::human_size(entry.size),
                 }
-            } else {
-                "Folder".into()
             };
             ui.painter().with_clip_rect(name_rect).text(Pos2::new(name_rect.center().x, name_rect.min.y + 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.5), p.faint);
         }
@@ -937,9 +991,9 @@ impl Browser {
         if open_now {
             egui::Popup::open_id(ui.ctx(), popup_id);
         }
-        let has_sel = !self.targets().is_empty();
+        let has_sel = !self.selected.is_empty() || self.focus.is_some();
         let p = core.pal;
-        let mut build = |ui: &mut Ui, ev: &mut Vec<BrowserEvent>| {
+        let build = |ui: &mut Ui, ev: &mut Vec<BrowserEvent>| {
             let item = |ui: &mut Ui, cmd: Command, ev: &mut Vec<BrowserEvent>| {
                 let text = format!("{}   {}", cmd.icon(), cmd.label());
                 let r = ui.add(egui::Button::new(text).shortcut_text(RichText::new(cmd.shortcut()).color(p.faint)));
@@ -996,7 +1050,7 @@ impl Browser {
     }
 
     fn keyboard(&mut self, ui: &mut Ui, _core: &mut Core, ev: &mut Vec<BrowserEvent>) {
-        if ui.ctx().egui_wants_keyboard_input() || self.items.is_empty() {
+        if self.suppress_keys || ui.ctx().egui_wants_keyboard_input() || self.items.is_empty() {
             return;
         }
         let cols = self.current_cols(ui, _core);
@@ -1027,18 +1081,6 @@ impl Browser {
                         _ => {}
                     }
                 }
-                egui::Event::Text(t) if !mods.ctrl && !mods.command => {
-                    // Type-ahead: jump to the first item starting with the typed text.
-                    // Digits and single shortcut letters are reserved for commands.
-                    if t.chars().all(|c| c.is_alphanumeric()) && self.typeahead.1.elapsed().as_millis() < 900 && !self.typeahead.0.is_empty() {
-                        self.typeahead.0.push_str(&t.to_lowercase());
-                        self.typeahead.1 = Instant::now();
-                        let q = self.typeahead.0.clone();
-                        if let Some(i) = self.items.iter().position(|&e| self.entries[e].name.to_lowercase().starts_with(&q)) {
-                            moved = Some(i);
-                        }
-                    }
-                }
                 _ => {}
             }
         }
@@ -1060,10 +1102,23 @@ impl Browser {
         }
     }
 
+    /// True within 900 ms of the last type-ahead letter: further letters extend
+    /// the search instead of firing single-letter commands.
+    pub fn typeahead_active(&self) -> bool {
+        !self.typeahead.0.is_empty() && self.typeahead.1.elapsed().as_millis() < 900
+    }
+
     /// Begin a type-ahead search with `c` (called by the app when a letter key
     /// is not bound to a command).
     pub fn typeahead_start(&mut self, c: &str) {
-        self.typeahead = (c.to_lowercase(), Instant::now());
+        self.typeahead = (String::new(), Instant::now());
+        self.typeahead_push(c);
+    }
+
+    /// Extend the type-ahead search (the app routes all text here while it is active).
+    pub fn typeahead_push(&mut self, c: &str) {
+        self.typeahead.0.push_str(&c.to_lowercase());
+        self.typeahead.1 = Instant::now();
         let q = self.typeahead.0.clone();
         if let Some(i) = self.items.iter().position(|&e| self.entries[e].name.to_lowercase().starts_with(&q)) {
             self.focus = Some(i);
@@ -1090,10 +1145,11 @@ impl Browser {
         if folders > 0 {
             s += &format!(", {folders} folder{}", if folders == 1 { "" } else { "s" });
         }
-        let sel = self.selected_paths();
-        if !sel.is_empty() {
-            let bytes: u64 = self.entries.iter().filter(|e| self.selected.contains(&e.path)).map(|e| e.size).sum();
-            s += &format!("   ·   {} selected ({})", sel.len(), catalog::human_size(bytes));
+        if !self.selected.is_empty() {
+            let (n, bytes) = self.entries.iter().filter(|e| self.selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size));
+            if n > 0 {
+                s += &format!("   ·   {n} selected ({})", catalog::human_size(bytes));
+            }
         }
         if core.meta.pending() > 0 {
             s += &format!("   ·   reading metadata... {}", core.meta.pending());

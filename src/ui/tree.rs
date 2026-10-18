@@ -19,13 +19,25 @@ pub enum TreeAction {
     DropFiles { target: PathBuf, files: Vec<PathBuf>, copy: bool },
 }
 
+type Listing = (PathBuf, Vec<PathBuf>);
+
+/// Sub-folder listings and drive labels are read on background threads: an offline
+/// network drive or a slow USB disk must never freeze the UI.
 #[derive(Default)]
 pub struct FolderTree {
     expanded: HashSet<PathBuf>,
     children: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Listings being read right now.
+    loading: HashSet<PathBuf>,
+    /// Listings shown but due for a refresh (kept until the new one arrives).
+    stale: HashSet<PathBuf>,
+    chan: Option<(crossbeam_channel::Sender<Listing>, crossbeam_channel::Receiver<Listing>)>,
     revealed_for: Option<PathBuf>,
     scroll_to: Option<PathBuf>,
     drives: Vec<(PathBuf, String)>,
+    drives_rx: Option<crossbeam_channel::Receiver<Vec<(PathBuf, String)>>>,
+    drives_requested: bool,
+    quick: Option<Vec<(String, PathBuf, &'static str)>>,
 }
 
 fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -33,7 +45,14 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
         Ok(rd) => rd
             .flatten()
             .filter(|e| {
-                let Ok(m) = e.metadata() else { return false };
+                let Ok(mut m) = e.metadata() else { return false };
+                // Follow folder symlinks / junctions (DirEntry::metadata does not on Windows).
+                if m.file_type().is_symlink() {
+                    match std::fs::metadata(e.path()) {
+                        Ok(t) => m = t,
+                        Err(_) => return false,
+                    }
+                }
                 if !m.is_dir() {
                     return false;
                 }
@@ -66,16 +85,61 @@ fn display_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().trim_end_matches('\\').to_string())
 }
 
+fn read_drives() -> Vec<(PathBuf, String)> {
+    fileops::drives()
+        .into_iter()
+        .map(|d| {
+            let label = fileops::volume_label(&d).unwrap_or_else(|| "Local Disk".into());
+            let letter = d.to_string_lossy().trim_end_matches('\\').to_string();
+            (d, format!("{label} ({letter})"))
+        })
+        .collect()
+}
+
 impl FolderTree {
-    pub fn refresh_drives(&mut self) {
-        self.drives = fileops::drives()
-            .into_iter()
-            .map(|d| {
-                let label = fileops::volume_label(&d).unwrap_or_else(|| "Local Disk".into());
-                let letter = d.to_string_lossy().trim_end_matches('\\').to_string();
-                (d, format!("{label} ({letter})"))
-            })
-            .collect();
+    fn start_drives(&mut self, ctx: &egui::Context) {
+        if self.drives_requested {
+            return;
+        }
+        self.drives_requested = true;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_drives());
+            c.request_repaint();
+        });
+        self.drives_rx = Some(rx);
+    }
+
+    fn start_listing(&mut self, dir: &Path, ctx: &egui::Context) {
+        if self.loading.contains(dir) {
+            return;
+        }
+        self.loading.insert(dir.to_path_buf());
+        self.stale.remove(dir);
+        let tx = self.chan.get_or_insert_with(crossbeam_channel::unbounded).0.clone();
+        let d = dir.to_path_buf();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let kids = list_subdirs(&d);
+            let _ = tx.send((d, kids));
+            c.request_repaint();
+        });
+    }
+
+    fn poll(&mut self) {
+        if let Some((_, rx)) = &self.chan {
+            while let Ok((dir, kids)) = rx.try_recv() {
+                self.loading.remove(&dir);
+                self.children.insert(dir, kids);
+            }
+        }
+        if let Some(rx) = &self.drives_rx {
+            if let Ok(d) = rx.try_recv() {
+                self.drives = d;
+                self.drives_rx = None;
+            }
+        }
     }
 
     /// Expand all ancestors of `path` so the current folder is visible.
@@ -93,12 +157,16 @@ impl FolderTree {
     }
 
     pub fn invalidate(&mut self, dir: &Path) {
-        self.children.remove(dir);
+        if self.children.contains_key(dir) {
+            self.stale.insert(dir.to_path_buf());
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, current: &Path, favorites: &[PathBuf], p: &Palette) -> Option<TreeAction> {
-        if self.drives.is_empty() {
-            self.refresh_drives();
+        self.poll();
+        self.start_drives(ui.ctx());
+        if self.quick.is_none() {
+            self.quick = Some(fileops::quick_access());
         }
         let mut action = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -114,7 +182,7 @@ impl FolderTree {
                 ui.add_space(6.0);
             }
             header(ui, p, "Quick access");
-            for (name, path, icon) in fileops::quick_access() {
+            for (name, path, icon) in self.quick.clone().unwrap_or_default() {
                 if let Some(a) = self.row(ui, &path, &name, icon, 0, current, false, p, false) {
                     action = Some(a);
                 }
@@ -122,6 +190,12 @@ impl FolderTree {
             ui.add_space(6.0);
             header(ui, p, "This PC");
             let drives = self.drives.clone();
+            if drives.is_empty() && self.drives_rx.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.spinner();
+                });
+            }
             for (d, label) in drives {
                 if let Some(a) = self.node(ui, &d, &label, I::HARD_DRIVES, 0, current, p) {
                     action = Some(a);
@@ -135,7 +209,22 @@ impl FolderTree {
     fn node(&mut self, ui: &mut Ui, path: &Path, name: &str, icon: &str, depth: usize, current: &Path, p: &Palette) -> Option<TreeAction> {
         let mut action = self.row(ui, path, name, icon, depth, current, true, p, false);
         if self.expanded.contains(path) {
-            let kids = self.children.entry(path.to_path_buf()).or_insert_with(|| list_subdirs(path)).clone();
+            let kids = match self.children.get(path).cloned() {
+                Some(k) => {
+                    if self.stale.contains(path) {
+                        self.start_listing(path, ui.ctx());
+                    }
+                    k
+                }
+                None => {
+                    self.start_listing(path, ui.ctx());
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0 + (depth + 1) as f32 * 14.0 + 22.0);
+                        ui.label(egui::RichText::new("Loading...").size(12.0).color(p.faint));
+                    });
+                    Vec::new()
+                }
+            };
             for k in kids {
                 let n = display_name(&k);
                 let is_open = self.expanded.contains(&k);
@@ -197,10 +286,11 @@ impl FolderTree {
             let galley = ui.painter().layout_no_wrap(name.to_string(), FontId::proportional(13.0), if selected { p.text } else { p.text.gamma_multiply(0.92) });
             let painter = ui.painter().with_clip_rect(text_rect);
             painter.galley(Pos2::new(text_rect.min.x, cy - galley.size().y / 2.0), galley, p.text);
-            if self.scroll_to.as_deref() == Some(path) {
-                ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                self.scroll_to = None;
-            }
+        }
+        // Outside the visibility check: the row to reveal is usually scrolled out of view.
+        if self.scroll_to.as_deref() == Some(path) {
+            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+            self.scroll_to = None;
         }
         if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
             let copy = ui.input(|i| i.modifiers.ctrl);
@@ -255,7 +345,7 @@ impl FolderTree {
     fn toggle(&mut self, path: &Path) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
-            self.children.remove(path); // re-list on expand so it stays fresh
+            self.invalidate(path); // re-list on expand so it stays fresh
         }
     }
 }
