@@ -124,7 +124,11 @@ impl Browser {
     }
 
     pub fn focused_path(&self) -> Option<PathBuf> {
-        self.focus.and_then(|i| self.items.get(i)).map(|&e| self.entries[e].path.clone())
+        self.focus.and_then(|i| self.items.get(i)).and_then(|&e| self.entries.get(e)).map(|e| e.path.clone())
+    }
+
+    fn anchor_path(&self) -> Option<PathBuf> {
+        self.anchor.and_then(|i| self.items.get(i)).and_then(|&e| self.entries.get(e)).map(|e| e.path.clone())
     }
 
     pub fn item(&self, i: usize) -> Option<&Entry> {
@@ -190,6 +194,7 @@ impl Browser {
     /// Re-apply sorting and filtering (keeps focus on the same file).
     pub fn rebuild(&mut self, core: &Core) {
         let focus_path = self.focused_path();
+        let anchor_path = self.anchor_path();
         let s = &core.settings;
         let dims = |p: &Path| core.meta.get(p).and_then(|m| m.dims);
         let taken = |p: &Path| core.meta.get(p).and_then(|m| m.taken);
@@ -217,6 +222,9 @@ impl Browser {
             })
             .collect();
         self.focus = focus_path.and_then(|p| self.index_of(&p)).or(if self.items.is_empty() { None } else { self.focus.map(|f| f.min(self.items.len() - 1)) });
+        // Re-resolve the Shift-selection anchor by path: indices are stale after
+        // a re-sort, filter change or reload. Fall back to the focus.
+        self.anchor = anchor_path.and_then(|p| self.index_of(&p)).or(self.focus);
         if !self.selected.is_empty() {
             let present: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
             self.selected.retain(|p| present.contains(p.as_path()));
@@ -232,6 +240,10 @@ impl Browser {
                     self.loading = false;
                     match res {
                         Ok(entries) => {
+                            // Old item indices point into the old entry list:
+                            // remember the anchor by path and drop them first.
+                            let anchor_path = self.anchor_path();
+                            self.items.clear();
                             self.entries = entries;
                             let needs_meta = matches!(core.settings.sort_key, SortKey::Dimensions | SortKey::DateTaken)
                                 || core.settings.browser_view == BrowserView::Details;
@@ -246,6 +258,9 @@ impl Browser {
                             } else if self.focus.is_none() && !self.items.is_empty() {
                                 // Focus the first media item so arrow keys work immediately.
                                 self.focus = self.items.iter().position(|&e| self.entries[e].is_media()).or(Some(0));
+                            }
+                            if let Some(i) = anchor_path.and_then(|p| self.index_of(&p)) {
+                                self.anchor = Some(i);
                             }
                         }
                         Err(e) => {
@@ -725,7 +740,7 @@ impl Browser {
         if let Some((i, m)) = clicked {
             let path = self.entries[self.items[i]].path.clone();
             if m.shift {
-                let a = self.anchor.unwrap_or(i);
+                let a = clamp_anchor(self.anchor, i, self.items.len());
                 if !m.ctrl {
                     self.selected.clear();
                 }
@@ -1070,7 +1085,7 @@ impl Browser {
         let n = self.items.len();
         let (mods, keys) = ui.input(|i| (i.modifiers, i.events.clone()));
         let mut moved = None;
-        let cur = self.focus.unwrap_or(0);
+        let cur = self.focus.unwrap_or(0).min(n - 1);
         for e in &keys {
             match e {
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
@@ -1100,7 +1115,7 @@ impl Browser {
         if let Some(i) = moved {
             let path = self.entries[self.items[i]].path.clone();
             if mods.shift {
-                let a = self.anchor.unwrap_or(cur);
+                let a = clamp_anchor(self.anchor, cur, self.items.len());
                 self.selected.clear();
                 for j in a.min(i)..=a.max(i) {
                     self.selected.insert(self.entries[self.items[j]].path.clone());
@@ -1175,4 +1190,29 @@ fn seg_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| p.to_string_lossy().trim_end_matches('\\').to_string())
+}
+
+/// The Shift-selection anchor as a valid index into a list of `len` items:
+/// a missing or out-of-range anchor (stale after a filter or reload) falls
+/// back to `fallback`, itself clamped.
+fn clamp_anchor(anchor: Option<usize>, fallback: usize, len: usize) -> usize {
+    let last = len.saturating_sub(1);
+    match anchor {
+        Some(a) if a < len => a,
+        _ => fallback.min(last),
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::clamp_anchor;
+
+    #[test]
+    fn anchor_is_clamped_into_range() {
+        assert_eq!(clamp_anchor(Some(3), 0, 10), 3);
+        assert_eq!(clamp_anchor(Some(10), 2, 10), 2);
+        assert_eq!(clamp_anchor(Some(500), 7, 5), 4);
+        assert_eq!(clamp_anchor(None, 1, 5), 1);
+        assert_eq!(clamp_anchor(None, 9, 0), 0);
+    }
 }
