@@ -2,12 +2,12 @@
 //!
 //! **Registration** is strictly per user (no admin rights) and lives under
 //! `HKEY_CURRENT_USER`:
-//! * `Software\Classes\Lumen.Image`, `Lumen.Video` — ProgIDs with icon + open command
-//! * `Software\Classes\.<ext>\OpenWithProgids` — puts Lumen in "Open with" for every supported type
-//! * `Software\Classes\Applications\lumen.exe` — friendly name + `SupportedTypes`
-//! * `Software\Lumen\Capabilities` + `Software\RegisteredApplications\Lumen` — lists Lumen in
+//! * `Software\Classes\Lumen.Image`, `Lumen.Video` - ProgIDs with icon + open command
+//! * `Software\Classes\.<ext>\OpenWithProgids` - puts Lumen in "Open with" for every supported type
+//! * `Software\Classes\Applications\lumen.exe` - friendly name + `SupportedTypes`
+//! * `Software\Lumen\Capabilities` + `Software\RegisteredApplications\Lumen` - lists Lumen in
 //!   Settings › Apps › Default apps (Windows only lets the *user* pick the default there)
-//! * `Software\Classes\{Directory,Directory\Background,Drive}\shell\Lumen` — "Browse with Lumen"
+//! * `Software\Classes\{Directory,Directory\Background,Drive}\shell\Lumen` - "Browse with Lumen"
 //!
 //! Unregistering removes exactly those keys/values again (shared `.ext` keys are only
 //! deleted when they end up empty).
@@ -78,12 +78,12 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// `"C:\…\lumen.exe" "%1"` — the shell substitutes the placeholder itself.
+/// `"C:\...\lumen.exe" "%1"` - the shell substitutes the placeholder itself.
 pub fn open_command(exe: &str, placeholder: &str) -> String {
     format!("{} \"{placeholder}\"", quote_arg(exe))
 }
 
-/// `"C:\…\lumen.exe",0` — first icon resource of the executable.
+/// `"C:\...\lumen.exe",0` - first icon resource of the executable.
 pub fn icon_ref(exe: &str) -> String {
     format!("{},0", quote_arg(exe))
 }
@@ -99,7 +99,7 @@ pub fn exe_from_command(cmd: &str) -> Option<PathBuf> {
     (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
-/// Remove the `\\?\` verbatim prefix some APIs return — the shell does not like it in commands.
+/// Remove the `\\?\` verbatim prefix some APIs return - the shell does not like it in commands.
 pub fn strip_verbatim(path: &Path) -> PathBuf {
     let s = path.as_os_str().to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {

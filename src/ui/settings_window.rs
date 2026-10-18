@@ -70,7 +70,7 @@ impl Page {
             Page::Browser => "Thumbnail grid and file listing",
             Page::Editing => "Defaults used when saving edited images",
             Page::Performance => "Memory and disk caches",
-            Page::Editors => "Programs offered for “Open in external editor” (E)",
+            Page::Editors => "Programs offered for "Open in external editor" (E)",
             Page::Integration => "File associations, Explorer menu and single window",
             Page::Privacy => "What Lumen stores, and where",
             Page::About => "Version, license and open-source credits",
@@ -567,7 +567,7 @@ fn editing(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     let mut changed = false;
     section_title(ui, p, "Saving");
     card(ui, p, |ui| {
-        changed |= row(ui, p, "JPEG quality", "Default for Save and Save as. 85–95 is visually lossless for most photos.", |ui| {
+        changed |= row(ui, p, "JPEG quality", "Default for Save and Save as. 85-95 is visually lossless for most photos.", |ui| {
             slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.jpeg_quality, 1..=100)).changed())
         });
         changed |= toggle_row(ui, p, "Keep EXIF metadata", "Copy camera data, date taken and GPS into saved files.", &mut s.keep_exif_on_save);
@@ -575,7 +575,7 @@ fn editing(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     });
     section_title(ui, p, "Color");
     card(ui, p, |ui| {
-        changed |= toggle_row(ui, p, "Color management", "Convert images with embedded ICC profiles (Adobe RGB, Display P3, …) to sRGB for accurate colors.", &mut s.color_manage);
+        changed |= toggle_row(ui, p, "Color management", "Convert images with embedded ICC profiles (Adobe RGB, Display P3, ...) to sRGB for accurate colors.", &mut s.color_manage);
     });
     changed
 }
@@ -604,7 +604,7 @@ fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.cache_budget_mb, 256..=8192).logarithmic(true).step_by(64.0).suffix(" MB")).changed())
         });
         if ram > 0 && (s.cache_budget_mb << 20) > ram / 2 {
-            ui.label(RichText::new(format!("{}  More than half of this PC's memory — other programs may slow down.", I::WARNING)).size(11.5).color(p.warn));
+            ui.label(RichText::new(format!("{}  More than half of this PC's memory - other programs may slow down.", I::WARNING)).size(11.5).color(p.warn));
             ui.add_space(6.0);
         }
     });
@@ -634,7 +634,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         if eds.is_empty() {
             ui.add_space(10.0);
             ui.label(RichText::new("No external editors yet").color(p.text));
-            hint(ui, p, "Add Photoshop, GIMP, Paint.NET, Krita or any other program. Without an editor, E shows the Windows “Open with” dialog.");
+            hint(ui, p, "Add Photoshop, GIMP, Paint.NET, Krita or any other program. Without an editor, E shows the Windows "Open with" dialog.");
             ui.add_space(10.0);
             return;
         }
@@ -649,7 +649,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let badge = if i == 0 { RichText::new(I::STAR).color(p.accent) } else { RichText::new(format!("{}", i + 1)).color(p.faint) };
-                ui.add_sized([18.0, 20.0], egui::Label::new(badge)).on_hover_text(if i == 0 { "Default — opened with E" } else { "" });
+                ui.add_sized([18.0, 20.0], egui::Label::new(badge)).on_hover_text(if i == 0 { "Default - opened with E" } else { "" });
                 let ed = &mut eds[i];
                 let w = (ui.available_width() - 110.0).max(120.0);
                 ui.vertical(|ui| {
@@ -693,7 +693,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         }
     });
     ui.horizontal(|ui| {
-        if ui.button(format!("{}  Add editor…", I::PLUS)).clicked() {
+        if ui.button(format!("{}  Add editor...", I::PLUS)).clicked() {
             if let Some(exe) = rfd::FileDialog::new().set_title("Choose an editor program").add_filter("Programs", &["exe"]).pick_file() {
                 if core.settings.external_editors.iter().any(|e| same_path(&e.exe, &exe)) {
                     core.toasts.info("That editor is already in the list");
@@ -734,7 +734,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
 
     section_title(ui, p, "File types");
     card(ui, p, |ui| {
-        row(ui, p, "Open with Lumen", "Adds Lumen to “Open with” for all supported image and video types and lists it under Windows Default apps. Per-user — no administrator rights needed.", |ui| {
+        row(ui, p, "Open with Lumen", "Adds Lumen to "Open with" for all supported image and video types and lists it under Windows Default apps. Per-user - no administrator rights needed.", |ui| {
             if status.file_types {
                 if ui.button("Unregister").clicked() {
                     match crate::shell::unregister_file_types() {
@@ -774,7 +774,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
 
     section_title(ui, p, "Explorer");
     card(ui, p, |ui| {
-        row(ui, p, "“Browse with Lumen” menu", "Right-click any folder, drive or folder background in Explorer to open it in Lumen's browser.", |ui| {
+        row(ui, p, ""Browse with Lumen" menu", "Right-click any folder, drive or folder background in Explorer to open it in Lumen's browser.", |ui| {
             if status.context_menu {
                 if ui.button("Remove").clicked() {
                     match crate::shell::unregister_context_menu() {
@@ -785,7 +785,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                 }
             } else if ui.add(egui::Button::new(RichText::new("Add").color(Color32::WHITE)).fill(p.accent)).clicked() {
                 match crate::shell::register_context_menu() {
-                    Ok(()) => core.toasts.success("“Browse with Lumen” added to Explorer"),
+                    Ok(()) => core.toasts.success(""Browse with Lumen" added to Explorer"),
                     Err(e) => core.toasts.error(format!("Could not add the Explorer menu entry: {e}")),
                 }
                 refresh = true;
@@ -794,7 +794,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             status_chip(ui, p, status.context_menu, "Added", "Not added");
             false
         });
-        hint(ui, p, "On Windows 11 the entry appears under “Show more options” (Shift+F10).");
+        hint(ui, p, "On Windows 11 the entry appears under "Show more options" (Shift+F10).");
         ui.add_space(8.0);
     });
 
@@ -852,7 +852,7 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
             p,
             "Portable mode",
             if portable {
-                "Active — all data lives in the LumenData folder next to lumen.exe."
+                "Active - all data lives in the LumenData folder next to lumen.exe."
             } else {
                 "Create an empty file named portable.txt next to lumen.exe to keep all data beside the program (e.g. on a USB stick)."
             },
@@ -866,7 +866,7 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
     section_title(ui, p, "Reset");
     card(ui, p, |ui| {
         row(ui, p, "Reset all settings", "Restore every preference to its default. Favorites, recent folders, tags and ratings are kept.", |ui| {
-            if ui.button(RichText::new(format!("{}  Reset…", I::ARROW_COUNTER_CLOCKWISE)).color(p.danger)).clicked() {
+            if ui.button(RichText::new(format!("{}  Reset...", I::ARROW_COUNTER_CLOCKWISE)).color(p.danger)).clicked() {
                 st.confirm_reset = true;
             }
             false
@@ -991,7 +991,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
 }
 
-/// "C:\…\paintdotnet.exe" → "Paintdotnet"; known programs get their proper name.
+/// "C:\...\paintdotnet.exe" → "Paintdotnet"; known programs get their proper name.
 fn editor_name_from_exe(exe: &Path) -> String {
     let stem = exe.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let known = [
@@ -1042,7 +1042,7 @@ fn find_installed_editors() -> Vec<ExternalEditor> {
         push("IrfanView", root.join(r"IrfanView\i_view64.exe"));
         push("Affinity Photo 2", root.join(r"Affinity\Photo 2\Photo.exe"));
         push("Lightroom Classic", root.join(r"Adobe\Adobe Lightroom Classic\Lightroom.exe"));
-        // Versioned folders: "GIMP 2", "GIMP 3"…, "Adobe Photoshop 2025"…
+        // Versioned folders: "GIMP 2", "GIMP 3"..., "Adobe Photoshop 2025"...
         for (dir, prefix, bin, exe_prefix, name) in [(root.clone(), "GIMP", "bin", "gimp-", "GIMP"), (root.join("Adobe"), "Adobe Photoshop", "", "Photoshop", "Photoshop")] {
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             for e in rd.flatten() {
