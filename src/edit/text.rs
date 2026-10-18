@@ -135,7 +135,14 @@ pub struct Stamp {
 }
 
 /// Coverage mask of the laid-out text. Returns (mask, w, h, text box x/y/w/h in mask coords).
-fn layout_mask(font: &FontArc, text: &str, st: &TextStyle, pad: f32) -> (Vec<f32>, usize, usize, [f32; 4]) {
+/// Largest stamp (pixels) rendered; bigger requests are scaled down so a huge
+/// font size with a wide outline can't exhaust memory (about 24 bytes/px peak).
+pub const MAX_STAMP_PX: usize = 24_000_000;
+
+type Layout = (Vec<f32>, usize, usize, [f32; 4]);
+
+/// Lay out and rasterize; `Err(area)` when the stamp would exceed [`MAX_STAMP_PX`].
+fn layout_mask(font: &FontArc, text: &str, st: &TextStyle, pad: f32) -> Result<Layout, usize> {
     let px = st.px.clamp(1.0, 4000.0);
     let sf = font.as_scaled(PxScale::from(px));
     let line_h = (sf.ascent() - sf.descent() + sf.line_gap()) * st.line_spacing.clamp(0.5, 4.0);
@@ -184,6 +191,9 @@ fn layout_mask(font: &FontArc, text: &str, st: &TextStyle, pad: f32) -> (Vec<f32
     let oy = (pad - miny).ceil();
     let w = ((maxx + ox + pad).ceil() as usize).clamp(1, geom::MAX_DIM as usize);
     let h = ((maxy + oy + pad).ceil() as usize).clamp(1, geom::MAX_DIM as usize);
+    if w * h > MAX_STAMP_PX {
+        return Err(w * h);
+    }
     let mut mask = vec![0f32; w * h];
     for o in outlined {
         let b = o.px_bounds();
@@ -196,65 +206,111 @@ fn layout_mask(font: &FontArc, text: &str, st: &TextStyle, pad: f32) -> (Vec<f32
             }
         });
     }
-    (mask, w, h, [ox, oy, tw, th])
+    Ok((mask, w, h, [ox, oy, tw, th]))
 }
 
-/// Sliding-window maximum over `2s+1` samples (van Herk / Gil-Werman).
-fn hmax(row: &[f32], s: usize, out: &mut [f32]) {
-    let n = row.len();
-    if s == 0 {
-        out.copy_from_slice(row);
+/// Scale every size in a style by `f`.
+fn scaled_style(st: &TextStyle, f: f32) -> TextStyle {
+    TextStyle {
+        px: st.px * f,
+        tracking: st.tracking * f,
+        outline: st.outline * f,
+        shadow_dx: st.shadow_dx * f,
+        shadow_dy: st.shadow_dy * f,
+        shadow_blur: st.shadow_blur * f,
+        bg_padding: st.bg_padding * f,
+        bg_radius: st.bg_radius * f,
+        ..st.clone()
+    }
+}
+
+/// 1-D squared Euclidean distance transform (Felzenszwalb and Huttenlocher)
+/// of `f` (0 = inside, `EDT_INF` = outside) into `d`. Scratch: `v`, `z`.
+fn edt_1d(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+    let n = f.len();
+    if n == 0 {
         return;
     }
-    let k = 2 * s + 1;
-    let padded_len = n + 2 * s;
-    let get = |i: usize| if i < s || i >= s + n { 0.0 } else { row[i - s] };
-    let mut g = vec![0f32; padded_len];
-    let mut hh = vec![0f32; padded_len];
-    for i in 0..padded_len {
-        g[i] = if i % k == 0 { get(i) } else { g[i - 1].max(get(i)) };
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    for q in 1..n {
+        let fq = f[q] + (q * q) as f32;
+        let mut s;
+        loop {
+            let p = v[k];
+            s = (fq - (f[p] + (p * p) as f32)) / (2.0 * (q - p) as f32);
+            // z[0] is -inf, so k never underflows.
+            if k > 0 && s <= z[k] {
+                k -= 1;
+            } else {
+                break;
+            }
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f32::INFINITY;
     }
-    for i in (0..padded_len).rev() {
-        hh[i] = if i % k == k - 1 || i == padded_len - 1 { get(i) } else { hh[i + 1].max(get(i)) };
-    }
-    for x in 0..n {
-        // window [x, x + 2s] in padded coordinates
-        out[x] = hh[x].max(g[x + 2 * s]);
+    k = 0;
+    for (q, out) in d.iter_mut().enumerate() {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let p = v[k];
+        let dq = q as f32 - p as f32;
+        *out = dq * dq + f[p];
     }
 }
 
-/// Circular dilation of a coverage mask by `r` pixels.
+const EDT_INF: f32 = 1e10;
+
+/// Squared distance from every pixel to the nearest pixel where `inside` is
+/// true. Memory: two `w*h` f32 planes; time O(w*h) regardless of radius.
+pub(crate) fn distance_sq(inside: impl Fn(usize) -> bool + Sync, w: usize, h: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    // Columns first, written transposed (h-long rows) so both passes are row-parallel.
+    let mut t = vec![0f32; w * h];
+    t.par_chunks_mut(h).enumerate().for_each_init(
+        || (vec![0f32; h], vec![0usize; h], vec![0f32; h + 1]),
+        |(f, v, z), (x, col)| {
+            for (y, fy) in f.iter_mut().enumerate() {
+                *fy = if inside(y * w + x) { 0.0 } else { EDT_INF };
+            }
+            edt_1d(f, col, v, z);
+        },
+    );
+    let mut out = vec![0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each_init(
+        || (vec![0f32; w], vec![0usize; w], vec![0f32; w + 1]),
+        |(f, v, z), (y, row)| {
+            for (x, fx) in f.iter_mut().enumerate() {
+                *fx = t[x * h + y];
+            }
+            edt_1d(f, row, v, z);
+        },
+    );
+    out
+}
+
+/// Circular dilation of a coverage mask by `r` pixels (anti-aliased edge).
+/// Uses a Euclidean distance transform: memory is bounded by the mask size
+/// and time does not grow with the radius.
 fn dilate(mask: &[f32], w: usize, h: usize, r: f32) -> Vec<f32> {
     use rayon::prelude::*;
-    let ri = r.ceil() as i64;
-    let rr = (r + 0.5) * (r + 0.5);
-    let spans: Vec<usize> = (-ri..=ri).map(|dy| ((rr - (dy * dy) as f32).max(0.0)).sqrt().floor() as usize).collect();
-    // Horizontal maxima per distinct span width, computed lazily per row.
-    let mut uniq: Vec<usize> = spans.clone();
-    uniq.sort_unstable();
-    uniq.dedup();
-    let hm: Vec<Vec<f32>> = uniq
-        .par_iter()
-        .map(|&s| {
-            let mut out = vec![0f32; w * h];
-            for y in 0..h {
-                hmax(&mask[y * w..(y + 1) * w], s, &mut out[y * w..(y + 1) * w]);
-            }
-            out
-        })
-        .collect();
+    if !(r > 0.0) || mask.len() != w * h {
+        return mask.to_vec();
+    }
+    let d2 = distance_sq(|i| mask[i] >= 0.5, w, h);
     let mut out = vec![0f32; w * h];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for (j, dy) in (-ri..=ri).enumerate() {
-            let sy = y as i64 + dy;
-            if sy < 0 || sy >= h as i64 {
-                continue;
-            }
-            let ui = uniq.binary_search(&spans[j]).unwrap_or(0);
-            let src = &hm[ui][sy as usize * w..(sy as usize + 1) * w];
-            for (o, &v) in row.iter_mut().zip(src) {
-                *o = o.max(v);
-            }
+    out.par_chunks_mut(w.max(1)).zip(d2.par_chunks(w.max(1))).zip(mask.par_chunks(w.max(1))).for_each(|((o, d), m)| {
+        for i in 0..o.len() {
+            let cov = (r + 1.0 - d[i].sqrt()).clamp(0.0, 1.0);
+            o[i] = cov.max(m[i]);
         }
     });
     out
@@ -273,11 +329,25 @@ fn mask_layer(mask: &[f32], w: usize, h: usize, color: [u8; 4]) -> RgbaImage {
 }
 
 pub fn render_stamp(font: &FontArc, text: &str, st: &TextStyle) -> Stamp {
+    let mut st = std::borrow::Cow::Borrowed(st);
+    for _ in 0..4 {
+        match render_stamp_inner(font, text, &st) {
+            Ok(s) => return s,
+            Err(area) => {
+                let f = ((MAX_STAMP_PX as f64 / area as f64).sqrt() * 0.95) as f32;
+                st = std::borrow::Cow::Owned(scaled_style(&st, f.clamp(0.01, 0.95)));
+            }
+        }
+    }
+    Stamp { image: RgbaImage::new(1, 1), anchor_x: 0.0, anchor_y: 0.0, anchor_w: 1.0, anchor_h: 1.0 }
+}
+
+fn render_stamp_inner(font: &FontArc, text: &str, st: &TextStyle) -> Result<Stamp, usize> {
     let outline = st.outline.clamp(0.0, 400.0);
     let bgpad = if st.background { st.bg_padding.clamp(0.0, 2000.0) } else { 0.0 };
     let shadow_ext = if st.shadow { st.shadow_blur.clamp(0.0, 500.0) * 3.0 + st.shadow_dx.abs().max(st.shadow_dy.abs()).min(2000.0) } else { 0.0 };
     let pad = (outline + 2.0).max(bgpad + 1.0) + shadow_ext;
-    let (mask, w, h, [bx, by, tw, th]) = layout_mask(font, text, st, pad);
+    let (mask, w, h, [bx, by, tw, th]) = layout_mask(font, text, st, pad)?;
     let outer = if outline > 0.0 { Some(dilate(&mask, w, h, outline)) } else { None };
     let mut img = RgbaImage::new(w as u32, h as u32);
     let (ax, ay, aw, ah) = (bx - bgpad, by - bgpad, tw + 2.0 * bgpad, th + 2.0 * bgpad);
@@ -302,7 +372,7 @@ pub fn render_stamp(font: &FontArc, text: &str, st: &TextStyle) -> Stamp {
         geom::composite_over(&mut img, &mask_layer(o, w, h, st.outline_color), 0, 0, 1.0);
     }
     geom::composite_over(&mut img, &mask_layer(&mask, w, h, st.color), 0, 0, 1.0);
-    Stamp { image: img, anchor_x: ax, anchor_y: ay, anchor_w: aw, anchor_h: ah }
+    Ok(Stamp { image: img, anchor_x: ax, anchor_y: ay, anchor_w: aw, anchor_h: ah })
 }
 
 /// Top-left position (in image pixels) of a box of size `bw`×`bh` placed at a
@@ -372,6 +442,34 @@ mod tests {
         assert!(e.image.width() >= 1);
         let mut img = RgbaImage::from_pixel(64, 64, image::Rgba([10, 10, 10, 255]));
         tile_layer(&mut img, &s.image, -30.0, 10.0, 0.5);
+    }
+
+    #[test]
+    fn huge_stamp_is_capped() {
+        let font = load(usize::MAX, false, false);
+        let st = TextStyle { px: 3000.0, outline: 900.0, ..Default::default() };
+        let s = render_stamp(&font, "Wide text line", &st);
+        assert!((s.image.width() as usize * s.image.height() as usize) <= MAX_STAMP_PX);
+        assert!(s.image.pixels().any(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn distance_transform_matches_brute_force() {
+        let (w, h) = (23usize, 17usize);
+        let inside = |i: usize| (i * 7919) % 31 == 0;
+        let d = distance_sq(inside, w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut best = f32::MAX;
+                for j in 0..w * h {
+                    if inside(j) {
+                        let (dx, dy) = (x as f32 - (j % w) as f32, y as f32 - (j / w) as f32);
+                        best = best.min(dx * dx + dy * dy);
+                    }
+                }
+                assert!((d[y * w + x] - best).abs() < 1e-3, "({x},{y}) {} vs {best}", d[y * w + x]);
+            }
+        }
     }
 
     #[test]
