@@ -408,7 +408,9 @@ const LABELS: [&str; 6] = ["", "Red", "Yellow", "Green", "Blue", "Purple"];
 
 /// Write (or update) `name.xmp` next to the image with xmp:Rating, xmp:Label
 /// and lumen:Flagged. Existing sidecars (e.g. from Lightroom) are edited in
-/// place so their other contents survive.
+/// place so their other contents survive, and only the properties Lumen has
+/// a value for are written: an unrated / unlabelled file never overwrites a
+/// rating or label stored by another program.
 pub fn export_xmp_sidecar(path: &Path, tag: crate::tags::Tag) -> Result<PathBuf> {
     let side = sidecar_path(path);
     let rating = tag.rating.min(5).to_string();
@@ -417,25 +419,41 @@ pub fn export_xmp_sidecar(path: &Path, tag: crate::tags::Tag) -> Result<PathBuf>
     let xml = match std::fs::read_to_string(&side) {
         Ok(existing) if existing.contains("<rdf:Description") => {
             let mut s = existing;
-            s = set_xmp_property(s, "xmp", "http://ns.adobe.com/xap/1.0/", "Rating", &rating);
-            s = set_xmp_property(s, "xmp", "http://ns.adobe.com/xap/1.0/", "Label", label);
-            s = set_xmp_property(s, "lumen", LUMEN_NS, "Flagged", flagged);
+            if tag.rating > 0 {
+                s = set_xmp_property(s, "xmp", "http://ns.adobe.com/xap/1.0/", "Rating", &rating);
+            }
+            if !label.is_empty() {
+                s = set_xmp_property(s, "xmp", "http://ns.adobe.com/xap/1.0/", "Label", label);
+            }
+            // lumen:Flagged is Lumen's own property: keep it in sync when present.
+            if tag.flagged || find_xmp_value(&s, "lumen:Flagged").is_some() {
+                s = set_xmp_property(s, "lumen", LUMEN_NS, "Flagged", flagged);
+            }
             s
         }
-        _ => format!(
+        _ => {
+            let mut props = String::new();
+            if tag.rating > 0 {
+                props.push_str(&format!("\n   xmp:Rating=\"{rating}\""));
+            }
+            if !label.is_empty() {
+                props.push_str(&format!("\n   xmp:Label=\"{label}\""));
+            }
+            if tag.flagged {
+                props.push_str("\n   lumen:Flagged=\"True\"");
+            }
+            format!(
             "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
 <x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Lumen\">\n\
  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
   <rdf:Description rdf:about=\"\"\n\
     xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n\
-    xmlns:lumen=\"{LUMEN_NS}\"\n\
-   xmp:Rating=\"{rating}\"\n\
-   xmp:Label=\"{label}\"\n\
-   lumen:Flagged=\"{flagged}\"/>\n\
+    xmlns:lumen=\"{LUMEN_NS}\"{props}/>\n\
  </rdf:RDF>\n\
 </x:xmpmeta>\n\
 <?xpacket end=\"w\"?>\n"
-        ),
+            )
+        }
     };
     write_atomic(&side, xml.as_bytes())?;
     Ok(side)
@@ -447,17 +465,62 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
+/// Byte range of the value of attribute `key` (e.g. `xmp:Rating`), with
+/// either quote style and optional spaces around `=`. The key must start at
+/// a name boundary so `foo:xmp:Rating` or `myxmp:Rating` do not match.
+fn find_xmp_attr(s: &str, key: &str) -> Option<(usize, usize, char)> {
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(off) = s[from..].find(key) {
+        let i = from + off;
+        from = i + key.len();
+        if i > 0 && !b[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let mut j = i + key.len();
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'=' {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let q = match b.get(j) {
+            Some(b'"') => '"',
+            Some(b'\'') => '\'',
+            _ => continue,
+        };
+        let start = j + 1;
+        let len = s[start..].find(q)?;
+        return Some((start, start + len, q));
+    }
+    None
+}
+
+/// Value of `key` as an attribute (either quote style) or a simple element.
+fn find_xmp_value(s: &str, key: &str) -> Option<String> {
+    if let Some((a, b, _)) = find_xmp_attr(s, key) {
+        return Some(s[a..b].to_string());
+    }
+    let open = format!("<{key}>");
+    let a = s.find(&open)? + open.len();
+    let b = s[a..].find('<')?;
+    Some(s[a..a + b].trim().to_string())
+}
+
 /// Set `prefix:name` on the first rdf:Description, as an attribute or by
 /// replacing an existing element / attribute value.
 fn set_xmp_property(mut s: String, prefix: &str, ns: &str, name: &str, value: &str) -> String {
-    let value = xml_escape(value);
-    let attr = format!("{prefix}:{name}=\"");
-    if let Some(i) = s.find(&attr) {
-        let start = i + attr.len();
-        if let Some(len) = s[start..].find('"') {
-            s.replace_range(start..start + len, &value);
-            return s;
+    let mut value = xml_escape(value);
+    if let Some((start, end, q)) = find_xmp_attr(&s, &format!("{prefix}:{name}")) {
+        if q == '\'' {
+            value = value.replace('\'', "&apos;");
         }
+        s.replace_range(start..end, &value);
+        return s;
     }
     let open = format!("<{prefix}:{name}>");
     let close = format!("</{prefix}:{name}>");
@@ -481,17 +544,7 @@ fn set_xmp_property(mut s: String, prefix: &str, ns: &str, name: &str, value: &s
 /// Read rating / label / flag back from a sidecar (for importing ratings).
 pub fn read_xmp_sidecar(path: &Path) -> Option<crate::tags::Tag> {
     let s = std::fs::read_to_string(sidecar_path(path)).ok()?;
-    let get = |key: &str| -> Option<String> {
-        let attr = format!("{key}=\"");
-        if let Some(i) = s.find(&attr) {
-            let st = i + attr.len();
-            return s[st..].find('"').map(|l| s[st..st + l].to_string());
-        }
-        let open = format!("<{key}>");
-        let a = s.find(&open)? + open.len();
-        let b = s[a..].find('<')?;
-        Some(s[a..a + b].trim().to_string())
-    };
+    let get = |key: &str| find_xmp_value(&s, key);
     let rating = get("xmp:Rating").and_then(|r| r.trim().parse::<i32>().ok()).unwrap_or(0).clamp(0, 5) as u8;
     let label = get("xmp:Label").map(|l| LABELS.iter().position(|n| !n.is_empty() && n.eq_ignore_ascii_case(l.trim())).unwrap_or(0) as u8).unwrap_or(0);
     let flagged = get("lumen:Flagged").map(|f| f.eq_ignore_ascii_case("true")).unwrap_or(false);
@@ -668,6 +721,33 @@ mod tests {
         assert!(s.contains("crs:Exposure2012=\"+0.50\""));
         assert!(s.contains("<xmp:Rating>5</xmp:Rating>"));
         assert_eq!(read_xmp_sidecar(&p), Some(crate::tags::Tag { rating: 5, flagged: false, label: 1 }));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn xmp_export_keeps_foreign_values_and_single_quotes() {
+        let d = tmpdir("xmpq");
+        let p = d.join("q.jpg");
+        std::fs::write(&p, b"x").unwrap();
+        let side = sidecar_path(&p);
+        // Single-quoted attributes (valid XML) are updated, not duplicated.
+        let lr = "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='r'><rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/' xmp:Rating='3' xmp:Label='Red'/></rdf:RDF></x:xmpmeta>";
+        std::fs::write(&side, lr).unwrap();
+        export_xmp_sidecar(&p, crate::tags::Tag { rating: 5, flagged: false, label: 0 }).unwrap();
+        let s = std::fs::read_to_string(&side).unwrap();
+        assert_eq!(s.matches("xmp:Rating").count(), 1, "{s}");
+        assert!(s.contains("xmp:Rating='5'"));
+        // Lumen has no label: the existing one survives.
+        assert!(s.contains("xmp:Label='Red'"));
+        assert!(!s.contains("lumen:Flagged"));
+        assert_eq!(read_xmp_sidecar(&p).map(|t| (t.rating, t.label)), Some((5, 1)));
+        // Untagged export to a fresh sidecar writes no rating / label.
+        let _ = std::fs::remove_file(&side);
+        export_xmp_sidecar(&p, crate::tags::Tag::default()).unwrap();
+        let s = std::fs::read_to_string(&side).unwrap();
+        assert!(!s.contains("xmp:Rating") && !s.contains("xmp:Label"), "{s}");
+        // Spaces around '=' and a prefix that merely ends in the key.
+        assert_eq!(find_xmp_value("<a myxmp:Rating=\"1\" xmp:Rating = \"4\"/>", "xmp:Rating").as_deref(), Some("4"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

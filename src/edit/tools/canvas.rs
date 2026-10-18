@@ -159,6 +159,9 @@ pub struct ShapeEditor {
     lasso: Vec<[f32; 2]>,
     history: Vec<Vec<Shape>>,
     future: Vec<Vec<Shape>>,
+    /// Redo stack set aside while a new shape is drawn; restored when the
+    /// shape is discarded (too small), so a stray click keeps redo.
+    tentative_future: Option<Vec<Vec<Shape>>>,
 }
 
 impl ShapeEditor {
@@ -168,12 +171,26 @@ impl ShapeEditor {
             self.history.remove(0);
         }
         self.future.clear();
+        self.tentative_future = None;
+    }
+    fn snapshot_tentative(&mut self) {
+        let future = std::mem::take(&mut self.future);
+        self.snapshot();
+        self.tentative_future = Some(future);
+    }
+    fn discard_tentative(&mut self) {
+        self.history.pop();
+        if let Some(f) = self.tentative_future.take() {
+            self.future = f;
+        }
     }
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.history.pop() else { return false };
         self.future.push(std::mem::replace(&mut self.shapes, prev));
         self.selected = None;
         self.drag = None;
+        self.lasso.clear();
+        self.tentative_future = None;
         true
     }
     pub fn redo(&mut self) -> bool {
@@ -181,6 +198,8 @@ impl ShapeEditor {
         self.history.push(std::mem::replace(&mut self.shapes, next));
         self.selected = None;
         self.drag = None;
+        self.lasso.clear();
+        self.tentative_future = None;
         true
     }
     pub fn can_undo(&self) -> bool {
@@ -261,7 +280,7 @@ impl ShapeEditor {
                     self.selected = Some(i);
                     self.drag = Some(SDrag::Move(start, self.shapes[i].clone()));
                 } else {
-                    self.snapshot();
+                    self.snapshot_tentative();
                     let start = cx.clamp_to_image(start);
                     match kind {
                         NewShape::Lasso => {
@@ -319,9 +338,10 @@ impl ShapeEditor {
                     if s.is_valid() {
                         self.shapes.push(s);
                         self.selected = Some(self.shapes.len() - 1);
+                        self.tentative_future = None;
                         changed = true;
                     } else {
-                        self.history.pop();
+                        self.discard_tentative();
                     }
                 }
                 Some(SDrag::Create(_)) => {
@@ -334,8 +354,10 @@ impl ShapeEditor {
                         if let Some(i) = self.selected.take() {
                             self.shapes.remove(i);
                         }
-                        self.history.pop();
+                        self.discard_tentative();
                         changed = true;
+                    } else {
+                        self.tentative_future = None;
                     }
                 }
                 _ => {}

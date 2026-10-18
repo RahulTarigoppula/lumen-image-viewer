@@ -30,7 +30,7 @@ impl Mask {
         if x < self.x0 || y < self.y0 || x >= self.x0 + self.w || y >= self.y0 + self.h {
             return 0.0;
         }
-        self.data[((y - self.y0) * self.w + (x - self.x0)) as usize] as f32 / 255.0
+        self.data[(y - self.y0) as usize * self.w as usize + (x - self.x0) as usize] as f32 / 255.0
     }
     /// Box as (x0, y0, x1, y1), exclusive end.
     pub fn bounds(&self) -> (u32, u32, u32, u32) {
@@ -388,7 +388,7 @@ pub fn blend_masked(img: &mut RgbaImage, fx: &RgbaImage, fx_origin: (u32, u32), 
             if t <= 0.0 {
                 continue;
             }
-            let si = (((y - oy) * fw + (x - ox)) * 4) as usize;
+            let si = ((y - oy) as usize * fw as usize + (x - ox) as usize) * 4;
             let d = &mut row[x as usize * 4..x as usize * 4 + 4];
             for k in 0..4 {
                 d[k] = (d[k] as f32 + (fraw[si + k] as f32 - d[k] as f32) * t).round().clamp(0.0, 255.0) as u8;
