@@ -26,8 +26,8 @@ fn on_worker<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) 
     std::thread::Builder::new()
         .name("lumen-pdf".into())
         .spawn(move || {
-            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED};
-            let init = unsafe { CoInitializeEx(None, if true { COINIT_APARTMENTTHREADED } else { COINIT_MULTITHREADED }) };
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+            let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err(anyhow!("The PDF renderer crashed on this file")));
             if init.is_ok() {
                 unsafe { CoUninitialize() };
