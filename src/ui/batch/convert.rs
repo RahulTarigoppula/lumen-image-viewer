@@ -482,6 +482,8 @@ fn run(files: Vec<PathBuf>, s: ConvertSettings, prog: Arc<Progress>, tx: Sender<
 #[serde(default)]
 pub struct BatchPrefs {
     pub convert: ConvertSettings,
+    /// Last tab of the batch convert window (0 basic, 1 advanced).
+    pub convert_tab: u8,
     pub rename: logic::RenameSettings,
     pub sheet: crate::ui::tools::sheet::SheetSettings,
     pub print: crate::ui::tools::print::PrintOptions,
@@ -533,6 +535,38 @@ mod tests {
         s.dest = DestMode::Folder;
         s.out_folder = Some(PathBuf::from("D:\\out"));
         assert_eq!(s.output_dir(&input), PathBuf::from("D:\\out"));
+    }
+
+    #[test]
+    fn end_to_end_advanced_pipeline() {
+        use super::super::pipeline::{CanvasMode, CanvasStep, Step, TextStep};
+        let dir = std::env::temp_dir().join(format!("lumen-conv-adv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("pic.png");
+        RgbaImage::from_pixel(200, 100, image::Rgba([10, 20, 30, 255])).save(&input).unwrap();
+        let mut s = ConvertSettings { format: SaveFormat::Png, dest: DestMode::Subfolder, subfolder: "out".into(), use_advanced: true, ..Default::default() };
+        s.advanced.push(Step::Canvas(CanvasStep { mode: CanvasMode::Add, add: 5, color: [255, 0, 0, 255], ..Default::default() }));
+        s.advanced.push(Step::Text(TextStep { text: "{name}".into(), shadow: false, size_pct: 30.0, anchor: 4, ..Default::default() }));
+        s.advanced.push(Step::Dpi { dpi: 240 });
+        let est = estimate(&input, 0, &s, &Default::default()).unwrap();
+        assert_eq!(est.out_dims, (210, 110));
+        assert!(est.before.is_some() && est.after.is_some());
+        match process_one(&input, 0, &s, &Mutex::new(HashSet::new())) {
+            FileStatus::Done { out, dims, .. } => {
+                assert_eq!(dims, (210, 110));
+                let bytes = std::fs::read(&out).unwrap();
+                assert_eq!(super::super::pipeline::read_dpi(&bytes).map(|d| d.round()), Some(240.0));
+                let back = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                assert_eq!(back.get_pixel(1, 1).0, [255, 0, 0, 255], "canvas color");
+                assert!(back.pixels().any(|p| p[0] > 200 && p[1] > 200), "text drawn");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Disabled pipeline: untouched size, no DPI.
+        s.use_advanced = false;
+        assert_eq!(estimate(&input, 0, &s, &Default::default()).unwrap().out_dims, (200, 100));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

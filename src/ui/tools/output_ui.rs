@@ -179,7 +179,7 @@ fn file_list(ui: &mut Ui, p: &Palette, files: &mut Vec<PathBuf>, id: &str) -> bo
             files.swap(i, j);
         }
     }
-    hint(ui, p, &format!("{} file{} - order is the page / frame order", files.len(), if files.len() == 1 { "" } else { "s" }));
+    hint(ui, p, &format!("{} file{} in this order", files.len(), if files.len() == 1 { "" } else { "s" }));
     changed
 }
 

@@ -438,13 +438,11 @@ pub fn pipeline_ui(ui: &mut Ui, p: &Palette, pipe: &mut Pipeline, selected: &mut
                 let e = &mut pipe.steps[i];
                 ui.checkbox(&mut e.enabled, "").on_hover_text("Enable or skip this step");
                 ui.label(RichText::new(format!("{}.", i + 1)).color(p.faint));
-                let text = RichText::new(e.step.label()).strong().color(if e.enabled { p.text } else { p.faint });
-                let r = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                let s = ui.add(egui::Label::new(RichText::new(e.step.summary()).size(11.5).color(p.muted)).truncate().sense(egui::Sense::click()));
-                if r.clicked() || s.clicked() {
-                    *selected = if sel { None } else { Some(i) };
-                }
+                let enabled = e.enabled;
+                let (label, summary) = (e.step.label(), e.step.summary());
+                // Buttons first (right to left) so the summary truncates in the space left.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     if ui.small_button(I::TRASH).on_hover_text("Remove").clicked() {
                         action = Some((i, 0));
                     }
@@ -460,6 +458,16 @@ pub fn pipeline_ui(ui: &mut Ui, p: &Palette, pipe: &mut Pipeline, selected: &mut
                     if ui.small_button(if sel { I::CARET_UP } else { I::PENCIL_SIMPLE }).on_hover_text("Edit").clicked() {
                         *selected = if sel { None } else { Some(i) };
                     }
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let text = RichText::new(label).strong().color(if enabled { p.text } else { p.faint });
+                        let r = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                        let s = ui.add(egui::Label::new(RichText::new(&summary).size(11.5).color(p.muted)).truncate().sense(egui::Sense::click())).on_hover_text(&summary);
+                        if r.clicked() || s.clicked() {
+                            *selected = if sel { None } else { Some(i) };
+                        }
+                    });
                 });
             });
             if sel {
