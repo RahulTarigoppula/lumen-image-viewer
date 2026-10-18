@@ -184,7 +184,9 @@ pub fn apply(ctx: &egui::Context, p: &Palette, scale: f32) {
     w.active.bg_fill = p.accent.gamma_multiply(0.7);
     w.active.weak_bg_fill = p.accent.gamma_multiply(0.5);
     w.active.bg_stroke = Stroke::new(1.0, p.accent);
-    w.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    // egui uses the active text color for every `.strong()` label, so it must
+    // contrast with the panel background in both themes (not plain white).
+    w.active.fg_stroke = Stroke::new(1.5, if p.dark { Color32::WHITE } else { Color32::from_rgb(10, 12, 16) });
     w.active.corner_radius = r;
     w.active.expansion = 0.0;
     w.open.bg_fill = p.hover;
