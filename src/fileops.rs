@@ -1,0 +1,278 @@
+//! File-system operations and Windows shell integration.
+
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+
+/// Pick a non-existing destination path by appending " (2)", " (3)", …
+pub fn unique_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let stem = target.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for i in 2..100_000 {
+        let p = parent.join(format!("{stem} ({i}){ext}"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    target.to_path_buf()
+}
+
+pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
+    trash::delete_all(paths).map_err(|e| anyhow!("Could not move to Recycle Bin: {e}"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Conflict {
+    Rename,
+    Overwrite,
+    Skip,
+}
+
+/// Copy or move files into `dest_dir`. Returns (source, destination) pairs that succeeded.
+pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool, conflict: Conflict) -> (Vec<(PathBuf, PathBuf)>, Vec<String>) {
+    let mut done = Vec::new();
+    let mut errors = Vec::new();
+    for src in paths {
+        let Some(name) = src.file_name() else { continue };
+        let mut dst = dest_dir.join(name);
+        if dst == *src {
+            if do_move {
+                continue;
+            }
+            dst = unique_path(&dst);
+        } else if dst.exists() {
+            match conflict {
+                Conflict::Skip => continue,
+                Conflict::Rename => dst = unique_path(&dst),
+                Conflict::Overwrite => {}
+            }
+        }
+        let res = if do_move {
+            std::fs::rename(src, &dst).or_else(|_| {
+                // Cross-volume move: copy then delete.
+                copy_any(src, &dst).and_then(|_| remove_any(src))
+            })
+        } else {
+            copy_any(src, &dst)
+        };
+        match res {
+            Ok(()) => done.push((src.clone(), dst)),
+            Err(e) => errors.push(format!("{}: {e}", src.display())),
+        }
+    }
+    (done, errors)
+}
+
+fn copy_any(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for e in std::fs::read_dir(src)? {
+            let e = e?;
+            copy_any(&e.path(), &dst.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn remove_any(p: &Path) -> std::io::Result<()> {
+    if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    }
+}
+
+pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(anyhow!("Name cannot be empty"));
+    }
+    if new_name.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')) {
+        return Err(anyhow!("A file name can't contain any of: < > : \" / \\ | ? *"));
+    }
+    let target = path.with_file_name(new_name);
+    if target == path {
+        return Ok(target);
+    }
+    // Allow case-only renames on case-insensitive file systems.
+    let case_only = target.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
+    if target.exists() && !case_only {
+        return Err(anyhow!("\"{new_name}\" already exists"));
+    }
+    std::fs::rename(path, &target).with_context(|| format!("Rename failed for {}", path.display()))?;
+    Ok(target)
+}
+
+pub fn new_folder(parent: &Path, name: &str) -> Result<PathBuf> {
+    let p = unique_path(&parent.join(name.trim()));
+    std::fs::create_dir(&p)?;
+    Ok(p)
+}
+
+pub fn show_in_explorer(path: &Path) {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+
+pub fn open_with_default(path: &Path) {
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+pub fn open_with(exe: &Path, path: &Path) -> Result<()> {
+    std::process::Command::new(exe).arg(path).spawn()?;
+    Ok(())
+}
+
+/// Show the Windows "Open with" chooser.
+pub fn open_with_dialog(path: &Path) {
+    let _ = std::process::Command::new("rundll32.exe")
+        .arg("shell32.dll,OpenAs_RunDLL")
+        .arg(path)
+        .spawn();
+}
+
+pub fn properties_dialog(path: &Path) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::{w, HSTRING};
+        use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW};
+        let file = HSTRING::from(path.as_os_str());
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_INVOKEIDLIST,
+            lpVerb: w!("properties"),
+            lpFile: windows::core::PCWSTR(file.as_ptr()),
+            nShow: 1,
+            ..Default::default()
+        };
+        let _ = ShellExecuteExW(&mut info);
+    }
+}
+
+/// Set the desktop wallpaper. `style`: 0 fill, 1 fit, 2 stretch, 3 tile, 4 center, 5 span.
+pub fn set_wallpaper(image_path: &Path, style: u8) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Registry::*;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let (ws, tile) = match style {
+            0 => ("10", "0"),
+            1 => ("6", "0"),
+            2 => ("2", "0"),
+            3 => ("0", "1"),
+            4 => ("0", "0"),
+            _ => ("22", "0"),
+        };
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, windows::core::w!("Control Panel\\Desktop"), Some(0), KEY_SET_VALUE, &mut key).is_ok() {
+            for (name, val) in [("WallpaperStyle", ws), ("TileWallpaper", tile)] {
+                let wide: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
+                let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+                let _ = RegSetValueExW(key, &windows::core::HSTRING::from(name), Some(0), REG_SZ, Some(bytes));
+            }
+            let _ = RegCloseKey(key);
+        }
+        let mut wide: Vec<u16> = image_path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER,
+            0,
+            Some(wide.as_mut_ptr() as *mut _),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )
+        .map_err(|e| anyhow!("Could not set wallpaper: {e}"))?;
+    }
+    Ok(())
+}
+
+pub fn copy_image_to_clipboard(img: &image::RgbaImage) -> Result<()> {
+    let mut cb = arboard::Clipboard::new()?;
+    cb.set_image(arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: std::borrow::Cow::Borrowed(img.as_raw()),
+    })?;
+    Ok(())
+}
+
+pub fn paste_image_from_clipboard() -> Result<image::RgbaImage> {
+    let mut cb = arboard::Clipboard::new()?;
+    let data = cb.get_image().map_err(|_| anyhow!("The clipboard doesn't contain an image"))?;
+    image::RgbaImage::from_raw(data.width as u32, data.height as u32, data.bytes.into_owned())
+        .ok_or_else(|| anyhow!("Invalid clipboard image"))
+}
+
+pub fn copy_text(text: &str) {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
+}
+
+/// Copy files to the clipboard so they can be pasted in Explorer.
+pub fn copy_files_to_clipboard(paths: &[PathBuf]) -> Result<()> {
+    let mut cb = arboard::Clipboard::new()?;
+    cb.set().file_list(paths)?;
+    Ok(())
+}
+
+pub fn paste_files_from_clipboard() -> Result<Vec<PathBuf>> {
+    let mut cb = arboard::Clipboard::new()?;
+    Ok(cb.get().file_list()?)
+}
+
+/// Logical drives ("C:\", "D:\", …).
+pub fn drives() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    unsafe {
+        let mask = windows::Win32::Storage::FileSystem::GetLogicalDrives();
+        for i in 0..26u32 {
+            if mask & (1 << i) != 0 {
+                out.push(PathBuf::from(format!("{}:\\", (b'A' + i as u8) as char)));
+            }
+        }
+    }
+    out
+}
+
+pub fn volume_label(drive: &Path) -> Option<String> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+        let root = windows::core::HSTRING::from(drive.as_os_str());
+        let mut name = [0u16; 261];
+        if GetVolumeInformationW(&root, Some(&mut name), None, None, None, None).is_ok() {
+            let len = name.iter().position(|&c| c == 0).unwrap_or(0);
+            let s = String::from_utf16_lossy(&name[..len]);
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Lowercased known folders for the sidebar.
+pub fn quick_access() -> Vec<(String, PathBuf, &'static str)> {
+    use crate::ui::icons as I;
+    let mut v = Vec::new();
+    let mut push = |name: &str, p: Option<PathBuf>, icon: &'static str| {
+        if let Some(p) = p {
+            if p.exists() {
+                v.push((name.to_string(), p, icon));
+            }
+        }
+    };
+    push("Pictures", dirs::picture_dir(), I::IMAGES);
+    push("Desktop", dirs::desktop_dir(), I::DESKTOP);
+    push("Downloads", dirs::download_dir(), I::DOWNLOAD_SIMPLE);
+    push("Documents", dirs::document_dir(), I::FILE_TEXT);
+    push("Videos", dirs::video_dir(), I::FILM_STRIP);
+    push("Home", dirs::home_dir(), I::HOUSE);
+    v
+}

@@ -1,0 +1,69 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen — a fast, private, modern image viewer, browser, editor and converter for Windows"
+license = "MIT"
+authors = ["Rahul Tarigoppula"]
+repository = "https://github.com/RahulTarigoppula/lumen-image-viewer"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["image"] }
+egui-phosphor = "0.14"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp", "ico", "tga", "pnm", "hdr", "exr", "qoi", "dds", "ff", "rayon"] }
+fast_image_resize = { version = "6", features = ["rayon", "image"] }
+rayon = "1"
+crossbeam-channel = "0.5"
+kamadak-exif = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.17"
+trash = "5"
+arboard = { version = "3", features = ["image-data"] }
+lru = "0.18"
+dirs = "7"
+parking_lot = "0.12"
+anyhow = "1"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+qcms = "0.3.0"
+jpeg-encoder = "0.7.1"
+img-parts = "0.4.1"
+webp = { version = "0.3", default-features = false }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
+]
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
