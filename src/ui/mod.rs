@@ -9,6 +9,7 @@ pub mod viewer;
 pub mod widgets;
 pub mod batch;
 pub mod compare;
+pub mod metadata_dialog;
 pub mod save_dialog;
 pub mod settings_window;
 pub mod slideshow;
