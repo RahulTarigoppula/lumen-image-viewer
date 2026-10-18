@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Pick a non-existing destination path by appending " (2)", " (3)", …
+/// Pick a non-existing destination path by appending " (2)", " (3)", ...
 pub fn unique_path(target: &Path) -> PathBuf {
     if !target.exists() {
         return target.to_path_buf();
@@ -225,7 +225,7 @@ pub fn paste_files_from_clipboard() -> Result<Vec<PathBuf>> {
     Ok(cb.get().file_list()?)
 }
 
-/// Logical drives ("C:\", "D:\", …).
+/// Logical drives ("C:\", "D:\", ...).
 pub fn drives() -> Vec<PathBuf> {
     let mut out = Vec::new();
     #[cfg(windows)]

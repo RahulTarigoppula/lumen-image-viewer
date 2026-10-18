@@ -1,5 +1,5 @@
 //! Local ratings, flags (FastStone-style "tags") and color labels. Stored in a
-//! private JSON file in the app data folder — never written into your images.
+//! private JSON file in the app data folder - never written into your images.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

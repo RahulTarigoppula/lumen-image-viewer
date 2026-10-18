@@ -1,6 +1,6 @@
 //! Image decoding. Pure-Rust decoders handle the common formats; Windows Imaging
 //! Component (WIC) handles everything else Windows has a codec for (HEIC, AVIF,
-//! camera RAW, JPEG-XR, JPEG-XL, …) and acts as a fallback when a native decode fails.
+//! camera RAW, JPEG-XR, JPEG-XL, ...) and acts as a fallback when a native decode fails.
 
 pub mod color;
 pub mod wic;

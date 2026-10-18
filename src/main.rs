@@ -1,8 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Lumen — a fast, private, modern image & video viewer for Windows.
+//! Lumen - a fast, private, modern image & video viewer for Windows.
 
 mod app;
 mod catalog;
+mod bg;
 mod decode;
 mod devhook;
 mod edit;

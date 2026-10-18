@@ -247,7 +247,7 @@ pub fn format_time(t: Option<SystemTime>) -> String {
             let dt: chrono::DateTime<chrono::Local> = t.into();
             dt.format("%Y-%m-%d %H:%M").to_string()
         }
-        None => "—".into(),
+        None => " - ".into(),
     }
 }
 

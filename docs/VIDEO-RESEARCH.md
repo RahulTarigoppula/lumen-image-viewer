@@ -6,7 +6,7 @@ Status: research note, October 2026. Target: Rust 1.99 (MSVC), eframe/egui 0.37 
 
 ## 0. TL;DR
 
-- **Decoder:** FFmpeg 9.0, **statically linked** from **vcpkg** (`x64-windows-static-md`, LGPL build with no `gpl` feature, plus `dav1d` for AV1). The Rust side uses `ffmpeg-next 9.0` / `ffmpeg-sys-next 9.0.1` with the `static` feature. Both added FFmpeg 9.0 support in Jul–Oct 2026, and vcpkg's `ffmpeg` port is at 9.0.2. Media Foundation is ruled out: it can't report frame types or packet sizes, its codec coverage depends on Store extensions, and its seeking isn't exact.
+- **Decoder:** FFmpeg 9.0, **statically linked** from **vcpkg** (`x64-windows-static-md`, LGPL build with no `gpl` feature, plus `dav1d` for AV1). The Rust side uses `ffmpeg-next 9.0` / `ffmpeg-sys-next 9.0.1` with the `static` feature. Both added FFmpeg 9.0 support in Jul-Oct 2026, and vcpkg's `ffmpeg` port is at 9.0.2. Media Foundation is ruled out: it can't report frame types or packet sizes, its codec coverage depends on Store extensions, and its seeking isn't exact.
 - **Rendering:** upload the Y/U/V (or NV12/P010) planes as GL textures and convert YUV→RGB in a fragment shader. The A/B compare modes (wipe, difference, checkerboard, flicker) run in the same shader, so they cost almost nothing. CPU conversion with the `yuv` crate is only for snapshots, metrics, and fallback.
 - **Audio:** `cpal` 0.18 (WASAPI), audio resampled to the device format with FFmpeg's `swresample`, and an SPSC ring buffer. The **audio clock is the master clock**, and playback falls back to a monotonic system clock when there's no audio.
 - **Metrics:** pure Rust (rayon plus autovectorized integer loops). PSNR per plane, SSIM (FFmpeg-compatible 8x8/stride-4 for speed, Wang Gaussian 11x11 for accuracy), and MS-SSIM. **VMAF is phase 3**: through an optional external `ffmpeg.exe` that has libvmaf, or a pure-Rust port later. vcpkg's `libvmaf` port is marked `!windows`.
@@ -17,8 +17,8 @@ Status: research note, October 2026. Target: Rust 1.99 (MSVC), eframe/egui 0.37 
 
 | Tool | Notable features worth copying |
 |---|---|
-| **pixop/video-compare** (C++, FFmpeg + SDL2) | Split-screen wipe slider that follows the mouse. Subtraction (difference) modes, with a luma-only option. hstack/vstack. Right-video time shift (`+`/`-` = 1 frame, Ctrl = 10, Alt = 100). In-buffer frame stepping (`A`/`D`), Shift+D to decode the next frame, Shift+A to seek back. Pixel value under cursor (`P`). Metrics printout (`M`). Histogram, vectorscope, and waveform windows (F1–F3). Zoom presets 4–9 and wheel zoom at the cursor. Magnifier loupes (`Z`/`C`). Swap (`S`). Per-side crop. Copy/paste timestamp. Multiple right-hand videos against one reference. HDR→SDR tone mapping. **No audio.** |
-| **MSU VQMT** | PSNR variants, SSIM/MS-SSIM/3SSIM/stSSIM, VMAF, and no-reference blur/blocking/noise metrics. Per-frame and per-component results. **Metric visualization maps** (per-pixel heatmaps). **Worst-frame extraction.** ROI masks. Multiple distorted files against one reference. CSV/JSON export. 1–16-bit and float, Rec.2020/ICtCp. |
+| **pixop/video-compare** (C++, FFmpeg + SDL2) | Split-screen wipe slider that follows the mouse. Subtraction (difference) modes, with a luma-only option. hstack/vstack. Right-video time shift (`+`/`-` = 1 frame, Ctrl = 10, Alt = 100). In-buffer frame stepping (`A`/`D`), Shift+D to decode the next frame, Shift+A to seek back. Pixel value under cursor (`P`). Metrics printout (`M`). Histogram, vectorscope, and waveform windows (F1-F3). Zoom presets 4-9 and wheel zoom at the cursor. Magnifier loupes (`Z`/`C`). Swap (`S`). Per-side crop. Copy/paste timestamp. Multiple right-hand videos against one reference. HDR→SDR tone mapping. **No audio.** |
+| **MSU VQMT** | PSNR variants, SSIM/MS-SSIM/3SSIM/stSSIM, VMAF, and no-reference blur/blocking/noise metrics. Per-frame and per-component results. **Metric visualization maps** (per-pixel heatmaps). **Worst-frame extraction.** ROI masks. Multiple distorted files against one reference. CSV/JSON export. 1-16-bit and float, Rec.2020/ICtCp. |
 | **Netflix VMAF / libvmaf** | Fusion of VIF (4 scales) + ADM/DLM + motion features, regressed with an SVM model (built-in JSON models). BSD-2-Clause-Patent. The meson build targets Unix/MinGW. |
 | **Elecard StreamEye** | Frame-size bar chart colored by frame type (I/P/B) with a thumbnail tooltip (type, PTS, QP, offset, POC, size). GOP view. Macroblock/CTU overlays (QP, partitions, motion vectors), DPB info. Lumen should copy the bar chart and tooltip. Block-level overlays need codec internals, so they are out of scope. |
 | **VQProbe / VQ Analyzer** (ViCueSoft) | Same class of tool as StreamEye: bitstream syntax trees and per-block overlays. Out of scope except for the "frame list with type and size" idea. |
@@ -37,11 +37,11 @@ Status: research note, October 2026. Target: Rust 1.99 (MSVC), eframe/egui 0.37 
 4. Zoom/pan using the same view model as image mode: fit, 100%, wheel at cursor.
 5. Metadata panel (container, codec, profile/level, resolution, SAR/DAR, fps (avg/real, VFR flag), bitrate, duration, frame count, pixel format and bit depth, color primaries/transfer/matrix/range, chroma location, HDR mastering and CLL, rotation, audio streams).
 6. Snapshot of the current frame (PNG, native resolution) and copy to clipboard.
-7. Correct YUV→RGB for BT.601/709/2020, limited and full range, 8–12 bit.
+7. Correct YUV→RGB for BT.601/709/2020, limited and full range, 8-12 bit.
 
 **P1: compare and analysis core**
-8. Open B (and later C, D…), with **sync by timestamp or by frame index**, plus a **time offset** (±1/10/100 frames).
-9. Compare modes: **side-by-side** (H/V), **wipe slider** (vertical/horizontal, mouse-driven), **flicker/toggle** (hold key or auto N ms), **difference** (|A−B| × gain 1–64, luma-only or RGB, signed mode, heatmap), **checkerboard** (tile size). Zoom and pan are always shared between views.
+8. Open B (and later C, D...), with **sync by timestamp or by frame index**, plus a **time offset** (±1/10/100 frames).
+9. Compare modes: **side-by-side** (H/V), **wipe slider** (vertical/horizontal, mouse-driven), **flicker/toggle** (hold key or auto N ms), **difference** (|A−B| × gain 1-64, luma-only or RGB, signed mode, heatmap), **checkerboard** (tile size). Zoom and pan are always shared between views.
 10. **Pixel inspector**: raw Y/Cb/Cr code values, converted RGB, and the A−B delta under the cursor. Loupe magnifier.
 11. **Per-frame metrics** PSNR-Y/U/V/avg and SSIM (current frame instantly). A background "analyze whole file" job produces a graph you can click to seek, a worst-N frames list, and CSV/JSON export.
 12. **Frame index**: per-frame PTS, DTS, key flag, packet size, and frame type I/P/B. Shown as a StreamEye-style frame-size bar chart and a **bitrate graph** (1 s sliding window).
@@ -77,7 +77,7 @@ PSNR_p = 10 * log10(MAX² / MSE_p)          (MSE_p = 0 → +inf; display as "inf
 - Some encoder papers use the alternative `(6·PSNR_Y + PSNR_U + PSNR_V)/8`. Report that only as an option and label it as such.
 - **Sequence PSNR:** keep per-frame MSE and report both the *mean of per-frame PSNR* (what FFmpeg's "average" prints) and the *PSNR of the mean MSE* (the "global" value). The two differ.
 - **RGB PSNR:** the same formula on R, G, and B after conversion. Combine with equal weights (1/3 each).
-- **Implementation:** process rows in parallel with `par_chunks` per row band. 8-bit: `d = a as i32 - b as i32; acc += (d*d) as u32` per row, then sum into a `u64` (this autovectorizes to `vpmaddwd` on AVX2). 16-bit: accumulate `i64`. A 4K 4:2:0 frame (12.4 M samples) takes about 1–2 ms on 8 cores.
+- **Implementation:** process rows in parallel with `par_chunks` per row band. 8-bit: `d = a as i32 - b as i32; acc += (d*d) as u32` per row, then sum into a `u64` (this autovectorizes to `vpmaddwd` on AVX2). 16-bit: accumulate `i64`. A 4K 4:2:0 frame (12.4 M samples) takes about 1-2 ms on 8 cores.
 
 ### 2.2 SSIM (Wang, Bovik, Sheikh, Simoncelli 2004)
 
@@ -100,7 +100,7 @@ SSIM dB    = 10·log10(1 / (1 − SSIM))   (FFmpeg reports this)
    ssim = (2·s1·s2 + c1)(2·covar + c2) / ((s1² + s2² + c1)(vars + c2))
    ```
    Average over `((W>>2)−1)·((H>>2)−1)` windows. Combine planes with the same pixel-count weights as PSNR. All sums are integers, so 8-bit fits in `i32` per 4x4 block. This is very fast: one pass, two rows of block sums kept in a sliding buffer.
-2. **Accurate (Wang reference / MATLAB `ssim_index`).** Use an **11x11 Gaussian, σ = 1.5**, normalized to sum to 1. Apply it as a separable filter (two 1-D 11-tap passes) to five f32 images: x, y, x², y², xy. Then `σx² = E[x²] − μx²`, and so on. Keep only "valid" outputs, without padding. The original also suggests downsampling by `f = max(1, round(min(W,H)/256))` with an f×f box filter first. Make that a toggle, because many tools (libvmaf `float_ssim`) apply it. Cost is about 110 MAC per pixel per image, roughly 30–60 ms for 4K luma with rayon + f32 SIMD. That's fine for the current frame, but slower for a whole file.
+2. **Accurate (Wang reference / MATLAB `ssim_index`).** Use an **11x11 Gaussian, σ = 1.5**, normalized to sum to 1. Apply it as a separable filter (two 1-D 11-tap passes) to five f32 images: x, y, x², y², xy. Then `σx² = E[x²] − μx²`, and so on. Keep only "valid" outputs, without padding. The original also suggests downsampling by `f = max(1, round(min(W,H)/256))` with an f×f box filter first. Make that a toggle, because many tools (libvmaf `float_ssim`) apply it. Cost is about 110 MAC per pixel per image, roughly 30-60 ms for 4K luma with rayon + f32 SIMD. That's fine for the current frame, but slower for a whole file.
 
 Compute SSIM on **Y only** by default. Y, U, and V plus the weighted "All" value are optional.
 
@@ -114,7 +114,7 @@ Compute SSIM on **Y only** by default. Y, U, and V plus the weighted "All" value
 ### 2.4 Scene-change score (FFmpeg `scdet` style)
 
 On downscaled luma (for example, ¼ resolution):
-- `mafd = SAD(Y_n, Y_{n−1}) / (pixels)`, normalized to 0–100 by dividing by MAX and multiplying by 100.
+- `mafd = SAD(Y_n, Y_{n−1}) / (pixels)`, normalized to 0-100 by dividing by MAX and multiplying by 100.
 - `diff = |mafd − mafd_prev|`.
 - `score = clamp(min(mafd, diff), 0, 100)`.
 - Mark a scene change when `score > 10` (configurable).
@@ -128,7 +128,7 @@ On downscaled luma (for example, ¼ resolution):
   ffmpeg -i dist.mp4 -i ref.mp4 -lavfi "[0:v][1:v]libvmaf=log_fmt=json:log_path=vmaf.json:n_threads=8" -f null -
   ```
   Parse the per-frame JSON into the same graph used for PSNR and SSIM.
-- **Native port (optional, later):** VMAF v0.6.1 = VIF at 4 scales + ADM + motion2, followed by nu-SVR with the JSON model. That's roughly 2–4k lines of Rust, and the main cost is validating it to within about 1e-3 of libvmaf.
+- **Native port (optional, later):** VMAF v0.6.1 = VIF at 4 scales + ADM + motion2, followed by nu-SVR with the JSON model. That's roughly 2-4k lines of Rust, and the main cost is validating it to within about 1e-3 of libvmaf.
 
 ---
 
@@ -143,7 +143,7 @@ On downscaled luma (for example, ¼ resolution):
 | Frame-accurate seeking | Yes: seek to keyframe, then decode and discard. Exact with a demux index. | `SetCurrentPosition` documents seeking to the nearest *preceding keyframe* without a guarantee, so you must read forward. There are reports of `ReadSample` stalls on Win11 with high-fps files. | mpv `hr-seek` is exact, but it's a black box |
 | Bit-exact output for metrics | Yes (software decoders are deterministic) | HW decoders may differ slightly, and output is usually only NV12 | n/a |
 | Single exe | Yes, static | Yes (OS component) | **No**: libmpv-2.dll / GStreamer runtime, so not single-exe |
-| Size cost | +15–35 MB (estimate; trimmable) | ~0 | n/a |
+| Size cost | +15-35 MB (estimate; trimmable) | ~0 | n/a |
 | License | LGPL-2.1+ (no `gpl` feature) | OS | mpv GPL/LGPL, GStreamer LGPL plus plugins |
 
 **Recommendation: FFmpeg, statically linked from vcpkg.** Media Foundation can't provide the analysis features (frame types, packet sizes, bitstream info), and its codec support varies with which Store extensions a user has installed. libmpv and GStreamer break the single-exe goal, and they don't expose decoded planes for metrics. A possible later extra is an optional MF/D3D11 *hardware playback* path, but FFmpeg's own `d3d11va` hwaccel already covers that.
@@ -173,9 +173,9 @@ Pin exact versions, because ffmpeg-next minor versions can break the API. Use th
 
 ### Size and build time (estimates)
 
-- With the default vcpkg port (all decoders, encoders, muxers, demuxers, protocols), static linking adds about 25–35 MB to the release exe. Every registered codec is referenced from `allcodecs.c`, so LTO can't strip unused ones.
-- **Trim** with a vcpkg *overlay port* that appends `--disable-encoders --disable-muxers --disable-devices --disable-filters --disable-network --disable-protocols --enable-protocol=file --disable-programs`. That should bring the cost to about 10–15 MB.
-- A first vcpkg build of ffmpeg + dav1d takes about 10–25 min (configure/make runs under the msys2 that vcpkg downloads). Later builds come from the binary cache. The Rust bindgen step is about 30 s.
+- With the default vcpkg port (all decoders, encoders, muxers, demuxers, protocols), static linking adds about 25-35 MB to the release exe. Every registered codec is referenced from `allcodecs.c`, so LTO can't strip unused ones.
+- **Trim** with a vcpkg *overlay port* that appends `--disable-encoders --disable-muxers --disable-devices --disable-filters --disable-network --disable-protocols --enable-protocol=file --disable-programs`. That should bring the cost to about 10-15 MB.
+- A first vcpkg build of ffmpeg + dav1d takes about 10-25 min (configure/make runs under the msys2 that vcpkg downloads). Later builds come from the binary cache. The Rust bindgen step is about 30 s.
 
 ---
 
@@ -183,9 +183,9 @@ Pin exact versions, because ffmpeg-next minor versions can break the API. Use th
 
 - **Output:** `cpal` 0.18 uses WASAPI shared mode by default on Windows. Open the default output device and use its `default_output_config()` (usually 48 kHz f32 stereo).
 - **Format conversion:** use FFmpeg `swresample` (already linked) to convert any decoded audio to device rate, channel layout, and f32 interleaved. That avoids pulling in `rubato`.
-- **Transport:** run an audio decode thread that pushes `(pts_of_first_sample, samples)` chunks into an SPSC ring (`ringbuf` 0.5, about 200–500 ms capacity). The cpal callback pops samples (and writes silence on underrun). After each callback it publishes `clock = chunk_pts + consumed/rate − output_latency`. `output_latency` comes from `OutputCallbackInfo::timestamp()` (`playback − callback`). Store it in an `AtomicU64` (f64 bits) together with an `Instant`, so the UI can interpolate between callbacks.
+- **Transport:** run an audio decode thread that pushes `(pts_of_first_sample, samples)` chunks into an SPSC ring (`ringbuf` 0.5, about 200-500 ms capacity). The cpal callback pops samples (and writes silence on underrun). After each callback it publishes `clock = chunk_pts + consumed/rate − output_latency`. `output_latency` comes from `OutputCallbackInfo::timestamp()` (`playback − callback`). Store it in an `AtomicU64` (f64 bits) together with an `Instant`, so the UI can interpolate between callbacks.
 - **Master clock:** audio when an audio stream exists and speed is 1×. Otherwise use `Instant` plus the accumulated pause offset. Muting is not the same as no-audio: keep feeding the device zeros while muted so the clock keeps running.
-- **Video presentation:** the video decode thread fills a bounded queue (about 4–8 frames) of decoded frames. Each repaint, the UI picks the newest frame with `pts ≤ clock`, drops the frames older than it, and calls `ctx.request_repaint_after(next_pts − clock)`. Lumen's display is vsync-locked, so expect normal 24p-on-60 Hz cadence judder (the same as mpv's default `video-sync=audio`).
+- **Video presentation:** the video decode thread fills a bounded queue (about 4-8 frames) of decoded frames. Each repaint, the UI picks the newest frame with `pts ≤ clock`, drops the frames older than it, and calls `ctx.request_repaint_after(next_pts − clock)`. Lumen's display is vsync-locked, so expect normal 24p-on-60 Hz cadence judder (the same as mpv's default `video-sync=audio`).
 - **Seeking:** pause the clock, flush both decoders (`avcodec_flush_buffers`), clear the rings, then `av_seek_frame(stream, ts, AVSEEK_FLAG_BACKWARD)`. Decode and discard until video `pts ≥ target` and trim audio samples before the target. Unmute only when both sides are ready. While dragging the scrubber, seek to keyframes only (no discard loop) for responsiveness, then do one exact seek on release.
 - **Speed other than 1×:** mute audio (or add `avfilter` atempo later) and switch to the system clock.
 
@@ -194,8 +194,8 @@ Pin exact versions, because ffmpeg-next minor versions can break the API. Use th
 ## 5. Rendering decoded frames in egui/glow
 
 **Recommended: GPU YUV→RGB.**
-- Keep the decoded `AVFrame` in its native format (yuv420p, nv12, yuv420p10le, p010, yuv444p, …). Upload each plane to its own texture with `glTexSubImage2D`: `GL_R8` (Y, U, V), `GL_RG8` (NV12 UV), or `GL_R16` for >8-bit. Use 2–3 round-robin **PBOs** for asynchronous upload.
-- 4K 4:2:0 8-bit is 12.4 MB per frame, about 750 MB/s at 60 fps. That's comfortable even on iGPUs. CPU→RGBA would be 33 MB per frame (2 GB/s) plus about 4–8 ms of conversion per frame.
+- Keep the decoded `AVFrame` in its native format (yuv420p, nv12, yuv420p10le, p010, yuv444p, ...). Upload each plane to its own texture with `glTexSubImage2D`: `GL_R8` (Y, U, V), `GL_RG8` (NV12 UV), or `GL_R16` for >8-bit. Use 2-3 round-robin **PBOs** for asynchronous upload.
+- 4K 4:2:0 8-bit is 12.4 MB per frame, about 750 MB/s at 60 fps. That's comfortable even on iGPUs. CPU→RGBA would be 33 MB per frame (2 GB/s) plus about 4-8 ms of conversion per frame.
 - Draw with `egui::PaintCallback` + `egui_glow::CallbackFn` (see the `custom3d_glow` demo; the callback gets `painter.gl()`). Alternatively, render into an FBO-backed RGBA texture registered with `frame.register_native_glow_texture()` and display it as a normal `egui::Image`, which reuses the image-mode zoom/pan code. **The FBO route is preferred:** you get one texture per side and can reuse it for scopes and snapshots.
 - Fragment shader inputs: the matrix (from `AVFrame.colorspace`) and range (`color_range`), a bit-depth scale (`65535/1023` for low-bit-packed 10-bit; ≈1 for P010), and chroma siting. When the matrix is unspecified, use BT.709 if height ≥ 720, otherwise BT.601 (the mpv/FFmpeg heuristic).
 
@@ -219,14 +219,14 @@ The result is gamma-encoded R′G′B′. Write it to an sRGB-agnostic RGBA8 tar
 - `flicker`: a uniform bool toggled on a timer or a held key.
 - Side-by-side uses two quads with the same view transform. B is sampled in A's coordinate space (with an optional scale-to-fit), so zoom and pan are always synchronized. Use nearest-neighbour filtering at zoom ≥ 2× so individual pixels are visible.
 
-**CPU path (still needed):** snapshots, pixel inspector RGB values, scopes, and the fallback. Use the `yuv` crate (yuvutils-rs 0.8.x: AVX2/SSE4.1/AVX-512 runtime dispatch, BT.601/709/2020, limited/full, 8–16 bit; libyuv-class speed). For format and size normalization of B (and odd pixel formats such as yuv422p10, gbrp, or paletted), use `sws_scale` → yuv420p/yuv444p16 before metrics or upload. Don't use sws for display conversion, because it's slower than the shader.
+**CPU path (still needed):** snapshots, pixel inspector RGB values, scopes, and the fallback. Use the `yuv` crate (yuvutils-rs 0.8.x: AVX2/SSE4.1/AVX-512 runtime dispatch, BT.601/709/2020, limited/full, 8-16 bit; libyuv-class speed). For format and size normalization of B (and odd pixel formats such as yuv422p10, gbrp, or paletted), use `sws_scale` → yuv420p/yuv444p16 before metrics or upload. Don't use sws for display conversion, because it's slower than the shader.
 
 **Scopes (CPU, on a ¼-res copy, rayon):**
 - Waveform: a 2D histogram (columns × 256 or 1024 levels) mapped with a log/gamma intensity curve into an R8 texture.
 - Parade: three waveforms side by side.
 - Vectorscope: a 2D histogram over (Cb, Cr) with a graticule (75% color targets, skin-tone line at about 123°).
 - Histogram: 256 bins for Y/R/G/B.
-- Each takes about 1–2 ms at ¼ res. Recompute only when the frame or settings change.
+- Each takes about 1-2 ms at ¼ res. Recompute only when the frame or settings change.
 
 **Hardware decode (P2):** `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_D3D11VA)` + `av_hwframe_transfer_data` → NV12/P010 in system memory, then the same upload path. Zero-copy D3D11↔GL interop (`WGL_NV_DX_interop2`) isn't worth the complexity. Keep software decode as the default in compare mode for bit-exactness. FFmpeg's `threads=0` (auto) frame threading plus dav1d already handle 4K60 H.264/HEVC/AV1 on 8+ cores.
 
@@ -302,7 +302,7 @@ Proposed keymap. It merges mpv, video-compare, and NLE (JKL) conventions, and st
 | I | Info panel (metadata + frame info); Shift+I stats overlay (decode ms, dropped frames, queue) |
 | P | Pixel inspector / loupe |
 | M | Metrics panel (current frame); Shift+M run whole-file analysis |
-| F2–F5 | Waveform / parade / vectorscope / histogram |
+| F2-F5 | Waveform / parade / vectorscope / histogram |
 | F (Ctrl+F) | Save snapshot of A (both / composited view) |
 | Ctrl+L | A-B loop: first press sets in, second sets out, third clears (mpv `l` semantics) |
 

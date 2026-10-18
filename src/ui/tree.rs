@@ -40,7 +40,7 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
-                    // Skip hidden + system folders ($Recycle.Bin, System Volume Information, …)
+                    // Skip hidden + system folders ($Recycle.Bin, System Volume Information, ...)
                     if m.file_attributes() & 0x6 != 0 {
                         return false;
                     }

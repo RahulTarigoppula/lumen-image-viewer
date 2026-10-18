@@ -387,7 +387,7 @@ impl Browser {
     fn address_bar(&mut self, ui: &mut Ui, width: f32, p: &Palette, ev: &mut Vec<BrowserEvent>) {
         let h = 28.0;
         if let Some(text) = &mut self.address {
-            let r = ui.add_sized([width, h], egui::TextEdit::singleline(text).hint_text("Type a folder path…").vertical_align(egui::Align::Center));
+            let r = ui.add_sized([width, h], egui::TextEdit::singleline(text).hint_text("Type a folder path...").vertical_align(egui::Align::Center));
             if !r.has_focus() && !r.lost_focus() {
                 r.request_focus();
             }
@@ -427,7 +427,7 @@ impl Browser {
                 len -= seg_name(&segs[skip]).len() + 3;
                 skip += 1;
             }
-            child.label(RichText::new("…").color(p.faint));
+            child.label(RichText::new("...").color(p.faint));
         }
         for (i, s) in segs.iter().enumerate().skip(skip) {
             if i > skip || skip > 0 {
@@ -621,11 +621,11 @@ impl Browser {
                         if i >= n {
                             break;
                         }
-                        let entry = self.entries[self.items[i]].clone();
+                        let entry = &self.entries[self.items[i]];
                         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
                         let selected = self.selected.contains(&entry.path);
                         let focused = self.focus == Some(i);
-                        self.paint_cell(ui, core, &entry, rect, ts, pad, captions, selected, focused, resp.hovered(), &p);
+                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, resp.hovered(), &p);
                         if resp.clicked() {
                             clicked = Some((i, ui.input(|inp| inp.modifiers)));
                         }
@@ -645,8 +645,8 @@ impl Browser {
                                 ev.push(BrowserEvent::DropFiles { target: entry.path.clone(), files: files.0.clone(), copy });
                             }
                         }
-                        let tip_entry = entry.clone();
                         let dims = core.meta.get(&entry.path).and_then(|m| m.dims);
+                        let tip_entry = entry;
                         resp.on_hover_ui_at_pointer(|ui| {
                             ui.label(RichText::new(&tip_entry.name).strong());
                             if let Some((w, h)) = dims {
@@ -1096,7 +1096,7 @@ impl Browser {
             s += &format!("   ·   {} selected ({})", sel.len(), catalog::human_size(bytes));
         }
         if core.meta.pending() > 0 {
-            s += &format!("   ·   reading metadata… {}", core.meta.pending());
+            s += &format!("   ·   reading metadata... {}", core.meta.pending());
         }
         s
     }

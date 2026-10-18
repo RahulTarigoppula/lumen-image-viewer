@@ -154,7 +154,7 @@ impl Transition {
         }
     }
 
-    /// Parse a settings value. Accepts loose spellings ("Slide", "fade", …).
+    /// Parse a settings value. Accepts loose spellings ("Slide", "fade", ...).
     pub fn from_name(s: &str) -> Transition {
         let k: String = s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_ascii_lowercase();
         for t in Transition::ALL {

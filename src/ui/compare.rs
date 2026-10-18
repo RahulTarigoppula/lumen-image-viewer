@@ -1,4 +1,4 @@
-//! Side-by-side comparison of 2–4 images with synchronized zoom/pan, plus
+//! Side-by-side comparison of 2-4 images with synchronized zoom/pan, plus
 //! split-slider, flicker and difference modes for pairs.
 //!
 //! View model: every pane has a `View`. With the *relative* basis the zoom is a
@@ -164,7 +164,7 @@ pub fn dest_rect(pane: Rect, ppp: f32, img: (u32, u32), z: f32, c: Vec2) -> Rect
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiffStats {
-    /// Mean absolute difference per channel (0–255).
+    /// Mean absolute difference per channel (0-255).
     pub mean: f64,
     pub max: u8,
     pub mse: f64,
@@ -985,7 +985,7 @@ impl Compare {
                         self.placeholder(ui, core, i, area);
                     } else {
                         egui::Spinner::new().size(28.0).paint_at(ui, Rect::from_center_size(area.center(), Vec2::splat(28.0)));
-                        ui.painter().text(area.center() + Vec2::new(0.0, 30.0), Align2::CENTER_TOP, "Computing difference…", FontId::proportional(13.0), p.muted);
+                        ui.painter().text(area.center() + Vec2::new(0.0, 30.0), Align2::CENTER_TOP, "Computing difference...", FontId::proportional(13.0), p.muted);
                     }
                 } else if busy {
                     egui::Spinner::new().size(16.0).paint_at(ui, Rect::from_center_size(area.right_top() + Vec2::new(-22.0, 22.0), Vec2::splat(16.0)));
@@ -1024,7 +1024,7 @@ impl Compare {
             let pair = self.panes.len() == 2;
             for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
                 let enabled = m == CmpMode::SideBySide || pair;
-                let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} — needs exactly 2 images", m.label()) };
+                let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} - needs exactly 2 images", m.label()) };
                 let r = ui.add_enabled(enabled, egui::Button::new(format!("{}  {}", m.icon(), m.label())).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
                 if r.on_hover_text(tip).clicked() {
                     self.set_mode(m);
@@ -1061,7 +1061,7 @@ impl Compare {
                 self.zoom_step(src, &rects, ppp, 0.8, None);
             }
             let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
-            let zl = ui.add_sized([52.0, 26.0], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| "—".into())).size(12.0)).frame(false));
+            let zl = ui.add_sized([52.0, 26.0], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
             if zl.on_hover_text("Click: 100%  (1)").clicked() && !rects.is_empty() {
                 self.actual_size(&rects, ppp);
             }

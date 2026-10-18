@@ -93,8 +93,10 @@ pub struct Viewer {
     last_view_rect: Rect,
     pub pending_nav: Option<isize>,
     pub confirm_discard: bool,
-    hist_cache: Option<(PathBuf, u64, Histogram)>,
-    exif_cache: Option<(PathBuf, Option<crate::meta::ExifSummary>)>,
+    hist_cache: crate::bg::BgSlot<(PathBuf, u64), Histogram>,
+    exif_cache: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
+    /// (size, mtime) per file so thumbnail lookups never stat() every frame.
+    stat_cache: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
     drag_pan: bool,
 }
 
@@ -122,10 +124,23 @@ impl Viewer {
             last_view_rect: Rect::NOTHING,
             pending_nav: None,
             confirm_discard: false,
-            hist_cache: None,
-            exif_cache: None,
+            hist_cache: Default::default(),
+            exif_cache: Default::default(),
+            stat_cache: Default::default(),
             drag_pan: false,
         }
+    }
+
+    fn thumb_key(&mut self, path: &Path) -> ThumbKey {
+        let (size, mtime) = *self.stat_cache.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::metadata(path).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
+        });
+        ThumbKey::new(path, size, mtime)
+    }
+
+    /// Drop cached file stats after the file changed on disk.
+    pub fn forget_stat(&mut self, path: &Path) {
+        self.stat_cache.remove(path);
     }
 
     pub fn current(&self) -> Option<&PathBuf> {
@@ -468,9 +483,8 @@ impl Viewer {
                             self.preview_tex = Some((path.clone(), tex));
                         }
                     }
+                    let key = self.thumb_key(&path);
                     let tex = self.preview_tex.as_ref().filter(|(pp, _)| pp == &path).map(|(_, t)| t.clone()).or_else(|| {
-                        let e = catalog::Entry::from_path(&path)?;
-                        let key = ThumbKey::new(&path, e.size, e.modified);
                         match core.thumbs.get(&key) {
                             Thumb::Ready(t) => Some(t.tex.clone()),
                             _ => None,
@@ -774,7 +788,7 @@ impl Viewer {
         b(&mut child, I::RESIZE, "Resize", Command::Resize, ev);
         widgets::separator_v(&mut child);
         let dirty = self.is_dirty();
-        if widgets::icon_button(&mut child, if dirty { I::FLOPPY_DISK } else { I::FLOPPY_DISK_BACK }, if dirty { "Save changes (Ctrl+S)" } else { "Save as… (Ctrl+Shift+S)" }, dirty).clicked() {
+        if widgets::icon_button(&mut child, if dirty { I::FLOPPY_DISK } else { I::FLOPPY_DISK_BACK }, if dirty { "Save changes (Ctrl+S)" } else { "Save as... (Ctrl+Shift+S)" }, dirty).clicked() {
             ev.push(ViewerEvent::Command(if dirty { Command::Save } else { Command::SaveAs }));
         }
         b(&mut child, I::TRASH, "Delete", Command::Delete, ev);
@@ -802,8 +816,9 @@ impl Viewer {
                         let path = &self.list[i];
                         let sel = i == self.index;
                         ui.painter().rect_filled(rect, CornerRadius::same(6), if sel { p.accent_soft } else if resp.hovered() { p.hover } else { Color32::TRANSPARENT });
-                        if let Some(e) = catalog::Entry::from_path(path) {
-                            let key = ThumbKey::new(path, e.size, e.modified);
+                        let path = path.clone();
+                        let key = self.thumb_key(&path);
+                        {
                             if let Thumb::Ready(t) = core.thumbs.get(&key) {
                                 let ts = t.tex.size_vec2();
                                 let s = ((cell.x - 8.0) / ts.x).min((cell.y - 8.0) / ts.y);
@@ -864,10 +879,7 @@ impl Viewer {
             // Histogram
             if let Some(img) = self.current_image(core) {
                 let ver = self.edit.as_ref().map(|e| e.version).unwrap_or(0);
-                if !matches!(&self.hist_cache, Some((hp, hv, _)) if hp == &path && *hv == ver) {
-                    self.hist_cache = Some((path.clone(), ver, Histogram::compute(&img)));
-                }
-                if let Some((_, _, hist)) = &self.hist_cache {
+                if let Some(hist) = self.hist_cache.get(&(path.clone(), ver), ui.ctx(), move || Histogram::compute(&img)) {
                     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
                     hist.paint(ui.painter(), r, p.dark);
                 }
@@ -889,10 +901,8 @@ impl Viewer {
                 widgets::kv_row(ui, &p, "Decoder", &format!("{} · {} ms", d.decoder, l.load_ms));
                 widgets::kv_row(ui, &p, "Modified", &catalog::format_time(l.modified));
             }
-            if !matches!(&self.exif_cache, Some((ep, _)) if ep == &path) {
-                self.exif_cache = Some((path.clone(), crate::meta::read_exif(&path)));
-            }
-            if let Some((_, Some(ex))) = &self.exif_cache {
+            let p2 = path.clone();
+            if let Some(Some(ex)) = self.exif_cache.get(&path, ui.ctx(), move || crate::meta::read_exif(&p2)) {
                 ui.add_space(6.0);
                 widgets::section_title(ui, &p, "Camera");
                 let rows: [(&str, &Option<String>); 10] = [
@@ -1040,7 +1050,7 @@ impl Viewer {
                     sess.push(img, &title);
                 }
                 self.auto_fit = Some(core.settings.fit_mode);
-                core.toasts.success(format!("{title} applied — Ctrl+Z to undo, Ctrl+S to save"));
+                core.toasts.success(format!("{title} applied - Ctrl+Z to undo, Ctrl+S to save"));
                 return;
             }
         }
