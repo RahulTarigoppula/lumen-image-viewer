@@ -185,7 +185,7 @@ pub fn build_index(path: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> 
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("cancelled"));
         }
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {}
             Err(ff::Error::Eof) => break,
             Err(e) => {
@@ -768,7 +768,7 @@ pub fn thumbnail(path: &Path, max_side: u32) -> Result<RgbaImage> {
     let mut reads = 0;
     while !got && reads < 4000 {
         reads += 1;
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {
                 if pkt.stream() != vidx {
                     continue;
@@ -935,7 +935,7 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
         if eof {
             break;
         }
-        match pkt.read(&mut input) {
+        match { pkt = ff::Packet::empty(); pkt.read(&mut input) } {
             Ok(()) => {
                 if pkt.stream() == vidx {
                     let _ = dec.send_packet(&pkt);

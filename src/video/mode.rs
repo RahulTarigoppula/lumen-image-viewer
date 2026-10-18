@@ -81,6 +81,8 @@ struct Source {
     /// A seek/step result is expected; when paused, only that frame becomes
     /// current (frames decoded ahead stay queued for stepping).
     awaiting: bool,
+    /// Mirrors the mode's playing state (set every frame by `poll`).
+    playing_hint: bool,
 }
 
 impl Source {
@@ -120,6 +122,7 @@ impl Source {
             out_size: out,
             error: None,
             awaiting: true,
+            playing_hint: false,
         })
     }
 
@@ -199,7 +202,11 @@ impl Source {
                 }
             }
         }
-        self.remember(f.clone());
+        // During playback the back-step history is not needed and would hold
+        // hundreds of MB of frames; it is filled when paused or stepping.
+        if !self.playing_hint {
+            self.remember(f.clone());
+        }
         self.current = Some(f);
     }
 
@@ -212,7 +219,7 @@ impl Source {
         }
         // Bound memory (~600 MB worth of display frames).
         let bytes_per = self.history.front().map(|h| h.rgba.as_raw().len()).unwrap_or(1).max(1);
-        let cap = ((600usize << 20) / bytes_per).clamp(8, 240);
+        let cap = ((320usize << 20) / bytes_per).clamp(8, 240);
         while self.history.len() > cap {
             // Drop the frame farthest from the current position.
             let cur = self.pts();
@@ -235,6 +242,10 @@ impl Source {
         // Bound the decode-ahead: once enough frames are buffered we stop
         // draining, the worker's channel fills and decoding pauses itself.
         const MAX_QUEUE: usize = 8;
+        self.playing_hint = playing;
+        if playing && !self.history.is_empty() && self.history.len() > 16 {
+            self.history.clear();
+        }
         loop {
             if self.queue.len() >= MAX_QUEUE && !self.awaiting {
                 break;
@@ -381,6 +392,8 @@ pub struct VideoMode {
     message: Option<String>,
     pending_swap: Option<(PathBuf, PathBuf, f64)>,
     snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
+    /// (index entries, columns, per-column (max size, kind, has key), p98 size, built at)
+    timeline_cache: Option<(usize, usize, Vec<(u32, u8, bool)>, f32, Instant)>,
 }
 
 impl VideoMode {
@@ -428,6 +441,7 @@ impl VideoMode {
             message: None,
             pending_swap: None,
             snap_rx: None,
+            timeline_cache: None,
         };
         for p in paths.into_iter().take(2) {
             vm.add_source(&p, &core.ctx, &mut None);
@@ -1322,21 +1336,31 @@ impl VideoMode {
         let idx_guard = a.index.lock();
         if let Some(idx) = idx_guard.as_ref() {
             let cols = rect.width().max(1.0) as usize;
-            let mut col_max = vec![(0u32, b'?', false); cols];
-            for e in idx.iter() {
-                let c = (((e.pts / dur) * cols as f64) as usize).min(cols - 1);
-                if e.size > col_max[c].0 || e.key {
-                    let key = col_max[c].2 || e.key;
-                    if e.size >= col_max[c].0 {
-                        col_max[c] = (e.size, e.kind, key);
-                    } else {
-                        col_max[c].2 = key;
+            // Aggregating 100k+ index entries is too costly per frame: cache it
+            // per (entry count, width) and refresh periodically as frame types are learned.
+            let stale = match &self.timeline_cache {
+                Some((n, c, _, _, at)) => *n != idx.len() || *c != cols || at.elapsed() > Duration::from_secs(2),
+                None => true,
+            };
+            if stale {
+                let mut col_max = vec![(0u32, b'?', false); cols];
+                for e in idx.iter() {
+                    let c = (((e.pts / dur) * cols as f64) as usize).min(cols - 1);
+                    let slot = &mut col_max[c];
+                    slot.2 |= e.key;
+                    if e.size >= slot.0 {
+                        slot.0 = e.size;
+                        slot.1 = if e.kind == b'?' && e.key { b'I' } else { e.kind };
                     }
                 }
+                let mut sizes: Vec<u32> = idx.iter().map(|e| e.size).collect();
+                let k = sizes.len() * 98 / 100;
+                let last = sizes.len().saturating_sub(1);
+                let p98 = if sizes.is_empty() { 1 } else { *sizes.select_nth_unstable(k.min(last)).1 }.max(1) as f32;
+                self.timeline_cache = Some((idx.len(), cols, col_max, p98, Instant::now()));
             }
-            let mut sizes: Vec<u32> = idx.iter().map(|e| e.size).collect();
-            sizes.sort_unstable();
-            let p98 = sizes.get(sizes.len() * 98 / 100).copied().unwrap_or(1).max(1) as f32;
+            let (_, _, col_max, p98, _) = self.timeline_cache.as_ref().unwrap();
+            let p98 = *p98;
             let bar_h = h - 18.0;
             let mut mesh = egui::Mesh::default();
             for (c, (size, kind, key)) in col_max.iter().enumerate() {
@@ -1344,8 +1368,9 @@ impl VideoMode {
                     continue;
                 }
                 let v = (*size as f32 / p98).min(1.0);
-                let color = match (*kind, *key) {
-                    (b'I', _) | (_, true) => Color32::from_rgb(235, 90, 80),
+                let _ = key;
+                let color = match (*kind, false) {
+                    (b'I', _) => Color32::from_rgb(235, 90, 80),
                     (b'P', _) => Color32::from_rgb(80, 150, 255),
                     (b'B', _) => Color32::from_rgb(80, 200, 120),
                     _ => Color32::from_rgb(110, 116, 128),
