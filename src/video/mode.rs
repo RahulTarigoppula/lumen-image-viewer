@@ -78,6 +78,9 @@ struct Source {
     eof: bool,
     out_size: (u32, u32),
     error: Option<String>,
+    /// A seek/step result is expected; when paused, only that frame becomes
+    /// current (frames decoded ahead stay queued for stepping).
+    awaiting: bool,
 }
 
 impl Source {
@@ -116,6 +119,7 @@ impl Source {
             eof: false,
             out_size: out,
             error: None,
+            awaiting: true,
         })
     }
 
@@ -179,6 +183,7 @@ impl Source {
         self.gen += 1;
         self.queue.clear();
         self.eof = false;
+        self.awaiting = true;
         self.player.send(Cmd::Seek { t, exact, gen: self.gen, fill_history });
     }
 
@@ -227,7 +232,14 @@ impl Source {
     }
 
     fn poll(&mut self, playing: bool) {
-        while let Ok(ev) = self.player.rx.try_recv() {
+        // Bound the decode-ahead: once enough frames are buffered we stop
+        // draining, the worker's channel fills and decoding pauses itself.
+        const MAX_QUEUE: usize = 8;
+        loop {
+            if self.queue.len() >= MAX_QUEUE && !self.awaiting {
+                break;
+            }
+            let Ok(ev) = self.player.rx.try_recv() else { break };
             match ev {
                 Event::Frame(f) => {
                     if f.gen != self.gen {
@@ -235,9 +247,15 @@ impl Source {
                     }
                     if f.history {
                         self.remember(f);
-                    } else if playing {
-                        self.queue.push_back(f);
+                    } else if playing || !self.awaiting {
+                        self.awaiting = false;
+                        if playing && self.current.is_none() {
+                            self.set_current(f);
+                        } else {
+                            self.queue.push_back(f);
+                        }
                     } else {
+                        self.awaiting = false;
                         self.set_current(f);
                     }
                 }
@@ -548,6 +566,7 @@ impl VideoMode {
                 s.set_current(f);
                 // Re-anchor the decoder so the next forward step continues from here.
                 s.gen += 1;
+                s.awaiting = true;
                 s.player.send(Cmd::Seek { t, exact: true, gen: s.gen, fill_history: false });
                 continue;
             }
@@ -1731,6 +1750,18 @@ impl VideoMode {
         };
         if let Some(t) = t {
             self.seek_all(t, true);
+        }
+    }
+}
+
+impl Drop for VideoMode {
+    fn drop(&mut self) {
+        // Stop a running whole-file analysis so it doesn't keep files open.
+        if let Some(a) = &self.analysis {
+            a.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(a) = self.audio_shared() {
+            a.playing.store(false, Ordering::Relaxed);
         }
     }
 }
