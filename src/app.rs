@@ -173,7 +173,10 @@ impl App {
         loader.opts.lock().color_manage = settings.color_manage;
         let thumbs = ThumbService::new(ctx.clone(), cores.saturating_sub(2).clamp(2, 12), crate::settings::cache_dir().join("thumbs"));
         thumbs.set_disk_cache(settings.thumb_disk_cache);
-        let meta = MetaService::new(ctx.clone());
+        let meta = MetaService::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
         crate::devhook::mark("services");
 
         let start_folder = settings

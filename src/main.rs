@@ -2,30 +2,27 @@
 //! Lumen - a fast, private, modern image & video viewer for Windows.
 
 mod app;
-mod catalog;
 mod bg;
-mod decode;
 mod devhook;
 mod edit;
-mod encode;
 mod fileops;
-mod formats;
-mod imaging;
 mod loader;
-mod meta;
-mod metaedit;
 mod render;
-mod settings;
 mod shell;
-mod tags;
 mod thumbs;
 mod ui;
 mod video;
+
+// UI-free modules live in the lumen-core crate; importing them at the crate
+// root keeps `crate::decode`, `crate::settings`, ... paths working.
+use lumen_core::{catalog, decode, encode, formats, imaging, meta, metaedit, settings, tags};
 
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     devhook::mark("main");
+    #[cfg(feature = "video")]
+    lumen_core::video::set_thumbnailer(video::engine::thumbnail);
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
         let dir = settings::data_dir();

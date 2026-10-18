@@ -12,7 +12,7 @@
 use super::icons as I;
 use super::widgets;
 use crate::app::Core;
-use crate::edit::Histogram;
+use crate::edit::{Histogram, HistogramPaint};
 use crate::loader::{LoadState, LoadedImage};
 use crate::render::{self, GpuImage};
 use crossbeam_channel::{unbounded, Receiver};

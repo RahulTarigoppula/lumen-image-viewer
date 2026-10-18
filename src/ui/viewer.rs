@@ -7,7 +7,7 @@ use super::theme::Palette;
 use super::widgets;
 use crate::app::Core;
 use crate::catalog;
-use crate::edit::{EditSession, EditTool, Histogram, ToolUiCtx};
+use crate::edit::{EditSession, EditTool, Histogram, HistogramPaint, ToolUiCtx};
 use crate::loader::{LoadState, LoadedImage};
 use crate::render::{self, GpuImage};
 use crate::settings::{FitMode, WheelAction};

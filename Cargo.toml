@@ -1,53 +1,79 @@
-[package]
-name = "lumen"
+[workspace]
+members = [".", "crates/lumen-core"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Lumen: a fast, private, modern image viewer, browser, editor and converter for Windows"
 license = "MIT"
 authors = ["Rahul Tarigoppula"]
 repository = "https://github.com/RahulTarigoppula/lumen-image-viewer"
-build = "build.rs"
 
-[dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
-egui = { version = "0.37", features = ["bytemuck"] }
-egui_extras = { version = "0.37", features = ["image"] }
+# Versions shared by more than one crate. Crate-specific dependencies stay in
+# that crate's manifest.
+[workspace.dependencies]
+lumen-core = { path = "crates/lumen-core" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp", "ico", "tga", "pnm", "hdr", "exr", "qoi", "dds", "ff", "rayon"] }
-fast_image_resize = { version = "6", features = ["rayon", "image"] }
 rayon = "1"
 crossbeam-channel = "0.5"
-kamadak-exif = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rfd = "0.17"
-trash = "5"
-arboard = { version = "3", features = ["image-data"] }
-lru = "0.18"
 dirs = "7"
 parking_lot = "0.12"
 anyhow = "1"
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-qcms = "0.3.0"
 jpeg-encoder = "0.7.1"
-img-parts = "0.4.1"
 webp = { version = "0.3", default-features = false }
+ab_glyph = "0.2"
+tiff = "0.11"
+# Features are chosen per crate.
+windows = "0.62"
+
+# The app: UI, viewer, browser, batch tools and the FFmpeg video engine.
+[package]
+name = "lumen"
+version.workspace = true
+edition.workspace = true
+description = "Lumen: a fast, private, modern image viewer, browser, editor and converter for Windows"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+lumen-core.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+egui = { version = "0.37", features = ["bytemuck"] }
+egui_extras = { version = "0.37", features = ["image"] }
+image.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+log.workspace = true
+chrono.workspace = true
+jpeg-encoder.workspace = true
+webp.workspace = true
+ab_glyph.workspace = true
+tiff.workspace = true
+rfd = "0.17"
+trash = "5"
+arboard = { version = "3", features = ["image-data"] }
+lru = "0.18"
 ffmpeg-next = { version = "=9.0.0", optional = true, default-features = false, features = ["codec", "format", "software-scaling", "software-resampling", "static"] }
 ffmpeg-sys-next = { version = "=9.0.1", optional = true, default-features = false, features = ["avcodec", "avformat", "swscale", "swresample", "static"] }
 cpal = { version = "0.18", optional = true }
 bytemuck = "1.25.2"
-ab_glyph = "0.2"
-epaint_default_fonts = "0.37"
-resvg = "0.48.1"
-tiff = "0.11"
 libwebp-sys = "0.9"
 flate2 = "1"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
-# Anti-aliased vector rasterization for the Draw Board and selection masks.
-tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 
 [dependencies.windows]
-version = "0.62"
+workspace = true
 features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -82,13 +108,10 @@ features = [
 default = ["video"]
 video = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next", "dep:cpal"]
 
-[dev-dependencies]
-png = "0.18"
-tiff = "0.11"
-
 [build-dependencies]
 winresource = "0.1"
 
+# Profiles apply to the whole workspace and must live in the root manifest.
 [profile.release]
 opt-level = 3
 lto = "thin"
