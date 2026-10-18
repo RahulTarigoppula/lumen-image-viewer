@@ -59,8 +59,8 @@ Requirements: Rust (stable, MSVC), Visual Studio Build Tools, and for video: vcp
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg C:\vcpkg; C:\vcpkg\bootstrap-vcpkg.bat
-C:\vcpkg\vcpkg install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md"
-$env:VCPKG_ROOT="C:\vcpkg"; $env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
+C:\vcpkg\vcpkg install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md-rel" --overlay-ports=vcpkg/overlay-ports --overlay-triplets=vcpkg/triplets
+$env:VCPKG_ROOT="C:\vcpkg"; $env:VCPKGRS_TRIPLET="x64-windows-static-md-rel"; $env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
 cargo build --release          # → target\release\lumen.exe
 cargo build --release --no-default-features   # image-only build without FFmpeg
 ```
