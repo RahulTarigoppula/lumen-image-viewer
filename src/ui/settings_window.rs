@@ -70,7 +70,7 @@ impl Page {
             Page::Browser => "Thumbnail grid and file listing",
             Page::Editing => "Defaults used when saving edited images",
             Page::Performance => "Memory and disk caches",
-            Page::Editors => "Programs offered for "Open in external editor" (E)",
+            Page::Editors => "Programs offered for 'Open in external editor' (E)",
             Page::Integration => "File associations, Explorer menu and single window",
             Page::Privacy => "What Lumen stores, and where",
             Page::About => "Version, license and open-source credits",
@@ -634,7 +634,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         if eds.is_empty() {
             ui.add_space(10.0);
             ui.label(RichText::new("No external editors yet").color(p.text));
-            hint(ui, p, "Add Photoshop, GIMP, Paint.NET, Krita or any other program. Without an editor, E shows the Windows "Open with" dialog.");
+            hint(ui, p, "Add Photoshop, GIMP, Paint.NET, Krita or any other program. Without an editor, E shows the Windows 'Open with' dialog.");
             ui.add_space(10.0);
             return;
         }
@@ -734,7 +734,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
 
     section_title(ui, p, "File types");
     card(ui, p, |ui| {
-        row(ui, p, "Open with Lumen", "Adds Lumen to "Open with" for all supported image and video types and lists it under Windows Default apps. Per-user - no administrator rights needed.", |ui| {
+        row(ui, p, "Open with Lumen", "Adds Lumen to 'Open with' for all supported image and video types and lists it under Windows Default apps. Per-user - no administrator rights needed.", |ui| {
             if status.file_types {
                 if ui.button("Unregister").clicked() {
                     match crate::shell::unregister_file_types() {
@@ -774,7 +774,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
 
     section_title(ui, p, "Explorer");
     card(ui, p, |ui| {
-        row(ui, p, ""Browse with Lumen" menu", "Right-click any folder, drive or folder background in Explorer to open it in Lumen's browser.", |ui| {
+        row(ui, p, "'Browse with Lumen' menu", "Right-click any folder, drive or folder background in Explorer to open it in Lumen's browser.", |ui| {
             if status.context_menu {
                 if ui.button("Remove").clicked() {
                     match crate::shell::unregister_context_menu() {
@@ -785,7 +785,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                 }
             } else if ui.add(egui::Button::new(RichText::new("Add").color(Color32::WHITE)).fill(p.accent)).clicked() {
                 match crate::shell::register_context_menu() {
-                    Ok(()) => core.toasts.success(""Browse with Lumen" added to Explorer"),
+                    Ok(()) => core.toasts.success("'Browse with Lumen' added to Explorer"),
                     Err(e) => core.toasts.error(format!("Could not add the Explorer menu entry: {e}")),
                 }
                 refresh = true;
@@ -794,7 +794,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             status_chip(ui, p, status.context_menu, "Added", "Not added");
             false
         });
-        hint(ui, p, "On Windows 11 the entry appears under "Show more options" (Shift+F10).");
+        hint(ui, p, "On Windows 11 the entry appears under 'Show more options' (Shift+F10).");
         ui.add_space(8.0);
     });
 
