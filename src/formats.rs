@@ -6,7 +6,13 @@ use std::path::Path;
 pub const NATIVE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "webp", "bmp", "dib", "ico", "cur", "tif",
     "tiff", "tga", "pbm", "pgm", "ppm", "pnm", "pam", "hdr", "exr", "qoi", "dds", "ff",
+    // Lumen's own decoders (src/decode): Photoshop, vector, PCX, metafiles.
+    "psd", "psb", "svg", "svgz", "pcx", "wmf", "emf",
 ];
+
+/// Document formats shown and viewed like images (pages become frames), but
+/// not offered for shell association or batch conversion by default.
+pub const DOCUMENT_EXTS: &[&str] = &["pdf"];
 
 /// Extensions decoded via Windows Imaging Component (codecs installed in Windows).
 pub const WIC_EXTS: &[&str] = &[
@@ -24,7 +30,7 @@ pub fn ext_of(path: &Path) -> String {
 }
 
 pub fn is_image_ext(ext: &str) -> bool {
-    NATIVE_EXTS.contains(&ext) || WIC_EXTS.contains(&ext) || ext == "svg" || ext == "psd"
+    NATIVE_EXTS.contains(&ext) || WIC_EXTS.contains(&ext) || DOCUMENT_EXTS.contains(&ext)
 }
 
 pub fn is_image_path(path: &Path) -> bool {
@@ -53,13 +59,20 @@ pub fn type_name(ext: &str) -> String {
         "gif" => "GIF image".into(),
         "webp" => "WebP image".into(),
         "bmp" | "dib" => "Bitmap image".into(),
-        "ico" | "cur" => "Icon".into(),
+        "ico" => "Icon".into(),
         "tif" | "tiff" => "TIFF image".into(),
         "heic" | "heif" | "hif" => "HEIF image".into(),
         "avif" => "AVIF image".into(),
         "jxl" => "JPEG XL image".into(),
         "psd" => "Photoshop document".into(),
+        "psb" => "Photoshop large document".into(),
         "svg" => "SVG vector image".into(),
+        "svgz" => "Compressed SVG image".into(),
+        "pcx" => "PCX image".into(),
+        "wmf" => "Windows metafile".into(),
+        "emf" => "Enhanced metafile".into(),
+        "pdf" => "PDF document".into(),
+        "cur" => "Cursor".into(),
         e if is_raw_ext(e) => format!("{} camera RAW", e.to_uppercase()),
         "" => "File".into(),
         e => format!("{} image", e.to_uppercase()),
@@ -109,7 +122,7 @@ impl SaveFormat {
         match self {
             SaveFormat::Jpeg => "JPEG",
             SaveFormat::Png => "PNG",
-            SaveFormat::WebP => "WebP (lossless)",
+            SaveFormat::WebP => "WebP",
             SaveFormat::Bmp => "BMP",
             SaveFormat::Tiff => "TIFF",
             SaveFormat::Gif => "GIF",
@@ -131,5 +144,25 @@ impl SaveFormat {
             "qoi" => SaveFormat::Qoi,
             _ => return None,
         })
+    }
+}
+
+/// True for vector formats that are rasterised at a chosen size.
+pub fn is_vector_ext(ext: &str) -> bool {
+    matches!(ext, "svg" | "svgz" | "wmf" | "emf" | "pdf")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_formats_are_registered() {
+        for e in ["psd", "psb", "svg", "svgz", "pcx", "wmf", "emf", "pdf", "cur", "ico", "tif"] {
+            assert!(is_image_ext(e), "{e}");
+            assert!(!type_name(e).is_empty());
+        }
+        assert_eq!(type_name("pdf"), "PDF document");
+        assert_eq!(SaveFormat::WebP.label(), "WebP");
     }
 }

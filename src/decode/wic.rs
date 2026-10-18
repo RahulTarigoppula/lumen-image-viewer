@@ -33,17 +33,84 @@ pub fn with_factory<R>(f: impl FnOnce(&IWICImagingFactory) -> Result<R>) -> Resu
     })
 }
 
-fn open_frame(factory: &IWICImagingFactory, path: &Path) -> Result<(IWICBitmapDecoder, IWICBitmapFrameDecode)> {
+/// Paths of 248+ characters need the `\\?\` prefix for most Win32 APIs.
+pub fn long_path(path: &Path) -> std::path::PathBuf {
+    let s = path.as_os_str().to_string_lossy();
+    if s.len() < 248 || s.starts_with(r"\\?\") || !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(unc) = s.strip_prefix(r"\\") {
+        return std::path::PathBuf::from(format!(r"\\?\UNC\{unc}"));
+    }
+    std::path::PathBuf::from(format!(r"\\?\{s}"))
+}
+
+pub fn open_decoder(factory: &IWICImagingFactory, path: &Path) -> Result<IWICBitmapDecoder> {
     unsafe {
-        let decoder = factory.CreateDecoderFromFilename(
-            &HSTRING::from(path.as_os_str()),
+        let direct = factory.CreateDecoderFromFilename(
+            &HSTRING::from(long_path(path).as_os_str()),
             None,
             GENERIC_READ,
             WICDecodeMetadataCacheOnDemand,
-        )?;
+        );
+        match direct {
+            Ok(d) => Ok(d),
+            Err(e) => {
+                // Sharing / lock violations (file open in another app without
+                // read sharing) and path problems: retry from memory, since
+                // std::fs::read opens with full sharing.
+                let code = e.code().0 as u32;
+                if !matches!(code, 0x8007_0020 | 0x8007_0021 | 0x8007_0003 | 0x8007_00CE | 0x8007_007B | 0x8007_0005) {
+                    return Err(e.into());
+                }
+                let bytes = std::fs::read(path).map_err(|_| anyhow::Error::from(e.clone()))?;
+                if bytes.is_empty() || bytes.len() >= u32::MAX as usize {
+                    return Err(e.into());
+                }
+                let stream = windows::Win32::UI::Shell::SHCreateMemStream(Some(&bytes)).ok_or_else(|| anyhow!("Out of memory"))?;
+                Ok(factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?)
+            }
+        }
+    }
+}
+
+fn open_frame(factory: &IWICImagingFactory, path: &Path) -> Result<(IWICBitmapDecoder, IWICBitmapFrameDecode)> {
+    unsafe {
+        let decoder = open_decoder(factory, path)?;
         let frame = decoder.GetFrame(0)?;
         Ok((decoder, frame))
     }
+}
+
+/// Number of frames / pages in the file.
+pub fn frame_count(path: &Path) -> Result<usize> {
+    with_factory(|factory| unsafe { Ok(open_decoder(factory, path)?.GetFrameCount()? as usize) })
+}
+
+/// Decode frames `from..to` (pages of a multi-page TIFF), stopping once
+/// `budget` bytes of RGBA have been produced.
+pub fn decode_frames(path: &Path, from: usize, to: usize, color_manage: bool, budget: u64) -> Result<Vec<RgbaImage>> {
+    with_factory(|factory| unsafe {
+        let decoder = open_decoder(factory, path)?;
+        let n = (decoder.GetFrameCount()? as usize).min(to);
+        let mut out = Vec::new();
+        let mut used = 0u64;
+        for i in from..n {
+            let frame = decoder.GetFrame(i as u32)?;
+            let (mut w, mut h) = (0u32, 0u32);
+            frame.GetSize(&mut w, &mut h)?;
+            used += w as u64 * h as u64 * 4;
+            if used > budget {
+                break;
+            }
+            let source = if color_manage { color_managed(factory, &frame)?.0 } else { frame.cast()? };
+            match source_to_rgba(&source) {
+                Ok(img) => out.push(img),
+                Err(_) => break,
+            }
+        }
+        Ok(out)
+    })
 }
 
 fn source_to_rgba(source: &IWICBitmapSource) -> Result<RgbaImage> {
@@ -51,9 +118,7 @@ fn source_to_rgba(source: &IWICBitmapSource) -> Result<RgbaImage> {
         let converted = WICConvertBitmapSource(&GUID_WICPixelFormat32bppRGBA, source)?;
         let (mut w, mut h) = (0u32, 0u32);
         converted.GetSize(&mut w, &mut h)?;
-        if w == 0 || h == 0 {
-            return Err(anyhow!("Empty image"));
-        }
+        super::check_alloc(w, h)?;
         let stride = w as usize * 4;
         let total = stride
             .checked_mul(h as usize)
@@ -171,6 +236,7 @@ pub fn decode_full(path: &Path, color_manage: bool) -> Result<Decoded> {
             orientation,
             source_size: (sw, sh),
             frame_count,
+            bit_depth: pixel_format_bit_depth(&pf),
         })
     })
 }
@@ -242,6 +308,17 @@ fn pixel_format_has_alpha(pf: &GUID) -> bool {
         GUID_WICPixelFormat1bppIndexed,
     ];
     alpha.contains(pf)
+}
+
+fn pixel_format_bit_depth(pf: &GUID) -> u8 {
+    let n = pixel_format_name(pf);
+    if n.contains("16-bit") {
+        16
+    } else if n.contains("32-bit") {
+        32
+    } else {
+        8
+    }
 }
 
 fn pixel_format_name(pf: &GUID) -> String {
