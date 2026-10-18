@@ -79,7 +79,7 @@ impl Default for ConvertSettings {
         ConvertSettings {
             keep_format: false,
             format: SaveFormat::Jpeg,
-            jpeg_quality: 90,
+            jpeg_quality: 92,
             jpeg_chroma: Chroma::S420,
             jpeg_progressive: false,
             webp_quality: 85.0,

@@ -192,7 +192,7 @@ fn default_name(files: &[PathBuf], fallback: &str) -> String {
 }
 
 fn window(title: String, ctx: &egui::Context, w: f32, h: f32) -> egui::Window<'static> {
-    egui::Window::new(title).default_size(window_size(ctx, w, h)).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).min_size([520.0, 380.0]).resizable(true).collapsible(false)
+    egui::Window::new(title).default_size(window_size(ctx, w, h)).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0)).resizable(true).collapsible(false)
 }
 
 // ============================================================ multi-page

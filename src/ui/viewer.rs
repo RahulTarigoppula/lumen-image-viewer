@@ -931,7 +931,9 @@ impl Viewer {
         }
 
         // ---- Overlays
-        if core.settings.show_info_overlay || !fullscreen {
+        // The caption sits top-left: hide it while a top/left pop-out panel covers that corner.
+        let caption_covered = matches!(self.edge.open, Some(Edge::Top) | Some(Edge::Left));
+        if (core.settings.show_info_overlay || !fullscreen) && !caption_covered {
             self.overlay_caption(ui, core, view, size, &path);
         }
         if self.show_histogram {
@@ -1292,7 +1294,8 @@ impl Viewer {
                 Rect::from_min_size(Pos2::new(view.max.x - w - 6.0 + slide, view.min.y + 8.0), Vec2::new(w, (view.height() - 16.0 - bottom_reserve).max(120.0)))
             }
             Edge::Left => {
-                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 900.0);
+                // Size to the menu's content (about 22 rows) instead of the full height.
+                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 640.0);
                 Rect::from_min_size(Pos2::new(view.min.x + 6.0 - slide, view.center().y - h / 2.0 - bottom_reserve / 2.0), Vec2::new(262.0, h))
             }
             Edge::Bottom => return false,
@@ -1306,7 +1309,7 @@ impl Viewer {
             .show(&ctx, |ui| {
                 ui.multiply_opacity(t);
                 egui::Frame::NONE
-                    .fill(p.panel.gamma_multiply(0.97))
+                    .fill(p.panel)
                     .stroke(Stroke::new(1.0, p.border))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(margin as i8))

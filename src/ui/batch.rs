@@ -349,10 +349,10 @@ impl BatchConvert {
         let mut close = false;
         egui::Window::new(format!("{}  Batch convert & resize", I::STACK))
             .open(&mut open)
-            .default_size(window_size(ctx, 780.0, 680.0))
+            .default_size(window_size(ctx, 780.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .min_size([520.0, 360.0])
+            .min_size(crate::ui::batch::window_size(ctx, 520.0, 360.0))
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -593,6 +593,16 @@ impl BatchConvert {
             let fmt = if self.s.keep_format { None } else { Some(self.s.format) };
             if self.s.keep_format {
                 hint(ui, p, "Formats Lumen can't write (HEIC, RAW, ...) are saved as JPEG.");
+            }
+            // Say up front what the chosen format cannot keep.
+            let has_ext = |exts: &[&str]| self.files.iter().any(|f| exts.contains(&crate::formats::ext_of(f).as_str()));
+            if let Some(f) = fmt {
+                if has_ext(&["gif", "apng", "webp", "tif", "tiff"]) {
+                    hint(ui, p, "Animated and multi-page files are converted using their first frame only.");
+                }
+                if matches!(f, SaveFormat::Jpeg | SaveFormat::Bmp) && has_ext(&["png", "gif", "webp", "tif", "tiff", "ico", "tga", "qoi", "psd", "svg"]) {
+                    hint(ui, p, "This format has no transparency: transparent areas are filled with white.");
+                }
             }
             egui::Grid::new("bc-format-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 if fmt.is_none() || fmt == Some(SaveFormat::Jpeg) {
@@ -1289,10 +1299,10 @@ impl BatchRename {
         let mut close = false;
         egui::Window::new(format!("{}  Batch rename", I::TEXTBOX))
             .open(&mut open)
-            .default_size(window_size(ctx, 820.0, 640.0))
+            .default_size(window_size(ctx, 820.0, 640.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .min_size([520.0, 380.0])
+            .min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0))
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {

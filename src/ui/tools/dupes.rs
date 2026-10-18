@@ -128,20 +128,43 @@ impl KeepRule {
 pub fn best_in_group(items: &[ScanItem], members: &[usize], rule: KeepRule) -> usize {
     let px = |i: usize| items[i].dims.map(|(w, h)| w as u64 * h as u64).unwrap_or(0);
     let t = |i: usize| items[i].modified.unwrap_or(SystemTime::UNIX_EPOCH);
+    use std::cmp::Ordering;
     let mut best = 0;
     for (k, &i) in members.iter().enumerate().skip(1) {
         let b = members[best];
-        let better = match rule {
-            KeepRule::Resolution => (px(i), items[i].size) > (px(b), items[b].size),
-            KeepRule::Largest => (items[i].size, px(i)) > (items[b].size, px(b)),
-            KeepRule::Newest => t(i) > t(b),
-            KeepRule::Oldest => t(i) < t(b),
+        let primary = match rule {
+            KeepRule::Resolution => (px(i), items[i].size).cmp(&(px(b), items[b].size)),
+            KeepRule::Largest => (items[i].size, px(i)).cmp(&(items[b].size, px(b))),
+            KeepRule::Newest => t(i).cmp(&t(b)),
+            KeepRule::Oldest => t(b).cmp(&t(i)),
+        };
+        // On a tie prefer the "original" name over "x - Copy", "Copy of x" or "x (2)",
+        // then the shorter name.
+        let better = match primary {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => (copy_penalty(&items[i].path), name_len(&items[i].path)) < (copy_penalty(&items[b].path), name_len(&items[b].path)),
         };
         if better {
             best = k;
         }
     }
     best
+}
+
+fn name_len(p: &std::path::Path) -> usize {
+    p.file_name().map(|n| n.len()).unwrap_or(usize::MAX)
+}
+
+/// 1 when a file name looks like a copy made by Explorer or a download manager.
+pub fn copy_penalty(p: &std::path::Path) -> u8 {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let copyish = stem.ends_with(" - copy")
+        || stem.contains(" - copy (")
+        || stem.starts_with("copy of ")
+        || stem.ends_with(" copy")
+        || (stem.ends_with(')') && stem.rfind(" (").map(|i| stem[i + 2..stem.len() - 1].chars().all(|c| c.is_ascii_digit())).unwrap_or(false));
+    copyish as u8
 }
 
 /// BK-tree over 64-bit hashes with Hamming distance, for fast radius queries.
@@ -469,5 +492,19 @@ mod tests {
         assert_eq!(file_hash(&a).unwrap(), file_hash(&b).unwrap());
         assert_ne!(file_hash(&a).unwrap(), file_hash(&c).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod copy_name_tests {
+    use super::copy_penalty;
+    use std::path::Path;
+    #[test]
+    fn detects_copy_names() {
+        assert_eq!(copy_penalty(Path::new("photo_01 - Copy.jpg")), 1);
+        assert_eq!(copy_penalty(Path::new("Copy of photo.jpg")), 1);
+        assert_eq!(copy_penalty(Path::new("photo (2).jpg")), 1);
+        assert_eq!(copy_penalty(Path::new("photo_01.jpg")), 0);
+        assert_eq!(copy_penalty(Path::new("party (birthday).jpg")), 0);
     }
 }
