@@ -79,13 +79,22 @@ impl SaveDialog {
         }
 
         egui::Modal::new(egui::Id::new("save-dialog")).show(ctx, |ui| {
-            ui.set_width(460.0);
+            // Wide enough for typical paths; the path field takes all the room
+            // the Browse button leaves.
+            let w = (ctx.content_rect().width() * 0.8).clamp(360.0, 640.0);
+            ui.set_width(w);
             ui.heading("Save as");
             ui.add_space(8.0);
             let mut changed = false;
             ui.horizontal(|ui| {
                 let mut s = self.path.display().to_string();
-                if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
+                let browse_w = ui.spacing().item_spacing.x + ui.spacing().button_padding.x * 2.0 + 64.0;
+                let field_w = (ui.available_width() - browse_w).max(160.0);
+                let field = ui.add(egui::TextEdit::singleline(&mut s).desired_width(field_w));
+                if field.hovered() {
+                    field.clone().on_hover_text(self.path.display().to_string());
+                }
+                if field.changed() {
                     self.path = PathBuf::from(s);
                     self.confirm_replace = false;
                     // A typed extension picks the format.

@@ -182,7 +182,7 @@ pub fn psnr_from_mse(mse: f64) -> f64 {
     }
 }
 
-/// |A − B| per RGB channel (images must have equal dimensions) and statistics.
+/// |A - B| per RGB channel (images must have equal dimensions) and statistics.
 pub fn difference(a: &RgbaImage, b: &RgbaImage) -> (RgbaImage, DiffStats) {
     use rayon::prelude::*;
     assert_eq!(a.dimensions(), b.dimensions());
@@ -1254,7 +1254,7 @@ impl Compare {
                 } else if busy {
                     egui::Spinner::new().size(16.0).paint_at(ui, Rect::from_center_size(area.right_top() + Vec2::new(-22.0, 22.0), Vec2::splat(16.0)));
                 }
-                let mut text = format!("|A − B|  ×{:.0}", self.amp);
+                let mut text = format!("|A - B|  ×{:.0}", self.amp);
                 if let Some(z) = zshow {
                     text.push_str(&format!("  ·  {:.0}%", z * 100.0));
                 }
@@ -1321,7 +1321,7 @@ impl Compare {
             let rects = self.layout(self.last_area);
             let ppp = ui.ctx().pixels_per_point();
             let src = self.selected.min(self.panes.len().saturating_sub(1));
-            if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out  (−)", false).clicked() && !rects.is_empty() {
+            if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out  (-)", false).clicked() && !rects.is_empty() {
                 self.zoom_step(src, &rects, ppp, 0.8, None);
             }
             let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
@@ -1401,7 +1401,7 @@ impl Compare {
             ("Drag", "Pan"),
             ("Double-click  or  /", "Fit"),
             ("Z", "100% (selected pane)"),
-            ("+ / −  arrows", "Zoom / pan"),
+            ("+ / -  arrows", "Zoom / pan"),
             ("B  W  F  D", "Side by side · Split · Flicker · Difference"),
             ("Tab / Space", "Flicker A ↔ B (Split: jump divider)"),
             ("X", "Swap A and B"),

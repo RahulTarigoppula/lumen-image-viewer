@@ -42,10 +42,13 @@ fn main() -> eframe::Result {
 
     // Single instance: if Lumen is already running, hand it the file and exit.
     // Any failure falls through to a normal start (see shell.rs).
+    // The first process owns a per-user mutex; launches that start at the same
+    // moment (Explorer "Open" on many files) see it and wait for its pipe.
     let force_new = args.iter().any(|a| a == "--new-window") || std::env::var_os("LUMEN_DEV_DIR").is_some();
     if settings.reuse_window && !force_new {
+        let primary = shell::claim_primary();
         if let Some(p) = &initial {
-            if shell::forward_to_running(std::slice::from_ref(p)) {
+            if shell::forward_to_running(std::slice::from_ref(p), !primary) {
                 return Ok(());
             }
         }
