@@ -339,7 +339,7 @@ fn paint_live(cx: &CanvasCtx, painter: &egui::Painter, o: &DrawObj) {
             if len > 0.5 {
                 let u = d / len;
                 let n = vec2(-u.y, u.x);
-                let hl = ((o.width * 3.2).max(o.width + 8.0) * k).min(len * 0.9);
+                let hl = (o.head_len() * k).min(len * 0.9);
                 let base = b - u * hl;
                 painter.line_segment([a, b - u * hl * 0.7], st);
                 painter.add(egui::Shape::convex_polygon(vec![b, base + n * hl * 0.5, b - u * hl * 0.78, base - n * hl * 0.5], col, Stroke::NONE));
