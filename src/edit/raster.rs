@@ -213,8 +213,8 @@ impl DrawObj {
         [b[0] - e, b[1] - e, b[2] + e, b[3] + e]
     }
 
-    fn head_len(&self) -> f32 {
-        (self.width * 3.2).max(self.width + 8.0)
+    pub fn head_len(&self) -> f32 {
+        (self.width * 4.0).max(self.width + 10.0)
     }
 
     fn shadow_params(&self) -> (f32, f32) {
