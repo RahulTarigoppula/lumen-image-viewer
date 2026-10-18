@@ -230,6 +230,13 @@ fn decode_file_inner(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
     if let Some(res) = decode_special(&bytes, &ext, Some(path), opts) {
         return res;
     }
+    // zune-jpeg silently mis-decodes baseline JPEGs whose components are stored
+    // in separate scans (written by some encoders); Windows' decoder is correct.
+    if jpeg_is_noninterleaved_baseline(&bytes) {
+        if let Ok(d) = wic::decode_full(path, opts.color_manage) {
+            return Ok(d);
+        }
+    }
     let mut d = match decode_bytes(&bytes, &ext, opts) {
         Ok(d) => d,
         Err(native_err) => match wic::decode_full(path, opts.color_manage) {
@@ -778,5 +785,59 @@ mod tests {
         assert_eq!(decode_file(&pdf_path, DecodeOptions::default()).unwrap().frame_count, 2);
         assert!(probe_dimensions(&pdf_path).is_some());
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// True for a baseline/extended sequential JPEG (SOF0/SOF1) with more than one
+/// component whose first scan does not contain all components.
+pub fn jpeg_is_noninterleaved_baseline(d: &[u8]) -> bool {
+    if d.len() < 4 || d[0] != 0xFF || d[1] != 0xD8 {
+        return false;
+    }
+    let mut sof_components = 0u8;
+    let mut baseline = false;
+    let mut i = 2;
+    while i + 4 <= d.len() {
+        if d[i] != 0xFF {
+            return false;
+        }
+        let m = d[i + 1];
+        if m == 0xFF {
+            i += 1;
+            continue;
+        }
+        let len = u16::from_be_bytes([d[i + 2], d[i + 3]]) as usize;
+        match m {
+            0xC0 | 0xC1 => {
+                baseline = true;
+                sof_components = *d.get(i + 9).unwrap_or(&0);
+            }
+            0xC2 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return false,
+            0xDA => {
+                let scan_components = *d.get(i + 4).unwrap_or(&0);
+                return baseline && sof_components > 1 && scan_components < sof_components;
+            }
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    false
+}
+
+#[cfg(test)]
+mod jpeg_layout_tests {
+    #[test]
+    fn detects_noninterleaved_baseline() {
+        let img = image::RgbaImage::from_fn(32, 32, |x, y| image::Rgba([x as u8 * 8, y as u8 * 8, 77, 255]));
+        let rgb = crate::encode::flatten_rgb(&img, [0, 0, 0]);
+        let mut bad = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut bad, 90);
+        enc.set_optimized_huffman_tables(true);
+        enc.encode(&rgb, 32, 32, jpeg_encoder::ColorType::Rgb).unwrap();
+        assert!(super::jpeg_is_noninterleaved_baseline(&bad));
+        let mut good = Vec::new();
+        jpeg_encoder::Encoder::new(&mut good, 90).encode(&rgb, 32, 32, jpeg_encoder::ColorType::Rgb).unwrap();
+        assert!(!super::jpeg_is_noninterleaved_baseline(&good));
+        assert!(!super::jpeg_is_noninterleaved_baseline(b"not a jpeg"));
     }
 }
