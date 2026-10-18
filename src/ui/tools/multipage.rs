@@ -8,7 +8,7 @@ use crate::decode::{self, DecodeOptions};
 use crate::formats::SaveFormat;
 use image::{Rgba, RgbaImage};
 use parking_lot::Mutex;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -63,13 +63,72 @@ impl TempOut {
         Ok((TempOut { tmp, target: target.to_path_buf(), committed: false }, f))
     }
     fn commit(mut self) -> Result<(), String> {
-        // The window confirmed any overwrite before starting the job.
-        if self.target.exists() {
-            let _ = std::fs::remove_file(&self.target);
+        // The window confirmed any overwrite before starting the job. A rename
+        // replaces an existing target in one step on Windows, so a failure
+        // leaves the old file untouched; the finished output is then kept
+        // under its temporary name instead of being thrown away.
+        match std::fs::rename(&self.tmp, &self.target) {
+            Ok(()) => {
+                self.committed = true;
+                Ok(())
+            }
+            Err(e) => {
+                self.committed = true;
+                Err(format!("Cannot create {}: {e}. The new file was kept as {}", self.target.display(), self.tmp.display()))
+            }
         }
-        std::fs::rename(&self.tmp, &self.target).map_err(|e| format!("Cannot create {}: {e}", self.target.display()))?;
-        self.committed = true;
-        Ok(())
+    }
+}
+
+/// Flush a buffered output file and make sure it reached the disk, so a full
+/// disk is reported instead of leaving a truncated file behind.
+fn finish_file(w: BufWriter<std::fs::File>) -> Result<(), String> {
+    let f = w.into_inner().map_err(|e| format!("Cannot write the file: {}", e.error()))?;
+    f.sync_all().map_err(|e| format!("Cannot write the file: {e}"))
+}
+
+/// A writer that remembers the first I/O error, for encoders that finish
+/// their output in `Drop` (where errors are otherwise lost).
+struct Tracked<W> {
+    inner: W,
+    err: Option<std::io::Error>,
+}
+
+impl<W> Tracked<W> {
+    fn new(inner: W) -> Self {
+        Tracked { inner, err: None }
+    }
+    fn note<T>(&mut self, r: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &r {
+            if e.kind() != std::io::ErrorKind::Interrupted && self.err.is_none() {
+                self.err = Some(std::io::Error::new(e.kind(), e.to_string()));
+            }
+        }
+        r
+    }
+    fn into_result(self) -> Result<W, String> {
+        match self.err {
+            Some(e) => Err(format!("Cannot write the file: {e}")),
+            None => Ok(self.inner),
+        }
+    }
+}
+
+impl<W: Write> Write for Tracked<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let r = self.inner.write(buf);
+        self.note(r)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let r = self.inner.flush();
+        self.note(r)
+    }
+}
+
+impl<W: Seek> Seek for Tracked<W> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let r = self.inner.seek(pos);
+        self.note(r)
     }
 }
 
@@ -82,7 +141,11 @@ impl Drop for TempOut {
 }
 
 fn load(path: &Path) -> Result<RgbaImage, String> {
-    let d = decode::decode_file(path, DecodeOptions { color_manage: true, animations: false }).map_err(|e| format!("{}: {e:#}", crate::ui::batch::file_name(path)))?;
+    let name = crate::ui::batch::file_name(path);
+    // A decoder panic on one file becomes an error naming that file.
+    let d = std::panic::catch_unwind(|| decode::decode_file(path, DecodeOptions { color_manage: true, animations: false }))
+        .map_err(|e| format!("{name}: unexpected error ({})", crate::ui::batch::convert::panic_message(&*e)))?
+        .map_err(|e| format!("{name}: {e:#}"))?;
     Ok(std::sync::Arc::try_unwrap(d.image).unwrap_or_else(|a| (*a).clone()))
 }
 
@@ -222,14 +285,15 @@ fn write_pdf(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &OutP
         w.add_jpeg_page(&jpeg, iw, ih, false, pw, ph, rect).map_err(|e| e.to_string())?;
         prog.step(1);
     }
-    w.finish(title).map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())
+    finish_file(w.finish(title).map_err(|e| e.to_string())?)
 }
 
 fn write_tiff(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &OutProgress) -> Result<(), String> {
     use tiff::encoder::{colortype, Compression, Rational, TiffEncoder};
     use tiff::tags::ResolutionUnit;
     let err = |e: tiff::TiffError| e.to_string();
-    let mut enc = TiffEncoder::new(BufWriter::new(f)).map_err(err)?.with_compression(Compression::Lzw);
+    let mut out = Tracked::new(BufWriter::new(f));
+    let mut enc = TiffEncoder::new(&mut out).map_err(err)?.with_compression(Compression::Lzw);
     let res = Rational { n: s.dpi.max(1), d: 1 };
     for p in files {
         if prog.cancelled() {
@@ -251,7 +315,7 @@ fn write_tiff(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &Out
         prog.step(1);
     }
     drop(enc);
-    Ok(())
+    finish_file(out.into_result()?)
 }
 
 /// Canvas size for an animation: the first frame fitted inside `max_side`.
@@ -265,7 +329,8 @@ pub fn anim_canvas(first: (u32, u32), max_side: u32) -> (u32, u32) {
 fn write_gif(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &OutProgress) -> Result<(), String> {
     use image::codecs::gif::{GifEncoder, Repeat};
     let mut canvas = None;
-    let mut enc = GifEncoder::new_with_speed(BufWriter::new(f), 10);
+    let mut out = Tracked::new(BufWriter::new(f));
+    let mut enc = GifEncoder::new_with_speed(&mut out, 10);
     enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
     for p in files {
         if prog.cancelled() {
@@ -279,7 +344,25 @@ fn write_gif(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &OutP
         enc.encode_frame(image::Frame::from_parts(frame, 0, 0, delay)).map_err(|e| e.to_string())?;
         prog.step(1);
     }
-    Ok(())
+    // The GIF trailer is written when the encoder is dropped; `Tracked`
+    // catches a failure there.
+    drop(enc);
+    finish_file(out.into_result()?)
+}
+
+/// Animated WebP keeps every frame in memory until it is encoded.
+pub const MAX_WEBP_ANIM_PIXELS: u64 = 250_000_000;
+
+/// Why an animated WebP of `frames` frames on a `w` x `h` canvas is refused.
+pub fn webp_anim_limit_error(frames: usize, w: u32, h: u32) -> Option<String> {
+    let total = frames as u64 * w as u64 * h as u64;
+    (total > MAX_WEBP_ANIM_PIXELS).then(|| {
+        format!(
+            "An animated WebP of {frames} frames at {w} x {h} px needs too much memory ({} MP in total, the limit is {} MP). Use fewer images, a smaller frame size or an animated GIF.",
+            total / 1_000_000,
+            MAX_WEBP_ANIM_PIXELS / 1_000_000
+        )
+    })
 }
 
 fn write_webp(files: &[PathBuf], s: &MultiSettings, mut f: std::fs::File, prog: &OutProgress) -> Result<(), String> {
@@ -291,6 +374,11 @@ fn write_webp(files: &[PathBuf], s: &MultiSettings, mut f: std::fs::File, prog: 
         }
         let img = load(p)?;
         let (cw, ch) = *canvas.get_or_insert_with(|| anim_canvas(img.dimensions(), s.anim_max_side.min(4000)));
+        if frames.is_empty() {
+            if let Some(e) = webp_anim_limit_error(files.len(), cw, ch) {
+                return Err(e);
+            }
+        }
         frames.push(letterbox(&img, cw, ch, s.bg));
         prog.step(1);
     }
@@ -306,7 +394,10 @@ fn write_webp(files: &[PathBuf], s: &MultiSettings, mut f: std::fs::File, prog: 
         enc.add_frame(webp::AnimFrame::from_rgba(fr.as_raw(), cw, ch, i as i32 * step));
     }
     let mem = enc.try_encode().map_err(|e| format!("WebP encoding failed: {e:?}"))?;
-    f.write_all(&mem).map_err(|e| e.to_string())
+    drop(enc);
+    drop(frames);
+    f.write_all(&mem).map_err(|e| format!("Cannot write the file: {e}"))?;
+    f.sync_all().map_err(|e| format!("Cannot write the file: {e}"))
 }
 
 /// Combine `files` into one multi-page / animated file at `out`.
@@ -475,7 +566,8 @@ pub fn write_strip(files: &[PathBuf], dims: &[(u32, u32)], s: &StripSettings, ou
     let opts = crate::encode::SaveOptions { format: s.format, jpeg_quality: s.jpeg_quality, keep_metadata: false, ..Default::default() };
     let bytes = crate::encode::encode(&img, &opts).map_err(|e| e.to_string())?;
     let (tmp, mut f) = TempOut::new(out)?;
-    f.write_all(&bytes).map_err(|e| e.to_string())?;
+    f.write_all(&bytes).map_err(|e| format!("Cannot write the file: {e}"))?;
+    f.sync_all().map_err(|e| format!("Cannot write the file: {e}"))?;
     drop(f);
     tmp.commit()?;
     prog.step(1);
@@ -521,6 +613,32 @@ pub fn common_parent(files: &[PathBuf]) -> PathBuf {
     base.iter().collect()
 }
 
+/// A safe archive entry name for `f` relative to `base` (a folder `f` is
+/// in, compared case-insensitively): only plain folder and file names, joined
+/// with '/'. Drive letters, UNC prefixes, root and '.'/'..' components never
+/// reach the archive, so extracting it cannot write outside its folder.
+pub fn entry_name(f: &Path, base: &Path) -> String {
+    use std::path::Component;
+    let skip = base.components().count();
+    let parts: Vec<String> = f
+        .components()
+        .skip(skip)
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .flat_map(|n| n.split(['/', '\\']).map(str::to_string).collect::<Vec<_>>())
+        .map(|n| n.trim_end_matches([' ', '.']).to_string())
+        .filter(|n| !n.is_empty() && n != "." && n != "..")
+        .collect();
+    if parts.is_empty() {
+        let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let name = name.trim_end_matches([' ', '.']);
+        return if name.is_empty() || name == ".." { "file".into() } else { name.to_string() };
+    }
+    parts.join("/")
+}
+
 /// Archive entry names (forward slashes, unique, case-insensitive).
 pub fn entry_names(files: &[PathBuf], keep_folders: bool) -> Vec<String> {
     let base = common_parent(files);
@@ -528,8 +646,7 @@ pub fn entry_names(files: &[PathBuf], keep_folders: bool) -> Vec<String> {
     files
         .iter()
         .map(|f| {
-            let rel = if keep_folders { f.strip_prefix(&base).map(Path::to_path_buf).unwrap_or_else(|_| PathBuf::from(f.file_name().unwrap_or_default())) } else { PathBuf::from(f.file_name().unwrap_or_default()) };
-            let name = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+            let name = if keep_folders { entry_name(f, &base) } else { entry_name(Path::new(f.file_name().unwrap_or_default()), Path::new("")) };
             let (stem, ext) = match name.rfind('.') {
                 Some(i) if i > name.rfind('/').map(|j| j + 1).unwrap_or(0) => (name[..i].to_string(), name[i..].to_string()),
                 _ => (name.clone(), String::new()),
@@ -582,9 +699,7 @@ pub fn write_zip(files: &[PathBuf], s: &ZipSettings, out: &Path, prog: &OutProgr
             prog.step(n as u64);
         }
     }
-    let mut w = zw.finish().map_err(|e| e.to_string())?;
-    w.flush().map_err(|e| e.to_string())?;
-    drop(w);
+    finish_file(zw.finish().map_err(|e| e.to_string())?)?;
     tmp.commit()?;
     Ok(std::fs::metadata(out).map(|m| m.len()).unwrap_or(0))
 }
@@ -674,6 +789,50 @@ mod tests {
     }
 
     #[test]
+    fn zip_entry_names_are_sanitized() {
+        // Files on different drives share no folder: no drive letters or roots.
+        let files = vec![PathBuf::from(r"C:\Photos\2024\a.jpg"), PathBuf::from(r"D:\Backup\b.jpg")];
+        assert_eq!(entry_names(&files, true), vec!["Photos/2024/a.jpg", "Backup/b.jpg"]);
+        // UNC paths and verbatim prefixes are stripped too.
+        let files = vec![PathBuf::from(r"\\server\share\pics\a.jpg"), PathBuf::from(r"\\?\C:\other\b.jpg")];
+        assert_eq!(entry_names(&files, true), vec!["pics/a.jpg", "other/b.jpg"]);
+        // '..' and '.' components never reach the archive.
+        assert_eq!(entry_name(Path::new(r"C:\a\..\..\evil\x.png"), Path::new("")), "a/evil/x.png");
+        assert_eq!(entry_name(Path::new(r"C:\a\.\b.png"), Path::new(r"C:\")), "a/b.png");
+        assert_eq!(entry_name(Path::new(r"C:\"), Path::new("")), "file");
+        for n in entry_names(&[PathBuf::from(r"C:\x\..\y.png"), PathBuf::from(r"\\?\UNC\srv\sh\z.png")], true) {
+            assert!(!n.contains(':') && !n.starts_with('/') && !n.contains('\\') && !n.split('/').any(|c| c == ".." || c == "."), "{n}");
+        }
+        // Without folders only the file name is used.
+        assert_eq!(entry_names(&[PathBuf::from(r"C:\a\p.png"), PathBuf::from(r"D:\b\p.png")], false), vec!["p.png", "p (2).png"]);
+    }
+
+    #[test]
+    fn webp_animation_memory_cap() {
+        assert!(webp_anim_limit_error(10, 1000, 1000).is_none());
+        assert!(webp_anim_limit_error(500, 4000, 3000).is_some());
+    }
+
+    #[test]
+    fn tracked_writer_reports_errors() {
+        struct Full;
+        impl Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut t = Tracked::new(Full);
+        let _ = t.write(b"x");
+        assert!(t.into_result().is_err());
+        let mut ok = Tracked::new(Vec::new());
+        ok.write_all(b"abc").unwrap();
+        assert_eq!(ok.into_result().unwrap(), b"abc");
+    }
+
+    #[test]
     fn zip_roundtrip_and_names() {
         let dir = tmpdir("zip");
         std::fs::create_dir_all(dir.join("x")).unwrap();
@@ -685,6 +844,9 @@ mod tests {
         let files = vec![a.clone(), b.clone(), c.clone()];
         assert_eq!(entry_names(&files, false), vec!["a.png", "a (2).png", "notes.txt"]);
         assert_eq!(entry_names(&files, true), vec!["a.png", "x/a.png", "notes.txt"]);
+        // Case differences in the shared folder still give relative names.
+        let upper = PathBuf::from(dir.join("x").join("a.png").to_string_lossy().to_uppercase());
+        assert_eq!(entry_names(&[a.clone(), upper], true), vec!["a.png", "X/A.PNG"]);
         let out = dir.join("out.zip");
         let prog = OutProgress::default();
         let size = write_zip(&files, &ZipSettings::default(), &out, &prog).unwrap();

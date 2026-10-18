@@ -186,12 +186,14 @@ impl ConvertSettings {
 }
 
 /// Apply adjustments and resizing, then the advanced pipeline (if enabled).
-pub fn render(src: RgbaImage, s: &ConvertSettings, cx: &StepCtx) -> RgbaImage {
-    let img = render_basic(src, s);
+/// Err when an output would exceed the batch size limits (checked before
+/// the memory is allocated).
+pub fn render(src: RgbaImage, s: &ConvertSettings, cx: &StepCtx) -> Result<RgbaImage, String> {
+    let img = render_basic(src, s)?;
     if s.use_advanced {
-        s.advanced.apply(img, cx)
+        s.advanced.try_apply(img, cx)
     } else {
-        img
+        Ok(img)
     }
 }
 
@@ -213,7 +215,7 @@ pub fn encode_output(img: &RgbaImage, s: &ConvertSettings, fmt: SaveFormat, exif
     })
 }
 
-fn render_basic(src: RgbaImage, s: &ConvertSettings) -> RgbaImage {
+fn render_basic(src: RgbaImage, s: &ConvertSettings) -> Result<RgbaImage, String> {
     let mut img = src;
     if s.auto_enhance {
         img = crate::edit::ops::auto_levels(&img);
@@ -224,12 +226,13 @@ fn render_basic(src: RgbaImage, s: &ConvertSettings) -> RgbaImage {
     let (w, h) = img.dimensions();
     let (nw, nh) = logic::output_size(w, h, &s.resize);
     if (nw, nh) != (w, h) {
+        logic::check_output_size(nw, nh)?;
         img = crate::imaging::resize_exact(&img, nw, nh, s.filter);
         if s.sharpen && nw < w {
             img = image::imageops::unsharpen(&img, 0.5, 2);
         }
     }
-    img
+    Ok(img)
 }
 
 pub fn grayscale_in_place(img: &mut RgbaImage) {
@@ -285,7 +288,7 @@ pub fn estimate(input: &Path, index: usize, s: &ConvertSettings, cache: &DecodeC
     let fmt = s.target_format(input);
     let taken = taken_from_exif(dec.exif.as_ref());
     let cx = StepCtx::for_file(input, s.start + index as i64, taken);
-    let img = render((*dec.image).clone(), s, &cx);
+    let img = render((*dec.image).clone(), s, &cx)?;
     let out_dims = img.dimensions();
     // Encode a reduced copy for very large outputs and extrapolate by pixel count.
     let px = out_dims.0 as f64 * out_dims.1 as f64;
@@ -314,7 +317,9 @@ pub fn estimate(input: &Path, index: usize, s: &ConvertSettings, cache: &DecodeC
 pub enum FileStatus {
     Pending,
     Working,
-    Done { out: PathBuf, in_bytes: u64, out_bytes: u64, dims: (u32, u32) },
+    /// `note` explains anything the user should know, e.g. a numbered name
+    /// chosen so the output does not replace another file of the batch.
+    Done { out: PathBuf, in_bytes: u64, out_bytes: u64, dims: (u32, u32), note: Option<String> },
     Skipped(String),
     Failed(String),
 }
@@ -334,8 +339,26 @@ pub struct Job {
 }
 
 fn path_key(p: &Path) -> String {
-    p.to_string_lossy().to_lowercase()
+    p.to_string_lossy().replace('/', "\\").to_lowercase()
 }
+
+/// Paths reserved during one batch run.
+pub(crate) struct Claims {
+    /// Outputs already chosen by this run.
+    reserved: Mutex<HashSet<String>>,
+    /// Every input of the run: an output never replaces another input
+    /// (it may still replace its own source under Overwrite).
+    inputs: HashSet<String>,
+}
+
+impl Claims {
+    pub(crate) fn new(inputs: &[PathBuf]) -> Self {
+        Claims { reserved: Mutex::new(HashSet::new()), inputs: inputs.iter().map(|p| path_key(p)).collect() }
+    }
+}
+
+/// Note shown when an output got a numbered name to protect another input.
+pub const PROTECTED_INPUT_NOTE: &str = "Numbered name: another file of this batch already has that name";
 
 /// Whether two folder paths name the same folder (canonicalized when they exist).
 pub fn same_dir(a: &Path, b: &Path) -> bool {
@@ -353,13 +376,16 @@ pub fn panic_message(e: &(dyn std::any::Any + Send)) -> String {
     e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown error".into())
 }
 
-/// Resolve a conflict and reserve the final path. None = skip.
-fn resolve(target: PathBuf, policy: ConflictPolicy, input: &Path, reserved: &Mutex<HashSet<String>>) -> Result<PathBuf, String> {
-    let mut r = reserved.lock();
+/// Resolve a conflict and reserve the final path. Err = skip (with the reason).
+/// The bool is true when a numbered name was chosen because the target is
+/// another input of the batch (which must never be replaced).
+fn resolve(target: PathBuf, policy: ConflictPolicy, input: &Path, claims: &Claims) -> Result<(PathBuf, bool), String> {
+    let mut r = claims.reserved.lock();
     let key = path_key(&target);
-    let in_batch = r.contains(&key);
-    let on_disk = target.exists();
     let is_source = path_key(input) == key;
+    let other_input = !is_source && claims.inputs.contains(&key);
+    let in_batch = r.contains(&key) || other_input;
+    let on_disk = target.exists();
     let final_path = if !in_batch && !on_disk {
         target
     } else {
@@ -374,7 +400,8 @@ fn resolve(target: PathBuf, policy: ConflictPolicy, input: &Path, reserved: &Mut
                 let mut found = None;
                 for i in 2..100_000 {
                     let p = parent.join(format!("{stem} ({i}){ext}"));
-                    if !p.exists() && !r.contains(&path_key(&p)) {
+                    let k = path_key(&p);
+                    if !p.exists() && !r.contains(&k) && !claims.inputs.contains(&k) {
                         found = Some(p);
                         break;
                     }
@@ -384,10 +411,10 @@ fn resolve(target: PathBuf, policy: ConflictPolicy, input: &Path, reserved: &Mut
         }
     };
     r.insert(path_key(&final_path));
-    Ok(final_path)
+    Ok((final_path, other_input))
 }
 
-fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex<HashSet<String>>) -> FileStatus {
+fn process_one(input: &Path, index: usize, s: &ConvertSettings, claims: &Claims) -> FileStatus {
     let meta = match std::fs::metadata(input) {
         Ok(m) => m,
         Err(e) => return FileStatus::Failed(format!("Cannot read file: {e}")),
@@ -400,7 +427,10 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex
     let taken = taken_from_exif(exif.as_ref());
     let img = Arc::try_unwrap(dec.image).unwrap_or_else(|a| (*a).clone());
     let cx = StepCtx::for_file(input, s.start + index as i64, taken);
-    let img = render(img, s, &cx);
+    let img = match render(img, s, &cx) {
+        Ok(i) => i,
+        Err(e) => return FileStatus::Failed(e),
+    };
     let fmt = s.target_format(input);
     let dims = if fmt == SaveFormat::Ico { (img.width().min(256), img.height().min(256)) } else { img.dimensions() };
     let dir = s.output_dir(input);
@@ -408,7 +438,7 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex
         return FileStatus::Failed(format!("Cannot create {}: {e}", dir.display()));
     }
     let target = dir.join(s.output_name(input, index, dims, taken));
-    let out = match resolve(target, s.conflict, input, reserved) {
+    let (out, protected) = match resolve(target, s.conflict, input, claims) {
         Ok(p) => p,
         Err(why) => return FileStatus::Skipped(why),
     };
@@ -428,7 +458,7 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex
             }
         }
     }
-    FileStatus::Done { out, in_bytes: meta.len(), out_bytes: bytes.len() as u64, dims }
+    FileStatus::Done { out, in_bytes: meta.len(), out_bytes: bytes.len() as u64, dims, note: protected.then(|| PROTECTED_INPUT_NOTE.to_string()) }
 }
 
 pub fn worker_threads() -> usize {
@@ -455,7 +485,7 @@ pub fn start(files: Vec<PathBuf>, s: ConvertSettings, ctx: egui::Context) -> Job
 
 fn run(files: Vec<PathBuf>, s: ConvertSettings, prog: Arc<Progress>, tx: Sender<(usize, FileStatus)>, ctx: egui::Context) {
     use rayon::prelude::*;
-    let reserved = Mutex::new(HashSet::new());
+    let claims = Claims::new(&files);
     let work = |i: usize| {
         if prog.cancel.load(Ordering::Relaxed) {
             return;
@@ -463,7 +493,7 @@ fn run(files: Vec<PathBuf>, s: ConvertSettings, prog: Arc<Progress>, tx: Sender<
         let _ = tx.send((i, FileStatus::Working));
         ctx.request_repaint();
         // A decoder or encoder panic on one file fails that file only.
-        let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process_one(&files[i], i, &s, &reserved)))
+        let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process_one(&files[i], i, &s, &claims)))
             .unwrap_or_else(|e| FileStatus::Failed(format!("Unexpected error: {}", panic_message(&*e))));
         let _ = tx.send((i, st));
         prog.done.fetch_add(1, Ordering::Relaxed);
@@ -552,7 +582,7 @@ mod tests {
         let est = estimate(&input, 0, &s, &Default::default()).unwrap();
         assert_eq!(est.out_dims, (210, 110));
         assert!(est.before.is_some() && est.after.is_some());
-        match process_one(&input, 0, &s, &Mutex::new(HashSet::new())) {
+        match process_one(&input, 0, &s, &Claims::new(std::slice::from_ref(&input))) {
             FileStatus::Done { out, dims, .. } => {
                 assert_eq!(dims, (210, 110));
                 let bytes = std::fs::read(&out).unwrap();
@@ -602,18 +632,55 @@ mod tests {
         let existing = dir.join("a.jpg");
         std::fs::write(&existing, b"x").unwrap();
         let src = dir.join("src.png");
-        let reserved = Mutex::new(HashSet::new());
-        let r1 = resolve(existing.clone(), ConflictPolicy::Rename, &src, &reserved).unwrap();
-        let r2 = resolve(existing.clone(), ConflictPolicy::Rename, &src, &reserved).unwrap();
+        let claims = Claims::new(&[src.clone()]);
+        let r1 = resolve(existing.clone(), ConflictPolicy::Rename, &src, &claims).unwrap().0;
+        let r2 = resolve(existing.clone(), ConflictPolicy::Rename, &src, &claims).unwrap().0;
         assert_eq!(r1, dir.join("a (2).jpg"));
         assert_eq!(r2, dir.join("a (3).jpg"));
-        assert!(resolve(existing.clone(), ConflictPolicy::Skip, &src, &reserved).is_err());
+        assert!(resolve(existing.clone(), ConflictPolicy::Skip, &src, &claims).is_err());
         let fresh = dir.join("b.jpg");
-        assert_eq!(resolve(fresh.clone(), ConflictPolicy::Overwrite, &src, &reserved).unwrap(), fresh);
+        assert_eq!(resolve(fresh.clone(), ConflictPolicy::Overwrite, &src, &claims).unwrap(), (fresh.clone(), false));
         // A second batch file mapping to the same name never overwrites the first output.
-        assert_eq!(resolve(fresh.clone(), ConflictPolicy::Overwrite, &src, &reserved).unwrap(), dir.join("b (2).jpg"));
-        let reserved = Mutex::new(HashSet::new());
-        assert_eq!(resolve(existing.clone(), ConflictPolicy::Overwrite, &src, &reserved).unwrap(), existing);
+        assert_eq!(resolve(fresh.clone(), ConflictPolicy::Overwrite, &src, &claims).unwrap().0, dir.join("b (2).jpg"));
+        let claims = Claims::new(&[src.clone()]);
+        assert_eq!(resolve(existing.clone(), ConflictPolicy::Overwrite, &src, &claims).unwrap().0, existing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_never_targets_another_input() {
+        let dir = std::env::temp_dir().join(format!("lumen-conv-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_png = dir.join("a.png");
+        let a_jpg = dir.join("a.jpg");
+        let b_png = dir.join("b.png");
+        for f in [&a_png, &a_jpg, &b_png] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let inputs = vec![a_png.clone(), a_jpg.clone(), b_png.clone()];
+        for policy in ConflictPolicy::ALL {
+            let claims = Claims::new(&inputs);
+            // a.png -> a.jpg must not replace the input a.jpg (processed or not).
+            match resolve(a_jpg.clone(), policy, &a_png, &claims) {
+                Ok((p, protected)) => {
+                    assert!(protected, "{policy:?}");
+                    assert!(!inputs.iter().any(|i| path_key(i) == path_key(&p)), "{policy:?} -> {}", p.display());
+                    assert_eq!(p, dir.join("a (2).jpg"));
+                }
+                Err(_) => assert_eq!(policy, ConflictPolicy::Skip),
+            }
+            // a.jpg -> a.jpg in place is still allowed with Overwrite.
+            let own = resolve(a_jpg.clone(), policy, &a_jpg, &claims);
+            if policy == ConflictPolicy::Overwrite {
+                assert_eq!(own.unwrap(), (a_jpg.clone(), false));
+            }
+            // Different case or slashes name the same file on Windows.
+            let upper = PathBuf::from(dir.join("B.PNG").to_string_lossy().replace('\\', "/"));
+            if let Ok((p, _)) = resolve(upper, policy, &a_png, &claims) {
+                assert!(!inputs.iter().any(|i| path_key(i) == path_key(&p)), "{policy:?} -> {}", p.display());
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -637,8 +704,8 @@ mod tests {
             grayscale: true,
             ..Default::default()
         };
-        let reserved = Mutex::new(HashSet::new());
-        match process_one(&input, 0, &s, &reserved) {
+        let claims = Claims::new(&[input.clone()]);
+        match process_one(&input, 0, &s, &claims) {
             FileStatus::Done { out, dims, .. } => {
                 assert_eq!(out, dir.join("out").join("wide-01.jpg"));
                 assert_eq!(dims, (100, 50));
