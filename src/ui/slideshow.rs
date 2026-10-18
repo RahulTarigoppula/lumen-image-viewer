@@ -530,6 +530,9 @@ pub struct Slideshow {
     help: bool,
     flash: Option<(&'static str, Instant)>,
     captions: HashMap<PathBuf, Option<String>>,
+    /// EXIF dates read off the UI thread.
+    caption_rx: crossbeam_channel::Receiver<(PathBuf, Option<String>)>,
+    caption_tx: crossbeam_channel::Sender<(PathBuf, Option<String>)>,
     random_count: u64,
     popup_was_open: bool,
     pending_since: Instant,
@@ -541,6 +544,7 @@ impl Slideshow {
         let start = start.min(list.len().saturating_sub(1));
         let base_list = list.clone();
         let start_path = list.get(start).cloned();
+        let (cap_tx, cap_rx) = crossbeam_channel::unbounded();
         let mut s = Slideshow {
             list,
             index: start,
@@ -563,6 +567,8 @@ impl Slideshow {
             help: false,
             flash: None,
             captions: HashMap::new(),
+            caption_rx: cap_rx,
+            caption_tx: cap_tx,
             random_count: 0,
             popup_was_open: false,
             pending_since: Instant::now(),
@@ -675,9 +681,18 @@ impl Slideshow {
     }
 
     fn caption_for(&mut self, path: &Path) {
+        while let Ok((p, d)) = self.caption_rx.try_recv() {
+            self.captions.insert(p, d);
+        }
         if !self.captions.contains_key(path) {
-            let date = crate::meta::read_exif(path).and_then(|e| e.taken);
-            self.captions.insert(path.to_path_buf(), date);
+            // Placeholder until the background read lands.
+            self.captions.insert(path.to_path_buf(), None);
+            let tx = self.caption_tx.clone();
+            let path = path.to_path_buf();
+            rayon::spawn(move || {
+                let date = crate::meta::read_exif(&path).and_then(|e| e.taken);
+                let _ = tx.send((path, date));
+            });
         }
     }
 
@@ -950,6 +965,9 @@ impl Slideshow {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, core: &mut Core) -> bool {
+        while let Ok((p, d)) = self.caption_rx.try_recv() {
+            self.captions.insert(p, d);
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
@@ -1108,8 +1126,11 @@ impl Slideshow {
         // ---- Repaint scheduling: smooth while moving, near-idle otherwise.
         let warming = self.active.is_none() && self.ready.iter().any(|s| !s.warm);
         let moving = self.active.is_some() || (cfg.ken_burns && self.current.is_some() && !self.paused) || flashing || warming;
-        if moving || show_bar {
+        if moving {
             ui.ctx().request_repaint();
+        } else if show_bar {
+            // The bar only needs a gentle tick for its progress line and auto-hide timer.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         } else if !self.paused && self.current.is_some() && self.pending.is_none() {
             let left = (interval - self.display).max(0.0);
             ui.ctx().request_repaint_after(Duration::from_secs_f32(left.min(10.0) + 0.001));

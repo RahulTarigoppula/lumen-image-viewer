@@ -46,6 +46,16 @@ impl AudioShared {
             i.next_pts = Some(pts);
         }
         i.buf.extend(samples.iter().copied());
+        // When audio isn't being consumed (muted speeds), keep at most ~3 s queued.
+        let cap = (self.rate as usize) * (self.channels as usize) * 3;
+        if i.buf.len() > cap {
+            let drop = i.buf.len() - cap;
+            i.buf.drain(..drop);
+            let secs = drop as f64 / (self.rate as f64 * self.channels as f64);
+            if let Some(p) = i.next_pts.as_mut() {
+                *p += secs;
+            }
+        }
     }
     /// Seconds of audio queued.
     pub fn buffered_secs(&self) -> f64 {
