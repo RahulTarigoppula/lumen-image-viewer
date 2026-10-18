@@ -103,7 +103,8 @@ fn cached_thumb(cache: &ThumbCache, path: &Path, s: &SheetSettings) -> Option<Ar
     if let Some(t) = cache.lock().get(&key) {
         return Some(t.clone());
     }
-    let t = Arc::new(sheet::cell_thumb(path, s)?);
+    // A decoder panic on one file leaves an empty cell instead of failing the sheet.
+    let t = Arc::new(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sheet::cell_thumb(path, s))).ok().flatten()?);
     let mut c = cache.lock();
     if c.len() > 400 {
         c.clear();
@@ -126,7 +127,10 @@ impl ContactSheet {
         let (list, ctx) = (files.clone(), core.ctx.clone());
         std::thread::spawn(move || {
             use rayon::prelude::*;
-            let items: Vec<SheetItem> = list.par_iter().map(|p| SheetItem::from_path(p)).collect();
+            let items: Vec<SheetItem> = list
+                .par_iter()
+                .map(|p| std::panic::catch_unwind(|| SheetItem::from_path(p)).unwrap_or_else(|_| SheetItem { path: p.clone(), dims: None, size: 0, modified: None }))
+                .collect();
             let _ = tx.send(items);
             ctx.request_repaint();
         });
@@ -552,7 +556,10 @@ pub struct Duplicates {
     scan: Option<ScanJob>,
     items: Arc<Vec<ScanItem>>,
     scanned: Option<(bool, bool)>,
+    /// Groups hold indices into `items`; they are only valid while
+    /// `groups_gen == items_gen` (see `replace_items` / `accept_groups`).
     groups: Vec<Group>,
+    groups_gen: u64,
     grouped_for: Option<(bool, u32)>,
     /// Grouping runs on a worker: (parameters, scan generation, result).
     group_rx: Option<Receiver<((bool, u32), u64, Vec<Group>)>>,
@@ -663,7 +670,13 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
 impl Duplicates {
     pub fn new(folder: PathBuf, files: Vec<PathBuf>, core: &Core) -> Self {
         let files: Vec<PathBuf> = files.into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
-        let mut d = Duplicates {
+        let mut d = Self::blank(folder, files);
+        d.start_scan(&core.ctx);
+        d
+    }
+
+    fn blank(folder: PathBuf, files: Vec<PathBuf>) -> Self {
+        Duplicates {
             folder,
             files,
             include_subfolders: false,
@@ -673,6 +686,7 @@ impl Duplicates {
             items: Arc::new(Vec::new()),
             scanned: None,
             groups: Vec::new(),
+            groups_gen: 0,
             grouped_for: None,
             group_rx: None,
             items_gen: 0,
@@ -683,9 +697,46 @@ impl Duplicates {
             confirm_delete: false,
             deleting: None,
             error: None,
-        };
-        d.start_scan(&core.ctx);
-        d
+        }
+    }
+
+    /// Swap in a new item list. Groups and marks from the old list are
+    /// dropped at once: group members are indices into `items`, so keeping
+    /// them would draw (or mark for deletion) the wrong files.
+    fn replace_items(&mut self, items: Vec<ScanItem>) {
+        self.items = Arc::new(items);
+        self.items_gen += 1;
+        self.groups.clear();
+        self.groups_gen = self.items_gen;
+        self.marked.clear();
+        self.grouped_for = None;
+        // A grouping still running for the old list is stale; let a new one start.
+        self.group_rx = None;
+    }
+
+    /// Accept a grouping result computed for `generation` of the item list.
+    /// Returns false (and changes nothing) when it belongs to another list.
+    fn accept_groups(&mut self, want: (bool, u32), generation: u64, mut groups: Vec<Group>) -> bool {
+        if generation != self.items_gen {
+            return false;
+        }
+        let n = self.items.len();
+        groups.retain(|g| g.members.len() > 1 && g.members.iter().all(|&i| i < n));
+        self.groups = groups;
+        self.groups_gen = generation;
+        self.grouped_for = Some(want);
+        let present: HashSet<&PathBuf> = self.groups.iter().flat_map(|g| g.members.iter().map(|&i| &self.items[i].path)).collect();
+        self.marked.retain(|m| present.contains(m));
+        true
+    }
+
+    /// Defensive: never keep groups that index into another item list.
+    fn ensure_groups_current(&mut self) {
+        let n = self.items.len();
+        if self.groups_gen != self.items_gen || self.groups.iter().any(|g| g.members.iter().any(|&i| i >= n)) {
+            self.groups.clear();
+            self.groups_gen = self.items_gen;
+        }
     }
 
     fn start_scan(&mut self, ctx: &egui::Context) {
@@ -716,11 +767,8 @@ impl Duplicates {
                 self.scan = None;
                 match r {
                     Ok(items) => {
-                        self.items = Arc::new(items);
-                        self.items_gen += 1;
+                        self.replace_items(items);
                         self.scanned = Some((sim, self.include_subfolders));
-                        self.marked.clear();
-                        self.grouped_for = None;
                     }
                     Err(e) if e == "Cancelled" => {}
                     Err(e) => self.error = Some(e),
@@ -731,12 +779,7 @@ impl Duplicates {
             match rx.try_recv() {
                 Ok((want, generation, groups)) => {
                     self.group_rx = None;
-                    if generation == self.items_gen {
-                        self.groups = groups;
-                        self.grouped_for = Some(want);
-                        let present: HashSet<&PathBuf> = self.groups.iter().flat_map(|g| g.members.iter().map(|&i| &self.items[i].path)).collect();
-                        self.marked.retain(|m| present.contains(m));
-                    }
+                    self.accept_groups(want, generation, groups);
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.group_rx = None;
@@ -786,10 +829,7 @@ impl Duplicates {
                 if !gone.is_empty() {
                     let set: HashSet<&PathBuf> = gone.iter().collect();
                     let items: Vec<ScanItem> = self.items.iter().filter(|it| !set.contains(&it.path)).cloned().collect();
-                    self.items = Arc::new(items);
-                    self.items_gen += 1;
-                    self.grouped_for = None;
-                    self.marked.retain(|m| !set.contains(m));
+                    self.replace_items(items);
                 }
                 match r {
                     Ok(_) => core.toasts.success(format!("Moved {} file{} to the Recycle Bin", gone.len(), if gone.len() == 1 { "" } else { "s" })),
@@ -807,7 +847,8 @@ impl Duplicates {
     }
 
     fn mark_best(&mut self, gi: usize) {
-        let g = &self.groups[gi];
+        self.ensure_groups_current();
+        let Some(g) = self.groups.get(gi) else { return };
         let best = dupes::best_in_group(&self.items, &g.members, self.keep_rule);
         for (k, &i) in g.members.iter().enumerate() {
             let path = self.items[i].path.clone();
@@ -836,6 +877,9 @@ impl Duplicates {
             .show(ctx, |ui| {
                 close = self.ui(ui, &p, core, &mut events);
             });
+        if self.confirm_delete && (self.marked.is_empty() || self.deleting.is_some()) {
+            self.confirm_delete = false;
+        }
         if self.confirm_delete {
             let paths: Vec<PathBuf> = self.marked.iter().cloned().collect();
             let bytes: u64 = self.items.iter().filter(|it| self.marked.contains(&it.path)).map(|it| it.size).sum();
@@ -870,6 +914,7 @@ impl Duplicates {
     }
 
     fn ui(&mut self, ui: &mut Ui, p: &Palette, core: &mut Core, events: &mut Vec<DupEvent>) -> bool {
+        self.ensure_groups_current();
         let mut close = false;
         let scanning = self.scan.is_some();
         let busy = scanning || self.deleting.is_some();
@@ -1051,8 +1096,8 @@ impl Duplicates {
             if let Some(gi) = mark_group {
                 self.mark_best(gi);
             }
-            if let Some(gi) = unmark_group {
-                for &i in &self.groups[gi].members {
+            if let Some(g) = unmark_group.and_then(|gi| self.groups.get(gi)) {
+                for &i in &g.members {
                     self.marked.remove(&self.items[i].path);
                 }
             }
@@ -1086,6 +1131,42 @@ mod tests {
         let p = std::path::Path::new("C:\\Users\\someone\\Pictures\\2024\\Holiday");
         assert_eq!(super::short_path(p, 80), "C:\\Users\\someone\\Pictures\\2024\\Holiday");
         assert_eq!(super::short_path(p, 20), "...\\2024\\Holiday");
+    }
+
+    fn item(name: &str) -> super::ScanItem {
+        super::ScanItem { path: std::path::PathBuf::from(name), size: 10, modified: None, dims: None, content: Some(1), dhash: None, detail: 0.0 }
+    }
+
+    fn group(members: Vec<usize>) -> super::Group {
+        super::Group { kind: super::GroupKind::Identical, members, min_similarity: 100 }
+    }
+
+    #[test]
+    fn duplicate_groups_never_outlive_their_item_list() {
+        let mut d = super::Duplicates::blank(std::path::PathBuf::from("C:\\x"), Vec::new());
+        d.replace_items(vec![item("a"), item("b"), item("c"), item("d")]);
+        let old_gen = d.items_gen;
+        assert!(d.accept_groups((false, 0), old_gen, vec![group(vec![2, 3])]));
+        d.marked.insert("d".into());
+        // The list shrinks (files were moved to the Recycle Bin): old groups and marks go.
+        d.replace_items(vec![item("a"), item("c")]);
+        assert!(d.groups.is_empty());
+        assert!(d.marked.is_empty());
+        assert!(d.grouped_for.is_none());
+        // A late result for the old list is ignored and cannot index the new one.
+        assert!(!d.accept_groups((false, 0), old_gen, vec![group(vec![2, 3])]));
+        assert!(d.groups.is_empty());
+        d.mark_best(0);
+        assert!(d.marked.is_empty());
+        // Out-of-range members are dropped even for the current generation.
+        assert!(d.accept_groups((false, 0), d.items_gen, vec![group(vec![0, 1]), group(vec![1, 5])]));
+        assert_eq!(d.groups.len(), 1);
+        d.mark_best(0);
+        assert_eq!(d.marked.len(), 1);
+        // Stale groups left behind by any other path are cleared before use.
+        d.items_gen += 1;
+        d.ensure_groups_current();
+        assert!(d.groups.is_empty());
     }
 }
 

@@ -340,7 +340,9 @@ impl BatchConvert {
             if job.elapsed.is_some() && !self.toasted {
                 self.toasted = true;
                 let ok = self.statuses.iter().filter(|s| matches!(s, FileStatus::Done { .. })).count();
-                core.toasts.success(format!("Batch convert finished: {ok} of {} files", self.statuses.len()));
+                let renamed = self.statuses.iter().filter(|s| matches!(s, FileStatus::Done { note: Some(_), .. })).count();
+                let extra = if renamed > 0 { format!(" ({renamed} given a numbered name so no other file of the batch was replaced)") } else { String::new() };
+                core.toasts.success(format!("Batch convert finished: {ok} of {} files{extra}", self.statuses.len()));
             }
         }
         let mut open = true;
@@ -927,8 +929,11 @@ impl BatchConvert {
                             }
                             ui.add(egui::Label::new(RichText::new(file_name(f)).size(12.5)).truncate()).on_hover_text(f.display().to_string());
                             match &self.statuses[i] {
-                                FileStatus::Done { out, out_bytes, dims, .. } => {
+                                FileStatus::Done { out, out_bytes, dims, note, .. } => {
                                     ui.label(RichText::new(I::ARROW_RIGHT).color(p.faint));
+                                    if let Some(note) = note {
+                                        ui.label(RichText::new(I::WARNING_CIRCLE).color(p.warn)).on_hover_text(note);
+                                    }
                                     ui.add(egui::Label::new(RichText::new(file_name(out)).size(12.5)).truncate()).on_hover_text(out.display().to_string());
                                     ui.label(RichText::new(format!("{} × {} · {}", dims.0, dims.1, human_size(*out_bytes))).size(11.5).color(p.muted));
                                 }

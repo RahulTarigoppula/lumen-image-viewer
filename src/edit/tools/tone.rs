@@ -182,7 +182,7 @@ impl EditTool for Levels {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button(format!("{}  Auto", crate::ui::icons::MAGIC_WAND)).on_hover_text("Stretch each channel (removes colour casts)").clicked() {
+            if ui.button(format!("{}  Auto", crate::ui::icons::MAGIC_WAND)).on_hover_text("Stretch each channel (removes color casts)").clicked() {
                 self.auto(cx.histogram);
                 c = true;
             }

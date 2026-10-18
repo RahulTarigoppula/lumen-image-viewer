@@ -49,7 +49,10 @@ pub struct GpuImage {
     pyramid: Vec<Arc<RgbaImage>>,
     levels: Vec<Level>,
     top: Option<TextureHandle>,
-    nearest_level0: bool,
+    /// Full-resolution tiles uploaded with nearest-neighbour magnification.
+    /// Kept apart from `levels[0]` (linear) so a view and the magnifier using
+    /// different filters do not free and re-upload each other's tiles.
+    nearest0: Level,
     frame_counter: u64,
     name: String,
 }
@@ -133,7 +136,12 @@ impl GpuImage {
             color_image_from_rgba(top_img),
             tex_options(false),
         ));
-        GpuImage { width, height, pyramid, levels, top, nearest_level0: false, frame_counter: 0, name: name.to_string() }
+        let nearest0 = {
+            let (cols, rows) = (width.div_ceil(TILE), height.div_ceil(TILE));
+            let n = (cols * rows) as usize;
+            Level { cols, rows, tiles: vec![None; n], last_used: vec![0; n] }
+        };
+        GpuImage { width, height, pyramid, levels, top, nearest0, frame_counter: 0, name: name.to_string() }
     }
 
     pub fn level_count(&self) -> usize {
@@ -166,12 +174,6 @@ impl GpuImage {
         tint: Color32,
     ) -> bool {
         self.frame_counter += 1;
-        if nearest != self.nearest_level0 {
-            self.nearest_level0 = nearest;
-            for t in self.levels[0].tiles.iter_mut() {
-                *t = None;
-            }
-        }
         let li = self.level_for_zoom(zoom);
         let started = Instant::now();
         let budget = std::time::Duration::from_millis(12);
@@ -190,7 +192,8 @@ impl GpuImage {
         let vy0 = (((visible.min.y - dest.min.y) / sy).floor().max(0.0)) as u32;
         let vx1 = (((visible.max.x - dest.min.x) / sx).ceil() as u32).min(lw);
         let vy1 = (((visible.max.y - dest.min.y) / sy).ceil() as u32).min(lh);
-        let level = &mut self.levels[li];
+        let use_nearest = li == 0 && nearest;
+        let level = if use_nearest { &mut self.nearest0 } else { &mut self.levels[li] };
         let c0 = vx0 / TILE;
         let r0 = vy0 / TILE;
         let c1 = vx1.saturating_sub(1) / TILE;
@@ -211,7 +214,8 @@ impl GpuImage {
             da.partial_cmp(&db).unwrap()
         });
 
-        let opts = tex_options(li == 0 && nearest);
+        let opts = tex_options(use_nearest);
+        let tag = if use_nearest { "n" } else { "" };
         let top_tex = self.top.as_ref().map(|t| t.id());
         let mut meshes: Vec<(egui::TextureId, Rect, Rect)> = Vec::new();
         for (c, r) in order {
@@ -226,7 +230,7 @@ impl GpuImage {
             );
             if level.tiles[idx].is_none() && (started.elapsed() < budget || meshes.is_empty() && li == self.pyramid.len() - 1) {
                 let ci = to_color_image_gutter(&level_img, tx, ty, tw, th, GUTTER);
-                level.tiles[idx] = Some(ctx.load_texture(format!("{}#{li}/{idx}", self.name), ci, opts));
+                level.tiles[idx] = Some(ctx.load_texture(format!("{}#{li}{tag}/{idx}", self.name), ci, opts));
             }
             level.last_used[idx] = self.frame_counter;
             match &level.tiles[idx] {
@@ -249,7 +253,7 @@ impl GpuImage {
             mesh.add_rect_with_uv(rect, uv, tint);
             painter.add(egui::Shape::mesh(mesh));
         }
-        self.evict(li);
+        self.evict(if use_nearest { usize::MAX } else { li });
         if pending {
             ctx.request_repaint();
         }
@@ -257,8 +261,14 @@ impl GpuImage {
     }
 
     /// Free tiles of other levels and tiles not drawn recently to bound VRAM use.
+    /// `current` is the level just drawn (`usize::MAX` for the nearest set).
     fn evict(&mut self, current: usize) {
         let now = self.frame_counter;
+        for (t, used) in self.nearest0.tiles.iter_mut().zip(self.nearest0.last_used.iter()) {
+            if t.is_some() && (current != usize::MAX && now - *used > 120 || now - *used > 600) {
+                *t = None;
+            }
+        }
         let last = self.levels.len() - 1;
         for (li, level) in self.levels.iter_mut().enumerate() {
             if li == last {

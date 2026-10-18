@@ -121,7 +121,7 @@ impl AudioOut {
         let s2 = shared.clone();
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => device.build_output_stream(
-                &config,
+                config.clone(),
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     s2.fill(data, latency_of(info));
                 },
@@ -131,7 +131,7 @@ impl AudioOut {
             cpal::SampleFormat::I16 => {
                 let mut tmp: Vec<f32> = Vec::new();
                 device.build_output_stream(
-                    &config,
+                    config.clone(),
                     move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
                         tmp.resize(data.len(), 0.0);
                         s2.fill(&mut tmp, latency_of(info));
@@ -146,7 +146,7 @@ impl AudioOut {
             cpal::SampleFormat::U16 => {
                 let mut tmp: Vec<f32> = Vec::new();
                 device.build_output_stream(
-                    &config,
+                    config.clone(),
                     move |data: &mut [u16], info: &cpal::OutputCallbackInfo| {
                         tmp.resize(data.len(), 0.0);
                         s2.fill(&mut tmp, latency_of(info));
@@ -167,5 +167,5 @@ impl AudioOut {
 
 fn latency_of(info: &cpal::OutputCallbackInfo) -> f64 {
     let ts = info.timestamp();
-    ts.playback.duration_since(&ts.callback).map(|d| d.as_secs_f64()).unwrap_or(0.0).min(0.5)
+    ts.playback.duration_since(ts.callback).as_secs_f64().min(0.5)
 }
