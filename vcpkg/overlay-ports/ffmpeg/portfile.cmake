@@ -33,7 +33,7 @@ if (VCPKG_TARGET_ARCHITECTURE STREQUAL "x86" OR VCPKG_TARGET_ARCHITECTURE STREQU
     vcpkg_add_to_path("${NASM_EXE_PATH}")
 endif()
 
-set(OPTIONS "--enable-pic --disable-doc --enable-runtime-cpudetect --disable-autodetect --disable-encoders --disable-muxers --disable-devices --disable-filters --disable-network --disable-protocols --enable-protocol=file")  # Lumen: decode-only build
+set(OPTIONS "--enable-pic --disable-doc --enable-runtime-cpudetect --disable-autodetect --disable-encoders --disable-muxers --disable-devices --disable-filters --disable-network --disable-protocols --enable-protocol=file --disable-decoder=sanm")  # Lumen: decode-only build (sanm hangs MSVC 2019)
 
 if(VCPKG_TARGET_IS_MINGW)
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x86")
