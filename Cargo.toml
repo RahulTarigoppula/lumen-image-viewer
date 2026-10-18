@@ -2,7 +2,7 @@
 name = "lumen"
 version = "0.1.0"
 edition = "2021"
-description = "Lumen — a fast, private, modern image viewer, browser, editor and converter for Windows"
+description = "Lumen: a fast, private, modern image viewer, browser, editor and converter for Windows"
 license = "MIT"
 authors = ["Rahul Tarigoppula"]
 repository = "https://github.com/RahulTarigoppula/lumen-image-viewer"
@@ -12,7 +12,6 @@ build = "build.rs"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 egui = { version = "0.37", features = ["bytemuck"] }
 egui_extras = { version = "0.37", features = ["image"] }
-egui-phosphor = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp", "ico", "tga", "pnm", "hdr", "exr", "qoi", "dds", "ff", "rayon"] }
 fast_image_resize = { version = "6", features = ["rayon", "image"] }
 rayon = "1"
@@ -59,6 +58,9 @@ features = [
     "Win32_Security",
     "Win32_System_Pipes",
     "Win32_System_IO",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Storage_Xps",
 ]
 
 [features]
