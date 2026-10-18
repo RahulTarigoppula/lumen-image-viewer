@@ -5,20 +5,53 @@ immediate-mode (egui 0.37 on OpenGL via eframe); every expensive operation runs
 off the UI thread so the interface stays at display refresh rate on folders with
 tens of thousands of files and on images of hundreds of megapixels.
 
+## Crates
+
+The repository is a Cargo workspace with two crates:
+
+| Crate | Path | Contents | Depends on |
+|---|---|---|---|
+| `lumen` (binary) | `src/` | UI (egui/eframe), viewer, browser, batch tools, GPU renderer, loader and thumbnail pools, shell integration, FFmpeg video engine (`video` feature), `build.rs` (resources, FFmpeg link libraries) | `lumen-core`, egui, eframe, FFmpeg |
+| `lumen-core` (library `lumen_core`) | `crates/lumen-core/` | Everything with no UI and no FFmpeg: formats, decoders, color, resizing, encoders, metadata, catalog, tags, settings data, edit pixel operations, video metrics and scopes | image, WIC (`windows`), small pure-Rust codecs |
+
+`lumen-core` must never depend on egui, eframe or FFmpeg. The app imports
+the core modules at its crate root (`use lumen_core::{decode, settings, ...}`
+in `main.rs`, `pub use lumen_core::edit::*` in `edit/mod.rs`, and
+`pub use lumen_core::video::...` in `video/mod.rs`), so app code keeps using
+`crate::decode`, `crate::edit::filters`, `crate::video::metrics` and so on.
+Two seams connect the crates at run time:
+
+- `lumen_core::video::set_thumbnailer`: the app installs the FFmpeg
+  thumbnailer at startup when built with `video`; without it video
+  thumbnails report "no video support".
+- `lumen_core::meta::MetaService::new(repaint)`: takes a repaint callback
+  instead of an `egui::Context`.
+
+Splitting the crates keeps incremental builds of the app small: editing UI
+code recompiles only `lumen`, and `lumen-core` is rebuilt only when its own
+sources change. Profiles live in the workspace root `Cargo.toml`; shared
+dependency versions are in `[workspace.dependencies]`.
+
 ## Module map
 
-| Area | Modules | Responsibility |
-|---|---|---|
-| Shell | `main.rs`, `app.rs`, `shell.rs`, `devhook.rs` | Startup, single instance (named pipe), mode switching, command dispatch, dialogs, dev automation hook |
-| Commands and input | `ui/commands.rs`, `ui/keymap.rs`, `ui/palette.rs` | One `Command` enum drives menus, toolbar, shortcuts and the Ctrl+K palette; remappable keymap with presets |
-| Browser | `ui/browser.rs`, `ui/tree.rs`, `catalog.rs`, `tags.rs` | Folder listing, sorting, filtering, grid and details views, folder tree, ratings/flags/labels |
-| Viewer | `ui/viewer.rs`, `render.rs`, `loader.rs` | Zoom/pan, magnifier, crop, tool hosting, animation, info panel; tiled GPU renderer; decode cache with preloading |
-| Decoding | `decode/*`, `formats.rs`, `meta.rs` | Pure-Rust decoders, WIC fallback (HEIC/AVIF/RAW/JXL), ICC to sRGB, EXIF |
-| Encoding | `encode.rs` | JPEG/PNG/WebP/TIFF/... with metadata preservation, atomic writes, lossless JPEG orientation |
-| Editing | `edit/*` | `EditTool` trait, undo session, filters, effects, geometry, tone curves, text, draw board, retouch |
-| Batch and tools | `ui/batch*`, `ui/tools*` | Batch convert pipeline, batch rename, contact sheet, duplicates, output tools, printing |
-| Modes | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and A/B analysis |
-| Video | `video/engine.rs`, `video/audio.rs`, `video/metrics.rs`, `video/scopes.rs`, `video/analyze.rs`, `video/mode.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, PSNR/SSIM, scopes, whole-file analysis, UI |
+| Area | Crate | Modules | Responsibility |
+|---|---|---|---|
+| Shell | `lumen` | `main.rs`, `app.rs`, `shell.rs`, `devhook.rs`, `fileops.rs`, `bg.rs` | Startup, single instance (named pipe), mode switching, command dispatch, dialogs, file operations, dev automation hook |
+| Commands and input | `lumen` | `ui/commands.rs`, `ui/keymap.rs`, `ui/palette.rs` | One `Command` enum drives menus, toolbar, shortcuts and the Ctrl+K palette; remappable keymap with presets |
+| Browser | `lumen` | `ui/browser.rs`, `ui/tree.rs`, `thumbs.rs` | Grid and details views, folder tree, thumbnail pool and GPU texture cache |
+| Catalog and tags | `lumen-core` | `catalog.rs`, `tags.rs`, `settings.rs` | Folder listing, sorting, filtering, ratings/flags/labels, settings data and storage paths |
+| Viewer | `lumen` | `ui/viewer.rs`, `render.rs`, `loader.rs` | Zoom/pan, magnifier, crop, tool hosting, animation, info panel; tiled GPU renderer; decode cache with preloading |
+| Decoding | `lumen-core` | `decode/*`, `formats.rs`, `imaging.rs`, `meta.rs` | Pure-Rust decoders, WIC fallback (HEIC/AVIF/RAW/JXL), ICC to sRGB, resizing, EXIF |
+| Encoding | `lumen-core` | `encode.rs`, `metaedit.rs` | JPEG/PNG/WebP/TIFF/... with metadata preservation, atomic writes, lossless JPEG orientation, metadata editing |
+| Editing (pixels) | `lumen-core` | `edit/mod.rs`, `edit/{ops,filters,effects,geom,tone,text,mask,raster,retouch}.rs` | Undo session, histogram data, filters, effects, geometry, tone curves, text, draw board rasterization, retouch |
+| Editing (UI) | `lumen` | `edit/mod.rs`, `edit/tools.rs`, `edit/tools/*` | `EditTool` trait, tool contexts, histogram painting, every adjustment dialog |
+| Batch and tools | `lumen` | `ui/batch*`, `ui/tools*` | Batch convert pipeline, batch rename, contact sheet, duplicates, output tools, printing |
+| Modes | `lumen` | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and A/B analysis |
+| Video (pure) | `lumen-core` | `video/mod.rs`, `video/metrics.rs`, `video/scopes.rs` | Video extensions, PSNR/SSIM, scopes, thumbnailer hook |
+| Video (FFmpeg) | `lumen` | `video/engine.rs`, `video/audio.rs`, `video/analyze.rs`, `video/mode.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, whole-file analysis, UI |
+
+Paths in the `lumen-core` rows are relative to `crates/lumen-core/src/`, the
+others to `src/`.
 
 ## Threading model
 
@@ -63,3 +96,5 @@ The dev hook (`LUMEN_DEV_DIR`) provides `bench <frames>` (per-section frame timi
 ## Testing
 
 Unit tests cover pure logic (sorting, metadata patching, encoders round-trip, metrics, edit operations, rename planning, keymap). UI flows are exercised through the dev automation hook, which can run commands, open files, and capture window screenshots from inside the app.
+
+Most unit tests live in `lumen-core` next to the code they cover. Run everything with `cargo test --workspace --no-default-features`; `cargo test -p lumen-core` runs only the core tests and does not build the UI.

@@ -29,9 +29,9 @@ jobs:
             target
           key: cargo-quick-${{ hashFiles('Cargo.lock') }}
       - name: Check UI text uses plain punctuation
-        run: python tools/scrub_text.py --check src
+        run: python tools/scrub_text.py --check src crates
       - name: Unit tests (image features)
-        run: cargo test --no-default-features
+        run: cargo test --workspace --no-default-features
 
   windows:
     runs-on: windows-latest

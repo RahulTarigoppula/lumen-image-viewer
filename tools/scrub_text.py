@@ -1,9 +1,9 @@
 """Replace typographic punctuation (em/en dashes, ellipsis, curly quotes) with plain ASCII.
-Usage: python tools/scrub_text.py [paths...]  (defaults to src, README.md, docs)"""
+Usage: python tools/scrub_text.py [paths...]  (defaults to src, crates, README.md, docs)"""
 import pathlib, sys
 check = "--check" in sys.argv
 args = [a for a in sys.argv[1:] if a != "--check"]
-roots = args or ["src", "README.md", "THIRD-PARTY-NOTICES.md", "docs"]
+roots = args or ["src", "crates", "README.md", "THIRD-PARTY-NOTICES.md", "docs"]
 # Curly double quotes map to a single quote: a bare " would end a Rust string literal.
 REPL = [(" — ", " - "), ("—", " - "), (" – ", " - "), ("–", "-"), ("…", "..."),
         ("“", "'"), ("”", "'"), ("‘", "'"), ("’", "'"), ("−", "-"), ("›", ">"), ("‹", "<")]

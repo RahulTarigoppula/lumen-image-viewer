@@ -67,6 +67,8 @@ cargo build --release                          # target\release\lumen.exe
 cargo build --release --no-default-features    # image-only build without FFmpeg
 ```
 
+The repository is a Cargo workspace: the `lumen` app at the root and the UI-free `lumen-core` library in `crates/lumen-core`. Run all unit tests with `cargo test --workspace --no-default-features` (no FFmpeg needed).
+
 Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md), and the proposed analysis feature in [docs/ANALYSIS-PLAN.md](docs/ANALYSIS-PLAN.md).
 
 ## Privacy
