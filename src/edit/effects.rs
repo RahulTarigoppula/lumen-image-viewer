@@ -15,7 +15,8 @@ fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
-/// Blend `fx` over `orig` by `t` (0..1), RGB only.
+/// Blend `fx` over `orig` by `t` (0..1). Alpha is blended too, so a partial
+/// strength stays consistent with 100 % for effects that change alpha.
 pub fn mix_images(orig: &RgbaImage, fx: &RgbaImage, t: f32) -> RgbaImage {
     let t = t.clamp(0.0, 1.0);
     if t >= 1.0 || orig.dimensions() != fx.dimensions() {
@@ -24,8 +25,8 @@ pub fn mix_images(orig: &RgbaImage, fx: &RgbaImage, t: f32) -> RgbaImage {
     let mut out = orig.clone();
     out.as_mut().par_chunks_mut(4 * 4096).zip(fx.as_raw().par_chunks(4 * 4096)).for_each(|(o, f)| {
         for (p, q) in o.chunks_exact_mut(4).zip(f.chunks_exact(4)) {
-            for c in 0..3 {
-                p[c] = (p[c] as f32 + (q[c] as f32 - p[c] as f32) * t + 0.5) as u8;
+            for c in 0..4 {
+                p[c] = (p[c] as f32 + (q[c] as f32 - p[c] as f32) * t).round().clamp(0.0, 255.0) as u8;
             }
         }
     });
