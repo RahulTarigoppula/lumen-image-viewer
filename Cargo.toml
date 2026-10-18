@@ -37,6 +37,8 @@ ffmpeg-next = { version = "=9.0.0", optional = true, default-features = false, f
 ffmpeg-sys-next = { version = "=9.0.1", optional = true, default-features = false, features = ["avcodec", "avformat", "swscale", "swresample", "static"] }
 cpal = { version = "0.18", optional = true }
 bytemuck = "1.25.2"
+ab_glyph = "0.2"
+epaint_default_fonts = "0.37"
 
 [dependencies.windows]
 version = "0.62"
