@@ -32,22 +32,189 @@ struct Anim {
     frame: usize,
     next_at: Instant,
     playing: bool,
+    /// One texture per frame when the whole animation is small enough
+    /// (no re-upload on every loop), otherwise a single reused texture.
+    frame_tex: Vec<Option<egui::TextureHandle>>,
     tex: Option<egui::TextureHandle>,
     shown_frame: usize,
 }
 
+/// Cache all frames of an animation as textures when it has at most this many pixels in total.
+const ANIM_CACHE_PIXELS: u64 = 24_000_000;
+
+/// The screen-sized working copy a tool previews on, prepared off the UI thread.
+struct ToolBase {
+    image: Arc<RgbaImage>,
+    scale: f32,
+    histogram: Histogram,
+}
+
 struct ActiveTool {
     tool: Box<dyn EditTool>,
-    base: Arc<RgbaImage>,
-    scale: f32,
+    base: Option<ToolBase>,
+    base_rx: Option<Receiver<ToolBase>>,
     version: u64,
     preview: Option<GpuImage>,
     preview_version: u64,
     rx: Option<Receiver<(u64, RgbaImage)>>,
     running: Option<u64>,
     final_rx: Option<Receiver<RgbaImage>>,
-    histogram: Histogram,
     show_original: bool,
+    error: Option<String>,
+}
+
+impl ActiveTool {
+    fn scale(&self) -> f32 {
+        self.base.as_ref().map(|b| b.scale).unwrap_or(1.0)
+    }
+}
+
+/// Identifies what a cached `GpuImage` was built from. Keying decoded images by
+/// the pyramid allocation means a re-decode of the same path (lossless rotate,
+/// external change) always gets a fresh texture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GpuKey {
+    Decoded(usize),
+    Edit(u64),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Edge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+/// Which edge of `view` the pointer is within `margin` points of (nearest wins).
+pub fn edge_at(view: Rect, pos: Pos2, margin: f32) -> Option<Edge> {
+    if !view.is_positive() || pos.x < view.min.x - 1.0 || pos.x > view.max.x + 1.0 || pos.y < view.min.y - 1.0 || pos.y > view.max.y + 1.0 {
+        return None;
+    }
+    let d = [(Edge::Top, pos.y - view.min.y), (Edge::Right, view.max.x - pos.x), (Edge::Bottom, view.max.y - pos.y), (Edge::Left, pos.x - view.min.x)];
+    d.iter().filter(|(_, v)| *v <= margin).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(e, _)| *e)
+}
+
+/// Pop-out edge panel state (FastStone-style full-screen panels).
+#[derive(Default)]
+struct EdgeState {
+    dwell: Option<(Edge, Instant)>,
+    open: Option<Edge>,
+    /// Last opened edge, kept while the panel fades out.
+    shown: Option<Edge>,
+    panel_rect: Option<Rect>,
+}
+
+const EDGE_MARGIN: f32 = 6.0;
+const EDGE_DWELL: Duration = Duration::from_millis(250);
+
+/// Wheel delta in points per mouse-wheel notch.
+pub const WHEEL_NOTCH: f32 = 40.0;
+
+/// Turns wheel / touchpad scrolling into whole navigation steps. A mouse steps
+/// once per notch; a precision touchpad swipe steps once per gesture.
+#[derive(Default, Debug)]
+pub struct WheelNav {
+    acc: f32,
+    last: Option<f64>,
+    latched: bool,
+}
+
+impl WheelNav {
+    /// Feed this frame's vertical delta (points, + = up). Returns -1, 0 or +1.
+    pub fn feed(&mut self, delta: f32, precise: bool, now: f64) -> i32 {
+        if delta == 0.0 {
+            return 0;
+        }
+        let idle = self.last.map(|t| now - t > 0.3).unwrap_or(true);
+        if idle || (self.acc != 0.0 && self.acc.signum() != delta.signum()) {
+            self.acc = 0.0;
+            self.latched = false;
+        }
+        self.last = Some(now);
+        if self.latched {
+            return 0;
+        }
+        self.acc += delta;
+        let threshold = if precise { WHEEL_NOTCH * 1.5 } else { WHEEL_NOTCH * 0.9 };
+        if self.acc.abs() >= threshold {
+            let s = self.acc.signum() as i32;
+            if precise {
+                // One image per touchpad swipe: wait for the gesture to end.
+                self.latched = true;
+                self.acc = 0.0;
+            } else {
+                self.acc = (self.acc - self.acc.signum() * WHEEL_NOTCH).clamp(-WHEEL_NOTCH * 0.5, WHEEL_NOTCH * 0.5);
+            }
+            return s;
+        }
+        0
+    }
+}
+
+/// True for scroll events from a precision touchpad (smooth deltas) rather
+/// than a notched mouse wheel. On Windows both arrive as line deltas; wheels
+/// report whole notches.
+pub fn is_precise_scroll(unit: egui::MouseWheelUnit, delta: Vec2) -> bool {
+    match unit {
+        egui::MouseWheelUnit::Point => true,
+        egui::MouseWheelUnit::Line => {
+            let frac = |v: f32| (v - v.round()).abs() > 0.01;
+            delta.x != 0.0 || frac(delta.y) || (delta.y != 0.0 && delta.y.abs() < 1.0)
+        }
+        egui::MouseWheelUnit::Page => false,
+    }
+}
+
+/// Scroll / gesture input of one frame, with ctrl-wheel and pinch kept apart
+/// (egui's `zoom_delta()` folds ctrl+wheel in, which would count it twice).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ScrollInput {
+    /// Vertical wheel delta in points (all sources).
+    pub wheel: f32,
+    /// Delta of precise (touchpad) events, both axes, in points.
+    pub precise: Vec2,
+    pub any_precise: bool,
+    /// Pinch zoom factor from touch screens / gesture events (1 = none).
+    pub pinch: f32,
+    /// Two-finger touch-screen pan in points.
+    pub touch_pan: Vec2,
+}
+
+pub fn scroll_input(i: &egui::InputState) -> ScrollInput {
+    let mut s = ScrollInput { pinch: 1.0, ..Default::default() };
+    let mut gesture_zoom = 1.0;
+    for e in &i.raw.events {
+        match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let k = match unit {
+                    egui::MouseWheelUnit::Point => 1.0,
+                    egui::MouseWheelUnit::Line => WHEEL_NOTCH,
+                    egui::MouseWheelUnit::Page => 400.0,
+                };
+                s.wheel += delta.y * k;
+                if is_precise_scroll(*unit, *delta) {
+                    s.any_precise = true;
+                    s.precise += *delta * k;
+                }
+            }
+            egui::Event::Zoom(f) => gesture_zoom *= *f,
+            _ => {}
+        }
+    }
+    match i.multi_touch() {
+        Some(t) => {
+            s.pinch = t.zoom_delta;
+            s.touch_pan = t.translation_delta;
+        }
+        None => s.pinch = gesture_zoom,
+    }
+    s
+}
+
+/// Image point (pixels) for a normalized centre when the zoom ratio is locked.
+pub fn locked_center(norm: Vec2, img: (u32, u32)) -> Vec2 {
+    Vec2::new(norm.x.clamp(0.0, 1.0) * img.0 as f32, norm.y.clamp(0.0, 1.0) * img.1 as f32)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -78,7 +245,9 @@ pub struct Viewer {
     pub center: Vec2,
     pub auto_fit: Option<FitMode>,
     zoom_target: Option<(f32, Pos2)>,
-    gpu: Option<(PathBuf, u64, GpuImage)>,
+    gpu: Option<(PathBuf, GpuKey, GpuImage)>,
+    /// Pyramid of an edited image being built off the UI thread.
+    gpu_build: Option<(PathBuf, GpuKey, Receiver<Vec<Arc<RgbaImage>>>)>,
     preview_tex: Option<(PathBuf, egui::TextureHandle)>,
     anim: Option<Anim>,
     pub edit: Option<EditSession>,
@@ -93,11 +262,21 @@ pub struct Viewer {
     last_view_rect: Rect,
     pub pending_nav: Option<isize>,
     pub confirm_discard: bool,
-    hist_cache: crate::bg::BgSlot<(PathBuf, u64), Histogram>,
+    hist_cache: crate::bg::BgSlot<(PathBuf, u64, usize), Histogram>,
     exif_cache: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
     /// (size, mtime) per file so thumbnail lookups never stat() every frame.
     stat_cache: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
     drag_pan: bool,
+    /// Show the pop-out panels when the pointer dwells at a window edge.
+    pub edge_panels: bool,
+    /// Keep zoom and (normalized) position when stepping to another image.
+    pub lock_zoom: bool,
+    /// (zoom, normalized centre) to apply once the next image's size is known.
+    pending_lock: Option<(f32, Vec2)>,
+    /// Size of the image the current zoom/centre refer to.
+    view_img: (u32, u32),
+    edge: EdgeState,
+    wheel_nav: WheelNav,
 }
 
 impl Viewer {
@@ -110,6 +289,7 @@ impl Viewer {
             auto_fit: Some(FitMode::FitLarge),
             zoom_target: None,
             gpu: None,
+            gpu_build: None,
             preview_tex: None,
             anim: None,
             edit: None,
@@ -128,6 +308,41 @@ impl Viewer {
             exif_cache: Default::default(),
             stat_cache: Default::default(),
             drag_pan: false,
+            edge_panels: true,
+            lock_zoom: false,
+            pending_lock: None,
+            view_img: (0, 0),
+            edge: EdgeState::default(),
+            wheel_nav: WheelNav::default(),
+        }
+    }
+
+    /// Toggle "lock zoom ratio" (keep zoom and position while browsing).
+    /// Returns the new state.
+    pub fn toggle_lock_zoom(&mut self) -> bool {
+        self.lock_zoom = !self.lock_zoom;
+        self.pending_lock = None;
+        self.lock_zoom
+    }
+
+    /// What step()/go_to() do with the view: reset to `fit`, or keep the
+    /// current zoom and normalized centre when the zoom is locked. A fitted
+    /// view stays fitted (the fit mode is the "ratio" then).
+    fn after_index_change(&mut self, fit: FitMode) {
+        if self.lock_zoom && self.auto_fit.is_none() && self.view_img.0 > 0 && self.view_img.1 > 0 {
+            let (zoom, norm) = match self.pending_lock {
+                // Stepping again before the previous image loaded: keep the original lock.
+                Some(l) => l,
+                None => {
+                    let z = self.zoom_target.map(|t| t.0).unwrap_or(self.zoom);
+                    (z, Vec2::new(self.center.x / self.view_img.0 as f32, self.center.y / self.view_img.1 as f32))
+                }
+            };
+            self.pending_lock = Some((sane_zoom(zoom), norm));
+            self.zoom_target = None;
+        } else {
+            self.pending_lock = None;
+            self.reset_view(fit);
         }
     }
 
@@ -191,7 +406,7 @@ impl Viewer {
             self.edit = None;
             self.tool = None;
             self.crop = None;
-            self.reset_view(fit);
+            self.after_index_change(fit);
         }
         true
     }
@@ -202,7 +417,7 @@ impl Viewer {
             self.edit = None;
             self.tool = None;
             self.crop = None;
-            self.reset_view(fit);
+            self.after_index_change(fit);
         }
     }
 
@@ -219,7 +434,11 @@ impl Viewer {
                 self.index = self.index.saturating_sub(1).min(self.list.len().saturating_sub(1));
             }
             self.edit = None;
+            self.tool = None;
+            self.crop = None;
             self.gpu = None;
+            self.gpu_build = None;
+            self.pending_lock = None;
             self.auto_fit = self.auto_fit.or(Some(FitMode::FitLarge));
         }
     }
@@ -274,13 +493,25 @@ impl Viewer {
     pub fn open_tool(&mut self, tool: Box<dyn EditTool>, core: &Core) {
         let Some(img) = self.current_image(core) else { return };
         self.crop = None;
-        // Preview runs on a copy sized to the screen for interactivity.
+        // Preview runs on a copy sized to the screen for interactivity. Resizing a
+        // big photo takes a while, so it is prepared off the UI thread.
         let screen = core.ctx.content_rect().size() * core.ctx.pixels_per_point();
         let max = (screen.x.max(screen.y) as u32).clamp(800, 2400);
-        let base = if img.width().max(img.height()) > max { Arc::new(crate::imaging::resize_to_fit(&img, max, max)) } else { img.clone() };
-        let scale = base.width() as f32 / img.width() as f32;
-        let histogram = Histogram::compute(&base);
-        self.tool = Some(ActiveTool { tool, base, scale, version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, histogram, show_original: false });
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = core.ctx.clone();
+        std::thread::spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let image = if img.width().max(img.height()) > max { Arc::new(crate::imaging::resize_to_fit(&img, max, max)) } else { img.clone() };
+                let scale = image.width() as f32 / img.width().max(1) as f32;
+                let histogram = Histogram::compute(&image);
+                ToolBase { image, scale, histogram }
+            }));
+            if let Ok(b) = res {
+                let _ = tx.send(b);
+            }
+            ctx.request_repaint();
+        });
+        self.tool = Some(ActiveTool { tool, base: None, base_rx: Some(rx), version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, show_original: false, error: None });
     }
 
     pub fn start_crop(&mut self, core: &Core) {
@@ -295,14 +526,15 @@ impl Viewer {
         let vw = view.x * ppp;
         let vh = view.y * ppp;
         let fit = (vw / w).min(vh / h);
-        match mode {
+        let z = match mode {
             FitMode::FitLarge => fit.min(1.0),
             FitMode::FitAlways => fit,
             FitMode::Fill => (vw / w).max(vh / h),
             FitMode::FitWidth => vw / w,
             FitMode::FitHeight => vh / h,
             FitMode::Actual => 1.0,
-        }
+        };
+        sane_zoom(z)
     }
 
     pub fn zoom_by(&mut self, factor: f32, anchor: Option<Pos2>) {
@@ -399,20 +631,69 @@ impl Viewer {
         let mut has_alpha = false;
         let edit_img = self.edit.as_ref().filter(|e| e.path == path).map(|e| (e.version, e.current.clone()));
         let state_ready = core.loader.get_ready(&path);
-        if let Some((ver, img)) = &edit_img {
-            let need = !matches!(&self.gpu, Some((gp, gv, _)) if gp == &path && *gv == *ver + 1_000_000);
-            if need {
-                let pyr = render::build_pyramid(img.clone());
-                self.gpu = Some((path.clone(), *ver + 1_000_000, GpuImage::new(ui.ctx(), &format!("{}-edit{ver}", path.display()), pyr)));
+        // Receive an edited image's pyramid built in the background.
+        if let Some((bp, key, rx)) = &self.gpu_build {
+            match rx.try_recv() {
+                Ok(pyr) => {
+                    if bp == &path {
+                        let name = format!("{}-edit{:?}", path.display(), key);
+                        self.gpu = Some((path.clone(), *key, GpuImage::new(ui.ctx(), &name, pyr)));
+                    }
+                    self.gpu_build = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.gpu_build = None,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
-            size = Some(img.dimensions());
+        }
+        if let Some((ver, img)) = &edit_img {
+            let key = GpuKey::Edit(*ver);
+            let have = matches!(&self.gpu, Some((gp, gk, _)) if gp == &path && *gk == key);
+            let building = matches!(&self.gpu_build, Some((bp, bk, _)) if bp == &path && *bk == key);
+            if !have && !building {
+                if img.width() as u64 * img.height() as u64 <= 4_000_000 {
+                    // Small enough to do right away without a visible hitch.
+                    let pyr = render::build_pyramid(img.clone());
+                    self.gpu = Some((path.clone(), key, GpuImage::new(ui.ctx(), &format!("{}-edit{ver}", path.display()), pyr)));
+                } else {
+                    // Keep showing the previous image while the pyramid is built.
+                    let (tx, rx) = crossbeam_channel::bounded(1);
+                    let img = img.clone();
+                    let ctx = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(render::build_pyramid(img));
+                        ctx.request_repaint();
+                    });
+                    self.gpu_build = Some((path.clone(), key, rx));
+                }
+            }
             has_alpha = state_ready.as_ref().map(|l| l.decoded.has_alpha).unwrap_or(false);
         } else if let Some(loaded) = &state_ready {
-            if !matches!(&self.gpu, Some((gp, 0, _)) if gp == &path) {
-                self.gpu = Some((path.clone(), 0, GpuImage::new(ui.ctx(), &path.display().to_string(), loaded.pyramid.clone())));
+            let key = GpuKey::Decoded(Arc::as_ptr(&loaded.pyramid[0]) as usize);
+            if !matches!(&self.gpu, Some((gp, gk, _)) if gp == &path && *gk == key) {
+                self.gpu = Some((path.clone(), key, GpuImage::new(ui.ctx(), &path.display().to_string(), loaded.pyramid.clone())));
+                self.anim = None;
             }
-            size = Some(loaded.decoded.image.dimensions());
             has_alpha = loaded.decoded.has_alpha;
+        }
+        // Size of what is actually on the GPU (the previous edit stays visible,
+        // with its own size, while a new pyramid is built).
+        if edit_img.is_some() || state_ready.is_some() {
+            if let Some((gp, _, g)) = &self.gpu {
+                if gp == &path {
+                    size = Some((g.width, g.height));
+                }
+            }
+        }
+        // Locked zoom ratio: apply the previous image's zoom and position once
+        // the new image's size is known.
+        if let Some(sz) = size {
+            if let Some((z, norm)) = self.pending_lock.take() {
+                self.auto_fit = None;
+                self.zoom_target = None;
+                self.zoom = z;
+                self.center = locked_center(norm, sz);
+            }
+            self.view_img = sz;
         }
 
         // Tool preview replaces the displayed image (same aspect unless the tool resizes).
@@ -426,7 +707,7 @@ impl Viewer {
         // ---- Zoom / pan maths
         if let Some(sz) = size {
             let disp = match (tool_preview_size, &self.tool) {
-                (Some(ps), Some(t)) if t.tool.changes_size() => ((ps.0 as f32 / t.scale) as u32, (ps.1 as f32 / t.scale) as u32),
+                (Some(ps), Some(t)) if t.tool.changes_size() => ((ps.0 as f32 / t.scale()) as u32, (ps.1 as f32 / t.scale()) as u32),
                 _ => sz,
             };
             self.update_zoom(ui, &resp, view, disp, ppp, core, &mut ev);
@@ -444,9 +725,10 @@ impl Viewer {
             let nearest = !core.settings.smooth_zoom_in && self.zoom >= 2.0;
             let mut drawn = false;
             if let Some(t) = &mut self.tool {
+                let ts = t.scale();
                 if !t.show_original {
                     if let Some(g) = &mut t.preview {
-                        g.paint(ui.ctx(), &painter, dest, view, self.zoom * t.scale, nearest, Color32::WHITE);
+                        g.paint(ui.ctx(), &painter, dest, view, self.zoom * ts, nearest, Color32::WHITE);
                         drawn = true;
                     }
                 }
@@ -514,18 +796,22 @@ impl Viewer {
                 }
             }
             // Still allow navigation while loading.
-            self.nav_input(ui, &resp, core, &mut ev);
+            self.nav_input(ui, &resp, core, &mut ev, false);
         }
 
         // ---- Overlays
         if core.settings.show_info_overlay || !fullscreen {
             self.overlay_caption(ui, core, view, size, &path);
         }
+        if self.show_histogram {
+            self.histogram_overlay(ui, core, view, &path);
+        }
+        let edge_open = self.edge_panels_ui(ui, core, view, &mut ev);
         let idle = self.last_activity.elapsed() > Duration::from_millis(2200);
         let near_bottom = ui.input(|i| i.pointer.hover_pos()).map(|pos| pos.y > view.max.y - 90.0 && view.contains(pos)).unwrap_or(false);
         if !idle || near_bottom || !fullscreen {
             self.bottom_bar(ui, core, view, &mut ev);
-        } else if fullscreen && self.crop.is_none() && self.tool.is_none() {
+        } else if fullscreen && self.crop.is_none() && self.tool.is_none() && !edge_open {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
         if !idle {
@@ -539,7 +825,11 @@ impl Viewer {
 
     #[allow(clippy::too_many_arguments)]
     fn update_zoom(&mut self, ui: &mut Ui, resp: &egui::Response, view: Rect, img: (u32, u32), ppp: f32, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
+        if !view.is_positive() || img.0 == 0 || img.1 == 0 {
+            return; // window minimized / collapsed: keep the old view
+        }
         let (w, h) = (img.0 as f32, img.1 as f32);
+        self.zoom = sane_zoom(self.zoom);
         if let Some(mode) = self.auto_fit {
             self.zoom = self.fit_zoom(mode, img, view.size(), ppp);
             self.center = Vec2::new(w / 2.0, h / 2.0);
@@ -565,7 +855,8 @@ impl Viewer {
                 ui.ctx().request_repaint();
             }
         }
-        self.nav_input(ui, resp, core, ev);
+        let fits = w * self.zoom / ppp <= view.width() + 1.0 && h * self.zoom / ppp <= view.height() + 1.0;
+        self.nav_input(ui, resp, core, ev, !fits);
 
         // Drag to pan (or press-and-hold magnifier when the whole image fits).
         let fits = w * self.zoom / ppp <= view.width() + 1.0 && h * self.zoom / ppp <= view.height() + 1.0;
@@ -594,20 +885,40 @@ impl Viewer {
         self.center.y = if h <= half_vh * 2.0 { h / 2.0 } else { self.center.y.clamp(half_vh, h - half_vh) };
     }
 
-    fn nav_input(&mut self, ui: &mut Ui, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
+    fn nav_input(&mut self, ui: &mut Ui, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>, can_pan: bool) {
         if !resp.hovered() && !resp.contains_pointer() {
             return;
         }
-        let (scroll, ctrl) = ui.input(|i| (super::wheel_delta(i), i.modifiers.ctrl));
+        let (si, ctrl, now) = ui.input(|i| (scroll_input(i), i.modifiers.ctrl, i.time));
         let pointer = ui.input(|i| i.pointer.hover_pos());
-        if scroll != 0.0 {
-            let zoom_mode = core.settings.wheel_action == WheelAction::Zoom;
-            if ctrl != zoom_mode {
-                // Proportional zoom so precision touchpads feel smooth too.
-                let f = (1.0 + scroll.clamp(-200.0, 200.0) * 0.0045).max(0.2);
-                self.zoom_by(f, pointer);
-            } else if scroll.abs() >= 1.0 {
-                ev.push(ViewerEvent::Command(if scroll > 0.0 { Command::PrevImage } else { Command::NextImage }));
+        let ppp = ui.ctx().pixels_per_point();
+        let zoom_mode = core.settings.wheel_action == WheelAction::Zoom;
+        // Pinch: touch screens and gesture events. Ctrl+wheel (which is also how
+        // Windows delivers touchpad pinches) is handled below, never both.
+        if (si.pinch - 1.0).abs() > 1e-4 && si.pinch.is_finite() && si.pinch > 0.0 {
+            self.zoom_by(si.pinch, pointer);
+        }
+        if si.touch_pan != Vec2::ZERO && can_pan {
+            self.center -= si.touch_pan * ppp / self.zoom;
+            self.auto_fit = None;
+        }
+        if si.wheel != 0.0 || si.precise != Vec2::ZERO {
+            if si.any_precise && can_pan && !ctrl {
+                // Two-finger touchpad scroll pans an image larger than the window.
+                self.center -= si.precise * ppp / self.zoom;
+                self.auto_fit = None;
+            } else if ctrl != zoom_mode {
+                if si.wheel != 0.0 {
+                    // Proportional zoom so precision touchpads feel smooth too.
+                    let f = (1.0 + si.wheel.clamp(-200.0, 200.0) * 0.0045).max(0.2);
+                    self.zoom_by(f, pointer);
+                }
+            } else {
+                match self.wheel_nav.feed(si.wheel, si.any_precise, now) {
+                    1 => ev.push(ViewerEvent::Command(Command::PrevImage)),
+                    -1 => ev.push(ViewerEvent::Command(Command::NextImage)),
+                    _ => {}
+                }
             }
         }
         if resp.double_clicked() && self.crop.is_none() {
@@ -655,24 +966,39 @@ impl Viewer {
 
     fn paint_animation(&mut self, ui: &mut Ui, painter: &egui::Painter, path: &Path, frames: &Arc<Vec<crate::decode::AnimFrame>>, dest: Rect) {
         let now = Instant::now();
-        if self.anim.as_ref().map(|a| a.path != path).unwrap_or(true) {
-            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + Duration::from_millis(frames[0].delay_ms as u64), playing: true, tex: None, shown_frame: usize::MAX });
+        if self.anim.as_ref().map(|a| a.path != path || a.frame_tex.len() != frames.len()).unwrap_or(true) {
+            let total: u64 = frames.iter().map(|f| f.image.width() as u64 * f.image.height() as u64).sum();
+            let frame_tex = if total <= ANIM_CACHE_PIXELS { vec![None; frames.len()] } else { Vec::new() };
+            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + frame_delay(frames, 0), playing: true, frame_tex, tex: None, shown_frame: usize::MAX });
         }
         let a = self.anim.as_mut().unwrap();
+        if a.frame >= frames.len() {
+            a.frame = 0;
+        }
         if a.playing && now >= a.next_at {
-            a.frame = (a.frame + 1) % frames.len();
-            a.next_at = now + Duration::from_millis(frames[a.frame].delay_ms as u64);
+            let (frame, next_at) = advance_animation(a.frame, a.next_at, now, |i| frame_delay(frames, i), frames.len());
+            a.frame = frame;
+            a.next_at = next_at;
         }
-        if a.shown_frame != a.frame || a.tex.is_none() {
-            let ci = render::color_image_from_rgba(&frames[a.frame].image);
-            match &mut a.tex {
-                Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
-                None => a.tex = Some(ui.ctx().load_texture("anim", ci, egui::TextureOptions::LINEAR)),
+        let tex_id = if !a.frame_tex.is_empty() {
+            let i = a.frame;
+            a.frame_tex[i]
+                .get_or_insert_with(|| ui.ctx().load_texture(format!("anim:{}#{i}", path.display()), render::color_image_from_rgba(&frames[i].image), egui::TextureOptions::LINEAR))
+                .id()
+        } else {
+            if a.shown_frame != a.frame || a.tex.is_none() {
+                let ci = render::color_image_from_rgba(&frames[a.frame].image);
+                match &mut a.tex {
+                    Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
+                    None => a.tex = Some(ui.ctx().load_texture("anim", ci, egui::TextureOptions::LINEAR)),
+                }
+                a.shown_frame = a.frame;
             }
-            a.shown_frame = a.frame;
-        }
-        if let Some(t) = &a.tex {
-            let mut mesh = egui::Mesh::with_texture(t.id());
+            a.tex.as_ref().map(|t| t.id()).unwrap_or_default()
+        };
+        {
+            let t = tex_id;
+            let mut mesh = egui::Mesh::with_texture(t);
             mesh.add_rect_with_uv(dest, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
             painter.add(egui::Shape::mesh(mesh));
         }
@@ -684,6 +1010,10 @@ impl Viewer {
     pub fn toggle_animation(&mut self) {
         if let Some(a) = &mut self.anim {
             a.playing = !a.playing;
+            if a.playing {
+                // Resume shortly instead of fast-forwarding through the pause.
+                a.next_at = Instant::now() + Duration::from_millis(100);
+            }
         }
     }
 
@@ -730,13 +1060,173 @@ impl Viewer {
         ui.painter().text(lens.left_bottom() + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, format!("{}, {}  ·  {:.0}%", px.0, px.1, z * 100.0), FontId::proportional(11.0), Color32::from_white_alpha(220));
     }
 
+    /// Histogram of the displayed image (computed off the UI thread, cached per
+    /// image version) for the overlay and the info panel.
+    fn histogram_for(&mut self, core: &Core, ctx: &egui::Context, path: &Path) -> Option<&Histogram> {
+        let img = self.current_image(core)?;
+        let ver = self.edit.as_ref().filter(|e| e.path == path).map(|e| e.version).unwrap_or(0);
+        let key = (path.to_path_buf(), ver, Arc::as_ptr(&img) as usize);
+        self.hist_cache.get(&key, ctx, move || Histogram::compute(&img))
+    }
+
+    fn histogram_overlay(&mut self, ui: &mut Ui, core: &Core, view: Rect, path: &Path) {
+        let r = Rect::from_min_size(Pos2::new(view.max.x - 12.0 - 240.0, view.min.y + 12.0), Vec2::new(240.0, 96.0));
+        if r.min.x < view.min.x + 8.0 || r.max.y > view.max.y - 8.0 {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter().with_clip_rect(view);
+        if let Some(h) = self.histogram_for(core, &ctx, path) {
+            painter.rect_filled(r.expand(6.0), CornerRadius::same(10), Color32::from_black_alpha(150));
+            h.paint(&painter, r, true);
+        }
+    }
+
+    /// FastStone-style pop-out panels: dwell at a window edge to show a floating
+    /// panel over the image (top: filmstrip, right: info, left: edit tools; the
+    /// bottom edge reveals the toolbar). Returns true while a panel is visible.
+    fn edge_panels_ui(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, ev: &mut Vec<ViewerEvent>) -> bool {
+        let ctx = ui.ctx().clone();
+        let enabled = self.edge_panels && self.crop.is_none() && self.tool.is_none() && !self.confirm_discard && view.is_positive();
+        let pos = ctx.input(|i| i.pointer.hover_pos());
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || egui::Popup::is_any_open(&ctx);
+        let allowed = |e: Edge, s: &Self| match e {
+            Edge::Top => true,
+            Edge::Left => true,
+            Edge::Right => !s.show_info,
+            Edge::Bottom => false, // the toolbar already pops up at the bottom
+        };
+        if !enabled {
+            self.edge.open = None;
+            self.edge.dwell = None;
+        } else if let Some(open) = self.edge.open {
+            // Hide once the pointer leaves the panel (with a little slack).
+            let inside = match (pos, self.edge.panel_rect) {
+                (Some(p), Some(r)) => r.expand(14.0).contains(p) || edge_at(view, p, EDGE_MARGIN) == Some(open),
+                (Some(p), None) => edge_at(view, p, EDGE_MARGIN) == Some(open),
+                _ => false,
+            };
+            if !inside && !egui::Popup::is_any_open(&ctx) {
+                self.edge.open = None;
+                self.edge.dwell = None;
+            }
+        } else {
+            match pos.and_then(|p| edge_at(view, p, EDGE_MARGIN)).filter(|e| allowed(*e, self)) {
+                Some(e) if !busy => {
+                    let since = match self.edge.dwell {
+                        Some((d, t)) if d == e => t,
+                        _ => {
+                            let now = Instant::now();
+                            self.edge.dwell = Some((e, now));
+                            now
+                        }
+                    };
+                    let waited = since.elapsed();
+                    if waited >= EDGE_DWELL {
+                        self.edge.open = Some(e);
+                        self.edge.shown = Some(e);
+                        self.edge.panel_rect = None;
+                    } else {
+                        ctx.request_repaint_after(EDGE_DWELL - waited);
+                    }
+                }
+                _ => self.edge.dwell = None,
+            }
+        }
+        let t = ctx.animate_bool_with_time(ui.scope_id().with("viewer-edge-fade"), self.edge.open.is_some(), 0.16);
+        let Some(edge) = self.edge.shown else { return false };
+        if t <= 0.0 {
+            self.edge.shown = None;
+            self.edge.panel_rect = None;
+            return false;
+        }
+        let p = core.pal;
+        let interact = self.edge.open.is_some();
+        let slide = (1.0 - t) * 18.0;
+        let bottom_reserve = 70.0; // keep clear of the bottom toolbar
+        let rect = match edge {
+            Edge::Top => Rect::from_min_size(view.min + Vec2::new(8.0, 4.0 - slide), Vec2::new(view.width() - 16.0, 112.0)),
+            Edge::Right => {
+                let w = 340.0_f32.min(view.width() - 16.0);
+                Rect::from_min_size(Pos2::new(view.max.x - w - 6.0 + slide, view.min.y + 8.0), Vec2::new(w, (view.height() - 16.0 - bottom_reserve).max(120.0)))
+            }
+            Edge::Left => {
+                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 900.0);
+                Rect::from_min_size(Pos2::new(view.min.x + 6.0 - slide, view.center().y - h / 2.0 - bottom_reserve / 2.0), Vec2::new(262.0, h))
+            }
+            Edge::Bottom => return false,
+        };
+        let margin = 10.0;
+        let area = egui::Area::new(ui.scope_id().with(("viewer-edge-panel", edge)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .interactable(interact)
+            .show(&ctx, |ui| {
+                ui.multiply_opacity(t);
+                egui::Frame::NONE
+                    .fill(p.panel.gamma_multiply(0.97))
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(margin as i8))
+                    .show(ui, |ui| {
+                        let inner = rect.size() - Vec2::splat(margin * 2.0);
+                        ui.set_min_size(inner);
+                        ui.set_max_size(inner);
+                        match edge {
+                            Edge::Top => {
+                                ui.allocate_ui(inner, |ui| self.filmstrip(ui, core, ev));
+                            }
+                            Edge::Right => self.info_panel(ui, core, ev),
+                            Edge::Left => self.edge_tool_menu(ui, ev),
+                            Edge::Bottom => {}
+                        }
+                    });
+            });
+        self.edge.panel_rect = Some(area.response.rect);
+        true
+    }
+
+    /// Compact vertical list of edit commands for the left pop-out panel.
+    fn edge_tool_menu(&mut self, ui: &mut Ui, ev: &mut Vec<ViewerEvent>) {
+        let groups: [&[Command]; 4] = [
+            &[Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::FreeRotate],
+            &[Command::Crop, Command::Resize, Command::CanvasSize],
+            &[Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects],
+            &[Command::AddText, Command::AddBorder, Command::Watermark],
+        ];
+        let dirty = self.is_dirty();
+        egui::ScrollArea::vertical().id_salt("edge-tools").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(RichText::new("Edit").font(super::theme::semibold(13.0)));
+            ui.add_space(4.0);
+            for (gi, g) in groups.iter().enumerate() {
+                if gi > 0 {
+                    ui.add_space(3.0);
+                    ui.separator();
+                    ui.add_space(3.0);
+                }
+                for c in g.iter() {
+                    edge_menu_item(ui, *c, ev);
+                }
+            }
+            ui.add_space(3.0);
+            ui.separator();
+            ui.add_space(3.0);
+            for c in [Command::Undo, Command::Redo] {
+                edge_menu_item(ui, c, ev);
+            }
+            edge_menu_item(ui, if dirty { Command::Save } else { Command::SaveAs }, ev);
+        });
+    }
+
     fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path) {
         let p = core.pal;
         let mut parts = vec![format!("{} / {}", self.index + 1, self.list.len()), file_name(path)];
         if let Some((w, h)) = size {
             parts.push(format!("{w} × {h}"));
         }
-        parts.push(format!("{:.0}%", self.zoom * 100.0));
+        parts.push(format!("{:.0}%{}", self.zoom * 100.0, if self.lock_zoom { " (locked)" } else { "" }));
         if self.is_dirty() {
             parts.push("● edited".into());
         }
@@ -752,7 +1242,7 @@ impl Viewer {
 
     fn bottom_bar(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
-        let w = 640.0_f32.min(view.width() - 20.0);
+        let w = 676.0_f32.min(view.width() - 20.0);
         let rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 34.0), Vec2::new(w, 44.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
         child.painter().rect_filled(rect, CornerRadius::same(12), p.overlay);
@@ -779,6 +1269,10 @@ impl Viewer {
         let fit_sel = self.auto_fit.is_some();
         if widgets::icon_button(&mut child, I::ARROWS_IN, "Fit to window (/)", fit_sel).clicked() {
             ev.push(ViewerEvent::Command(Command::ZoomFit));
+        }
+        let (lock_icon, lock_tip) = if self.lock_zoom { (I::LOCK_SIMPLE, "Zoom ratio locked: next/previous keep zoom and position (click to unlock)") } else { (I::LOCK_SIMPLE_OPEN, "Lock zoom ratio: keep zoom and position when changing images") };
+        if widgets::icon_button(&mut child, lock_icon, lock_tip, self.lock_zoom).clicked() {
+            self.toggle_lock_zoom();
         }
         widgets::separator_v(&mut child);
         b(&mut child, I::ARROW_COUNTER_CLOCKWISE, "Rotate left", Command::RotateLeft, ev);
@@ -877,12 +1371,10 @@ impl Viewer {
             });
             ui.add_space(8.0);
             // Histogram
-            if let Some(img) = self.current_image(core) {
-                let ver = self.edit.as_ref().map(|e| e.version).unwrap_or(0);
-                if let Some(hist) = self.hist_cache.get(&(path.clone(), ver), ui.ctx(), move || Histogram::compute(&img)) {
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
-                    hist.paint(ui.painter(), r, p.dark);
-                }
+            let ctx = ui.ctx().clone();
+            if let Some(hist) = self.histogram_for(core, &ctx, &path) {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
+                hist.paint(ui.painter(), r, p.dark);
                 ui.add_space(6.0);
             }
             widgets::section_title(ui, &p, "File");
@@ -948,61 +1440,106 @@ impl Viewer {
     fn tool_panel(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
         let Some(t) = &mut self.tool else { return };
-        // Receive preview results.
-        if let Some(rx) = &t.rx {
-            if let Ok((ver, img)) = rx.try_recv() {
-                t.running = None;
-                t.rx = None;
-                if ver >= t.preview_version {
-                    t.preview_version = ver;
-                    let pyr = render::build_pyramid(Arc::new(img));
-                    t.preview = Some(GpuImage::new(ui.ctx(), &format!("toolprev{ver}"), pyr));
+        // The preview base is prepared in the background (resize + histogram).
+        if let Some(rx) = &t.base_rx {
+            match rx.try_recv() {
+                Ok(b) => {
+                    t.base = Some(b);
+                    t.base_rx = None;
                 }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    t.base_rx = None;
+                    t.error = Some("Could not prepare the preview for this image.".into());
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+        // Receive preview results. A panicking tool drops the sender: treat that
+        // as a failed render so the panel never waits forever.
+        if let Some(rx) = &t.rx {
+            match rx.try_recv() {
+                Ok((ver, img)) => {
+                    t.running = None;
+                    t.rx = None;
+                    if ver >= t.preview_version {
+                        t.preview_version = ver;
+                        let pyr = render::build_pyramid(Arc::new(img));
+                        t.preview = Some(GpuImage::new(ui.ctx(), &format!("toolprev{ver}"), pyr));
+                    }
+                    t.error = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Do not retry the same parameters in a loop; wait for a change.
+                    t.preview_version = t.preview_version.max(t.running.unwrap_or(0));
+                    t.running = None;
+                    t.rx = None;
+                    t.error = Some("The preview failed with these settings. Try other values.".into());
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new(t.tool.title()).font(super::theme::semibold(16.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if t.running.is_some() || t.final_rx.is_some() {
+                if t.running.is_some() || t.final_rx.is_some() || t.base_rx.is_some() {
                     ui.spinner();
                 }
             });
         });
         ui.add_space(8.0);
-        let size = self.edit.as_ref().map(|e| e.current.dimensions()).or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions())).unwrap_or((t.base.width(), t.base.height()));
-        let changed = {
-            let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &t.histogram, preview: Some(&t.base) };
+        let mut changed = false;
+        if let Some(base) = &t.base {
+            let size = self
+                .edit
+                .as_ref()
+                .map(|e| e.current.dimensions())
+                .or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions()))
+                .unwrap_or((base.image.width(), base.image.height()));
+            let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &base.histogram, preview: Some(&base.image) };
             let w = ui.available_width();
-            egui::ScrollArea::vertical().max_height(ui.available_height() - 90.0).show(ui, |ui| {
-                ui.set_max_width(w);
-                t.tool.ui(ui, &cx)
-            })
-            .inner
-        };
+            changed = egui::ScrollArea::vertical()
+                .max_height(ui.available_height() - 110.0)
+                .show(ui, |ui| {
+                    ui.set_max_width(w);
+                    t.tool.ui(ui, &cx)
+                })
+                .inner;
+        } else if t.base_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Preparing preview...").color(p.muted));
+            });
+        }
+        if let Some(err) = &t.error {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("{}  {err}", I::WARNING)).size(12.0).color(Color32::from_rgb(235, 110, 90)));
+        }
         if changed {
             t.version += 1;
         }
         // Launch a preview render when parameters changed and no render is in flight.
-        if t.version > t.preview_version && t.running.is_none() {
-            let tool = t.tool.clone_box();
-            let base = t.base.clone();
-            let scale = t.scale;
-            let ver = t.version;
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            let ctx = ui.ctx().clone();
-            std::thread::spawn(move || {
-                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.apply(&base, scale)));
-                if let Ok(out) = out {
-                    let _ = tx.send((ver, out));
-                }
-                ctx.request_repaint();
-            });
-            t.rx = Some(rx);
-            t.running = Some(ver);
+        if let Some(base) = &t.base {
+            if t.version > t.preview_version && t.running.is_none() {
+                let tool = t.tool.clone_box();
+                let img = base.image.clone();
+                let scale = base.scale;
+                let ver = t.version;
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool.apply(&img, scale)));
+                    if let Ok(out) = out {
+                        let _ = tx.send((ver, out));
+                    }
+                    ctx.request_repaint();
+                });
+                t.rx = Some(rx);
+                t.running = Some(ver);
+            }
         }
         ui.add_space(10.0);
         let hold = ui.add(egui::Button::new(format!("{}  Hold to compare with original", I::EYE)).min_size(Vec2::new(ui.available_width(), 28.0)).sense(Sense::click_and_drag()));
-        t.show_original = hold.is_pointer_button_down_on() || ui.input(|i| i.key_down(Key::Backslash));
+        t.show_original = hold.is_pointer_button_down_on() || (ui.input(|i| i.key_down(Key::Backslash)) && !ui.ctx().egui_wants_keyboard_input());
         ui.add_space(6.0);
         let mut close = false;
         let mut apply = false;
@@ -1012,7 +1549,7 @@ impl Viewer {
                 t.version += 1;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = t.final_rx.is_none();
+                let enabled = t.final_rx.is_none() && t.base.is_some();
                 if ui.add_enabled(enabled, egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(80.0, 28.0))).clicked() {
                     apply = true;
                 }
@@ -1021,13 +1558,13 @@ impl Viewer {
                 }
             });
         });
-        if ui.input(|i| i.key_pressed(Key::Escape)) {
+        if keyboard_free(ui) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             close = true;
         }
-        if ui.input(|i| i.key_pressed(Key::Enter)) && !ui.ctx().egui_wants_keyboard_input() {
+        if keyboard_free(ui) && ui.input(|i| i.key_pressed(Key::Enter)) {
             apply = true;
         }
-        if apply && t.final_rx.is_none() {
+        if apply && t.final_rx.is_none() && t.base.is_some() {
             let full = self.edit.as_ref().filter(|e| e.path == self.list[self.index]).map(|e| e.current.clone()).or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.clone()));
             if let Some(full) = full {
                 let tool = t.tool.clone_box();
@@ -1043,15 +1580,23 @@ impl Viewer {
             }
         }
         if let Some(rx) = &t.final_rx {
-            if let Ok(img) = rx.try_recv() {
-                let title = t.tool.title();
-                self.tool = None;
-                if let Some(sess) = self.ensure_edit(core) {
-                    sess.push(img, &title);
+            match rx.try_recv() {
+                Ok(img) => {
+                    let title = t.tool.title();
+                    self.tool = None;
+                    if let Some(sess) = self.ensure_edit(core) {
+                        sess.push(img, &title);
+                    }
+                    self.auto_fit = Some(core.settings.fit_mode);
+                    core.toasts.success(format!("{title} applied - Ctrl+Z to undo, Ctrl+S to save"));
+                    return;
                 }
-                self.auto_fit = Some(core.settings.fit_mode);
-                core.toasts.success(format!("{title} applied - Ctrl+Z to undo, Ctrl+S to save"));
-                return;
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    t.final_rx = None;
+                    t.error = Some("Applying the tool failed. The image was not changed.".into());
+                    core.toasts.error(format!("{} failed", t.tool.title()));
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
         }
         if close {
@@ -1142,8 +1687,8 @@ impl Viewer {
         ui.add_space(12.0);
         ui.label(RichText::new("Drag inside to move, drag edges or corners to resize, drag outside to draw a new area. Enter applies, Esc cancels.").size(11.5).color(p.faint));
         ui.add_space(12.0);
-        let mut apply = ui.input(|i| i.key_pressed(Key::Enter)) && !ui.ctx().egui_wants_keyboard_input();
-        let mut cancel = ui.input(|i| i.key_pressed(Key::Escape));
+        let mut apply = keyboard_free(ui) && ui.input(|i| i.key_pressed(Key::Enter));
+        let mut cancel = keyboard_free(ui) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 cancel = true;
@@ -1317,6 +1862,42 @@ impl Viewer {
     }
 }
 
+/// True when no text field has keyboard focus and no popup/menu is open, so
+/// Esc / Enter belong to the viewer's tool panels.
+fn keyboard_free(ui: &Ui) -> bool {
+    !ui.ctx().egui_wants_keyboard_input() && !egui::Popup::is_any_open(ui.ctx())
+}
+
+fn frame_delay(frames: &[crate::decode::AnimFrame], i: usize) -> Duration {
+    // The decoder already maps tiny delays to 100 ms (browser convention); the
+    // floor here only guards against a repaint storm from other sources.
+    Duration::from_millis(frames.get(i).map(|f| f.delay_ms).unwrap_or(100).max(20) as u64)
+}
+
+/// Advance an animation that is due (`now >= next_at`). Deadlines accumulate
+/// from the previous deadline rather than from `now`, so frame timing does not
+/// drift by a frame's render latency each step; when far behind (window was
+/// hidden, a slow frame), it resynchronizes instead of fast-forwarding.
+pub fn advance_animation(frame: usize, next_at: Instant, now: Instant, delay: impl Fn(usize) -> Duration, n: usize) -> (usize, Instant) {
+    let n = n.max(1);
+    let f = (frame + 1) % n;
+    let mut next = next_at + delay(f);
+    if next <= now {
+        next = now + delay(f);
+    }
+    (f, next)
+}
+
+/// Zoom factors must stay finite and positive (a collapsed view gives 0 or NaN,
+/// and `f32::clamp` panics on NaN bounds).
+fn sane_zoom(z: f32) -> f32 {
+    if z.is_finite() && z > 0.0 {
+        z.clamp(0.001, 64.0)
+    } else {
+        1.0
+    }
+}
+
 fn clamp_crop(r: &mut [f32; 4], iw: f32, ih: f32) {
     r[0] = r[0].clamp(0.0, iw - 1.0);
     r[1] = r[1].clamp(0.0, ih - 1.0);
@@ -1332,9 +1913,157 @@ fn menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
     }
 }
 
+fn edge_menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
+    let text = RichText::new(format!("{}   {}", c.icon(), c.label())).size(12.5);
+    let r = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(text).frame(false).shortcut_text(RichText::new(c.shortcut()).size(11.0).weak()));
+    if r.clicked() {
+        ev.push(ViewerEvent::Command(c));
+    }
+}
+
 pub fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
 #[allow(dead_code)]
 fn _palette_unused(_: &Palette) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 600.0))
+    }
+
+    #[test]
+    fn edge_detection() {
+        let v = view();
+        assert_eq!(edge_at(v, Pos2::new(500.0, 2.0), 6.0), Some(Edge::Top));
+        assert_eq!(edge_at(v, Pos2::new(997.0, 300.0), 6.0), Some(Edge::Right));
+        assert_eq!(edge_at(v, Pos2::new(1000.0, 300.0), 6.0), Some(Edge::Right));
+        assert_eq!(edge_at(v, Pos2::new(0.0, 300.0), 6.0), Some(Edge::Left));
+        assert_eq!(edge_at(v, Pos2::new(500.0, 598.0), 6.0), Some(Edge::Bottom));
+        assert_eq!(edge_at(v, Pos2::new(500.0, 300.0), 6.0), None);
+        assert_eq!(edge_at(v, Pos2::new(500.0, 7.0), 6.0), None);
+        // Corner: the nearer edge wins.
+        assert_eq!(edge_at(v, Pos2::new(1.0, 4.0), 6.0), Some(Edge::Left));
+        assert_eq!(edge_at(v, Pos2::new(5.0, 1.0), 6.0), Some(Edge::Top));
+        // Outside the view.
+        assert_eq!(edge_at(v, Pos2::new(500.0, -20.0), 6.0), None);
+        assert_eq!(edge_at(Rect::NOTHING, Pos2::ZERO, 6.0), None);
+    }
+
+    #[test]
+    fn wheel_nav_mouse_steps_per_notch() {
+        let mut w = WheelNav::default();
+        assert_eq!(w.feed(-40.0, false, 0.0), -1);
+        assert_eq!(w.feed(-40.0, false, 0.05), -1);
+        assert_eq!(w.feed(-40.0, false, 0.10), -1);
+        // Direction change steps immediately.
+        assert_eq!(w.feed(40.0, false, 0.15), 1);
+        // Two notches in one frame still give one step (no burst).
+        let mut w = WheelNav::default();
+        assert_eq!(w.feed(-80.0, false, 0.0), -1);
+        assert_eq!(w.feed(0.0, false, 0.01), 0);
+    }
+
+    #[test]
+    fn wheel_nav_touchpad_steps_once_per_swipe() {
+        let mut w = WheelNav::default();
+        let mut steps = 0;
+        let mut t = 0.0;
+        // A long smooth swipe: 60 frames of 8 points.
+        for _ in 0..60 {
+            steps += w.feed(-8.0, true, t);
+            t += 0.016;
+        }
+        assert_eq!(steps, -1);
+        // After a pause a new swipe steps again.
+        t += 0.5;
+        let mut steps = 0;
+        for _ in 0..20 {
+            steps += w.feed(-8.0, true, t);
+            t += 0.016;
+        }
+        assert_eq!(steps, -1);
+        // Small jitter never navigates.
+        let mut w = WheelNav::default();
+        assert_eq!(w.feed(3.0, true, 0.0) + w.feed(-3.0, true, 0.02) + w.feed(2.0, true, 0.04), 0);
+    }
+
+    #[test]
+    fn precise_scroll_classification() {
+        use egui::MouseWheelUnit as U;
+        assert!(!is_precise_scroll(U::Line, Vec2::new(0.0, 1.0)));
+        assert!(!is_precise_scroll(U::Line, Vec2::new(0.0, -3.0)));
+        assert!(is_precise_scroll(U::Line, Vec2::new(0.0, 0.25)));
+        assert!(is_precise_scroll(U::Line, Vec2::new(0.0, 1.4)));
+        assert!(is_precise_scroll(U::Line, Vec2::new(0.5, 0.0)));
+        assert!(is_precise_scroll(U::Point, Vec2::new(0.0, 40.0)));
+        assert!(!is_precise_scroll(U::Page, Vec2::new(0.0, 1.0)));
+    }
+
+    #[test]
+    fn locked_center_keeps_relative_position() {
+        assert_eq!(locked_center(Vec2::new(0.25, 0.5), (4000, 3000)), Vec2::new(1000.0, 1500.0));
+        assert_eq!(locked_center(Vec2::new(1.5, -1.0), (100, 50)), Vec2::new(100.0, 0.0));
+    }
+
+    #[test]
+    fn lock_zoom_keeps_view_across_steps() {
+        let mut v = Viewer::new();
+        v.list = vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg"), PathBuf::from("c.jpg")];
+        v.view_img = (2000, 1000);
+        v.auto_fit = None;
+        v.zoom = 2.0;
+        v.center = Vec2::new(500.0, 250.0);
+        assert!(v.toggle_lock_zoom());
+        v.step(1, false, FitMode::FitLarge);
+        assert_eq!(v.index, 1);
+        assert!(v.auto_fit.is_none());
+        let (z, n) = v.pending_lock.unwrap();
+        assert_eq!(z, 2.0);
+        assert_eq!(n, Vec2::new(0.25, 0.25));
+        // Stepping again before the image loaded keeps the original lock.
+        v.go_to(2, FitMode::FitLarge);
+        assert_eq!(v.pending_lock.unwrap(), (2.0, Vec2::new(0.25, 0.25)));
+        // Unlocked: back to fit.
+        v.toggle_lock_zoom();
+        v.step(-1, false, FitMode::FitLarge);
+        assert_eq!(v.auto_fit, Some(FitMode::FitLarge));
+        assert!(v.pending_lock.is_none());
+        // Locked but fitted: stays fitted.
+        v.toggle_lock_zoom();
+        v.step(-1, false, FitMode::FitAlways);
+        assert_eq!(v.auto_fit, Some(FitMode::FitAlways));
+    }
+
+    #[test]
+    fn sane_zoom_rejects_bad_values() {
+        assert_eq!(sane_zoom(f32::NAN), 1.0);
+        assert_eq!(sane_zoom(0.0), 1.0);
+        assert_eq!(sane_zoom(-2.0), 1.0);
+        assert_eq!(sane_zoom(f32::INFINITY), 1.0);
+        assert_eq!(sane_zoom(0.5), 0.5);
+        assert_eq!(sane_zoom(1000.0), 64.0);
+        let v = Viewer::new();
+        assert_eq!(v.fit_zoom(FitMode::FitAlways, (100, 100), Vec2::ZERO, 1.0), 1.0);
+    }
+
+    #[test]
+    fn animation_deadlines_do_not_drift() {
+        let t0 = Instant::now();
+        let d = |_| Duration::from_millis(100);
+        // Rendered 7 ms late: the next deadline still lands on the 100 ms grid.
+        let (f, next) = advance_animation(0, t0 + Duration::from_millis(100), t0 + Duration::from_millis(107), d, 3);
+        assert_eq!(f, 1);
+        assert_eq!(next, t0 + Duration::from_millis(200));
+        // Wraps around.
+        assert_eq!(advance_animation(2, t0, t0, d, 3).0, 0);
+        // Far behind (window was hidden): resync rather than fast-forward.
+        let now = t0 + Duration::from_secs(5);
+        let (_, next) = advance_animation(0, t0, now, d, 3);
+        assert_eq!(next, now + Duration::from_millis(100));
+    }
+}
