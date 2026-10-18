@@ -2173,7 +2173,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let protect: Vec<PathBuf> = self.viewer.current().cloned().into_iter().collect();
+        let protect = self.viewer.protected_paths();
         let changed = self.core.loader.poll(&protect);
         let _ = changed;
         if self.core.meta.poll() && matches!(self.core.settings.sort_key, crate::settings::SortKey::Dimensions | crate::settings::SortKey::DateTaken) && self.core.meta.pending() == 0 {
