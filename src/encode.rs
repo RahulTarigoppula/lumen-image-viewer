@@ -76,7 +76,11 @@ pub fn encode(img: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
                 Chroma::S420 => jpeg_encoder::SamplingFactor::R_4_2_0,
             });
             enc.set_progressive(opts.jpeg_progressive);
-            enc.set_optimized_huffman_tables(true);
+            // Optimized Huffman tables make jpeg-encoder emit one scan per
+            // component. That is valid for progressive JPEGs, but as *baseline*
+            // it is mis-decoded by zune-jpeg (and some other decoders), so only
+            // optimize when writing progressive files.
+            enc.set_optimized_huffman_tables(opts.jpeg_progressive);
             if opts.keep_metadata {
                 if let Some(exif) = &opts.exif {
                     let mut e = strip_exif_header(exif).to_vec();
@@ -429,6 +433,30 @@ mod tests {
             .unwrap_or_else(|e| panic!("{f:?}: {e}"));
             if f != SaveFormat::Ico {
                 assert_eq!((back.width(), back.height()), (17, 9), "{f:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod jpeg_interop {
+    use super::*;
+
+    /// Every JPEG variant Lumen writes must decode back to the right colors
+    /// with our own native decoder (zune-jpeg), not just with libjpeg.
+    #[test]
+    fn saved_jpegs_decode_correctly() {
+        let img = RgbaImage::from_fn(64, 48, |x, y| image::Rgba([(x * 4) as u8, (y * 5) as u8, 90, 255]));
+        for progressive in [false, true] {
+            for chroma in [Chroma::S444, Chroma::S422, Chroma::S420] {
+                let opts = SaveOptions { format: SaveFormat::Jpeg, jpeg_progressive: progressive, jpeg_chroma: chroma, ..Default::default() };
+                let bytes = encode(&img, &opts).unwrap();
+                assert!(!crate::decode::jpeg_is_noninterleaved_baseline(&bytes), "progressive={progressive} {chroma:?}");
+                let back = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                let (a, b) = (img.get_pixel(40, 30).0, back.get_pixel(40, 30).0);
+                for c in 0..3 {
+                    assert!((a[c] as i32 - b[c] as i32).abs() < 12, "progressive={progressive} {chroma:?}: {a:?} vs {b:?}");
+                }
             }
         }
     }
