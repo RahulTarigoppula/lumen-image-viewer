@@ -458,6 +458,28 @@ impl Viewer {
                     g.paint(ui.ctx(), &painter, dest, view, self.zoom, nearest, Color32::WHITE);
                 }
             }
+            // Edit-tool canvas hook (interactive tools: draw board, retouch,
+            // regions): overlays + pointer input in image coordinates.
+            if let Some(t) = &mut self.tool {
+                if t.tool.wants_canvas() && !t.tool.changes_size() {
+                    let cx = crate::edit::CanvasCtx {
+                        palette: &p,
+                        image_size: sz,
+                        dest,
+                        view,
+                        zoom: self.zoom,
+                        pixels_per_point: ppp,
+                        preview: Some(&t.base),
+                        preview_scale: t.scale,
+                        preview_current: t.preview_version >= t.version,
+                        interactive: !ui.input(|i| i.key_down(Key::Space)),
+                    };
+                    if t.tool.canvas(&cx, &painter, &resp) {
+                        t.version += 1;
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
             if self.crop.is_some() {
                 self.crop_overlay(ui, &painter, dest, sz, &resp);
             }
@@ -570,7 +592,7 @@ impl Viewer {
         // Drag to pan (or press-and-hold magnifier when the whole image fits).
         let fits = w * self.zoom / ppp <= view.width() + 1.0 && h * self.zoom / ppp <= view.height() + 1.0;
         let primary_down = ui.input(|i| i.pointer.primary_down());
-        if self.crop.is_none() {
+        if self.crop.is_none() && !self.tool_grabs_pointer(ui) {
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 self.drag_pan = !fits;
             }
@@ -594,6 +616,12 @@ impl Viewer {
         self.center.y = if h <= half_vh * 2.0 { h / 2.0 } else { self.center.y.clamp(half_vh, h - half_vh) };
     }
 
+    /// Edit-tool canvas hook: an interactive tool owns primary clicks/drags
+    /// (hold Space to pan instead).
+    fn tool_grabs_pointer(&self, ui: &Ui) -> bool {
+        self.tool.as_ref().is_some_and(|t| t.tool.wants_canvas()) && !ui.input(|i| i.key_down(Key::Space))
+    }
+
     fn nav_input(&mut self, ui: &mut Ui, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         if !resp.hovered() && !resp.contains_pointer() {
             return;
@@ -610,7 +638,7 @@ impl Viewer {
                 ev.push(ViewerEvent::Command(if scroll > 0.0 { Command::PrevImage } else { Command::NextImage }));
             }
         }
-        if resp.double_clicked() && self.crop.is_none() {
+        if resp.double_clicked() && self.crop.is_none() && !self.tool_grabs_pointer(ui) {
             ev.push(ViewerEvent::Close);
         }
         if resp.middle_clicked() {

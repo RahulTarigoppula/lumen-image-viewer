@@ -5,6 +5,36 @@ use crate::edit::{effects as fx, filters, EditTool, ToolUiCtx};
 use egui::{vec2, Color32, Sense, Stroke};
 use image::RgbaImage;
 
+/// Spatial radius for a render at `scale` (preview size / full size). Kernels
+/// treat sigma < 0.2 as a no-op, so on a downscaled preview tiny radii are
+/// raised to a small visible floor instead of silently disappearing; the final render
+/// (scale 1) always uses the exact value.
+const PREVIEW_MIN_SIGMA: f32 = 0.35;
+
+fn scaled_radius(r: f32, scale: f32) -> f32 {
+    let s = r * scale;
+    if scale < 1.0 && r >= 0.2 {
+        s.max(PREVIEW_MIN_SIGMA)
+    } else {
+        s
+    }
+}
+
+/// Preview scale (preview size / full size) from the UI context.
+fn preview_scale(cx: &ToolUiCtx) -> f32 {
+    match cx.preview {
+        Some(p) if cx.image_size.0 > 0 => (p.width() as f32 / cx.image_size.0 as f32).min(1.0),
+        _ => 1.0,
+    }
+}
+
+/// Note shown when a radius is too fine to show up in the downscaled preview.
+fn fine_detail_note(ui: &mut egui::Ui, cx: &ToolUiCtx, radius: f32) {
+    if radius * preview_scale(cx) < 0.5 {
+        info(ui, cx, "Detail is finer than the preview resolution: the preview is approximate. Check at 100% after applying.");
+    }
+}
+
 // ---------------------------------------------------------------- Sharpen
 
 #[derive(Clone)]
@@ -41,10 +71,11 @@ impl EditTool for Sharpen {
         c |= slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 2.0, "", 1.0, 0, false);
         ui.add_space(6.0);
         info(ui, cx, "Tip: judge sharpening at 100% zoom; previews are downscaled.");
+        fine_detail_note(ui, cx, self.radius);
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {
-        filters::unsharp_mask(img, self.amount / 100.0, self.radius * scale, self.threshold.round().clamp(0.0, 255.0) as u8)
+        filters::unsharp_mask(img, self.amount / 100.0, scaled_radius(self.radius, scale), self.threshold.round().clamp(0.0, 255.0) as u8)
     }
     fn clone_box(&self) -> Box<dyn EditTool> {
         Box::new(self.clone())
@@ -103,10 +134,13 @@ impl EditTool for Blur {
                 _ => "Natural soft focus.",
             },
         );
+        if self.mode != 2 {
+            fine_detail_note(ui, cx, self.radius);
+        }
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {
-        let r = self.radius * scale;
+        let r = scaled_radius(self.radius, scale);
         match self.mode {
             1 => filters::box_blur(img, r.round().max(0.0) as usize),
             2 => filters::motion_blur(img, self.angle, self.distance * scale),
@@ -400,6 +434,15 @@ pub mod tests {
             let z = Effects { kind: k, strength: 0.0, ..Effects::default() };
             assert_eq!(z.apply(&img, 1.0), img, "{} at 0%", EFFECTS[k]);
         }
+    }
+
+    #[test]
+    fn small_radius_still_previews() {
+        let img = RgbaImage::from_fn(40, 40, |x, y| image::Rgba([((x * 37 + y * 11) % 256) as u8, (y * 6) as u8, 99, 255]));
+        let s = Sharpen { amount: 200.0, radius: 0.5, threshold: 0.0 };
+        assert_ne!(s.apply(&img, 0.28), img, "preview must show something");
+        assert_eq!(scaled_radius(0.5, 1.0), 0.5);
+        assert_eq!(scaled_radius(0.1, 0.25), 0.025);
     }
 
     #[test]
