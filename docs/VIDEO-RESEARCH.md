@@ -41,8 +41,8 @@ Status: research note, October 2026. Target: Rust 1.99 (MSVC), eframe/egui 0.37 
 
 **P1: compare and analysis core**
 8. Open B (and later C, D...), with **sync by timestamp or by frame index**, plus a **time offset** (±1/10/100 frames).
-9. Compare modes: **side-by-side** (H/V), **wipe slider** (vertical/horizontal, mouse-driven), **flicker/toggle** (hold key or auto N ms), **difference** (|A−B| × gain 1-64, luma-only or RGB, signed mode, heatmap), **checkerboard** (tile size). Zoom and pan are always shared between views.
-10. **Pixel inspector**: raw Y/Cb/Cr code values, converted RGB, and the A−B delta under the cursor. Loupe magnifier.
+9. Compare modes: **side-by-side** (H/V), **wipe slider** (vertical/horizontal, mouse-driven), **flicker/toggle** (hold key or auto N ms), **difference** (|A-B| × gain 1-64, luma-only or RGB, signed mode, heatmap), **checkerboard** (tile size). Zoom and pan are always shared between views.
+10. **Pixel inspector**: raw Y/Cb/Cr code values, converted RGB, and the A-B delta under the cursor. Loupe magnifier.
 11. **Per-frame metrics** PSNR-Y/U/V/avg and SSIM (current frame instantly). A background "analyze whole file" job produces a graph you can click to seek, a worst-N frames list, and CSV/JSON export.
 12. **Frame index**: per-frame PTS, DTS, key flag, packet size, and frame type I/P/B. Shown as a StreamEye-style frame-size bar chart and a **bitrate graph** (1 s sliding window).
 13. Thumbnail filmstrip on the timeline.
@@ -66,10 +66,10 @@ All metrics run on **decoded native planes** (YUV code values), not on display R
 
 ### 2.1 PSNR
 
-For plane *p* with width W_p and height H_p, and bit depth *b* (MAX = 2^b − 1; 255 for 8-bit, 1023 for 10-bit):
+For plane *p* with width W_p and height H_p, and bit depth *b* (MAX = 2^b - 1; 255 for 8-bit, 1023 for 10-bit):
 
 ```
-MSE_p  = (1 / (W_p*H_p)) * Σ (A_p(x,y) − B_p(x,y))²
+MSE_p  = (1 / (W_p*H_p)) * Σ (A_p(x,y) - B_p(x,y))²
 PSNR_p = 10 * log10(MAX² / MSE_p)          (MSE_p = 0 → +inf; display as "inf" or cap at 100 dB)
 ```
 
@@ -85,22 +85,22 @@ For each local window with means μ, variances σ², and covariance σ_xy:
 
 ```
 SSIM(x,y) = ((2 μx μy + C1) (2 σxy + C2)) / ((μx² + μy² + C1)(σx² + σy² + C2))
-C1 = (K1·L)²,  C2 = (K2·L)²,  K1 = 0.01, K2 = 0.03,  L = 2^b − 1 (255 for 8-bit)
+C1 = (K1·L)²,  C2 = (K2·L)²,  K1 = 0.01, K2 = 0.03,  L = 2^b - 1 (255 for 8-bit)
 Frame SSIM = mean of the SSIM map over all valid windows (no padding)
-SSIM dB    = 10·log10(1 / (1 − SSIM))   (FFmpeg reports this)
+SSIM dB    = 10·log10(1 / (1 - SSIM))   (FFmpeg reports this)
 ```
 
 **Two variants. Offer both:**
 
 1. **Fast, FFmpeg/x264-compatible (default for whole-file analysis).** Use unweighted **8x8 windows at stride 4**, built from 4x4 block sums. For each 4x4 block, compute `s1=Σa, s2=Σb, ss=Σa²+Σb², s12=Σab`. Each 8x8 window sums a 2x2 group of neighboring blocks. Then, with N = 64:
    ```
-   vars  = ss·64 − s1² − s2²
-   covar = s12·64 − s1·s2
+   vars  = ss·64 - s1² - s2²
+   covar = s12·64 - s1·s2
    c1 = 0.01²·L²·64 ,  c2 = 0.03²·L²·64·63
    ssim = (2·s1·s2 + c1)(2·covar + c2) / ((s1² + s2² + c1)(vars + c2))
    ```
-   Average over `((W>>2)−1)·((H>>2)−1)` windows. Combine planes with the same pixel-count weights as PSNR. All sums are integers, so 8-bit fits in `i32` per 4x4 block. This is very fast: one pass, two rows of block sums kept in a sliding buffer.
-2. **Accurate (Wang reference / MATLAB `ssim_index`).** Use an **11x11 Gaussian, σ = 1.5**, normalized to sum to 1. Apply it as a separable filter (two 1-D 11-tap passes) to five f32 images: x, y, x², y², xy. Then `σx² = E[x²] − μx²`, and so on. Keep only "valid" outputs, without padding. The original also suggests downsampling by `f = max(1, round(min(W,H)/256))` with an f×f box filter first. Make that a toggle, because many tools (libvmaf `float_ssim`) apply it. Cost is about 110 MAC per pixel per image, roughly 30-60 ms for 4K luma with rayon + f32 SIMD. That's fine for the current frame, but slower for a whole file.
+   Average over `((W>>2)-1)·((H>>2)-1)` windows. Combine planes with the same pixel-count weights as PSNR. All sums are integers, so 8-bit fits in `i32` per 4x4 block. This is very fast: one pass, two rows of block sums kept in a sliding buffer.
+2. **Accurate (Wang reference / MATLAB `ssim_index`).** Use an **11x11 Gaussian, σ = 1.5**, normalized to sum to 1. Apply it as a separable filter (two 1-D 11-tap passes) to five f32 images: x, y, x², y², xy. Then `σx² = E[x²] - μx²`, and so on. Keep only "valid" outputs, without padding. The original also suggests downsampling by `f = max(1, round(min(W,H)/256))` with an f×f box filter first. Make that a toggle, because many tools (libvmaf `float_ssim`) apply it. Cost is about 110 MAC per pixel per image, roughly 30-60 ms for 4K luma with rayon + f32 SIMD. That's fine for the current frame, but slower for a whole file.
 
 Compute SSIM on **Y only** by default. Y, U, and V plus the weighted "All" value are optional.
 
@@ -114,8 +114,8 @@ Compute SSIM on **Y only** by default. Y, U, and V plus the weighted "All" value
 ### 2.4 Scene-change score (FFmpeg `scdet` style)
 
 On downscaled luma (for example, ¼ resolution):
-- `mafd = SAD(Y_n, Y_{n−1}) / (pixels)`, normalized to 0-100 by dividing by MAX and multiplying by 100.
-- `diff = |mafd − mafd_prev|`.
+- `mafd = SAD(Y_n, Y_{n-1}) / (pixels)`, normalized to 0-100 by dividing by MAX and multiplying by 100.
+- `diff = |mafd - mafd_prev|`.
 - `score = clamp(min(mafd, diff), 0, 100)`.
 - Mark a scene change when `score > 10` (configurable).
 
@@ -183,9 +183,9 @@ Pin exact versions, because ffmpeg-next minor versions can break the API. Use th
 
 - **Output:** `cpal` 0.18 uses WASAPI shared mode by default on Windows. Open the default output device and use its `default_output_config()` (usually 48 kHz f32 stereo).
 - **Format conversion:** use FFmpeg `swresample` (already linked) to convert any decoded audio to device rate, channel layout, and f32 interleaved. That avoids pulling in `rubato`.
-- **Transport:** run an audio decode thread that pushes `(pts_of_first_sample, samples)` chunks into an SPSC ring (`ringbuf` 0.5, about 200-500 ms capacity). The cpal callback pops samples (and writes silence on underrun). After each callback it publishes `clock = chunk_pts + consumed/rate − output_latency`. `output_latency` comes from `OutputCallbackInfo::timestamp()` (`playback − callback`). Store it in an `AtomicU64` (f64 bits) together with an `Instant`, so the UI can interpolate between callbacks.
+- **Transport:** run an audio decode thread that pushes `(pts_of_first_sample, samples)` chunks into an SPSC ring (`ringbuf` 0.5, about 200-500 ms capacity). The cpal callback pops samples (and writes silence on underrun). After each callback it publishes `clock = chunk_pts + consumed/rate - output_latency`. `output_latency` comes from `OutputCallbackInfo::timestamp()` (`playback - callback`). Store it in an `AtomicU64` (f64 bits) together with an `Instant`, so the UI can interpolate between callbacks.
 - **Master clock:** audio when an audio stream exists and speed is 1×. Otherwise use `Instant` plus the accumulated pause offset. Muting is not the same as no-audio: keep feeding the device zeros while muted so the clock keeps running.
-- **Video presentation:** the video decode thread fills a bounded queue (about 4-8 frames) of decoded frames. Each repaint, the UI picks the newest frame with `pts ≤ clock`, drops the frames older than it, and calls `ctx.request_repaint_after(next_pts − clock)`. Lumen's display is vsync-locked, so expect normal 24p-on-60 Hz cadence judder (the same as mpv's default `video-sync=audio`).
+- **Video presentation:** the video decode thread fills a bounded queue (about 4-8 frames) of decoded frames. Each repaint, the UI picks the newest frame with `pts ≤ clock`, drops the frames older than it, and calls `ctx.request_repaint_after(next_pts - clock)`. Lumen's display is vsync-locked, so expect normal 24p-on-60 Hz cadence judder (the same as mpv's default `video-sync=audio`).
 - **Seeking:** pause the clock, flush both decoders (`avcodec_flush_buffers`), clear the rings, then `av_seek_frame(stream, ts, AVSEEK_FLAG_BACKWARD)`. Decode and discard until video `pts ≥ target` and trim audio samples before the target. Unmute only when both sides are ready. While dragging the scrubber, seek to keyframes only (no discard loop) for responsiveness, then do one exact seek on release.
 - **Speed other than 1×:** mute audio (or add `avfilter` atempo later) and switch to the system clock.
 
@@ -199,23 +199,23 @@ Pin exact versions, because ffmpeg-next minor versions can break the API. Use th
 - Draw with `egui::PaintCallback` + `egui_glow::CallbackFn` (see the `custom3d_glow` demo; the callback gets `painter.gl()`). Alternatively, render into an FBO-backed RGBA texture registered with `frame.register_native_glow_texture()` and display it as a normal `egui::Image`, which reuses the image-mode zoom/pan code. **The FBO route is preferred:** you get one texture per side and can reuse it for scopes and snapshots.
 - Fragment shader inputs: the matrix (from `AVFrame.colorspace`) and range (`color_range`), a bit-depth scale (`65535/1023` for low-bit-packed 10-bit; ≈1 for P010), and chroma siting. When the matrix is unspecified, use BT.709 if height ≥ 720, otherwise BT.601 (the mpv/FFmpeg heuristic).
 
-YUV→RGB math. With Kg = 1 − Kr − Kb and Y′∈[0,1], Cb,Cr∈[−0.5,0.5]:
+YUV→RGB math. With Kg = 1 - Kr - Kb and Y′∈[0,1], Cb,Cr∈[-0.5,0.5]:
 ```
-Limited 8-bit:  Y′ = (Y − 16)/219,   Cb = (U − 128)/224,  Cr = (V − 128)/224   (×2^(b−8) for b-bit codes)
-Full range:     Y′ = Y/255,          Cb = (U − 128)/255,  Cr = (V − 128)/255
-R = Y′ + 2(1−Kr)·Cr
-G = Y′ − (2Kb(1−Kb)/Kg)·Cb − (2Kr(1−Kr)/Kg)·Cr
-B = Y′ + 2(1−Kb)·Cb
-BT.601  Kr=0.299  Kb=0.114   → R=Y+1.402Cr,  G=Y−0.344136Cb−0.714136Cr, B=Y+1.772Cb
-BT.709  Kr=0.2126 Kb=0.0722  → R=Y+1.5748Cr, G=Y−0.187324Cb−0.468124Cr, B=Y+1.8556Cb
-BT.2020 Kr=0.2627 Kb=0.0593  → R=Y+1.4746Cr, G=Y−0.164553Cb−0.571353Cr, B=Y+1.8814Cb
+Limited 8-bit:  Y′ = (Y - 16)/219,   Cb = (U - 128)/224,  Cr = (V - 128)/224   (×2^(b-8) for b-bit codes)
+Full range:     Y′ = Y/255,          Cb = (U - 128)/255,  Cr = (V - 128)/255
+R = Y′ + 2(1-Kr)·Cr
+G = Y′ - (2Kb(1-Kb)/Kg)·Cb - (2Kr(1-Kr)/Kg)·Cr
+B = Y′ + 2(1-Kb)·Cb
+BT.601  Kr=0.299  Kb=0.114   → R=Y+1.402Cr,  G=Y-0.344136Cb-0.714136Cr, B=Y+1.772Cb
+BT.709  Kr=0.2126 Kb=0.0722  → R=Y+1.5748Cr, G=Y-0.187324Cb-0.468124Cr, B=Y+1.8556Cb
+BT.2020 Kr=0.2627 Kb=0.0593  → R=Y+1.4746Cr, G=Y-0.164553Cb-0.571353Cr, B=Y+1.8814Cb
 ```
 The result is gamma-encoded R′G′B′. Write it to an sRGB-agnostic RGBA8 target as-is, which matches what players show for SDR. For PQ/HLG, linearize, tone map (BT.2390 EETF or Hable), apply the 2020→709 matrix, and re-encode.
 
 **Compare modes in the same shader** (two YUV inputs → one output):
-- `wipe`: pick by `dot(uv − p, n) > 0` (any angle), with a 1 px divider line.
+- `wipe`: pick by `dot(uv - p, n) > 0` (any angle), with a 1 px divider line.
 - `checker`: pick by `(floor(x/T) + floor(y/T)) & 1`.
-- `diff`: `abs(A − B)·gain`, on luma or RGB. Variants: signed `0.5 + (A − B)·gain`, a heatmap ramp, and a threshold mask.
+- `diff`: `abs(A - B)·gain`, on luma or RGB. Variants: signed `0.5 + (A - B)·gain`, a heatmap ramp, and a threshold mask.
 - `flicker`: a uniform bool toggled on a timer or a held key.
 - Side-by-side uses two quads with the same view transform. B is sampled in A's coordinate space (with an optional scale-to-fit), so zoom and pan are always synchronized. Use nearest-neighbour filtering at zoom ≥ 2× so individual pixels are visible.
 
@@ -257,7 +257,7 @@ src/video/
 Key decisions:
 - **Per-source threads.** One demux thread routes packets to a video decode thread and an audio decode thread through `crossbeam-channel` (already a dependency). The UI thread only uploads textures and draws.
 - **Index first.** On open, run a demux-only pass in the background: `av_read_frame`, no decoding, typically several hundred MB/s. It gives exact frame count, frame number↔PTS mapping (VFR-safe), keyframe positions, packet sizes, and the bitrate graph. Frame types come from `av_parser_parse2` (`AVCodecParserContext.pict_type`) for H.264/HEVC/MPEG-2, after `h264_mp4toannexb`/`hevc_mp4toannexb` for MP4/MKV. For AV1/VP9 the frame type is only key vs inter. Decoded `AVFrame.pict_type` overwrites the entry whenever a frame is actually decoded.
-- **Frame-accurate stepping.** Forward step = next frame from the decode queue. Back step = if the frame is in the GOP cache, show it instantly. Otherwise seek to the keyframe ≤ (target − 1) using the index, decode forward to the target, and **keep every frame of that GOP** in the back cache (budget default 1 GB, about 80 frames at 4K 4:2:0 8-bit). The cache stores refcounted `AVFrame`s, with no copies.
+- **Frame-accurate stepping.** Forward step = next frame from the decode queue. Back step = if the frame is in the GOP cache, show it instantly. Otherwise seek to the keyframe ≤ (target - 1) using the index, decode forward to the target, and **keep every frame of that GOP** in the back cache (budget default 1 GB, about 80 frames at 4K 4:2:0 8-bit). The cache stores refcounted `AVFrame`s, with no copies.
 - **Jump to frame/time** accepts `1234`, `1234f`, `00:01:02.500`, `62.5s`, and `+10f`/`-2s`. It resolves through the index to a PTS, then does an exact seek.
 - **Compare pairing.** The A timeline is the master. B shows the frame with the largest `pts_B ≤ pts_A + offset` (timestamp mode) or `index_A + offset_frames` (index mode). Index mode is the default when both files have the same frame count, which is typical for encoder comparisons. Both sources decode in lockstep while paused. During playback, B follows A's clock.
 - **Metrics.** "Current frame" metrics compute on demand (fast SSIM < 5 ms at 4K). Whole-file jobs run in a separate worker that opens its own decoder instances, so playback isn't disturbed. Results go into `Vec<FrameMetrics>`, which the timeline graph and CSV/JSON export read.
@@ -288,7 +288,7 @@ Proposed keymap. It merges mpv, video-compare, and NLE (JKL) conventions, and st
 | PgDn / PgUp | Next / previous keyframe; Ctrl+PgDn/PgUp next/prev scene change |
 | Home / End | First / last frame |
 | J / L | Shuttle reverse (by stepping) / forward; repeat to go faster |
-| `[` / `]`, Backspace | Speed −/+; reset to 1× |
+| `[` / `]`, Backspace | Speed -/+; reset to 1× |
 | G | Go to frame/time dialog |
 | Ctrl+C / Ctrl+V | Copy timecode+frame / paste and seek (video-compare) |
 | 0 / 1 / wheel / drag | Fit / 100% / zoom at cursor / pan (same as image mode) |
