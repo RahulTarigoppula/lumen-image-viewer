@@ -1,0 +1,56 @@
+[package]
+name = "lumen-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Lumen core: UI-free decoders, encoders, metadata, catalog and pixel operations"
+publish = false
+
+[lib]
+name = "lumen_core"
+
+[dependencies]
+image.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+anyhow.workspace = true
+log.workspace = true
+chrono.workspace = true
+jpeg-encoder.workspace = true
+webp.workspace = true
+ab_glyph.workspace = true
+fast_image_resize = { version = "6", features = ["rayon", "image"] }
+kamadak-exif = "0.6"
+qcms = "0.3.0"
+img-parts = "0.4.1"
+epaint_default_fonts = "0.37"
+resvg = "0.48.1"
+# Anti-aliased vector rasterization for the Draw Board and selection masks.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Data_Pdf",
+    "Storage",
+    "Storage_Streams",
+    "Foundation",
+]
+
+[dev-dependencies]
+png = "0.18"
+tiff.workspace = true

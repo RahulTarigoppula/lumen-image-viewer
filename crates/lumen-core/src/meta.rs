@@ -156,13 +156,15 @@ pub struct MetaService {
 }
 
 impl MetaService {
-    pub fn new(ctx: egui::Context) -> Self {
+    /// `repaint` is called from the worker threads when a batch of results is
+    /// ready (the app passes a closure that requests a UI repaint).
+    pub fn new(repaint: impl Fn() + Clone + Send + 'static) -> Self {
         let (tx, jrx) = unbounded::<PathBuf>();
         let (rtx, rx) = unbounded();
         for _ in 0..2 {
             let jrx = jrx.clone();
             let rtx = rtx.clone();
-            let ctx = ctx.clone();
+            let repaint = repaint.clone();
             std::thread::spawn(move || {
                 let mut n = 0u32;
                 while let Ok(p) = jrx.recv() {
@@ -171,7 +173,7 @@ impl MetaService {
                     let _ = rtx.send((p, QuickMeta { dims, taken }));
                     n += 1;
                     if n % 32 == 0 || jrx.is_empty() {
-                        ctx.request_repaint();
+                        repaint();
                     }
                 }
             });
