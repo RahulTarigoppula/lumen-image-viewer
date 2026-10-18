@@ -2,7 +2,12 @@
 //! `EditTool` interface used by every adjustment dialog (live preview runs on a
 //! screen-sized copy in the background; "Apply" runs on full resolution).
 
+pub mod effects;
+pub mod filters;
+pub mod geom;
 pub mod ops;
+pub mod text;
+pub mod tone;
 pub mod tools;
 
 use image::RgbaImage;
@@ -111,6 +116,9 @@ pub struct ToolUiCtx<'a> {
     pub image_size: (u32, u32),
     /// 256-bin luminance + RGB histograms of the current image.
     pub histogram: &'a Histogram,
+    /// The screen-sized preview copy the live preview is rendered from (for
+    /// tools that show their own thumbnails).
+    pub preview: Option<&'a RgbaImage>,
 }
 
 /// An adjustment dialog. Implementations hold their own parameters.
@@ -119,13 +127,13 @@ pub trait EditTool: Send {
     /// Draw parameter controls; return true when a parameter changed.
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool;
     /// Apply to `img`. `scale` is preview-size / full-size (1.0 for the final
-    /// render) so spatial parameters (blur radius, border width, font size…)
+    /// render) so spatial parameters (blur radius, border width, font size...)
     /// can be scaled to look the same in the preview.
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage;
     fn clone_box(&self) -> Box<dyn EditTool>;
     /// Reset parameters to defaults.
     fn reset(&mut self) {}
-    /// Whether the output size differs from the input (resize, canvas, border …).
+    /// Whether the output size differs from the input (resize, canvas, border ...).
     fn changes_size(&self) -> bool {
         false
     }

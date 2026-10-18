@@ -971,7 +971,7 @@ impl Viewer {
         ui.add_space(8.0);
         let size = self.edit.as_ref().map(|e| e.current.dimensions()).or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions())).unwrap_or((t.base.width(), t.base.height()));
         let changed = {
-            let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &t.histogram };
+            let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &t.histogram, preview: Some(&t.base) };
             let w = ui.available_width();
             egui::ScrollArea::vertical().max_height(ui.available_height() - 90.0).show(ui, |ui| {
                 ui.set_max_width(w);
