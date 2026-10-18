@@ -457,7 +457,10 @@ impl Browser {
                 .size_range(140.0..=640.0)
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| {
-                    core.settings.preview_height = ui.available_height() + 16.0;
+                    // Content must never ask for more than the panel has, or a
+                    // resizable panel grows a little every frame.
+                    let h = ui.available_height();
+                    ui.set_max_height(h);
                     self.preview_pane(ui, core);
                 });
         }
@@ -481,7 +484,7 @@ impl Browser {
             return;
         };
         let avail = ui.available_size();
-        let img_h = (avail.y - 92.0).max(60.0);
+        let img_h = (avail.y - 118.0).max(60.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(avail.x, img_h), Sense::hover());
         ui.painter().rect_filled(rect, CornerRadius::same(8), ui.visuals().extreme_bg_color);
         let mut dims = core.meta.get(&entry.path).and_then(|m| m.dims);
