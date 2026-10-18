@@ -1486,6 +1486,19 @@ impl eframe::App for App {
         if was_loading && !self.browser.loading {
             self.sync_viewer_list();
         }
+        // Single instance: open a file/folder another `lumen.exe` launch forwarded
+        // to us (see shell.rs), then bring this window to the front.
+        if let Some(p) = crate::shell::poll_forwarded(ctx).pop() {
+            if p.is_dir() {
+                self.navigate(p);
+            } else {
+                self.open_file(&p);
+            }
+            if ctx.input(|i| i.viewport().minimized == Some(true)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.last_save.elapsed().as_secs() > 5 {
             self.core.tags.save_if_dirty();
             self.last_save = Instant::now();

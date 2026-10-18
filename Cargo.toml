@@ -56,6 +56,9 @@ features = [
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_UI_HiDpi",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
 ]
 
 [features]
