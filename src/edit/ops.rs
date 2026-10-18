@@ -91,27 +91,41 @@ pub fn auto_levels(img: &RgbaImage) -> RgbaImage {
     if total == 0 {
         return img.clone();
     }
-    let pct = |h: &Vec<u32>, p: f64| -> usize {
-        let target = (total as f64 * p) as u64;
-        let mut acc = 0u64;
-        for (i, &v) in h.iter().enumerate() {
-            acc += v as u64;
-            if acc >= target {
-                return i;
-            }
-        }
-        255
-    };
+    use crate::edit::tone::percentile;
+    let (llo, lhi) = (percentile(&hist.l, 0.003) as f32, percentile(&hist.l, 0.997) as f32);
+    // Midtone correction from the stretched mean luminance.
+    let mean: f64 = hist.l.iter().enumerate().map(|(i, &v)| i as f64 * v as f64).sum::<f64>() / total as f64;
+    let span = (lhi - llo).max(32.0);
+    let m = ((mean as f32 - llo) / span).clamp(0.02, 0.98) as f64;
+    let p = ((0.46f64.ln() / m.ln()) as f32).clamp(0.78, 1.25);
+    // Pull the gamma towards 1: an automatic tool shouldn't be heavy handed.
+    let p = 1.0 + (p - 1.0) * 0.6;
     let mut lut = [[0u8; 256]; 3];
     for (c, h) in [&hist.r, &hist.g, &hist.b].iter().enumerate() {
-        let lo = pct(h, 0.005) as f32;
-        let hi = (pct(h, 0.995) as f32).max(lo + 16.0);
+        // Per-channel stretch pulled towards the luminance stretch so colour
+        // casts are only partially corrected and results stay natural.
+        let lo = llo + (percentile(h, 0.003) as f32 - llo) * 0.65;
+        let hi = (lhi + (percentile(h, 0.997) as f32 - lhi) * 0.65).max(lo + 32.0);
         for i in 0..256 {
-            let v = ((i as f32 - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let v = ((i as f32 - lo) / (hi - lo)).clamp(0.0, 1.0).powf(p);
             lut[c][i] = (v * 255.0 + 0.5) as u8;
         }
     }
-    apply_lut(img, &lut)
+    // LUT + a touch of saturation in a single pass.
+    let mut out = img.clone();
+    out.as_mut().par_chunks_mut(4 * 4096).for_each(|chunk| {
+        const SAT: f32 = 1.1;
+        for px in chunk.chunks_exact_mut(4) {
+            let r = lut[0][px[0] as usize] as f32;
+            let g = lut[1][px[1] as usize] as f32;
+            let b = lut[2][px[2] as usize] as f32;
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            px[0] = (l + (r - l) * SAT + 0.5).clamp(0.0, 255.0) as u8;
+            px[1] = (l + (g - l) * SAT + 0.5).clamp(0.0, 255.0) as u8;
+            px[2] = (l + (b - l) * SAT + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    });
+    out
 }
 
 #[cfg(test)]
@@ -125,6 +139,16 @@ mod tests {
                 assert!((back[i] - c[i]).abs() < 1e-4, "{c:?} -> {back:?}");
             }
         }
+    }
+    #[test]
+    fn auto_levels_stretches() {
+        let img = RgbaImage::from_fn(64, 64, |x, _| image::Rgba([60 + x as u8, 60 + x as u8, 60 + x as u8, 255]));
+        let out = auto_levels(&img);
+        assert_eq!(out.dimensions(), img.dimensions());
+        let (mn, mx) = out.pixels().fold((255u8, 0u8), |(a, b), p| (a.min(p[0]), b.max(p[0])));
+        assert!(mn < 10 && mx > 245, "{mn} {mx}");
+        let one = RgbaImage::from_pixel(1, 1, image::Rgba([5, 5, 5, 255]));
+        assert_eq!(auto_levels(&one).dimensions(), (1, 1));
     }
     #[test]
     fn crop_clamps() {
