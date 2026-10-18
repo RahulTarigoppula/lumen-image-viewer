@@ -102,6 +102,13 @@ pub enum Command {
     OpenGpsMap,
     /// Keep the zoom ratio when moving to the next image.
     ToggleLockZoom,
+    EditComment,
+    RemoveMetadata,
+    ChangeDates,
+    ExportXmp,
+    CreateMultiPage,
+    ImageStrip,
+    CreateZip,
 }
 
 use Command::*;
@@ -204,6 +211,13 @@ impl Command {
             FitHeight => "Fit height".into(),
             OpenGpsMap => "Show GPS location on map".into(),
             ToggleLockZoom => "Lock zoom ratio".into(),
+            EditComment => "Edit comment / description...".into(),
+            RemoveMetadata => "Remove metadata...".into(),
+            ChangeDates => "Change dates...".into(),
+            ExportXmp => "Export ratings to XMP sidecars".into(),
+            CreateMultiPage => "Create multi-page file (PDF/TIFF/GIF)...".into(),
+            ImageStrip => "Join images (strip)...".into(),
+            CreateZip => "Create ZIP archive...".into(),
         }
     }
 
@@ -308,6 +322,13 @@ impl Command {
             FitHeight => I::ARROWS_OUT_LINE_VERTICAL,
             OpenGpsMap => I::MAP_PIN,
             ToggleLockZoom => I::LOCK_SIMPLE,
+            EditComment => I::NOTE_PENCIL,
+            RemoveMetadata => I::ERASER,
+            ChangeDates => I::CALENDAR,
+            ExportXmp => I::EXPORT,
+            CreateMultiPage => I::FILES,
+            ImageStrip => I::COLUMNS,
+            CreateZip => I::FILE_ZIP,
         }
     }
 
@@ -323,7 +344,8 @@ impl Command {
             CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance, AddText, AddBorder,
             Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
-            FitHeight, OpenGpsMap, ToggleLockZoom, Exit,
+            FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
+            CreateMultiPage, ImageStrip, CreateZip, Exit,
         ];
         for n in 0..=5 {
             v.push(Rate(n));
@@ -354,7 +376,7 @@ impl Command {
             OpenWithEditor,
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
-        v.extend([Properties, OpenGpsMap]);
+        v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
         v
     }
 

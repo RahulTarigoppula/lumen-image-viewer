@@ -138,7 +138,11 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Alt+I", Properties),
             ("Ctrl+W", SetWallpaper),
             ("W", ShowInExplorer),
-            ("Ctrl+Shift+M", OpenGpsMap),
+            ("Ctrl+Alt+M", OpenGpsMap),
+            ("D", EditComment),
+            ("Ctrl+Shift+M", CreateMultiPage),
+            ("Ctrl+Shift+J", ImageStrip),
+            ("Ctrl+Alt+Z", CreateZip),
         ],
         KeyMode::Viewer => vec![
             ("Esc", CloseViewer),
@@ -208,7 +212,11 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Alt+I", Properties),
             ("Enter", ToggleFullscreen),
             ("W", ShowInExplorer),
-            ("Ctrl+Shift+M", OpenGpsMap),
+            ("Ctrl+Alt+M", OpenGpsMap),
+            ("D", EditComment),
+            ("Ctrl+Shift+M", CreateMultiPage),
+            ("Ctrl+Shift+J", ImageStrip),
+            ("Ctrl+Alt+Z", CreateZip),
         ],
     };
     if mode != KeyMode::Global {
@@ -627,7 +635,8 @@ mod tests {
                 assert!(has(mode, "\\", Command::ToggleFlag));
                 assert!(has(mode, "W", Command::ShowInExplorer));
                 assert!(has(mode, "Alt+I", Command::Properties));
-                assert!(has(mode, "Ctrl+Shift+M", Command::OpenGpsMap));
+                assert!(has(mode, "Ctrl+Alt+M", Command::OpenGpsMap));
+                assert!(has(mode, "D", Command::EditComment));
                 for n in 2..=9u8 {
                     assert!(has(mode, &format!("Alt+{n}"), Command::OpenWithEditorN(n)));
                 }
