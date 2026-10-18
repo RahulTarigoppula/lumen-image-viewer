@@ -1,5 +1,5 @@
 //! ICC color management: convert embedded profiles (Adobe RGB, Display P3,
-//! ProPhoto, …) to sRGB so colors look right on a standard display.
+//! ProPhoto, ...) to sRGB so colors look right on a standard display.
 
 use image::RgbaImage;
 use rayon::prelude::*;

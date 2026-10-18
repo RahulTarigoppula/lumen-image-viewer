@@ -50,14 +50,16 @@ pub struct GpuImage {
 fn to_color_image(img: &RgbaImage, x0: u32, y0: u32, w: u32, h: u32) -> ColorImage {
     let stride = img.width() as usize * 4;
     let raw = img.as_raw();
-    let mut pixels = Vec::with_capacity((w * h) as usize);
+    let mut pixels: Vec<Color32> = Vec::with_capacity((w * h) as usize);
     for y in y0..y0 + h {
         let start = y as usize * stride + x0 as usize * 4;
         let row = &raw[start..start + w as usize * 4];
-        pixels.extend(
-            row.chunks_exact(4)
-                .map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])),
-        );
+        // Opaque rows (the common case) need no premultiplication: copy bytes directly.
+        if row.iter().skip(3).step_by(4).all(|&a| a == 255) {
+            pixels.extend_from_slice(bytemuck::cast_slice::<u8, Color32>(row));
+        } else {
+            pixels.extend(row.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])));
+        }
     }
     ColorImage::new([w as usize, h as usize], pixels)
 }

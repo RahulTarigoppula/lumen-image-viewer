@@ -77,7 +77,7 @@ impl SaveDialog {
                 if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
                     self.path = PathBuf::from(s);
                 }
-                if ui.button("Browse…").clicked() {
+                if ui.button("Browse...").clicked() {
                     let mut dlg = rfd::FileDialog::new().add_filter(self.opts.format.label(), &[self.opts.format.ext()]);
                     if let Some(dir) = self.path.parent() {
                         dlg = dlg.set_directory(dir);

@@ -389,7 +389,7 @@ impl App {
                 let files = self.targets();
                 if !files.is_empty() {
                     match fileops::copy_files_to_clipboard(&files) {
-                        Ok(()) => self.core.toasts.info(format!("{} file(s) copied — paste in Explorer or another folder", files.len())),
+                        Ok(()) => self.core.toasts.info(format!("{} file(s) copied - paste in Explorer or another folder", files.len())),
                         Err(e) => self.core.toasts.error(e.to_string()),
                     }
                 }
@@ -506,7 +506,7 @@ impl App {
                     let j = if i + 1 < self.viewer.list.len() { i + 1 } else { i - 1 };
                     vec![self.viewer.list[i].clone(), self.viewer.list[j].clone()]
                 } else {
-                    self.core.toasts.info("Select 2–4 images (or 2 videos) to compare");
+                    self.core.toasts.info("Select 2-4 images (or 2 videos) to compare");
                     return;
                 };
                 self.compare = Some(crate::ui::compare::Compare::new(imgs.into_iter().take(4).collect(), &self.core));
@@ -706,7 +706,7 @@ impl App {
             self.open_viewer_at(f);
         }
         if self.viewer.current_image(&self.core).is_none() {
-            self.core.toasts.info("Image is still loading…");
+            self.core.toasts.info("Image is still loading...");
             return false;
         }
         true
@@ -726,6 +726,7 @@ impl App {
                             ok += 1;
                             self.core.loader.invalidate(p);
                             self.core.thumbs.forget(p);
+                            self.viewer.forget_stat(p);
                             self.core.meta.forget(p);
                         }
                         Err(e) => self.core.toasts.error(format!("{}: {e}", p.display())),
@@ -734,7 +735,7 @@ impl App {
                 if ok > 0 {
                     self.viewer.edit = None;
                     self.viewer.reset_view(fit);
-                    self.core.toasts.info(format!("{} — lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                    self.core.toasts.info(format!("{} - lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
                 }
                 return;
             }
@@ -752,6 +753,7 @@ impl App {
                         ok += 1;
                         self.core.loader.invalidate(p);
                         self.core.thumbs.forget(p);
+                        self.viewer.forget_stat(p);
                     }
                 }
             }
@@ -804,6 +806,7 @@ impl App {
                     }
                 }
                 self.core.thumbs.forget(path);
+                self.viewer.forget_stat(path);
                 self.core.meta.forget(path);
                 if !same {
                     self.core.loader.invalidate(path);
@@ -862,6 +865,7 @@ impl App {
                     self.core.tags.removed(f);
                     self.core.loader.invalidate(f);
                     self.core.thumbs.forget(f);
+                    self.viewer.forget_stat(f);
                     self.viewer.remove_path(f);
                     self.browser.selected.remove(f);
                 }
@@ -1194,7 +1198,7 @@ impl App {
                 ui.heading(title);
                 ui.label(RichText::new(format!("{n} item(s)")).color(p.muted));
                 ui.add_space(8.0);
-                if ui.add(egui::Button::new(format!("{}  Browse for a folder…", I::FOLDER_OPEN)).min_size(Vec2::new(ui.available_width(), 30.0))).clicked() {
+                if ui.add(egui::Button::new(format!("{}  Browse for a folder...", I::FOLDER_OPEN)).min_size(Vec2::new(ui.available_width(), 30.0))).clicked() {
                     if let Some(d) = rfd::FileDialog::new().set_directory(&self.browser.folder).pick_folder() {
                         go = Some(d);
                     }
@@ -1247,7 +1251,7 @@ impl App {
                                 }
                             }
                         } else if let Some(d) = &mut self.save_dialog {
-                            d.error = Some("Could not save — see the message below.".into());
+                            d.error = Some("Could not save - see the message below.".into());
                         }
                     }
                 }
@@ -1321,6 +1325,7 @@ impl App {
                         for f in &paths {
                             self.core.tags.removed(f);
                             self.core.thumbs.forget(f);
+                            self.viewer.forget_stat(f);
                             self.core.loader.invalidate(f);
                         }
                         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -1360,7 +1365,7 @@ impl App {
                 }
                 widgets::section_title(ui, &p, "Mouse");
                 for (k, v) in [
-                    ("Wheel", "Next / previous image (or zoom — configurable in Settings)"),
+                    ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
                     ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
                     ("Drag", "Pan a zoomed image"),
                     ("Press & hold", "Magnifier loupe (when the image fits the window)"),
@@ -1454,11 +1459,11 @@ impl App {
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match self.mode {
             Mode::Viewer => match self.viewer.current() {
-                Some(p) => format!("{}{} — Lumen", crate::ui::viewer::file_name(p), if self.viewer.is_dirty() { " •" } else { "" }),
+                Some(p) => format!("{}{} - Lumen", crate::ui::viewer::file_name(p), if self.viewer.is_dirty() { " •" } else { "" }),
                 None => "Lumen".into(),
             },
-            Mode::Video => "Video — Lumen".into(),
-            _ => format!("{} — Lumen", self.browser.folder.display()),
+            Mode::Video => "Video - Lumen".into(),
+            _ => format!("{} - Lumen", self.browser.folder.display()),
         };
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1573,6 +1578,7 @@ impl eframe::App for App {
                         ViewerEvent::FileChanged(p) => {
                             self.core.loader.invalidate(&p);
                             self.core.thumbs.forget(&p);
+                            self.viewer.forget_stat(&p);
                         }
                         ViewerEvent::IndexChanged(_) => {}
                     }

@@ -156,7 +156,7 @@ impl Toasts {
     }
 }
 
-/// Simple modal-like text prompt state (rename, new folder, …).
+/// Simple modal-like text prompt state (rename, new folder, ...).
 pub struct Prompt {
     pub title: String,
     pub value: String,

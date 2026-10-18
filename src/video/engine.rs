@@ -662,7 +662,7 @@ impl Worker {
         if direct8 || direct16 {
             return Ok(copy_planes(f, direct16));
         }
-        // Normalise everything else (NV12, P010, RGB, …) to planar YUV.
+        // Normalise everything else (NV12, P010, RGB, ...) to planar YUV.
         let depth = unsafe {
             let d = ff::ffi::av_pix_fmt_desc_get(fmt.into());
             if d.is_null() { 8 } else { (*d).comp[0].depth as u32 }

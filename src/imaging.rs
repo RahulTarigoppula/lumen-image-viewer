@@ -64,7 +64,7 @@ pub fn resize_to_fit(src: &RgbaImage, max_w: u32, max_h: u32) -> RgbaImage {
     resize_exact(src, nw, nh, filter)
 }
 
-/// Halve each dimension (2x2 box average) — used to build display pyramids.
+/// Halve each dimension (2x2 box average) - used to build display pyramids.
 pub fn half(src: &RgbaImage) -> RgbaImage {
     let nw = (src.width() / 2).max(1);
     let nh = (src.height() / 2).max(1);

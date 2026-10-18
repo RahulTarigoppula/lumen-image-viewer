@@ -760,7 +760,7 @@ impl VideoMode {
             ui.label(RichText::new(format!("{}  Video", I::FILM_STRIP)).font(crate::ui::theme::semibold(15.0)));
             widgets::separator_v(ui);
             for (i, label) in ["A", "B"].iter().enumerate() {
-                let name = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_else(|| if i == 0 { "Open video…".into() } else { "Add B to compare…".into() });
+                let name = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_else(|| if i == 0 { "Open video...".into() } else { "Add B to compare...".into() });
                 let color = if i == 0 { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(90, 190, 255) };
                 ui.label(RichText::new(*label).strong().color(color));
                 let resp = ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text("Choose a file");
@@ -861,7 +861,7 @@ impl VideoMode {
                 ui.painter().text(c + Vec2::new(0.0, 70.0), Align2::CENTER_CENTER, m, FontId::proportional(12.0), p.danger);
             }
             let br = Rect::from_center_size(c + Vec2::new(0.0, 110.0), Vec2::new(200.0, 34.0));
-            if ui.put(br, egui::Button::new(RichText::new(format!("{}  Open video…", I::FOLDER_OPEN)).color(Color32::WHITE)).fill(p.accent)).clicked() {
+            if ui.put(br, egui::Button::new(RichText::new(format!("{}  Open video...", I::FOLDER_OPEN)).color(Color32::WHITE)).fill(p.accent)).clicked() {
                 let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                 if let Some(files) = rfd::FileDialog::new().add_filter("Videos", &exts).pick_files() {
                     for f in files.into_iter().take(2) {
@@ -1190,7 +1190,7 @@ impl VideoMode {
             }
             widgets::separator_v(ui);
             let a = &self.sources[0];
-            let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "…".into());
+            let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "...".into());
             ui.label(RichText::new(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration()))).monospace().color(p.text));
             ui.add_space(6.0);
             let fr = ui.add(egui::Button::new(RichText::new(format!("frame {} / {}", a.frame_of(a.pts()), total)).monospace().size(12.0)).frame(false)).on_hover_text("Go to frame or time (G)");
@@ -1200,7 +1200,7 @@ impl VideoMode {
             widgets::separator_v(ui);
             // A-B loop
             let lab = match self.loop_ab {
-                (None, _) => "Loop A–B",
+                (None, _) => "Loop A-B",
                 (Some(_), None) => "Set B",
                 _ => "Clear loop",
             };
@@ -1315,7 +1315,7 @@ impl VideoMode {
             painter.add(egui::Shape::mesh(mesh));
         } else {
             let prog = f32::from_bits(a.index_progress.load(Ordering::Relaxed));
-            painter.text(rect.center(), Align2::CENTER_CENTER, format!("Indexing frames… {:.0}%", prog * 100.0), FontId::proportional(11.5), p.faint);
+            painter.text(rect.center(), Align2::CENTER_CENTER, format!("Indexing frames... {:.0}%", prog * 100.0), FontId::proportional(11.5), p.faint);
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
         drop(idx_guard);
@@ -1381,7 +1381,7 @@ impl VideoMode {
         }
         if self.analysis.is_some() {
             painter.rect_filled(Rect::from_min_size(Pos2::new(lx, rect.min.y + 9.0), Vec2::new(12.0, 2.0)), 0.0, Color32::from_rgb(250, 210, 80));
-            painter.text(Pos2::new(lx + 15.0, rect.min.y + 10.0), Align2::LEFT_CENTER, "PSNR-Y (20–60 dB)", FontId::proportional(10.0), p.muted);
+            painter.text(Pos2::new(lx + 15.0, rect.min.y + 10.0), Align2::LEFT_CENTER, "PSNR-Y (20-60 dB)", FontId::proportional(10.0), p.muted);
         }
     }
 
@@ -1428,7 +1428,7 @@ impl VideoMode {
                     }
                     None => {
                         let mismatch = self.sources[0].info.width != self.sources[1].info.width || self.sources[0].info.height != self.sources[1].info.height;
-                        ui.label(RichText::new(if mismatch { "Metrics need identical resolutions (A and B differ)." } else if self.playing { "Pause to measure the current frame." } else { "Measuring…" }).size(12.0).color(p.muted));
+                        ui.label(RichText::new(if mismatch { "Metrics need identical resolutions (A and B differ)." } else if self.playing { "Pause to measure the current frame." } else { "Measuring..." }).size(12.0).color(p.muted));
                     }
                 }
                 ui.add_space(6.0);
@@ -1445,7 +1445,7 @@ impl VideoMode {
                             ui.colored_label(p.danger, e);
                         }
                         if !done {
-                            ui.add(egui::ProgressBar::new(prog).show_percentage().text(format!("Analyzing… {:.0}%", prog * 100.0)));
+                            ui.add(egui::ProgressBar::new(prog).show_percentage().text(format!("Analyzing... {:.0}%", prog * 100.0)));
                             if ui.button("Cancel").clicked() {
                                 an.cancel.store(true, Ordering::Relaxed);
                             }
@@ -1729,7 +1729,7 @@ fn rotate_mesh(mesh: &mut egui::Mesh, dest: Rect, rotation: i32) {
 
 fn media_rows(infos: &[&MediaInfo]) -> Vec<(&'static str, Vec<String>)> {
     let f = |g: &dyn Fn(&MediaInfo) -> String| infos.iter().map(|i| g(i)).collect::<Vec<_>>();
-    let br = |b: i64| if b > 0 { format!("{:.2} Mb/s", b as f64 / 1e6) } else { "—".into() };
+    let br = |b: i64| if b > 0 { format!("{:.2} Mb/s", b as f64 / 1e6) } else { " - ".into() };
     vec![
         ("File", f(&|i| crate::ui::viewer::file_name(&i.path))),
         ("Size", f(&|i| crate::catalog::human_size(i.file_size))),
@@ -1776,7 +1776,7 @@ fn fmt_db(v: f64) -> String {
     if v.is_infinite() {
         "∞ (identical)".into()
     } else if v.is_nan() {
-        "—".into()
+        " - ".into()
     } else {
         format!("{v:.3} dB")
     }

@@ -76,7 +76,7 @@ impl CommandPalette {
                     ui.set_width(560.0_f32.min(screen.width() - 40.0));
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text(format!("{}  Type a command…", super::icons::MAGNIFYING_GLASS))
+                            .hint_text(format!("{}  Type a command...", super::icons::MAGNIFYING_GLASS))
                             .desired_width(f32::INFINITY)
                             .font(egui::FontId::proportional(16.0))
                             .frame(egui::Frame::NONE),
@@ -148,8 +148,8 @@ mod tests {
     use super::*;
     #[test]
     fn fuzzy() {
-        assert!(fuzzy_score("Rotate left", "rot").unwrap() > fuzzy_score("Batch convert / resize…", "rot").unwrap_or(-1));
-        assert!(fuzzy_score("Adjust colors…", "adjc").is_some());
+        assert!(fuzzy_score("Rotate left", "rot").unwrap() > fuzzy_score("Batch convert / resize...", "rot").unwrap_or(-1));
+        assert!(fuzzy_score("Adjust colors...", "adjc").is_some());
         assert!(fuzzy_score("Zoom in", "xyz").is_none());
     }
 }
