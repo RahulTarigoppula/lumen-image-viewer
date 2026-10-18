@@ -43,6 +43,8 @@ tiff = "0.11"
 libwebp-sys = "0.9"
 flate2 = "1"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# Anti-aliased vector rasterization for the Draw Board and selection masks.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 
 [dependencies.windows]
 version = "0.62"

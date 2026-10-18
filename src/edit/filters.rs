@@ -4,8 +4,9 @@
 //! separable or running-sum kernels so large radii stay O(pixels).
 //!
 //! Images are straight-alpha RGBA8. Neighbourhood filters work on
-//! premultiplied copies (only when the image actually has transparency) so
-//! transparent pixels don't bleed their hidden colour.
+//! premultiplied 16-bit copies (only when the image actually has transparency)
+//! so transparent pixels don't bleed their hidden colour and semi-transparent
+//! colours survive the round trip without 8-bit quantisation.
 
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -16,46 +17,86 @@ pub fn is_opaque(img: &RgbaImage) -> bool {
     img.as_raw().par_chunks(4 * 16384).all(|c| c.chunks_exact(4).all(|p| p[3] == 255))
 }
 
-pub fn premultiply(img: &RgbaImage) -> RgbaImage {
-    let mut out = img.clone();
-    out.as_mut().par_chunks_mut(4 * 4096).for_each(|c| {
-        for p in c.chunks_exact_mut(4) {
+/// A channel type the separable kernels can run on (8-bit for opaque images,
+/// 16-bit premultiplied when there is transparency).
+pub trait Px: Copy + Default + Send + Sync + 'static {
+    fn get(self) -> u32;
+    fn put(v: u32) -> Self;
+}
+
+impl Px for u8 {
+    #[inline]
+    fn get(self) -> u32 {
+        self as u32
+    }
+    #[inline]
+    fn put(v: u32) -> Self {
+        v.min(255) as u8
+    }
+}
+
+impl Px for u16 {
+    #[inline]
+    fn get(self) -> u32 {
+        self as u32
+    }
+    #[inline]
+    fn put(v: u32) -> Self {
+        v.min(65535) as u16
+    }
+}
+
+/// Straight RGBA8 to premultiplied RGBA16 (alpha scaled to 0..65535).
+pub fn premultiply16(img: &RgbaImage) -> Vec<u16> {
+    let mut out = vec![0u16; img.as_raw().len()];
+    out.par_chunks_mut(4 * 4096).zip(img.as_raw().par_chunks(4 * 4096)).for_each(|(o, i)| {
+        for (q, p) in o.chunks_exact_mut(4).zip(i.chunks_exact(4)) {
             let a = p[3] as u32;
-            if a != 255 {
-                for v in &mut p[..3] {
-                    *v = ((*v as u32 * a + 127) / 255) as u8;
-                }
+            for c in 0..3 {
+                // c/255 * a/255 * 65535 == c * a * 257 / 255
+                q[c] = ((p[c] as u32 * a * 257 + 127) / 255) as u16;
             }
+            q[3] = (a * 257) as u16;
         }
     });
     out
 }
 
-pub fn unpremultiply_in_place(img: &mut RgbaImage) {
-    img.as_mut().par_chunks_mut(4 * 4096).for_each(|c| {
-        for p in c.chunks_exact_mut(4) {
-            let a = p[3] as u32;
-            if a == 0 {
-                p[0] = 0;
-                p[1] = 0;
-                p[2] = 0;
-            } else if a != 255 {
-                for v in &mut p[..3] {
-                    *v = ((*v as u32 * 255 + a / 2) / a).min(255) as u8;
-                }
+/// Premultiplied RGBA16 back to straight RGBA8.
+pub fn unpremultiply16(w: u32, h: u32, buf: &[u16]) -> RgbaImage {
+    let mut out = vec![0u8; buf.len()];
+    out.par_chunks_mut(4 * 4096).zip(buf.par_chunks(4 * 4096)).for_each(|(o, i)| {
+        for (p, q) in o.chunks_exact_mut(4).zip(i.chunks_exact(4)) {
+            let a16 = q[3] as u32;
+            let a8 = (a16 + 128) / 257;
+            if a8 == 0 {
+                p.copy_from_slice(&[0, 0, 0, 0]);
+                continue;
             }
+            for c in 0..3 {
+                p[c] = ((q[c] as u32 * 255 + a16 / 2) / a16).min(255) as u8;
+            }
+            p[3] = a8.min(255) as u8;
         }
     });
+    RgbaImage::from_raw(w, h, out).expect("buffer size")
 }
 
-/// Run a neighbourhood filter in premultiplied space when the image has alpha.
-pub fn with_premul(img: &RgbaImage, f: impl FnOnce(&RgbaImage) -> RgbaImage) -> RgbaImage {
+/// Run a neighbourhood filter on the raw channels: directly on 8-bit data when
+/// the image is opaque, otherwise on a premultiplied 16-bit copy. The closures
+/// get `(src, width, height)` and must return a buffer of the same length.
+pub fn with_premul(img: &RgbaImage, f8: impl FnOnce(&[u8], usize, usize) -> Vec<u8>, f16: impl FnOnce(&[u16], usize, usize) -> Vec<u16>) -> RgbaImage {
+    let (w, h) = img.dimensions();
     if is_opaque(img) {
-        f(img)
+        let out = f8(img.as_raw(), w as usize, h as usize);
+        RgbaImage::from_raw(w, h, out).unwrap_or_else(|| img.clone())
     } else {
-        let mut out = f(&premultiply(img));
-        unpremultiply_in_place(&mut out);
-        out
+        let pre = premultiply16(img);
+        let out = f16(&pre, w as usize, h as usize);
+        if out.len() != pre.len() {
+            return img.clone();
+        }
+        unpremultiply16(w, h, &out)
     }
 }
 
@@ -74,26 +115,26 @@ pub fn gaussian_blur(img: &RgbaImage, sigma: f32) -> RgbaImage {
         return img.clone();
     }
     let sigma = sigma.min(w.max(h) as f32).min(4000.0);
-    with_premul(img, |src| gaussian_raw(src, sigma))
+    with_premul(img, |s, w, h| gaussian_raw(s, w, h, sigma), |s, w, h| gaussian_raw(s, w, h, sigma))
 }
 
-fn gaussian_raw(src: &RgbaImage, sigma: f32) -> RgbaImage {
-    let (w, h) = (src.width() as usize, src.height() as usize);
+/// Gaussian blur of a raw RGBA buffer (any channel depth).
+pub fn gaussian_raw<P: Px>(src: &[P], w: usize, h: usize, sigma: f32) -> Vec<P> {
     if sigma <= 3.0 {
         let kernel = gauss_kernel(sigma);
-        let mut tmp = vec![0u8; w * h * 4];
-        conv_h(src.as_raw(), &mut tmp, w, h, &kernel);
-        let mut out = vec![0u8; w * h * 4];
+        let mut tmp = vec![P::default(); w * h * 4];
+        conv_h(src, &mut tmp, w, h, &kernel);
+        let mut out = vec![P::default(); w * h * 4];
         conv_v(&tmp, &mut out, w, h, &kernel);
-        RgbaImage::from_raw(w as u32, h as u32, out).unwrap()
+        out
     } else {
-        let mut a = src.as_raw().clone();
-        let mut b = vec![0u8; a.len()];
+        let mut a = src.to_vec();
+        let mut b = vec![P::default(); a.len()];
         for r in boxes_for_gauss(sigma, 3) {
             box_h(&a, &mut b, w, h, r);
             box_v(&b, &mut a, w, h, r);
         }
-        RgbaImage::from_raw(w as u32, h as u32, a).unwrap()
+        a
     }
 }
 
@@ -104,13 +145,14 @@ pub fn box_blur(img: &RgbaImage, radius: usize) -> RgbaImage {
         return img.clone();
     }
     let radius = radius.min(w.max(h)).min(8000);
-    with_premul(img, |src| {
-        let mut b = vec![0u8; w * h * 4];
-        box_h(src.as_raw(), &mut b, w, h, radius);
-        let mut out = vec![0u8; w * h * 4];
+    fn run<P: Px>(src: &[P], w: usize, h: usize, radius: usize) -> Vec<P> {
+        let mut b = vec![P::default(); w * h * 4];
+        box_h(src, &mut b, w, h, radius);
+        let mut out = vec![P::default(); w * h * 4];
         box_v(&b, &mut out, w, h, radius);
-        RgbaImage::from_raw(w as u32, h as u32, out).unwrap()
-    })
+        out
+    }
+    with_premul(img, |s, w, h| run(s, w, h, radius), |s, w, h| run(s, w, h, radius))
 }
 
 /// Integer kernel (weights sum to exactly 65536 so flat areas stay exact).
@@ -125,40 +167,42 @@ fn gauss_kernel(sigma: f32) -> Vec<u32> {
     k
 }
 
-fn conv_h(src: &[u8], dst: &mut [u8], w: usize, _h: usize, k: &[u32]) {
+fn conv_h<P: Px>(src: &[P], dst: &mut [P], w: usize, _h: usize, k: &[u32]) {
     let r = (k.len() / 2) as i64;
     let stride = w * 4;
     dst.par_chunks_mut(stride).zip(src.par_chunks(stride)).for_each(|(out, row)| {
         for x in 0..w {
-            let mut acc = [0u32; 4];
+            let mut acc = [0u64; 4];
             for (j, &kw) in k.iter().enumerate() {
                 let sx = clampi(x as i64 + j as i64 - r, w) * 4;
-                acc[0] += kw * row[sx] as u32;
-                acc[1] += kw * row[sx + 1] as u32;
-                acc[2] += kw * row[sx + 2] as u32;
-                acc[3] += kw * row[sx + 3] as u32;
+                let kw = kw as u64;
+                acc[0] += kw * row[sx].get() as u64;
+                acc[1] += kw * row[sx + 1].get() as u64;
+                acc[2] += kw * row[sx + 2].get() as u64;
+                acc[3] += kw * row[sx + 3].get() as u64;
             }
             for c in 0..4 {
-                out[x * 4 + c] = ((acc[c] + 32768) >> 16).min(255) as u8;
+                out[x * 4 + c] = P::put(((acc[c] + 32768) >> 16) as u32);
             }
         }
     });
 }
 
-fn conv_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, k: &[u32]) {
+fn conv_v<P: Px>(src: &[P], dst: &mut [P], w: usize, h: usize, k: &[u32]) {
     let r = (k.len() / 2) as i64;
     let stride = w * 4;
     dst.par_chunks_mut(stride).enumerate().for_each(|(y, out)| {
-        let mut acc = vec![0u32; stride];
+        let mut acc = vec![0u64; stride];
         for (j, &kw) in k.iter().enumerate() {
             let sy = clampi(y as i64 + j as i64 - r, h);
             let row = &src[sy * stride..(sy + 1) * stride];
+            let kw = kw as u64;
             for (a, &v) in acc.iter_mut().zip(row) {
-                *a += kw * v as u32;
+                *a += kw * v.get() as u64;
             }
         }
         for (o, a) in out.iter_mut().zip(acc) {
-            *o = ((a + 32768) >> 16).min(255) as u8;
+            *o = P::put(((a + 32768) >> 16) as u32);
         }
     });
 }
@@ -179,11 +223,11 @@ fn boxes_for_gauss(sigma: f32, n: usize) -> Vec<usize> {
 }
 
 #[inline]
-fn div_round(sum: u32, inv: u64) -> u8 {
-    ((sum as u64 * inv + (1 << 31)) >> 32).min(255) as u8
+fn div_round<P: Px>(sum: u32, inv: u64) -> P {
+    P::put(((sum as u64 * inv + (1 << 31)) >> 32) as u32)
 }
 
-fn box_h(src: &[u8], dst: &mut [u8], w: usize, _h: usize, r: usize) {
+fn box_h<P: Px>(src: &[P], dst: &mut [P], w: usize, _h: usize, r: usize) {
     let stride = w * 4;
     let d = (2 * r + 1) as u64;
     let inv = ((1u64 << 32) + d / 2) / d;
@@ -193,7 +237,7 @@ fn box_h(src: &[u8], dst: &mut [u8], w: usize, _h: usize, r: usize) {
         for k in -r..=r {
             let i = clampi(k, w) * 4;
             for c in 0..4 {
-                s[c] += row[i + c] as u32;
+                s[c] += row[i + c].get();
             }
         }
         for x in 0..w as i64 {
@@ -204,13 +248,13 @@ fn box_h(src: &[u8], dst: &mut [u8], w: usize, _h: usize, r: usize) {
             let add = clampi(x + r + 1, w) * 4;
             let sub = clampi(x - r, w) * 4;
             for c in 0..4 {
-                s[c] = s[c] + row[add + c] as u32 - row[sub + c] as u32;
+                s[c] = s[c] + row[add + c].get() - row[sub + c].get();
             }
         }
     });
 }
 
-fn box_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+fn box_v<P: Px>(src: &[P], dst: &mut [P], w: usize, h: usize, r: usize) {
     let stride = w * 4;
     let d = (2 * r + 1) as u64;
     let inv = ((1u64 << 32) + d / 2) / d;
@@ -224,7 +268,7 @@ fn box_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
         for k in -r..=r {
             let sy = clampi(y0 + k, h);
             for (s, &v) in sums.iter_mut().zip(&src[sy * stride..(sy + 1) * stride]) {
-                *s += v as u32;
+                *s += v.get();
             }
         }
         for yy in 0..rows {
@@ -238,7 +282,7 @@ fn box_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
                 let sub = clampi(y - r, h) * stride;
                 let (ra, rs) = (&src[add..add + stride], &src[sub..sub + stride]);
                 for i in 0..stride {
-                    sums[i] = sums[i] + ra[i] as u32 - rs[i] as u32;
+                    sums[i] = sums[i] + ra[i].get() - rs[i].get();
                 }
             }
         }
@@ -273,6 +317,11 @@ pub fn unsharp_mask(img: &RgbaImage, amount: f32, sigma: f32, threshold: u8) -> 
 
 #[inline]
 pub fn sample_bilinear(raw: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 4] {
+    sample_bilinear_px(raw, w, h, x, y)
+}
+
+#[inline]
+fn sample_bilinear_px<P: Px>(raw: &[P], w: usize, h: usize, x: f32, y: f32) -> [f32; 4] {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
     let x0 = x.floor() as usize;
@@ -283,7 +332,7 @@ pub fn sample_bilinear(raw: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 
     let fy = y - y0 as f32;
     let px = |xx: usize, yy: usize| {
         let i = (yy * w + xx) * 4;
-        [raw[i] as f32, raw[i + 1] as f32, raw[i + 2] as f32, raw[i + 3] as f32]
+        [raw[i].get() as f32, raw[i + 1].get() as f32, raw[i + 2].get() as f32, raw[i + 3].get() as f32]
     };
     let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
     let mut out = [0.0; 4];
@@ -305,26 +354,27 @@ pub fn motion_blur(img: &RgbaImage, angle_deg: f32, distance: f32) -> RgbaImage 
     }
     let distance = distance.min(4.0 * w.max(h) as f32);
     let (s, c) = angle_deg.to_radians().sin_cos();
-    with_premul(img, |src| {
-        let mut cur = src.as_raw().clone();
+    fn run<P: Px>(src: &[P], w: usize, h: usize, distance: f32, s: f32, c: f32) -> Vec<P> {
+        let mut cur = src.to_vec();
         let mut shift = distance / 2.0;
         while shift >= 0.5 {
             let (dx, dy) = (c * shift / 2.0, -s * shift / 2.0);
-            let mut next = vec![0u8; cur.len()];
+            let mut next = vec![P::default(); cur.len()];
             next.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
                 for x in 0..w {
-                    let a = sample_bilinear(&cur, w, h, x as f32 - dx, y as f32 - dy);
-                    let b = sample_bilinear(&cur, w, h, x as f32 + dx, y as f32 + dy);
+                    let a = sample_bilinear_px(&cur, w, h, x as f32 - dx, y as f32 - dy);
+                    let b = sample_bilinear_px(&cur, w, h, x as f32 + dx, y as f32 + dy);
                     for i in 0..4 {
-                        row[x * 4 + i] = ((a[i] + b[i]) * 0.5 + 0.5).min(255.0) as u8;
+                        row[x * 4 + i] = P::put(((a[i] + b[i]) * 0.5 + 0.5) as u32);
                     }
                 }
             });
             cur = next;
             shift /= 2.0;
         }
-        RgbaImage::from_raw(w as u32, h as u32, cur).unwrap()
-    })
+        cur
+    }
+    with_premul(img, |src, w, h| run(src, w, h, distance, s, c), |src, w, h| run(src, w, h, distance, s, c))
 }
 
 /// Edge-preserving "surface" blur: a Gaussian blur that is faded out where it
@@ -530,6 +580,26 @@ mod tests {
         t("rotate 7", &|| geom::rotate(&img, 7.0, true, [0; 4]));
         t("levels", &|| tone::apply_levels(&img, &[tone::LevelsParams { gamma: 1.3, ..Default::default() }; 4]));
         t("auto enh", &|| crate::edit::ops::auto_levels(&img));
+    }
+
+    #[test]
+    fn semi_transparent_colour_survives_blur() {
+        // Flat colour at low alpha: an 8-bit premultiplied round trip shifts it.
+        let img = RgbaImage::from_pixel(24, 24, image::Rgba([201, 117, 33, 9]));
+        for out in [gaussian_blur(&img, 2.0), gaussian_blur(&img, 9.0), box_blur(&img, 3), motion_blur(&img, 20.0, 12.0)] {
+            assert_eq!(out, img);
+        }
+        let mut grad = RgbaImage::from_pixel(32, 4, image::Rgba([0, 0, 0, 0]));
+        for x in 0..32 {
+            for y in 0..4 {
+                grad.put_pixel(x, y, image::Rgba([250, 140, 20, (x * 8) as u8]));
+            }
+        }
+        let b = gaussian_blur(&grad, 1.5);
+        for x in 2..30 {
+            let p = b.get_pixel(x, 1);
+            assert!((p[0] as i32 - 250).abs() <= 1 && (p[1] as i32 - 140).abs() <= 1 && (p[2] as i32 - 20).abs() <= 1, "{x}: {p:?}");
+        }
     }
 
     #[test]
