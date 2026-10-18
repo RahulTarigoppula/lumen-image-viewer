@@ -111,7 +111,7 @@ fn summarize(exif: &exif::Exif) -> ExifSummary {
         let mut val = f.display_value().with_unit(exif).to_string();
         if val.len() > 200 {
             val.truncate(200);
-            val.push('...');
+            val.push_str("...");
         }
         s.all.push((group.to_string(), f.tag.to_string(), val));
     }
