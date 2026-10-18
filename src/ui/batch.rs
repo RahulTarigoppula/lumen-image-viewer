@@ -150,6 +150,8 @@ pub struct BatchConvert {
     confirm_overwrite: bool,
     toasted: bool,
     adv_selected: Option<usize>,
+    /// 0 = basic settings, 1 = advanced steps.
+    tab: u8,
     presets: advanced::PresetUi,
     /// Index of the file shown in the before/after preview.
     preview_index: usize,
@@ -185,6 +187,7 @@ impl BatchConvert {
             confirm_overwrite: false,
             toasted: false,
             adv_selected: None,
+            tab: convert::load_prefs().convert_tab.min(1),
             presets: advanced::PresetUi::new(),
             preview_index: 0,
             preview_tex: None,
@@ -379,8 +382,11 @@ impl BatchConvert {
             if let Some(job) = &self.job {
                 job.progress.cancel.store(true, Ordering::SeqCst);
             }
-            let s = self.s.clone();
-            convert::save_prefs(|p| p.convert = s);
+            let (s, tab) = (self.s.clone(), self.tab);
+            convert::save_prefs(|p| {
+                p.convert = s;
+                p.convert_tab = tab;
+            });
         }
         still_open
     }
@@ -409,7 +415,29 @@ impl BatchConvert {
                 });
             });
         });
+        egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let active = self.s.advanced.steps.iter().filter(|e| e.enabled).count();
+                let adv = if self.s.use_advanced && active > 0 { format!("{}  Advanced ({active})", I::SLIDERS_HORIZONTAL) } else { format!("{}  Advanced", I::SLIDERS_HORIZONTAL) };
+                ui.selectable_value(&mut self.tab, 0, format!("{}  Basic", I::GEAR));
+                ui.selectable_value(&mut self.tab, 1, adv);
+            });
+        });
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.tab == 1 {
+                // Steps on the left, live before/after preview on the right.
+                ui.columns(2, |cols| {
+                    egui::ScrollArea::vertical().id_salt("bc-adv-scroll").auto_shrink([false, false]).show(&mut cols[0], |ui| {
+                        self.advanced_card(ui, p);
+                        ui.add_space(8.0);
+                        self.presets_card(ui, p);
+                    });
+                    egui::ScrollArea::vertical().id_salt("bc-adv-preview").auto_shrink([false, false]).show(&mut cols[1], |ui| {
+                        self.estimate_card(ui, p);
+                    });
+                });
+                return;
+            }
             egui::ScrollArea::vertical().id_salt("bc-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.columns(2, |cols| {
                     self.sources_card(&mut cols[0], p);
@@ -423,8 +451,6 @@ impl BatchConvert {
                     cols[1].add_space(8.0);
                     self.adjust_card(&mut cols[1], p);
                 });
-                ui.add_space(8.0);
-                self.advanced_card(ui, p);
                 ui.add_space(8.0);
                 self.estimate_card(ui, p);
             });
@@ -690,9 +716,9 @@ impl BatchConvert {
     fn preview_images(&mut self, ui: &mut Ui, p: &Palette) {
         let Some((before, after)) = &self.preview_tex else { return };
         let avail = ui.available_width();
-        let h_max = 300.0f32;
         // Side by side when there is room, otherwise one above the other.
         let side = avail > 520.0;
+        let h_max = if side { 300.0f32 } else { 240.0 };
         let slot_w = if side { (avail - 12.0) / 2.0 } else { avail };
         let fit = |t: &egui::TextureHandle| {
             let sz = t.size_vec2();
@@ -727,7 +753,21 @@ impl BatchConvert {
             let first = &first;
             let pending = self.est_version < self.version;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(file_name(first)).strong());
+                if self.files.len() > 1 && self.files.len() <= 5000 {
+                    // Pick the preview file without going back to the source list.
+                    let mut idx = self.preview_index;
+                    egui::ComboBox::from_id_salt("bc-preview-file").width(180.0).truncate().selected_text(file_name(first)).show_ui(ui, |ui| {
+                        for (i, f) in self.files.iter().enumerate() {
+                            ui.selectable_value(&mut idx, i, file_name(f));
+                        }
+                    });
+                    if idx != self.preview_index {
+                        self.selected.clear();
+                        self.selected.insert(idx);
+                    }
+                } else {
+                    ui.label(RichText::new(file_name(first)).strong());
+                }
                 match &self.estimate {
                     Some(Ok(e)) => {
                         ui.label(RichText::new(format!("{} × {} · {}", e.in_dims.0, e.in_dims.1, human_size(e.in_bytes))).color(p.muted));
