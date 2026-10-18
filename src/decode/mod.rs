@@ -86,6 +86,33 @@ impl Decoded {
 /// are rejected before anything is allocated.
 pub const MAX_DECODE_BYTES: u64 = 1536 * 1024 * 1024;
 
+/// One readable line for a decode error: the anyhow chain without repeats
+/// (image crate errors embed their source text, so `{:#}` printed it twice),
+/// and "Format error decoding Png: ..." phrased for people.
+pub fn friendly_error(e: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in e.chain() {
+        let m = c.to_string().trim().trim_end_matches('.').to_string();
+        if m.is_empty() || parts.iter().any(|p| p.contains(&m)) {
+            continue;
+        }
+        parts.push(m);
+    }
+    let mut s = parts.join(": ");
+    if let Some(rest) = s.strip_prefix("Format error decoding ") {
+        if let Some((fmt, detail)) = rest.split_once(':') {
+            let detail = detail.trim().trim_end_matches('.');
+            let detail = detail.strip_prefix("Invalid ").map(|d| d.to_lowercase()).unwrap_or_else(|| detail.to_lowercase());
+            let detail = if detail.ends_with("signature") { "bad signature".to_string() } else { detail };
+            s = format!("This file is not a valid {} image ({detail})", fmt.trim().to_uppercase());
+        }
+    }
+    if !s.ends_with('.') {
+        s.push('.');
+    }
+    s
+}
+
 pub fn too_large_msg(w: u32, h: u32) -> String {
     format!(
         "Image is too large to open ({w} x {h} pixels needs {:.1} GB; the limit is 1.5 GB)",
@@ -576,6 +603,17 @@ pub fn exif_orientation_from_file(path: &Path) -> u8 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn friendly_errors_dedupe_and_rephrase() {
+        // A fake PNG through the image crate.
+        let e = anyhow::Error::from(image::load_from_memory_with_format(b"not a png at all", image::ImageFormat::Png).unwrap_err());
+        let m = friendly_error(&e);
+        assert_eq!(m.matches("signature").count(), 1, "{m}");
+        assert!(m.starts_with("This file is not a valid PNG image"), "{m}");
+        let e = anyhow!("outer: inner detail").context("Cannot open");
+        assert_eq!(friendly_error(&e), "Cannot open: outer: inner detail.");
+    }
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("lumen-decode-{name}-{}", std::process::id()));

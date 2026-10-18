@@ -37,6 +37,16 @@ struct Anim {
     frame_tex: Vec<Option<egui::TextureHandle>>,
     tex: Option<egui::TextureHandle>,
     shown_frame: usize,
+    /// Number of frames this state was built for (`frame_tex` is empty for
+    /// large animations, so its length cannot stand in for this).
+    frame_count: usize,
+}
+
+impl Anim {
+    /// Whether this playback state belongs to a different animation.
+    fn is_stale(&self, path: &Path, frame_count: usize) -> bool {
+        self.path != path || self.frame_count != frame_count
+    }
 }
 
 /// Cache all frames of an animation as textures when it has at most this many pixels in total.
@@ -236,6 +246,9 @@ pub struct CropState {
     pub r: [f32; 4],
     pub aspect: Option<f32>,
     drag: Option<(CropHandle, Pos2, [f32; 4])>,
+    /// Image size `r` refers to. The overlay works in the displayed image's
+    /// size, which can differ (e.g. right after a rotate): `r` is rescaled.
+    size: (f32, f32),
 }
 
 pub struct Viewer {
@@ -250,6 +263,16 @@ pub struct Viewer {
     gpu_build: Option<(PathBuf, GpuKey, Receiver<Vec<Arc<RgbaImage>>>)>,
     preview_tex: Option<(PathBuf, egui::TextureHandle)>,
     anim: Option<Anim>,
+    /// The loader keep set from the last `request_loads` (current first).
+    keep: Vec<PathBuf>,
+    /// After a size-changing edit (crop, resize, rotate): the displayed size
+    /// at that moment and the fit mode to re-apply once the new size shows
+    /// (the GPU copy of the result is built asynchronously, so fitting at
+    /// apply time would fit the old size).
+    refit_on_size: Option<((u32, u32), FitMode)>,
+    /// Neighbours found too big to keep preloaded (huge panoramas): only
+    /// decoded when actually shown.
+    no_preload: std::collections::HashSet<PathBuf>,
     pub edit: Option<EditSession>,
     tool: Option<ActiveTool>,
     pub crop: Option<CropState>,
@@ -292,6 +315,9 @@ impl Viewer {
             gpu_build: None,
             preview_tex: None,
             anim: None,
+            keep: Vec::new(),
+            refit_on_size: None,
+            no_preload: Default::default(),
             edit: None,
             tool: None,
             crop: None,
@@ -418,10 +444,11 @@ impl Viewer {
         if wrap {
             i = i.rem_euclid(n);
         } else {
-            i = i.clamp(0, n - 1);
+            i = i.clamp(0, (n - 1).max(0));
         }
         if i as usize != self.index {
             self.index = i as usize;
+            self.refit_on_size = None;
             self.edit = None;
             self.tool = None;
             self.crop = None;
@@ -537,7 +564,7 @@ impl Viewer {
         let Some(img) = self.current_image(core) else { return };
         self.tool = None;
         let (w, h) = (img.width() as f32, img.height() as f32);
-        self.crop = Some(CropState { r: [w * 0.1, h * 0.1, w * 0.9, h * 0.9], aspect: None, drag: None });
+        self.crop = Some(CropState { r: [w * 0.1, h * 0.1, w * 0.9, h * 0.9], aspect: None, drag: None, size: (w, h) });
     }
 
     fn fit_zoom(&self, mode: FitMode, img: (u32, u32), view: Vec2, ppp: f32) -> f32 {
@@ -574,20 +601,75 @@ impl Viewer {
         let Some(cur) = self.current().cloned() else { return };
         let screen = core.ctx.content_rect().size() * core.ctx.pixels_per_point();
         core.loader.request(&cur, 0, Some(screen.x.max(screen.y) as u32));
-        let mut keep = vec![cur];
-        if core.settings.preload_neighbors {
-            for (d, pr) in [(1isize, 1u32), (-1, 2), (2, 3)] {
-                let i = self.index as isize + d;
-                if i >= 0 && (i as usize) < self.list.len() {
-                    let p = self.list[i as usize].clone();
-                    if crate::formats::is_image_path(&p) {
-                        core.loader.request(&p, pr, None);
-                        keep.push(p);
-                    }
-                }
+        let mut keep = self.preload_set(&core.loader, core.settings.preload_neighbors);
+        // A preloaded neighbour that turned out huge is dropped again and not
+        // preloaded any more (it is decoded when the user moves to it).
+        let limit = preload_limit(core.loader.budget_bytes);
+        let mut dropped = false;
+        for p in keep.iter().skip(1) {
+            if core.loader.bytes_of(p).is_some_and(|b| b > limit) {
+                self.no_preload.insert(p.clone());
+                core.loader.invalidate(p);
+                dropped = true;
             }
         }
+        if dropped {
+            keep = self.preload_set(&core.loader, core.settings.preload_neighbors);
+        }
+        for (pr, p) in keep.iter().enumerate().skip(1) {
+            core.loader.request(p, pr as u32, None);
+        }
         core.loader.retain_queued(&keep);
+        self.keep = keep;
+    }
+
+    /// The paths the viewer wants cached, most important first: the current
+    /// image, then neighbours (next, previous, next + 1) as long as the
+    /// estimated total fits the loader's memory budget. Unknown neighbour
+    /// sizes are estimated from the current image.
+    fn preload_set(&self, loader: &crate::loader::Loader, preload: bool) -> Vec<PathBuf> {
+        let Some(cur) = self.current().cloned() else { return Vec::new() };
+        let mut keep = vec![cur.clone()];
+        if !preload {
+            return keep;
+        }
+        let estimate = loader.bytes_of(&cur);
+        let mut total = estimate.unwrap_or(0);
+        for d in [1isize, -1, 2] {
+            let i = self.index as isize + d;
+            if i < 0 || i as usize >= self.list.len() {
+                continue;
+            }
+            let p = &self.list[i as usize];
+            if !crate::formats::is_image_path(p) || keep.contains(p) || self.no_preload.contains(p) {
+                continue;
+            }
+            if loader.bytes_of(p).is_some_and(|b| b > preload_limit(loader.budget_bytes)) {
+                continue; // a decoded neighbour too big to keep preloaded
+            }
+            let Some(b) = loader.bytes_of(p).or(estimate) else {
+                // Current size unknown yet: preload only the next image.
+                if keep.len() == 1 {
+                    keep.push(p.clone());
+                }
+                continue;
+            };
+            if total.saturating_add(b) > loader.budget_bytes {
+                break;
+            }
+            total += b;
+            keep.push(p.clone());
+        }
+        keep
+    }
+
+    /// Paths the loader must not evict for the memory budget: the image on
+    /// screen and the neighbours being preloaded for it.
+    pub fn protected_paths(&self) -> Vec<PathBuf> {
+        match self.current() {
+            Some(cur) if self.keep.first() == Some(cur) => self.keep.clone(),
+            cur => cur.cloned().into_iter().collect(),
+        }
     }
 
     // ------------------------------------------------------------------ UI
@@ -711,6 +793,14 @@ impl Viewer {
                 self.zoom_target = None;
                 self.zoom = z;
                 self.center = locked_center(norm, sz);
+            }
+            if let Some((old, mode)) = self.refit_on_size {
+                if sz != old {
+                    self.refit_on_size = None;
+                    self.pending_lock = None;
+                    self.zoom_target = None;
+                    self.auto_fit = Some(mode);
+                }
             }
             self.view_img = sz;
         }
@@ -922,8 +1012,8 @@ impl Viewer {
         // Clamp so the image never drifts off-screen.
         let half_vw = view.width() * ppp / self.zoom / 2.0;
         let half_vh = view.height() * ppp / self.zoom / 2.0;
-        self.center.x = if w <= half_vw * 2.0 { w / 2.0 } else { self.center.x.clamp(half_vw, w - half_vw) };
-        self.center.y = if h <= half_vh * 2.0 { h / 2.0 } else { self.center.y.clamp(half_vh, h - half_vh) };
+        self.center.x = if w <= half_vw * 2.0 { w / 2.0 } else { safe_clamp(self.center.x, half_vw, w - half_vw) };
+        self.center.y = if h <= half_vh * 2.0 { h / 2.0 } else { safe_clamp(self.center.y, half_vh, h - half_vh) };
     }
 
     /// Edit-tool canvas hook: an interactive tool owns primary clicks/drags
@@ -1013,10 +1103,10 @@ impl Viewer {
 
     fn paint_animation(&mut self, ui: &mut Ui, painter: &egui::Painter, path: &Path, frames: &Arc<Vec<crate::decode::AnimFrame>>, dest: Rect) {
         let now = Instant::now();
-        if self.anim.as_ref().map(|a| a.path != path || a.frame_tex.len() != frames.len()).unwrap_or(true) {
+        if self.anim.as_ref().map(|a| a.is_stale(path, frames.len())).unwrap_or(true) {
             let total: u64 = frames.iter().map(|f| f.image.width() as u64 * f.image.height() as u64).sum();
             let frame_tex = if total <= ANIM_CACHE_PIXELS { vec![None; frames.len()] } else { Vec::new() };
-            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + frame_delay(frames, 0), playing: !frames.iter().all(|f| f.delay_ms == 0), frame_tex, tex: None, shown_frame: usize::MAX });
+            self.anim = Some(Anim { path: path.to_path_buf(), frame: 0, next_at: now + frame_delay(frames, 0), playing: !frames.iter().all(|f| f.delay_ms == 0), frame_tex, tex: None, shown_frame: usize::MAX, frame_count: frames.len() });
         }
         let a = self.anim.as_mut().unwrap();
         if a.frame >= frames.len() {
@@ -1292,60 +1382,126 @@ impl Viewer {
     }
 
     fn bottom_bar(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, ev: &mut Vec<ViewerEvent>) {
+        use BarItem as B;
         let p = core.pal;
-        let w = 676.0_f32.min(view.width() - 20.0);
+        // Fit the bar to the view: drop separators first, then move the least
+        // important buttons into a "..." menu (never Prev / Next / zoom / fit).
+        let avail = (view.width() - 20.0 - 16.0).max(0.0);
+        let (items, hidden) = bar_layout(avail);
+        let content: f32 = items.iter().map(|i| i.width()).sum();
+        let w = (content + 16.0).min(view.width() - 8.0).max(0.0);
         let rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 34.0), Vec2::new(w, 44.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        child.set_clip_rect(rect.intersect(view));
         child.painter().rect_filled(rect, CornerRadius::same(12), p.overlay);
         child.painter().rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
         child.add_space(8.0);
         child.spacing_mut().item_spacing.x = 1.0;
-        let b = |ui: &mut Ui, icon: &str, tip: &str, cmd: Command, ev: &mut Vec<ViewerEvent>| {
-            if widgets::icon_button(ui, icon, &format!("{tip}  ({})", cmd.shortcut()), false).clicked() {
-                ev.push(ViewerEvent::Command(cmd));
-            }
-        };
-        b(&mut child, I::SQUARES_FOUR, "Back to browser", Command::CloseViewer, ev);
-        widgets::separator_v(&mut child);
-        b(&mut child, I::CARET_LEFT, "Previous", Command::PrevImage, ev);
-        b(&mut child, I::CARET_RIGHT, "Next", Command::NextImage, ev);
-        widgets::separator_v(&mut child);
-        b(&mut child, I::MAGNIFYING_GLASS_MINUS, "Zoom out", Command::ZoomOut, ev);
-        let zl = child.add_sized([54.0, 26.0], egui::Button::new(RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(12.0)).frame(false));
-        if zl.clicked() {
-            ev.push(ViewerEvent::Command(Command::ZoomActual));
-        }
-        zl.on_hover_text("Click: 100%");
-        b(&mut child, I::MAGNIFYING_GLASS_PLUS, "Zoom in", Command::ZoomIn, ev);
-        let fit_sel = self.auto_fit.is_some();
-        if widgets::icon_button(&mut child, I::ARROWS_IN, "Fit to window (/)", fit_sel).clicked() {
-            ev.push(ViewerEvent::Command(Command::ZoomFit));
-        }
-        let (lock_icon, lock_tip) = if self.lock_zoom { (I::LOCK_SIMPLE, "Zoom ratio locked: next/previous keep zoom and position (click to unlock)") } else { (I::LOCK_SIMPLE_OPEN, "Lock zoom ratio: keep zoom and position when changing images") };
-        if widgets::icon_button(&mut child, lock_icon, lock_tip, self.lock_zoom).clicked() {
-            self.toggle_lock_zoom();
-        }
-        widgets::separator_v(&mut child);
-        b(&mut child, I::ARROW_COUNTER_CLOCKWISE, "Rotate left", Command::RotateLeft, ev);
-        b(&mut child, I::ARROW_CLOCKWISE, "Rotate right", Command::RotateRight, ev);
-        b(&mut child, I::CROP, "Crop", Command::Crop, ev);
-        b(&mut child, I::SLIDERS_HORIZONTAL, "Adjust colors", Command::AdjustColors, ev);
-        b(&mut child, I::RESIZE, "Resize", Command::Resize, ev);
-        widgets::separator_v(&mut child);
         let dirty = self.is_dirty();
-        if widgets::icon_button(&mut child, if dirty { I::FLOPPY_DISK } else { I::FLOPPY_DISK_BACK }, if dirty { "Save changes (Ctrl+S)" } else { "Save as... (Ctrl+Shift+S)" }, dirty).clicked() {
-            ev.push(ViewerEvent::Command(if dirty { Command::Save } else { Command::SaveAs }));
+        for item in items {
+            let cmd = self.bar_command(item, dirty);
+            match item {
+                B::Sep => widgets::separator_v(&mut child),
+                B::ZoomPct => {
+                    let zl = child.add_sized([54.0, 26.0], egui::Button::new(RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(12.0)).frame(false));
+                    if zl.clicked() {
+                        ev.push(ViewerEvent::Command(Command::ZoomActual));
+                    }
+                    zl.on_hover_text("Click: 100%");
+                }
+                B::More => {
+                    child.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| {
+                        for &h in &hidden {
+                            if let Some(c) = self.bar_command(h, dirty) {
+                                menu_item(ui, c, ev);
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    let Some(cmd) = cmd else { continue };
+                    let (icon, tip, sel) = self.bar_button(item, cmd, dirty);
+                    if widgets::icon_button(&mut child, icon, &tip, sel).clicked() {
+                        if item == B::Lock {
+                            self.toggle_lock_zoom();
+                        } else {
+                            ev.push(ViewerEvent::Command(cmd));
+                        }
+                    }
+                }
+            }
         }
-        b(&mut child, I::TRASH, "Delete", Command::Delete, ev);
-        widgets::separator_v(&mut child);
-        if widgets::icon_button(&mut child, I::INFO, "Info panel (I)", self.show_info).clicked() {
-            ev.push(ViewerEvent::Command(Command::ToggleInfo));
+    }
+
+    /// The command behind a toolbar item.
+    fn bar_command(&self, item: BarItem, dirty: bool) -> Option<Command> {
+        use BarItem as B;
+        Some(match item {
+            B::Browser => Command::CloseViewer,
+            B::Prev => Command::PrevImage,
+            B::Next => Command::NextImage,
+            B::ZoomOut => Command::ZoomOut,
+            B::ZoomIn => Command::ZoomIn,
+            B::Fit => Command::ZoomFit,
+            B::Lock => Command::ToggleLockZoom,
+            B::RotL => Command::RotateLeft,
+            B::RotR => Command::RotateRight,
+            B::Crop => Command::Crop,
+            B::Adjust => Command::AdjustColors,
+            B::Resize => Command::Resize,
+            B::Save => {
+                if dirty {
+                    Command::Save
+                } else {
+                    Command::SaveAs
+                }
+            }
+            B::Delete => Command::Delete,
+            B::Info => Command::ToggleInfo,
+            B::Film => Command::ToggleFilmstrip,
+            B::Slideshow => Command::Slideshow,
+            B::Fullscreen => Command::ToggleFullscreen,
+            B::Sep | B::ZoomPct | B::More => return None,
+        })
+    }
+
+    /// Icon, tooltip and selected state of a toolbar button.
+    fn bar_button(&self, item: BarItem, cmd: Command, dirty: bool) -> (&'static str, String, bool) {
+        use BarItem as B;
+        let plain = |icon: &'static str, tip: &str| (icon, format!("{tip}  ({})", cmd.shortcut()), false);
+        match item {
+            B::Browser => plain(I::SQUARES_FOUR, "Back to browser"),
+            B::Prev => plain(I::CARET_LEFT, "Previous"),
+            B::Next => plain(I::CARET_RIGHT, "Next"),
+            B::ZoomOut => plain(I::MAGNIFYING_GLASS_MINUS, "Zoom out"),
+            B::ZoomIn => plain(I::MAGNIFYING_GLASS_PLUS, "Zoom in"),
+            B::Fit => (I::ARROWS_IN, "Fit to window (/)".into(), self.auto_fit.is_some()),
+            B::Lock => {
+                if self.lock_zoom {
+                    (I::LOCK_SIMPLE, "Zoom ratio locked: next/previous keep zoom and position (click to unlock)".into(), true)
+                } else {
+                    (I::LOCK_SIMPLE_OPEN, "Lock zoom ratio: keep zoom and position when changing images".into(), false)
+                }
+            }
+            B::RotL => plain(I::ARROW_COUNTER_CLOCKWISE, "Rotate left"),
+            B::RotR => plain(I::ARROW_CLOCKWISE, "Rotate right"),
+            B::Crop => plain(I::CROP, "Crop"),
+            B::Adjust => plain(I::SLIDERS_HORIZONTAL, "Adjust colors"),
+            B::Resize => plain(I::RESIZE, "Resize"),
+            B::Save => {
+                if dirty {
+                    (I::FLOPPY_DISK, "Save changes (Ctrl+S)".into(), true)
+                } else {
+                    (I::FLOPPY_DISK_BACK, "Save as... (Ctrl+Shift+S)".into(), false)
+                }
+            }
+            B::Delete => plain(I::TRASH, "Delete"),
+            B::Info => (I::INFO, "Info panel (I)".into(), self.show_info),
+            B::Film => (I::FILM_STRIP, "Filmstrip (F)".into(), self.show_filmstrip),
+            B::Slideshow => plain(I::PLAY_CIRCLE, "Slideshow"),
+            B::Fullscreen => plain(I::CORNERS_OUT, "Full screen"),
+            B::Sep | B::ZoomPct | B::More => (I::DOTS_THREE, String::new(), false),
         }
-        if widgets::icon_button(&mut child, I::FILM_STRIP, "Filmstrip (F)", self.show_filmstrip).clicked() {
-            ev.push(ViewerEvent::Command(Command::ToggleFilmstrip));
-        }
-        b(&mut child, I::PLAY_CIRCLE, "Slideshow", Command::Slideshow, ev);
-        b(&mut child, I::CORNERS_OUT, "Full screen", Command::ToggleFullscreen, ev);
     }
 
     fn filmstrip(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
@@ -1364,13 +1520,20 @@ impl Viewer {
                         let path = path.clone();
                         let key = self.thumb_key(&path);
                         {
-                            if let Thumb::Ready(t) = core.thumbs.get(&key) {
-                                let ts = t.tex.size_vec2();
-                                let s = ((cell.x - 8.0) / ts.x).min((cell.y - 8.0) / ts.y);
-                                let r = Rect::from_center_size(rect.center(), ts * s);
-                                let mut mesh = egui::Mesh::with_texture(t.tex.id());
-                                mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                                ui.painter().add(egui::Shape::mesh(mesh));
+                            match core.thumbs.get(&key) {
+                                Thumb::Ready(t) => {
+                                    let ts = t.tex.size_vec2();
+                                    let s = ((cell.x - 8.0) / ts.x).min((cell.y - 8.0) / ts.y);
+                                    let r = Rect::from_center_size(rect.center(), ts * s);
+                                    let mut mesh = egui::Mesh::with_texture(t.tex.id());
+                                    mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                                    ui.painter().add(egui::Shape::mesh(mesh));
+                                }
+                                // Undecodable file: a placeholder instead of an empty slot.
+                                Thumb::Failed => {
+                                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional((cell.y * 0.4).clamp(12.0, 32.0)), p.faint);
+                                }
+                                Thumb::Pending => {}
                             }
                         }
                         if sel {
@@ -1639,6 +1802,7 @@ impl Viewer {
                         sess.push(img, &title);
                     }
                     self.auto_fit = Some(core.settings.fit_mode);
+                    self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
                     core.toasts.success(format!("{title} applied - Ctrl+Z to undo, Ctrl+S to save"));
                     return;
                 }
@@ -1755,6 +1919,7 @@ impl Viewer {
             let (w, h) = ((r[2] - r[0]).round().max(1.0) as u32, (r[3] - r[1]).round().max(1.0) as u32);
             self.apply_simple(core, "Crop", |img| crate::edit::ops::crop(img, x, y, w, h));
             self.auto_fit = Some(core.settings.fit_mode);
+            self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
         } else if cancel {
             self.crop = None;
         }
@@ -1762,7 +1927,14 @@ impl Viewer {
 
     fn crop_overlay(&mut self, ui: &mut Ui, painter: &egui::Painter, dest: Rect, img: (u32, u32), resp: &egui::Response) {
         let Some(c) = &mut self.crop else { return };
-        let (iw, ih) = (img.0 as f32, img.1 as f32);
+        let (iw, ih) = (img.0.max(1) as f32, img.1.max(1) as f32);
+        if c.size != (iw, ih) {
+            let (kx, ky) = (iw / c.size.0.max(1.0), ih / c.size.1.max(1.0));
+            c.r = [c.r[0] * kx, c.r[1] * ky, c.r[2] * kx, c.r[3] * ky];
+            c.size = (iw, ih);
+            c.drag = None;
+            clamp_crop(&mut c.r, iw, ih);
+        }
         let to_screen = |x: f32, y: f32| Pos2::new(dest.min.x + x / iw * dest.width(), dest.min.y + y / ih * dest.height());
         let to_img = |p: Pos2| ((p.x - dest.min.x) / dest.width() * iw, (p.y - dest.min.y) / dest.height() * ih);
         let sr = Rect::from_min_max(to_screen(c.r[0], c.r[1]), to_screen(c.r[2], c.r[3]));
@@ -1831,8 +2003,8 @@ impl Viewer {
                     CropHandle::Move => {
                         let w = r[2] - r[0];
                         let hh = r[3] - r[1];
-                        r[0] = (orig[0] + dx).clamp(0.0, iw - w);
-                        r[1] = (orig[1] + dy).clamp(0.0, ih - hh);
+                        r[0] = safe_clamp(orig[0] + dx, 0.0, (iw - w).max(0.0));
+                        r[1] = safe_clamp(orig[1] + dy, 0.0, (ih - hh).max(0.0));
                         r[2] = r[0] + w;
                         r[3] = r[1] + hh;
                     }
@@ -1949,11 +2121,92 @@ fn sane_zoom(z: f32) -> f32 {
     }
 }
 
+/// `v` limited to `lo..=hi` that never panics: an inverted range collapses
+/// to `lo` and NaN bounds are ignored (`f32::clamp` panics on both).
+fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
+    v.max(lo).min(hi.max(lo))
+}
+
 fn clamp_crop(r: &mut [f32; 4], iw: f32, ih: f32) {
-    r[0] = r[0].clamp(0.0, iw - 1.0);
-    r[1] = r[1].clamp(0.0, ih - 1.0);
-    r[2] = r[2].clamp(r[0] + 1.0, iw);
-    r[3] = r[3].clamp(r[1] + 1.0, ih);
+    let (iw, ih) = (iw.max(1.0), ih.max(1.0));
+    r[0] = safe_clamp(r[0], 0.0, iw - 1.0);
+    r[1] = safe_clamp(r[1], 0.0, ih - 1.0);
+    r[2] = safe_clamp(r[2], r[0] + 1.0, iw);
+    r[3] = safe_clamp(r[3], r[1] + 1.0, ih);
+}
+
+/// Neighbours bigger than this (decoded bytes) are not kept preloaded: half
+/// the cache budget, and never more than a 60 MP image.
+fn preload_limit(budget: u64) -> u64 {
+    (budget / 2).min(60_000_000 * 4)
+}
+
+/// Items of the viewer's bottom toolbar.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BarItem {
+    Sep,
+    Browser,
+    Prev,
+    Next,
+    ZoomOut,
+    ZoomPct,
+    ZoomIn,
+    Fit,
+    Lock,
+    RotL,
+    RotR,
+    Crop,
+    Adjust,
+    Resize,
+    Save,
+    Delete,
+    Info,
+    Film,
+    Slideshow,
+    Fullscreen,
+    More,
+}
+
+impl BarItem {
+    /// Width in points including the 1 pt item spacing.
+    fn width(self) -> f32 {
+        match self {
+            BarItem::Sep => 10.0,
+            BarItem::ZoomPct => 55.0,
+            _ => 31.0,
+        }
+    }
+}
+
+/// Toolbar items that fit in `avail` points, plus the ones moved to the
+/// "..." menu (in toolbar order).
+fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
+    use BarItem as B;
+    let full = [
+        B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Lock, B::Sep, B::RotL, B::RotR, B::Crop, B::Adjust, B::Resize, B::Sep,
+        B::Save, B::Delete, B::Sep, B::Info, B::Film, B::Slideshow, B::Fullscreen,
+    ];
+    let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
+    if width(&full) <= avail {
+        return (full.to_vec(), Vec::new());
+    }
+    let mut items: Vec<BarItem> = full.iter().copied().filter(|i| *i != B::Sep).collect();
+    if width(&items) <= avail {
+        return (items, Vec::new());
+    }
+    // Least important first; Prev / Next / zoom / fit always stay.
+    let drop_order = [B::Fullscreen, B::Slideshow, B::Lock, B::Film, B::Resize, B::Adjust, B::Delete, B::RotR, B::Info, B::RotL, B::Browser, B::ZoomOut, B::ZoomIn, B::Crop, B::Save];
+    let mut hidden = Vec::new();
+    for d in drop_order {
+        if width(&items) + B::More.width() <= avail {
+            break;
+        }
+        items.retain(|i| *i != d);
+        hidden.push(d);
+    }
+    items.push(B::More);
+    hidden.sort_by_key(|h| full.iter().position(|f| f == h));
+    (items, hidden)
 }
 
 fn menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
@@ -1982,6 +2235,64 @@ fn _palette_unused(_: &Palette) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_animation_state_is_not_rebuilt_every_frame() {
+        // Above ANIM_CACHE_PIXELS frame_tex stays empty: staleness must come
+        // from the stored frame count, not frame_tex.len().
+        let p = PathBuf::from("Z:/a.gif");
+        let a = Anim { path: p.clone(), frame: 3, next_at: Instant::now(), playing: true, frame_tex: Vec::new(), tex: None, shown_frame: 3, frame_count: 12 };
+        assert!(!a.is_stale(&p, 12));
+        assert!(a.is_stale(&p, 11));
+        assert!(a.is_stale(Path::new("Z:/b.gif"), 12));
+    }
+
+    #[test]
+    fn bottom_bar_always_fits() {
+        let (all, hidden) = bar_layout(1000.0);
+        assert!(hidden.is_empty() && all.contains(&BarItem::Sep));
+        for avail in [600.0, 400.0, 300.0, 250.0] {
+            let (items, hidden) = bar_layout(avail);
+            let w: f32 = items.iter().map(|i| i.width()).sum();
+            assert!(w <= avail, "{avail}: {w}");
+            assert!(items.contains(&BarItem::Prev) && items.contains(&BarItem::Next) && items.contains(&BarItem::Fit));
+            assert_eq!(items.contains(&BarItem::More), !hidden.is_empty());
+        }
+    }
+
+    #[test]
+    fn clamps_never_panic() {
+        assert_eq!(safe_clamp(5.0, 0.0, -3.0), 0.0);
+        assert_eq!(safe_clamp(5.0, 0.0, 2.0), 2.0);
+        assert_eq!(safe_clamp(-1.0, 0.0, 2.0), 0.0);
+        assert!(safe_clamp(1.0, f32::NAN, f32::NAN).is_finite());
+        // Crop rect larger than the (rotated) image.
+        let mut r = [10.0, 10.0, 900.0, 300.0];
+        clamp_crop(&mut r, 200.0, 0.5);
+        assert!(r[0] <= r[2] && r[1] <= r[3] && r[2] <= 200.0);
+    }
+
+    #[test]
+    fn preload_set_respects_memory_budget() {
+        let mut v = Viewer::new();
+        v.list = ["a", "b", "c", "d"].iter().map(|n| PathBuf::from(format!("Z:/lumen-test/{n}.png"))).collect();
+        v.index = 1;
+        let mut l = crate::loader::Loader::new(egui::Context::default(), 1);
+        // Current size unknown yet: only the next image is preloaded.
+        assert_eq!(v.preload_set(&l, true), vec![v.list[1].clone(), v.list[2].clone()]);
+        let rgba = RgbaImage::new(10, 10); // 400 bytes
+        l.insert(&v.list[1], crate::loader::LoadedImage { decoded: crate::decode::Decoded::from_rgba(rgba.clone(), "t"), pyramid: vec![Arc::new(rgba)], load_ms: 0, file_size: 0, modified: None });
+        l.budget_bytes = 10_000;
+        assert_eq!(v.preload_set(&l, true).len(), 4);
+        // Room for the current image plus one neighbour of the same size.
+        l.budget_bytes = 1000;
+        assert_eq!(v.preload_set(&l, true), vec![v.list[1].clone(), v.list[2].clone()]);
+        l.budget_bytes = 500;
+        assert_eq!(v.preload_set(&l, true), vec![v.list[1].clone()]);
+        assert_eq!(v.preload_set(&l, false), vec![v.list[1].clone()]);
+        // protected_paths falls back to the current image before any request.
+        assert_eq!(v.protected_paths(), vec![v.list[1].clone()]);
+    }
 
     fn view() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 600.0))

@@ -99,16 +99,7 @@ pub fn decode(bytes: &[u8], color_manage: bool) -> Result<Decoded> {
     // extra channel of the composite is its transparency (negative layer count).
     let lm_len = if psb { r.u64()? } else { r.u32()? as u64 };
     let lm_start = r.pos;
-    let mut merged_alpha = false;
-    if lm_len >= 6 {
-        let mut lr = Rd { b: bytes, pos: lm_start };
-        let li_len = if psb { lr.u64().unwrap_or(0) } else { lr.u32().unwrap_or(0) as u64 };
-        if li_len >= 2 {
-            if let Ok(c) = lr.u16() {
-                merged_alpha = (c as i16) < 0;
-            }
-        }
-    }
+    let merged_alpha = if lm_len >= 4 { merged_alpha_flag(bytes, lm_start, lm_len, psb) } else { false };
     r.skip(lm_len)?;
 
     // Image data.
@@ -140,7 +131,15 @@ pub fn decode(bytes: &[u8], color_manage: bool) -> Result<Decoded> {
         }
         1 => {
             let rows = channels * height as usize;
-            let mut counts = Vec::with_capacity(rows);
+            // The row byte-count table comes straight from the header: make sure
+            // the file actually holds it before reserving memory for it.
+            let entry = if psb { 4 } else { 2 };
+            let remaining = bytes.len().saturating_sub(r.pos);
+            if rows.checked_mul(entry).is_none_or(|n| n > remaining) {
+                bail!("PSD file is truncated");
+            }
+            let mut counts: Vec<usize> = Vec::new();
+            counts.try_reserve_exact(rows).map_err(|_| anyhow!("PSD too large"))?;
             for _ in 0..rows {
                 counts.push(if psb { r.u32()? as usize } else { r.u16()? as usize });
             }
@@ -270,6 +269,53 @@ pub fn decode(bytes: &[u8], color_manage: bool) -> Result<Decoded> {
         frame_count: 1,
         bit_depth: depth.max(8) as u8,
     })
+}
+
+/// Whether the first extra channel of the merged composite is its
+/// transparency: signalled by a negative layer count in the layer info, which
+/// 16/32-bit documents store in an `Lr16` / `Lr32` tagged block after the
+/// (empty) layer info and global mask sections.
+fn merged_alpha_flag(bytes: &[u8], start: usize, len: u64, psb: bool) -> bool {
+    let end = usize::try_from(len).ok().and_then(|l| start.checked_add(l)).map_or(bytes.len(), |e| e.min(bytes.len()));
+    let section = &bytes[..end];
+    let mut lr = Rd { b: section, pos: start };
+    let li_len = if psb { lr.u64() } else { lr.u32().map(|v| v as u64) };
+    let Ok(li_len) = li_len else { return false };
+    if li_len >= 2 {
+        return lr.u16().map(|c| (c as i16) < 0).unwrap_or(false);
+    }
+    // Empty layer info: skip it and the global layer mask info, then scan the
+    // additional layer information blocks.
+    if lr.skip(li_len).is_err() {
+        return false;
+    }
+    let Ok(gm_len) = lr.u32() else { return false };
+    if lr.skip(gm_len as u64).is_err() {
+        return false;
+    }
+    while lr.pos + 12 <= section.len() {
+        let Ok(sig) = lr.take(4) else { return false };
+        if sig != b"8BIM" && sig != b"8B64" {
+            return false;
+        }
+        let Ok(key) = lr.take(4) else { return false };
+        // PSB uses 8-byte lengths for a handful of keys, including Lr16/Lr32.
+        let long = psb && matches!(key, b"LMsk" | b"Lr16" | b"Lr32" | b"Layr" | b"Mt16" | b"Mt32" | b"Mtrn" | b"Alph" | b"FMsk" | b"lnk2" | b"FEid" | b"FXid" | b"PxSD");
+        let blen = if long { lr.u64() } else { lr.u32().map(|v| v as u64) };
+        let Ok(blen) = blen else { return false };
+        if matches!(key, b"Lr16" | b"Lr32" | b"Layr") {
+            if blen < 2 {
+                return false;
+            }
+            return lr.u16().map(|c| (c as i16) < 0).unwrap_or(false);
+        }
+        // Blocks are padded to an even length (4 in some writers; tolerate both
+        // by trusting the stated length rounded up to 2).
+        if lr.skip(blen + (blen & 1)).is_err() {
+            return false;
+        }
+    }
+    false
 }
 
 fn parse_resources(mut res: &[u8]) -> (Option<Vec<u8>>, Option<u8>) {
@@ -429,6 +475,44 @@ pub(crate) mod tests {
         assert_eq!(d.format, "Photoshop PSB");
         assert_eq!(d.bit_depth, 16);
         assert_eq!(d.image.get_pixel(1, 1).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rgba16_alpha_from_lr16_block() {
+        // 16-bit documents: empty layer info, alpha flag in an Lr16 block.
+        let (w, h) = (2u32, 1u32);
+        let p16 = |v: u16| -> Vec<u8> { (0..2).flat_map(|_| v.to_be_bytes()).collect() };
+        let chans = vec![p16(0xFFFF), p16(0), p16(0), p16(0)];
+        let mut f = build(false, 3, 16, w, h, &chans, false, false);
+        // Replace the layer & mask section (offset 34: 4 + 2 + 6 + 2 + 4 + 4 + 2 + 2 + 4 + 4).
+        let lm_off = 34;
+        let old_len = u32::from_be_bytes(f[lm_off..lm_off + 4].try_into().unwrap()) as usize;
+        let mut lm = Vec::new();
+        lm.extend_from_slice(&0u32.to_be_bytes()); // layer info (empty)
+        lm.extend_from_slice(&0u32.to_be_bytes()); // global mask info
+        lm.extend_from_slice(b"8BIMLr16");
+        lm.extend_from_slice(&2u32.to_be_bytes());
+        lm.extend_from_slice(&(-1i16).to_be_bytes());
+        let mut sec = (lm.len() as u32).to_be_bytes().to_vec();
+        sec.extend_from_slice(&lm);
+        f.splice(lm_off..lm_off + 4 + old_len, sec);
+        let d = decode(&f, false).unwrap();
+        assert!(d.has_alpha);
+        assert_eq!(d.image.get_pixel(0, 0).0[3], 0);
+    }
+
+    #[test]
+    fn crafted_rle_row_table_does_not_allocate() {
+        // PSB 300000 x 300000 fails check_alloc; use a size that passes it
+        // with 56 channels so the RLE table claims ~ 56 * 20000 entries in a
+        // tiny file.
+        let mut f = build(true, 3, 8, 1, 1, &[vec![1], vec![2], vec![3]], true, false);
+        f[12..14].copy_from_slice(&56u16.to_be_bytes());
+        f[14..18].copy_from_slice(&20_000u32.to_be_bytes());
+        f[18..22].copy_from_slice(&1u32.to_be_bytes());
+        let t = std::time::Instant::now();
+        assert!(decode(&f, false).is_err());
+        assert!(t.elapsed().as_secs() < 2);
     }
 
     #[test]
