@@ -38,6 +38,18 @@ pub struct FolderTree {
     drives_rx: Option<crossbeam_channel::Receiver<Vec<(PathBuf, String)>>>,
     drives_requested: bool,
     quick: Option<Vec<(String, PathBuf, &'static str)>>,
+    /// Flattened visible rows, rebuilt only when the tree changes.
+    rows: Vec<Row>,
+    rows_dirty: bool,
+    rows_favs: Vec<PathBuf>,
+}
+
+const ROW_H: f32 = 26.0;
+
+enum Row {
+    Header(&'static str),
+    Loading { depth: usize },
+    Item { path: PathBuf, name: String, icon: &'static str, depth: usize, expandable: bool, favorite: bool },
 }
 
 fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -127,19 +139,24 @@ impl FolderTree {
         });
     }
 
-    fn poll(&mut self) {
+    /// Take finished background listings; true when something arrived.
+    fn poll(&mut self) -> bool {
+        let mut got = false;
         if let Some((_, rx)) = &self.chan {
             while let Ok((dir, kids)) = rx.try_recv() {
                 self.loading.remove(&dir);
                 self.children.insert(dir, kids);
+                got = true;
             }
         }
         if let Some(rx) = &self.drives_rx {
             if let Ok(d) = rx.try_recv() {
                 self.drives = d;
                 self.drives_rx = None;
+                got = true;
             }
         }
+        got
     }
 
     /// Expand all ancestors of `path` so the current folder is visible.
@@ -154,85 +171,130 @@ impl FolderTree {
             cur = p.parent();
         }
         self.scroll_to = Some(path.to_path_buf());
+        self.rows_dirty = true;
     }
 
     pub fn invalidate(&mut self, dir: &Path) {
         if self.children.contains_key(dir) {
             self.stale.insert(dir.to_path_buf());
+            self.rows_dirty = true;
         }
     }
 
+    /// Rebuild the flat row list (only when something changed).
+    fn rebuild_rows(&mut self, favorites: &[PathBuf], ctx: &egui::Context) {
+        let mut rows = Vec::new();
+        if !favorites.is_empty() {
+            rows.push(Row::Header("FAVORITES"));
+            for f in favorites {
+                rows.push(Row::Item { path: f.clone(), name: display_name(f), icon: I::STAR, depth: 0, expandable: false, favorite: true });
+            }
+        }
+        rows.push(Row::Header("QUICK ACCESS"));
+        for (name, path, icon) in self.quick.clone().unwrap_or_default() {
+            rows.push(Row::Item { path, name, icon, depth: 0, expandable: false, favorite: false });
+        }
+        rows.push(Row::Header("THIS PC"));
+        if self.drives.is_empty() && self.drives_rx.is_some() {
+            rows.push(Row::Loading { depth: 0 });
+        }
+        for (d, label) in self.drives.clone() {
+            self.flatten(&mut rows, &d, label, I::HARD_DRIVES, 0, ctx);
+        }
+        self.rows = rows;
+        self.rows_favs = favorites.to_vec();
+        self.rows_dirty = false;
+    }
+
+    fn flatten(&mut self, rows: &mut Vec<Row>, path: &Path, name: String, icon: &'static str, depth: usize, ctx: &egui::Context) {
+        rows.push(Row::Item { path: path.to_path_buf(), name, icon, depth, expandable: true, favorite: false });
+        if !self.expanded.contains(path) {
+            return;
+        }
+        let kids = match self.children.get(path).cloned() {
+            Some(k) => {
+                if self.stale.contains(path) {
+                    self.start_listing(path, ctx);
+                }
+                k
+            }
+            None => {
+                self.start_listing(path, ctx);
+                rows.push(Row::Loading { depth: depth + 1 });
+                return;
+            }
+        };
+        for k in kids {
+            let ic = if self.expanded.contains(&k) { I::FOLDER_OPEN } else { I::FOLDER };
+            let n = display_name(&k);
+            self.flatten(rows, &k, n, ic, depth + 1, ctx);
+        }
+    }
+
+    /// Rows are virtualized: the tree is flattened once per change and only the
+    /// rows on screen are laid out, so folders with thousands of sub-folders stay cheap.
     pub fn ui(&mut self, ui: &mut Ui, current: &Path, favorites: &[PathBuf], p: &Palette) -> Option<TreeAction> {
-        self.poll();
-        self.start_drives(ui.ctx());
+        let ctx = ui.ctx().clone();
+        if self.poll() {
+            self.rows_dirty = true;
+        }
+        self.start_drives(&ctx);
         if self.quick.is_none() {
             self.quick = Some(fileops::quick_access());
+            self.rows_dirty = true;
+        }
+        if self.rows_dirty || self.rows_favs.as_slice() != favorites {
+            self.rebuild_rows(favorites, &ctx);
+        }
+        let row_h = ROW_H;
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("folder-tree");
+        if let Some(target) = self.scroll_to.clone() {
+            // Look in the drive tree (after the "This PC" header), not in favorites / quick access.
+            let start = self.rows.iter().position(|r| matches!(r, Row::Header("THIS PC"))).unwrap_or(0);
+            let find = |t: &Path| self.rows[start..].iter().position(|r| matches!(r, Row::Item { path, .. } if path == t)).map(|i| i + start);
+            let settled = self.loading.is_empty() && self.drives_rx.is_none() && !self.rows.iter().any(|r| matches!(r, Row::Loading { .. }));
+            // Once loading settles, fall back to the deepest visible ancestor (a hidden
+            // folder like `.git` on the way is not listed in the tree).
+            let found = find(&target).or_else(|| if settled { target.ancestors().skip(1).find_map(find) } else { None });
+            match found {
+                Some(i) => {
+                    let view_h = ui.available_height();
+                    scroll = scroll.vertical_scroll_offset((i as f32 * row_h - view_h / 2.0 + row_h / 2.0).max(0.0));
+                    self.scroll_to = None;
+                }
+                // Give up once nothing is loading any more (the target is hidden or gone).
+                None if settled => self.scroll_to = None,
+                None => {}
+            }
         }
         let mut action = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let rows = std::mem::take(&mut self.rows);
+        // show_rows measures rows with the outer item spacing: make it zero there too.
+        let prev_spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            if !favorites.is_empty() {
-                header(ui, p, "Favorites");
-                for f in favorites {
-                    let name = display_name(f);
-                    if let Some(a) = self.row(ui, f, &name, I::STAR, 0, current, false, p, true) {
-                        action = Some(a);
+            for i in range {
+                let Some(r) = rows.get(i) else { break };
+                match r {
+                    Row::Header(text) => header(ui, p, text),
+                    Row::Loading { depth } => {
+                        let depth = *depth;
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
+                        let x = rect.min.x + 12.0 + depth as f32 * 14.0 + 22.0;
+                        ui.painter().text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, "Loading...", FontId::proportional(12.0), p.faint);
+                    }
+                    Row::Item { path, name, icon, depth, expandable, favorite } => {
+                        if let Some(a) = self.row(ui, path, name, icon, *depth, current, *expandable, p, *favorite) {
+                            action = Some(a);
+                        }
                     }
                 }
-                ui.add_space(6.0);
             }
-            header(ui, p, "Quick access");
-            for (name, path, icon) in self.quick.clone().unwrap_or_default() {
-                if let Some(a) = self.row(ui, &path, &name, icon, 0, current, false, p, false) {
-                    action = Some(a);
-                }
-            }
-            ui.add_space(6.0);
-            header(ui, p, "This PC");
-            let drives = self.drives.clone();
-            if drives.is_empty() && self.drives_rx.is_some() {
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    ui.spinner();
-                });
-            }
-            for (d, label) in drives {
-                if let Some(a) = self.node(ui, &d, &label, I::HARD_DRIVES, 0, current, p) {
-                    action = Some(a);
-                }
-            }
-            ui.add_space(12.0);
         });
-        action
-    }
-
-    fn node(&mut self, ui: &mut Ui, path: &Path, name: &str, icon: &str, depth: usize, current: &Path, p: &Palette) -> Option<TreeAction> {
-        let mut action = self.row(ui, path, name, icon, depth, current, true, p, false);
-        if self.expanded.contains(path) {
-            let kids = match self.children.get(path).cloned() {
-                Some(k) => {
-                    if self.stale.contains(path) {
-                        self.start_listing(path, ui.ctx());
-                    }
-                    k
-                }
-                None => {
-                    self.start_listing(path, ui.ctx());
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0 + (depth + 1) as f32 * 14.0 + 22.0);
-                        ui.label(egui::RichText::new("Loading...").size(12.0).color(p.faint));
-                    });
-                    Vec::new()
-                }
-            };
-            for k in kids {
-                let n = display_name(&k);
-                let is_open = self.expanded.contains(&k);
-                let ic = if is_open { I::FOLDER_OPEN } else { I::FOLDER };
-                if let Some(a) = self.node(ui, &k, &n, ic, depth + 1, current, p) {
-                    action = Some(a);
-                }
-            }
+        ui.spacing_mut().item_spacing.y = prev_spacing;
+        if !self.rows_dirty {
+            self.rows = rows;
         }
         action
     }
@@ -251,7 +313,7 @@ impl FolderTree {
         is_favorite: bool,
     ) -> Option<TreeAction> {
         let mut action = None;
-        let h = 26.0;
+        let h = ROW_H;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
         let selected = path == current;
         let hovered_drop = resp.dnd_hover_payload::<DragFiles>().is_some();
@@ -287,11 +349,6 @@ impl FolderTree {
             let painter = ui.painter().with_clip_rect(text_rect);
             painter.galley(Pos2::new(text_rect.min.x, cy - galley.size().y / 2.0), galley, p.text);
         }
-        // Outside the visibility check: the row to reveal is usually scrolled out of view.
-        if self.scroll_to.as_deref() == Some(path) {
-            ui.scroll_to_rect(rect, Some(egui::Align::Center));
-            self.scroll_to = None;
-        }
         if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
             let copy = ui.input(|i| i.modifiers.ctrl);
             action = Some(TreeAction::DropFiles { target: path.to_path_buf(), files: files.0.clone(), copy });
@@ -312,7 +369,8 @@ impl FolderTree {
         if resp.double_clicked() && expandable {
             self.toggle(path);
         }
-        resp.on_hover_text(path.display().to_string()).context_menu(|ui| {
+        let resp = if resp.hovered() { resp.on_hover_text(path.display().to_string()) } else { resp };
+        resp.context_menu(|ui| {
             if ui.button(format!("{}  Open", I::FOLDER_OPEN)).clicked() {
                 action = Some(TreeAction::Navigate(path.to_path_buf()));
                 ui.close();
@@ -343,6 +401,7 @@ impl FolderTree {
     }
 
     fn toggle(&mut self, path: &Path) {
+        self.rows_dirty = true;
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
             self.invalidate(path); // re-list on expand so it stays fresh
@@ -351,10 +410,6 @@ impl FolderTree {
 }
 
 fn header(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(14.0);
-        ui.label(egui::RichText::new(text.to_uppercase()).size(10.5).color(p.faint).strong());
-    });
-    ui.add_space(3.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
+    ui.painter().text(Pos2::new(rect.min.x + 14.0, rect.max.y - 8.0), Align2::LEFT_CENTER, text, FontId::proportional(10.5), p.faint);
 }
