@@ -33,6 +33,7 @@ qcms = "0.3.0"
 jpeg-encoder = "0.7.1"
 img-parts = "0.4.1"
 webp = { version = "0.3", default-features = false }
+ab_glyph = "0.2"
 
 [dependencies.windows]
 version = "0.62"
@@ -50,6 +51,9 @@ features = [
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_UI_HiDpi",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Storage_Xps",
 ]
 
 [build-dependencies]
