@@ -70,6 +70,47 @@ impl SheetSettings {
     pub fn line_h(&self) -> u32 {
         (self.caption_px * 1.35).ceil() as u32
     }
+
+    /// A copy with every pixel size multiplied by `f` (for reduced previews).
+    pub fn scaled(&self, f: f32) -> SheetSettings {
+        let sc = |v: u32, min: u32| ((v as f32 * f).round() as u32).max(min);
+        SheetSettings {
+            cell_w: sc(self.cell_w, 4),
+            cell_h: sc(self.cell_h, 4),
+            spacing: sc(self.spacing, 0),
+            margin: sc(self.margin, 0),
+            caption_px: (self.caption_px * f).max(1.0),
+            title_px: (self.title_px * f).max(1.0),
+            ..self.clone()
+        }
+    }
+}
+
+/// Largest page we will allocate (RGBA, 4 bytes per pixel = 1.2 GB).
+pub const MAX_PAGE_PIXELS: u64 = 300_000_000;
+
+/// Why a page of this layout cannot be written, if it can't.
+pub fn page_limit_error(format: SaveFormat, l: &Layout) -> Option<String> {
+    let px = l.width as u64 * l.height as u64;
+    if px > MAX_PAGE_PIXELS {
+        return Some(format!(
+            "The page would be {} x {} px ({} MP); the limit is {} MP. Use fewer rows or columns or smaller thumbnails.",
+            l.width,
+            l.height,
+            px / 1_000_000,
+            MAX_PAGE_PIXELS / 1_000_000
+        ));
+    }
+    let max_side = match format {
+        SaveFormat::Jpeg => 65_535,
+        SaveFormat::WebP => 16_383,
+        _ => u32::MAX,
+    };
+    if l.width > max_side || l.height > max_side {
+        let name = if format == SaveFormat::WebP { "WebP" } else { format.label() };
+        return Some(format!("{name} pages can be at most {max_side} px per side (this one is {} x {} px).", l.width, l.height));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +395,26 @@ pub fn page_paths(s: &SheetSettings, dir: &Path, pages: usize) -> Vec<PathBuf> {
             dir.join(name)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn page_limits_and_scaling() {
+        let mut s = SheetSettings { cols: 20, rows: 30, cell_w: 2000, cell_h: 2000, ..Default::default() };
+        let l = layout(&s, 600);
+        assert!(page_limit_error(SaveFormat::Png, &l).is_some(), "12 GB page is refused");
+        s = SheetSettings::default();
+        let l = layout(&s, 10);
+        assert!(page_limit_error(SaveFormat::Jpeg, &l).is_none());
+        let small = layout(&s.scaled(0.5), 10);
+        assert!((small.width as i64 - l.width as i64 / 2).abs() <= 6, "{} vs {}", small.width, l.width);
+        let wide = Layout { width: 70_000, height: 100, ..l };
+        assert!(page_limit_error(SaveFormat::Jpeg, &wide).is_some());
+        assert!(page_limit_error(SaveFormat::Png, &wide).is_none());
+    }
 }
 
 #[cfg(test)]
