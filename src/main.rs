@@ -13,6 +13,7 @@ mod formats;
 mod imaging;
 mod loader;
 mod meta;
+mod metaedit;
 mod render;
 mod settings;
 mod shell;

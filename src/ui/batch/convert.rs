@@ -2,6 +2,7 @@
 //! worker pool. No UI code lives here.
 
 use super::logic::{self, ResizeSpec, TemplateCtx};
+use super::pipeline::{Pipeline, StepCtx};
 use crate::decode::{self, DecodeOptions};
 use crate::encode::{Chroma, SaveOptions};
 use crate::formats::SaveFormat;
@@ -68,6 +69,9 @@ pub struct ConvertSettings {
     pub keep_exif: bool,
     pub preserve_date: bool,
     pub include_subfolders: bool,
+    /// Run the advanced pipeline after the basic options.
+    pub use_advanced: bool,
+    pub advanced: Pipeline,
 }
 
 impl Default for ConvertSettings {
@@ -95,6 +99,8 @@ impl Default for ConvertSettings {
             keep_exif: true,
             preserve_date: false,
             include_subfolders: false,
+            use_advanced: false,
+            advanced: Pipeline::default(),
         }
     }
 }
@@ -156,14 +162,58 @@ impl ConvertSettings {
         format!("{stem}.{}", self.target_format(input).ext())
     }
 
-    /// True when the settings can replace the original files.
-    pub fn may_overwrite_originals(&self) -> bool {
-        self.conflict == ConflictPolicy::Overwrite && self.dest == DestMode::Same
+    /// True when converting `files` with these settings can replace an
+    /// original: the conflict policy is Overwrite and, for at least one file,
+    /// the output folder is the file's own folder (whatever the destination
+    /// mode says - a chosen folder or a subfolder named "." can be the source
+    /// folder too).
+    pub fn overwrites_originals(&self, files: &[PathBuf]) -> bool {
+        if self.conflict != ConflictPolicy::Overwrite {
+            return false;
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for f in files {
+            let parent = f.parent().map(Path::to_path_buf).unwrap_or_default();
+            if !seen.insert(path_key(&parent)) {
+                continue;
+            }
+            if same_dir(&self.output_dir(f), &parent) {
+                return true;
+            }
+        }
+        false
     }
 }
 
-/// Apply adjustments and resizing.
-pub fn render(src: RgbaImage, s: &ConvertSettings) -> RgbaImage {
+/// Apply adjustments and resizing, then the advanced pipeline (if enabled).
+pub fn render(src: RgbaImage, s: &ConvertSettings, cx: &StepCtx) -> RgbaImage {
+    let img = render_basic(src, s);
+    if s.use_advanced {
+        s.advanced.apply(img, cx)
+    } else {
+        img
+    }
+}
+
+/// The DPI to write into the output, if the advanced pipeline sets one.
+pub fn output_dpi(s: &ConvertSettings) -> Option<u16> {
+    if s.use_advanced {
+        s.advanced.dpi()
+    } else {
+        None
+    }
+}
+
+/// Encode with the batch settings (including the DPI metadata).
+pub fn encode_output(img: &RgbaImage, s: &ConvertSettings, fmt: SaveFormat, exif: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+    let bytes = crate::encode::encode(img, &s.save_options(fmt, exif)).map_err(|e| e.to_string())?;
+    Ok(match output_dpi(s) {
+        Some(dpi) => super::pipeline::set_dpi(bytes, fmt, dpi),
+        None => bytes,
+    })
+}
+
+fn render_basic(src: RgbaImage, s: &ConvertSettings) -> RgbaImage {
     let mut img = src;
     if s.auto_enhance {
         img = crate::edit::ops::auto_levels(&img);
@@ -207,12 +257,19 @@ pub struct Estimate {
     pub out_dims: (u32, u32),
     pub in_bytes: u64,
     pub out_bytes: usize,
+    /// Reduced copies of the source and the result for the before/after preview.
+    pub before: Option<RgbaImage>,
+    pub after: Option<RgbaImage>,
 }
 
-/// Cache of the decoded first file so tweaking options doesn't re-decode it.
+/// Longest side of the before/after preview images.
+pub const PREVIEW_SIDE: u32 = 900;
+
+/// Cache of the decoded preview file so tweaking options doesn't re-decode it.
 pub type DecodeCache = Arc<Mutex<Option<(PathBuf, decode::Decoded)>>>;
 
-pub fn estimate(input: &Path, s: &ConvertSettings, cache: &DecodeCache) -> Result<Estimate, String> {
+/// Render the `index`-th file with the current settings and estimate the output.
+pub fn estimate(input: &Path, index: usize, s: &ConvertSettings, cache: &DecodeCache) -> Result<Estimate, String> {
     let dec = {
         let cached = cache.lock().as_ref().filter(|(p, _)| p == input).map(|(_, d)| d.clone());
         match cached {
@@ -226,25 +283,28 @@ pub fn estimate(input: &Path, s: &ConvertSettings, cache: &DecodeCache) -> Resul
     };
     let in_dims = (dec.width(), dec.height());
     let fmt = s.target_format(input);
-    let out_dims = logic::output_size(in_dims.0, in_dims.1, &s.resize);
+    let taken = taken_from_exif(dec.exif.as_ref());
+    let cx = StepCtx::for_file(input, s.start + index as i64, taken);
+    let img = render((*dec.image).clone(), s, &cx);
+    let out_dims = img.dimensions();
     // Encode a reduced copy for very large outputs and extrapolate by pixel count.
     let px = out_dims.0 as f64 * out_dims.1 as f64;
-    let img = render((*dec.image).clone(), s);
-    let opts = s.save_options(fmt, dec.exif.clone());
     let out_bytes = if px > 8e6 && fmt != SaveFormat::Ico {
         let small = crate::imaging::resize_to_fit(&img, 2400, 2400);
         let f = px / (small.width() as f64 * small.height() as f64);
-        (crate::encode::encode(&small, &opts).map_err(|e| e.to_string())?.len() as f64 * f) as usize
+        (encode_output(&small, s, fmt, dec.exif.clone())?.len() as f64 * f) as usize
     } else {
-        crate::encode::encode(&img, &opts).map_err(|e| e.to_string())?.len()
+        encode_output(&img, s, fmt, dec.exif.clone())?.len()
     };
-    let out_dims = if fmt == SaveFormat::Ico { (out_dims.0.min(256), out_dims.1.min(256)) } else { img.dimensions() };
+    let out_dims = if fmt == SaveFormat::Ico { (out_dims.0.min(256), out_dims.1.min(256)) } else { out_dims };
     Ok(Estimate {
-        name: s.output_name(input, 0, out_dims, taken_from_exif(dec.exif.as_ref())),
+        name: s.output_name(input, index, out_dims, taken),
         in_dims,
         out_dims,
         in_bytes: std::fs::metadata(input).map(|m| m.len()).unwrap_or(0),
         out_bytes,
+        before: Some(crate::imaging::resize_to_fit(&dec.image, PREVIEW_SIDE, PREVIEW_SIDE)),
+        after: Some(crate::imaging::resize_to_fit(&img, PREVIEW_SIDE, PREVIEW_SIDE)),
     })
 }
 
@@ -275,6 +335,22 @@ pub struct Job {
 
 fn path_key(p: &Path) -> String {
     p.to_string_lossy().to_lowercase()
+}
+
+/// Whether two folder paths name the same folder (canonicalized when they exist).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => {
+            let norm = |p: &Path| path_key(p).trim_end_matches(['\\', '/']).trim_end_matches("\\.").to_string();
+            norm(a) == norm(b)
+        }
+    }
+}
+
+/// Turn a panic payload into a readable message.
+pub fn panic_message(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown error".into())
 }
 
 /// Resolve a conflict and reserve the final path. None = skip.
@@ -323,7 +399,8 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex
     let exif = dec.exif.clone();
     let taken = taken_from_exif(exif.as_ref());
     let img = Arc::try_unwrap(dec.image).unwrap_or_else(|a| (*a).clone());
-    let img = render(img, s);
+    let cx = StepCtx::for_file(input, s.start + index as i64, taken);
+    let img = render(img, s, &cx);
     let fmt = s.target_format(input);
     let dims = if fmt == SaveFormat::Ico { (img.width().min(256), img.height().min(256)) } else { img.dimensions() };
     let dir = s.output_dir(input);
@@ -335,10 +412,9 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, reserved: &Mutex
         Ok(p) => p,
         Err(why) => return FileStatus::Skipped(why),
     };
-    let opts = s.save_options(fmt, exif);
-    let bytes = match crate::encode::encode(&img, &opts) {
+    let bytes = match encode_output(&img, s, fmt, exif) {
         Ok(b) => b,
-        Err(e) => return FileStatus::Failed(e.to_string()),
+        Err(e) => return FileStatus::Failed(e),
     };
     // write_atomic writes a temporary file and renames it into place, so the
     // original survives any failure even when it is being replaced.
@@ -367,7 +443,9 @@ pub fn start(files: Vec<PathBuf>, s: ConvertSettings, ctx: egui::Context) -> Job
     std::thread::Builder::new()
         .name("lumen-batch-convert".into())
         .spawn(move || {
-            run(files, s, prog.clone(), tx, ctx.clone());
+            // `finished` must be set even if the pool itself fails.
+            let c2 = ctx.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(files, s, prog.clone(), tx, c2)));
             prog.finished.store(true, Ordering::SeqCst);
             ctx.request_repaint();
         })
@@ -384,7 +462,9 @@ fn run(files: Vec<PathBuf>, s: ConvertSettings, prog: Arc<Progress>, tx: Sender<
         }
         let _ = tx.send((i, FileStatus::Working));
         ctx.request_repaint();
-        let st = process_one(&files[i], i, &s, &reserved);
+        // A decoder or encoder panic on one file fails that file only.
+        let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process_one(&files[i], i, &s, &reserved)))
+            .unwrap_or_else(|e| FileStatus::Failed(format!("Unexpected error: {}", panic_message(&*e))));
         let _ = tx.send((i, st));
         prog.done.fetch_add(1, Ordering::Relaxed);
         ctx.request_repaint();
@@ -402,8 +482,14 @@ fn run(files: Vec<PathBuf>, s: ConvertSettings, prog: Arc<Progress>, tx: Sender<
 #[serde(default)]
 pub struct BatchPrefs {
     pub convert: ConvertSettings,
+    /// Last tab of the batch convert window (0 basic, 1 advanced).
+    pub convert_tab: u8,
     pub rename: logic::RenameSettings,
     pub sheet: crate::ui::tools::sheet::SheetSettings,
+    pub print: crate::ui::tools::print::PrintOptions,
+    pub multi: crate::ui::tools::multipage::MultiSettings,
+    pub strip: crate::ui::tools::multipage::StripSettings,
+    pub zip: crate::ui::tools::multipage::ZipSettings,
 }
 
 fn prefs_path() -> PathBuf {
@@ -449,6 +535,63 @@ mod tests {
         s.dest = DestMode::Folder;
         s.out_folder = Some(PathBuf::from("D:\\out"));
         assert_eq!(s.output_dir(&input), PathBuf::from("D:\\out"));
+    }
+
+    #[test]
+    fn end_to_end_advanced_pipeline() {
+        use super::super::pipeline::{CanvasMode, CanvasStep, Step, TextStep};
+        let dir = std::env::temp_dir().join(format!("lumen-conv-adv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("pic.png");
+        RgbaImage::from_pixel(200, 100, image::Rgba([10, 20, 30, 255])).save(&input).unwrap();
+        let mut s = ConvertSettings { format: SaveFormat::Png, dest: DestMode::Subfolder, subfolder: "out".into(), use_advanced: true, ..Default::default() };
+        s.advanced.push(Step::Canvas(CanvasStep { mode: CanvasMode::Add, add: 5, color: [255, 0, 0, 255], ..Default::default() }));
+        s.advanced.push(Step::Text(TextStep { text: "{name}".into(), shadow: false, size_pct: 30.0, anchor: 4, ..Default::default() }));
+        s.advanced.push(Step::Dpi { dpi: 240 });
+        let est = estimate(&input, 0, &s, &Default::default()).unwrap();
+        assert_eq!(est.out_dims, (210, 110));
+        assert!(est.before.is_some() && est.after.is_some());
+        match process_one(&input, 0, &s, &Mutex::new(HashSet::new())) {
+            FileStatus::Done { out, dims, .. } => {
+                assert_eq!(dims, (210, 110));
+                let bytes = std::fs::read(&out).unwrap();
+                assert_eq!(super::super::pipeline::read_dpi(&bytes).map(|d| d.round()), Some(240.0));
+                let back = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                assert_eq!(back.get_pixel(1, 1).0, [255, 0, 0, 255], "canvas color");
+                assert!(back.pixels().any(|p| p[0] > 200 && p[1] > 200), "text drawn");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Disabled pipeline: untouched size, no DPI.
+        s.use_advanced = false;
+        assert_eq!(estimate(&input, 0, &s, &Default::default()).unwrap().out_dims, (200, 100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_guard_covers_every_destination() {
+        let dir = std::env::temp_dir().join(format!("lumen-conv-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = vec![dir.join("a.jpg")];
+        let mut s = ConvertSettings { conflict: ConflictPolicy::Overwrite, dest: DestMode::Same, ..Default::default() };
+        assert!(s.overwrites_originals(&files));
+        s.dest = DestMode::Folder;
+        s.out_folder = Some(dir.clone());
+        assert!(s.overwrites_originals(&files), "chosen folder == source folder");
+        s.out_folder = Some(PathBuf::from(format!("{}\\", dir.display())));
+        assert!(s.overwrites_originals(&files), "trailing separator");
+        s.out_folder = Some(dir.join("other"));
+        assert!(!s.overwrites_originals(&files));
+        s.dest = DestMode::Subfolder;
+        s.subfolder = ".".into();
+        assert!(!s.overwrites_originals(&files), "'.' is sanitized to a real subfolder name");
+        s.subfolder = "Converted".into();
+        assert!(!s.overwrites_originals(&files));
+        s.dest = DestMode::Same;
+        s.conflict = ConflictPolicy::Rename;
+        assert!(!s.overwrites_originals(&files));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
