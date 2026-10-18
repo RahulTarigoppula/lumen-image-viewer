@@ -1033,6 +1033,16 @@ impl Browser {
                     item(ui, Command::FindDuplicates, ev);
                     item(ui, Command::SetWallpaper, ev);
                     item(ui, Command::OpenWithEditor, ev);
+                    ui.separator();
+                    item(ui, Command::CreateMultiPage, ev);
+                    item(ui, Command::ImageStrip, ev);
+                    item(ui, Command::CreateZip, ev);
+                    item(ui, Command::Print, ev);
+                    ui.separator();
+                    item(ui, Command::EditComment, ev);
+                    item(ui, Command::RemoveMetadata, ev);
+                    item(ui, Command::ChangeDates, ev);
+                    item(ui, Command::ExportXmp, ev);
                 });
                 ui.separator();
                 item(ui, Command::ShowInExplorer, ev);

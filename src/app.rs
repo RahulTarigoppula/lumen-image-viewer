@@ -86,6 +86,11 @@ pub struct App {
     batch_rename: Option<crate::ui::batch::BatchRename>,
     contact_sheet: Option<crate::ui::tools::ContactSheet>,
     duplicates: Option<crate::ui::tools::Duplicates>,
+    metadata_dialog: Option<(crate::ui::metadata_dialog::MetadataDialog, Vec<PathBuf>)>,
+    print_window: Option<crate::ui::tools::PrintWindow>,
+    multipage: Option<crate::ui::tools::MultiPageWindow>,
+    strip: Option<crate::ui::tools::StripWindow>,
+    zip: Option<crate::ui::tools::ZipWindow>,
     palette: CommandPalette,
     prompt: Option<(Prompt, PendingPrompt)>,
     confirm: Option<Confirm>,
@@ -160,6 +165,11 @@ impl App {
             batch_rename: None,
             contact_sheet: None,
             duplicates: None,
+            metadata_dialog: None,
+            print_window: None,
+            multipage: None,
+            strip: None,
+            zip: None,
             palette: CommandPalette::default(),
             prompt: None,
             confirm: None,
@@ -184,6 +194,9 @@ impl App {
         };
         crate::ui::keymap::install(&app.core.settings);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        for msg in crate::ui::batch::recover_pending_renames() {
+            app.core.toasts.info(msg);
+        }
         app.viewer.show_info = app.core.settings.show_info_overlay;
         match initial {
             Some(p) if p.is_file() => app.open_file(&p),
@@ -345,7 +358,7 @@ impl App {
         let wrap = self.core.settings.loop_navigation;
         match cmd {
             OpenFile => {
-                let exts: Vec<&str> = crate::formats::NATIVE_EXTS.iter().chain(crate::formats::WIC_EXTS.iter()).chain(crate::video::VIDEO_EXTS.iter()).copied().collect();
+                let exts: Vec<&str> = crate::formats::NATIVE_EXTS.iter().chain(crate::formats::WIC_EXTS.iter()).chain(crate::formats::DOCUMENT_EXTS.iter()).chain(crate::video::VIDEO_EXTS.iter()).copied().collect();
                 let mut dlg = rfd::FileDialog::new().add_filter("Images and videos", &exts).add_filter("All files", &["*"]);
                 dlg = dlg.set_directory(&self.browser.folder);
                 if let Some(p) = dlg.pick_file() {
@@ -756,12 +769,46 @@ impl App {
             },
             SetWallpaper => self.set_wallpaper(),
             Print => {
-                let img = self.viewer.current_image(&self.core).or_else(|| self.targets().first().and_then(|p| crate::decode::decode_file(p, Default::default()).ok()).map(|d| d.image));
-                if let Some(img) = img {
-                    let title = self.targets().first().map(|p| crate::ui::viewer::file_name(p)).unwrap_or_else(|| "Lumen".into());
-                    if let Err(e) = crate::ui::tools::print_image(&img, &title) {
-                        self.core.toasts.error(e.to_string());
+                if self.mode == Mode::Viewer {
+                    let Some(img) = self.viewer.current_image(&self.core) else {
+                        self.core.toasts.info("Image is still loading");
+                        return;
+                    };
+                    let title = self.viewer.current().map(|p| crate::ui::viewer::file_name(p)).unwrap_or_else(|| "Lumen".into());
+                    self.print_window = Some(crate::ui::tools::PrintWindow::with_image(img, title, &self.core));
+                } else {
+                    let files: Vec<PathBuf> = self.media_targets().into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
+                    if files.is_empty() {
+                        self.core.toasts.info("Select images to print");
+                        return;
                     }
+                    self.print_window = Some(crate::ui::tools::PrintWindow::new(files, &self.core));
+                }
+            }
+            EditComment | RemoveMetadata | ChangeDates | ExportXmp => {
+                use crate::ui::metadata_dialog::{MetadataDialog, Tab};
+                let files = self.media_targets();
+                if files.is_empty() {
+                    self.core.toasts.info("Select files first");
+                    return;
+                }
+                let tab = match cmd {
+                    EditComment => Tab::Comment,
+                    RemoveMetadata => Tab::Strip,
+                    ChangeDates => Tab::Dates,
+                    _ => Tab::Sidecar,
+                };
+                self.metadata_dialog = Some((MetadataDialog::new(files.clone(), &self.core).with_tab(tab), files));
+            }
+            CreateMultiPage | ImageStrip | CreateZip => {
+                let mut files = self.media_targets();
+                if files.len() <= 1 && self.mode == Mode::Browser {
+                    files = self.browser.media_paths();
+                }
+                match cmd {
+                    CreateMultiPage => self.multipage = Some(crate::ui::tools::MultiPageWindow::new(files, &self.core)),
+                    ImageStrip => self.strip = Some(crate::ui::tools::StripWindow::new(files, &self.core)),
+                    _ => self.zip = Some(crate::ui::tools::ZipWindow::new(files, &self.core)),
                 }
             }
             ToggleInfo => self.viewer.show_info = !self.viewer.show_info,
@@ -1295,7 +1342,18 @@ impl App {
     }
 
     fn tool_window_open(&self) -> bool {
-        self.batch_convert.is_some() || self.batch_rename.is_some() || self.contact_sheet.is_some() || self.duplicates.is_some() || self.show_settings || self.show_help || self.show_about
+        self.batch_convert.is_some()
+            || self.batch_rename.is_some()
+            || self.contact_sheet.is_some()
+            || self.duplicates.is_some()
+            || self.metadata_dialog.is_some()
+            || self.print_window.is_some()
+            || self.multipage.is_some()
+            || self.strip.is_some()
+            || self.zip.is_some()
+            || self.show_settings
+            || self.show_help
+            || self.show_about
     }
 
     /// Remember whether the last click landed in a floating window, so keys typed
@@ -1610,6 +1668,43 @@ impl App {
                 self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
             }
         }
+        if let Some((w, files)) = &mut self.metadata_dialog {
+            if !w.show(ctx, &mut self.core) {
+                let files = std::mem::take(files);
+                self.metadata_dialog = None;
+                for f in &files {
+                    self.forget_file(f);
+                }
+                self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+            }
+        }
+        if let Some(w) = &mut self.print_window {
+            if !w.show(ctx, &mut self.core) {
+                self.print_window = None;
+            }
+        }
+        let mut reload = false;
+        if let Some(w) = &mut self.multipage {
+            if !w.show(ctx, &mut self.core) {
+                self.multipage = None;
+                reload = true;
+            }
+        }
+        if let Some(w) = &mut self.strip {
+            if !w.show(ctx, &mut self.core) {
+                self.strip = None;
+                reload = true;
+            }
+        }
+        if let Some(w) = &mut self.zip {
+            if !w.show(ctx, &mut self.core) {
+                self.zip = None;
+                reload = true;
+            }
+        }
+        if reload {
+            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        }
         if let Some(w) = &mut self.duplicates {
             let (open, events) = w.show(ctx, &mut self.core);
             for e in events {
@@ -1737,7 +1832,11 @@ impl App {
                 }
             });
             ui.menu_button(format!("{}   Tools", I::WRENCH), |ui| {
-                for c in [Command::BatchConvert, Command::BatchRename, Command::ContactSheet, Command::FindDuplicates, Command::Slideshow, Command::Compare, Command::OpenVideoMode] {
+                for c in [Command::BatchConvert, Command::BatchRename, Command::ContactSheet, Command::FindDuplicates, Command::CreateMultiPage, Command::ImageStrip, Command::CreateZip, Command::Slideshow, Command::Compare, Command::OpenVideoMode] {
+                    item(ui, c, &mut fire);
+                }
+                ui.separator();
+                for c in [Command::EditComment, Command::RemoveMetadata, Command::ChangeDates, Command::ExportXmp] {
                     item(ui, c, &mut fire);
                 }
             });
