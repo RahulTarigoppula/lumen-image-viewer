@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod commands;
+pub mod keymap;
 #[allow(dead_code)]
 pub mod icons;
 pub mod palette;

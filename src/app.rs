@@ -18,7 +18,7 @@ use crate::ui::save_dialog::{SaveDialog, SaveOutcome};
 use crate::ui::theme::{self, Palette};
 use crate::ui::viewer::{Viewer, ViewerEvent};
 use crate::ui::widgets::{self, Prompt, Toasts};
-use egui::{Key, KeyboardShortcut, Modifiers, RichText, Vec2};
+use egui::{Key, RichText, Vec2};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -50,6 +50,23 @@ enum PendingPrompt {
 
 enum Confirm {
     Delete(Vec<PathBuf>),
+    /// Rotate / flip non-JPEG files by decoding and re-encoding them in place.
+    Reencode { files: Vec<PathBuf>, jpegs: Vec<PathBuf>, t: Transform },
+}
+
+/// An action that would discard unsaved edits; held while the user decides.
+enum PendingAction {
+    OpenFile(PathBuf),
+    OpenViewerAt(usize),
+    Exit,
+    Transfer(Vec<PathBuf>, PathBuf, bool),
+    Delete(Vec<PathBuf>),
+}
+
+/// One undoable file operation batch: each pair is (original path, current path).
+struct FileUndo {
+    label: String,
+    moves: Vec<(PathBuf, PathBuf)>,
 }
 
 struct TransferDialog {
@@ -83,6 +100,18 @@ pub struct App {
     last_title: String,
     effective_dark: bool,
     dev: crate::devhook::DevHook,
+    /// Unsaved-edits guard: the action waiting for Save / Discard / Cancel.
+    pending_guard: Option<PendingAction>,
+    /// Set once the user agreed to quit with unsaved edits.
+    allow_close: bool,
+    /// The last click landed in a floating window (tool windows, settings).
+    click_in_window: bool,
+    /// A tool window has the user's attention: mode shortcuts are suspended.
+    tool_window_active: bool,
+    /// Undo stack for move / rename batches (Ctrl+Z in the browser).
+    file_undo: Vec<FileUndo>,
+    /// The running slideshow was started from the viewer (return there when it ends).
+    slideshow_from_viewer: bool,
 }
 
 impl App {
@@ -140,8 +169,16 @@ impl App {
             last_title: String::new(),
             effective_dark: dark,
             dev: crate::devhook::DevHook::new(),
+            pending_guard: None,
+            allow_close: false,
+            click_in_window: false,
+            tool_window_active: false,
+            file_undo: Vec::new(),
+            slideshow_from_viewer: false,
         };
-        app.viewer.show_info = app.core.settings.show_info_overlay && false;
+        crate::ui::keymap::install(&app.core.settings);
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        app.viewer.show_info = app.core.settings.show_info_overlay;
         match initial {
             Some(p) if p.is_file() => app.open_file(&p),
             Some(p) if p.is_dir() => app.navigate(p),
@@ -157,6 +194,11 @@ impl App {
             self.browser.back.push(self.browser.folder.clone());
             self.browser.forward.clear();
         }
+        self.load_folder(folder);
+    }
+
+    /// Show `folder` in the browser without touching the back / forward history.
+    fn load_folder(&mut self, folder: PathBuf) {
         self.core.thumbs.cancel_all();
         self.core.settings.last_folder = Some(folder.clone());
         self.core.settings.push_recent(&folder);
@@ -167,7 +209,21 @@ impl App {
     }
 
     /// Open a single file: show its folder in the browser and the file in the viewer.
+    /// Asks first when the viewer holds unsaved edits of another image.
     pub fn open_file(&mut self, path: &Path) {
+        let is_video = crate::video::is_video_ext(&crate::formats::ext_of(path));
+        if !is_video && self.viewer.is_dirty() {
+            if self.viewer.current().map(|c| c == path).unwrap_or(false) {
+                self.mode = Mode::Viewer;
+            } else {
+                self.pending_guard = Some(PendingAction::OpenFile(path.to_path_buf()));
+            }
+            return;
+        }
+        self.open_file_now(path);
+    }
+
+    fn open_file_now(&mut self, path: &Path) {
         let ext = crate::formats::ext_of(path);
         if crate::video::is_video_ext(&ext) {
             self.video = Some(crate::video::VideoMode::new(vec![path.to_path_buf()], &self.core));
@@ -202,6 +258,14 @@ impl App {
                 self.mode = Mode::Video;
             }
             EntryKind::Image => {
+                if self.viewer.is_dirty() {
+                    if self.viewer.current() == Some(&entry.path) {
+                        self.mode = Mode::Viewer;
+                    } else {
+                        self.pending_guard = Some(PendingAction::OpenViewerAt(item));
+                    }
+                    return;
+                }
                 let list = self.browser.image_paths();
                 let idx = list.iter().position(|p| p == &entry.path).unwrap_or(0);
                 self.viewer.open(list, idx, self.core.settings.fit_mode);
@@ -263,7 +327,10 @@ impl App {
     }
 
     fn media_targets(&self) -> Vec<PathBuf> {
-        self.targets().into_iter().filter(|p| !p.is_dir()).collect()
+        match self.mode {
+            Mode::Viewer => self.targets(),
+            _ => self.browser.media_targets(),
+        }
     }
 
     pub fn run(&mut self, cmd: Command) {
@@ -293,7 +360,13 @@ impl App {
                 self.core.settings.theme = if self.effective_dark { ThemeChoice::Light } else { ThemeChoice::Dark };
                 self.apply_theme();
             }
-            Exit => self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Exit => {
+                if self.viewer.is_dirty() {
+                    self.pending_guard = Some(PendingAction::Exit);
+                } else {
+                    self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
             Refresh => {
                 for e in &self.browser.entries {
                     self.core.meta.forget(&e.path);
@@ -311,21 +384,21 @@ impl App {
             GoBack => {
                 if let Some(p) = self.browser.back.pop() {
                     self.browser.forward.push(self.browser.folder.clone());
-                    self.browser.load(p, &self.core.ctx, self.core.settings.show_hidden_files);
+                    self.load_folder(p);
                 }
             }
             GoForward => {
                 if let Some(p) = self.browser.forward.pop() {
                     self.browser.back.push(self.browser.folder.clone());
-                    self.browser.load(p, &self.core.ctx, self.core.settings.show_hidden_files);
+                    self.load_folder(p);
                 }
             }
             SelectAll => {
-                self.browser.selected = self.browser.items.iter().map(|&e| self.browser.entries[e].path.clone()).filter(|p| !p.is_dir()).collect();
+                self.browser.selected = self.browser.items.iter().map(|&e| &self.browser.entries[e]).filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect();
             }
             SelectNone => self.browser.selected.clear(),
             InvertSelection => {
-                let all: Vec<PathBuf> = self.browser.items.iter().map(|&e| self.browser.entries[e].path.clone()).filter(|p| !p.is_dir()).collect();
+                let all: Vec<PathBuf> = self.browser.items.iter().map(|&e| &self.browser.entries[e]).filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect();
                 let cur = std::mem::take(&mut self.browser.selected);
                 self.browser.selected = all.into_iter().filter(|p| !cur.contains(p)).collect();
             }
@@ -338,6 +411,10 @@ impl App {
             Delete => {
                 let files = self.targets();
                 if files.is_empty() {
+                    return;
+                }
+                if self.dirty_current_in(&files) {
+                    self.pending_guard = Some(PendingAction::Delete(files));
                     return;
                 }
                 if self.core.settings.confirm_delete {
@@ -486,6 +563,7 @@ impl App {
                     self.core.toasts.info("No images to show");
                     return;
                 }
+                self.slideshow_from_viewer = self.mode == Mode::Viewer;
                 self.slideshow = Some(crate::ui::slideshow::Slideshow::new(list, start, &self.core));
                 self.mode = Mode::Slideshow;
                 self.set_fullscreen(true);
@@ -518,7 +596,7 @@ impl App {
                 for p in &t {
                     self.core.tags.update(p, |tag| tag.flagged = !all_flagged);
                 }
-                if self.browser.flagged_only {
+                if self.browser.flagged_only || self.core.settings.sort_key == crate::settings::SortKey::Flagged {
                     self.browser.mark_resort();
                 }
             }
@@ -537,6 +615,9 @@ impl App {
             Label(n) => {
                 for p in &self.media_targets() {
                     self.core.tags.update(p, |tag| tag.label = n);
+                }
+                if self.core.settings.sort_key == crate::settings::SortKey::ColorLabel {
+                    self.browser.mark_resort();
                 }
             }
             ShowFlaggedOnly => {
@@ -581,6 +662,8 @@ impl App {
                     self.viewer.set_zoom(1.0, None);
                 }
             }
+            FitWidth => self.viewer.reset_view(FitMode::FitWidth),
+            FitHeight => self.viewer.reset_view(FitMode::FitHeight),
             ZoomFit => self.viewer.reset_view(if self.viewer.auto_fit == Some(fit) && fit == FitMode::FitLarge { FitMode::FitAlways } else { fit }),
             CycleFit => {
                 let cur = self.viewer.auto_fit.unwrap_or(fit);
@@ -617,6 +700,8 @@ impl App {
                     None => self.core.toasts.info(format!("{} is coming soon", cmd.label())),
                 }
             }
+            Undo if self.mode == Mode::Browser => self.undo_file_op(),
+            Undo | Redo if self.viewer.has_tool() => {}
             Undo => {
                 if let Some(e) = &mut self.viewer.edit {
                     if let Some(w) = e.undo() {
@@ -670,22 +755,36 @@ impl App {
                 }
             }
             ToggleInfo => self.viewer.show_info = !self.viewer.show_info,
-            ToggleHistogram => self.viewer.show_info = !self.viewer.show_info,
+            ToggleHistogram => self.viewer.show_histogram = !self.viewer.show_histogram,
             ToggleMagnifier => self.viewer.magnifier_locked = !self.viewer.magnifier_locked,
             ToggleFilmstrip => self.viewer.show_filmstrip = !self.viewer.show_filmstrip,
             PlayPause => self.viewer.toggle_animation(),
             NextFrame => self.viewer.step_frame(&self.core, 1),
             PrevFrame => self.viewer.step_frame(&self.core, -1),
-            OpenWithEditor => {
+            OpenWithEditor | OpenWithEditorN(_) => {
+                let n = if let OpenWithEditorN(n) = cmd { n.max(1) as usize } else { 1 };
                 if let Some(p) = self.targets().first() {
-                    match self.core.settings.external_editors.first() {
+                    match self.core.settings.external_editors.get(n - 1) {
                         Some(ed) => {
                             if let Err(e) = fileops::open_with(&ed.exe, p) {
                                 self.core.toasts.error(format!("Could not start {}: {e}", ed.name));
                             }
                         }
-                        None => fileops::open_with_dialog(p),
+                        None if n == 1 => fileops::open_with_dialog(p),
+                        None => self.core.toasts.info(format!("No external editor {n} - add one in Settings > External editors")),
                     }
+                }
+            }
+            OpenGpsMap => {
+                let Some(p) = self.media_targets().first().cloned() else { return };
+                match crate::meta::read_exif(&p).and_then(|e| e.gps) {
+                    Some((lat, lon)) => {
+                        let url = format!("https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}");
+                        if let Err(e) = std::process::Command::new("explorer.exe").arg(&url).spawn() {
+                            self.core.toasts.error(format!("Could not open the map: {e}"));
+                        }
+                    }
+                    None => self.core.toasts.info("This image has no GPS location"),
                 }
             }
             Properties => {
@@ -714,58 +813,116 @@ impl App {
 
     fn transform(&mut self, t: Transform) {
         let fit = self.core.settings.fit_mode;
-        // Lossless path: unedited JPEG → rewrite EXIF orientation only.
+        if self.mode == Mode::Browser {
+            // JPEGs are always rotated losslessly; anything else must be re-encoded,
+            // which the user confirms first.
+            let targets: Vec<PathBuf> = self.media_targets().into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
+            let (jpegs, others): (Vec<PathBuf>, Vec<PathBuf>) = targets.into_iter().partition(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p)));
+            if others.is_empty() {
+                self.lossless_transform(&jpegs, t);
+            } else {
+                self.confirm = Some(Confirm::Reencode { files: others, jpegs, t });
+            }
+            return;
+        }
+        // Viewer, unedited JPEG: rewrite the EXIF orientation only.
         if self.core.settings.lossless_jpeg_rotate && !self.viewer.is_dirty() {
-            let targets = self.media_targets();
-            let jpegs: Vec<PathBuf> = targets.iter().filter(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p))).cloned().collect();
-            if !jpegs.is_empty() && jpegs.len() == targets.len() {
-                let mut ok = 0;
-                for p in &jpegs {
-                    match crate::encode::lossless_jpeg_transform(p, t) {
-                        Ok(_) => {
-                            ok += 1;
-                            self.core.loader.invalidate(p);
-                            self.core.thumbs.forget(p);
-                            self.viewer.forget_stat(p);
-                            self.core.meta.forget(p);
-                        }
-                        Err(e) => self.core.toasts.error(format!("{}: {e}", p.display())),
-                    }
-                }
-                if ok > 0 {
+            if let Some(p) = self.viewer.current().cloned().filter(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p))) {
+                if self.lossless_transform(&[p], t) > 0 {
                     self.viewer.edit = None;
                     self.viewer.reset_view(fit);
-                    self.core.toasts.info(format!("{} - lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
                 }
                 return;
             }
-        }
-        if self.mode == Mode::Browser {
-            // Batch rotate non-JPEG files: decode, transform, re-save in place.
-            let targets = self.media_targets();
-            let mut ok = 0;
-            for p in &targets {
-                let Some(fmt) = crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(p)) else { continue };
-                if let Ok(d) = crate::decode::decode_file(p, Default::default()) {
-                    let out = t.apply(&d.image);
-                    let opts = SaveOptions { format: fmt, jpeg_quality: self.core.settings.jpeg_quality, exif: d.exif.clone(), ..Default::default() };
-                    if crate::encode::save(&out, p, &opts).is_ok() {
-                        ok += 1;
-                        self.core.loader.invalidate(p);
-                        self.core.thumbs.forget(p);
-                        self.viewer.forget_stat(p);
-                    }
-                }
-            }
-            if ok > 0 {
-                self.core.toasts.info(format!("{} applied to {ok} file(s)", t.label()));
-            }
-            return;
         }
         if !self.viewer.apply_simple(&self.core, t.label(), |img| t.apply(img)) {
             self.core.toasts.info("Image is still loading");
         }
         self.viewer.reset_view(fit);
+    }
+
+    fn forget_file(&mut self, p: &Path) {
+        self.core.loader.invalidate(p);
+        self.core.thumbs.forget(p);
+        self.viewer.forget_stat(p);
+        self.core.meta.forget(p);
+    }
+
+    /// Lossless JPEG rotate / flip; returns how many files changed.
+    fn lossless_transform(&mut self, jpegs: &[PathBuf], t: Transform) -> usize {
+        let mut ok = 0;
+        let mut errs = Vec::new();
+        for p in jpegs {
+            match crate::encode::lossless_jpeg_transform(p, t) {
+                Ok(_) => {
+                    ok += 1;
+                    self.forget_file(p);
+                }
+                Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
+            }
+        }
+        if !errs.is_empty() {
+            self.core.toasts.error(format!("{} file(s) not rotated - {}", errs.len(), errs[0]));
+        }
+        if ok > 0 {
+            self.core.toasts.info(format!("{} - lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+        }
+        ok
+    }
+
+    /// Decode, transform and re-save non-JPEG files in place (after confirmation).
+    /// Animations, multi-page files, high bit depth images and icons are refused,
+    /// since re-encoding would lose frames or precision.
+    fn reencode_transform(&mut self, files: &[PathBuf], t: Transform) {
+        let mut ok = 0;
+        let mut skipped: Vec<String> = Vec::new();
+        let mut errs: Vec<String> = Vec::new();
+        for p in files {
+            let name = crate::ui::viewer::file_name(p);
+            let ext = crate::formats::ext_of(p);
+            if ext == "ico" || ext == "cur" {
+                skipped.push(format!("{name} (icon)"));
+                continue;
+            }
+            let Some(fmt) = crate::formats::SaveFormat::from_ext(&ext) else {
+                skipped.push(format!("{name} (format cannot be saved)"));
+                continue;
+            };
+            let d = match crate::decode::decode_file(p, Default::default()) {
+                Ok(d) => d,
+                Err(e) => {
+                    errs.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            if d.frame_count > 1 || d.frames.is_some() {
+                skipped.push(format!("{name} (animated or multi-page)"));
+                continue;
+            }
+            let ci = d.color_info.to_ascii_lowercase();
+            if ci.contains("16-bit") || ci.contains("32-bit") || ci.contains("float") {
+                skipped.push(format!("{name} (more than 8 bits per channel)"));
+                continue;
+            }
+            let out = t.apply(&d.image);
+            let opts = SaveOptions { format: fmt, jpeg_quality: self.core.settings.jpeg_quality, exif: d.exif.clone(), ..Default::default() };
+            match crate::encode::save(&out, p, &opts) {
+                Ok(()) => {
+                    ok += 1;
+                    self.forget_file(p);
+                }
+                Err(e) => errs.push(format!("{name}: {e}")),
+            }
+        }
+        if !skipped.is_empty() {
+            self.core.toasts.info(format!("Skipped {} file(s): {}", skipped.len(), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+        }
+        if !errs.is_empty() {
+            self.core.toasts.error(format!("{} file(s) failed: {}", errs.len(), errs[0]));
+        }
+        if ok > 0 {
+            self.core.toasts.info(format!("{} applied to {ok} file(s)", t.label()));
+        }
     }
 
     fn save(&mut self, save_as: bool) {
@@ -808,9 +965,10 @@ impl App {
                 self.core.thumbs.forget(path);
                 self.viewer.forget_stat(path);
                 self.core.meta.forget(path);
-                if !same {
-                    self.core.loader.invalidate(path);
-                }
+                // Always drop the cached pre-edit decode: otherwise returning to this
+                // file later shows (and re-edits) the old pixels. The edit session keeps
+                // showing the saved image meanwhile.
+                self.core.loader.invalidate(path);
                 self.core.toasts.success(format!("Saved {}", crate::ui::viewer::file_name(path)));
                 if path.parent() == Some(self.browser.folder.as_path()) {
                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -888,8 +1046,25 @@ impl App {
         }
     }
 
+    /// True when the viewer has unsaved edits of one of `files`.
+    fn dirty_current_in(&self, files: &[PathBuf]) -> bool {
+        self.viewer.is_dirty() && self.viewer.current().map(|c| files.iter().any(|f| c == f || c.starts_with(f))).unwrap_or(false)
+    }
+
     fn transfer_files(&mut self, files: Vec<PathBuf>, dest: PathBuf, do_move: bool) {
+        if do_move && self.dirty_current_in(&files) {
+            self.pending_guard = Some(PendingAction::Transfer(files, dest, do_move));
+            return;
+        }
+        self.transfer_files_now(files, dest, do_move);
+    }
+
+    fn transfer_files_now(&mut self, files: Vec<PathBuf>, dest: PathBuf, do_move: bool) {
         let (done, errs) = fileops::transfer(&files, &dest, do_move, fileops::Conflict::Rename);
+        if do_move && !done.is_empty() {
+            let label = format!("Move {} item(s) to {}", done.len(), dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string()));
+            self.push_file_undo(label, done.clone());
+        }
         for (from, to) in &done {
             if do_move {
                 self.core.tags.moved(from, to);
@@ -910,6 +1085,148 @@ impl App {
         }
     }
 
+    fn push_file_undo(&mut self, label: String, moves: Vec<(PathBuf, PathBuf)>) {
+        self.file_undo.push(FileUndo { label, moves });
+        if self.file_undo.len() > 20 {
+            self.file_undo.remove(0);
+        }
+    }
+
+    /// Ctrl+Z in the browser: put the last moved / renamed files back.
+    fn undo_file_op(&mut self) {
+        let Some(op) = self.file_undo.pop() else {
+            self.core.toasts.info("Nothing to undo. Deleted files can be restored from the Recycle Bin.");
+            return;
+        };
+        let mut ok = 0;
+        let mut errs = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for (orig, cur) in op.moves.iter().rev() {
+            match fileops::move_path(cur, orig) {
+                Ok(()) => {
+                    ok += 1;
+                    self.core.tags.moved(cur, orig);
+                    self.core.loader.invalidate(cur);
+                    self.core.thumbs.forget(cur);
+                    self.viewer.replace_path(cur, orig);
+                    for d in [orig.parent(), cur.parent()].into_iter().flatten() {
+                        if !folders.iter().any(|f| f == d) {
+                            folders.push(d.to_path_buf());
+                        }
+                    }
+                }
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        for f in &folders {
+            self.browser.tree.invalidate(f);
+        }
+        if let Some((orig, _)) = op.moves.first() {
+            if orig.parent() == Some(self.browser.folder.as_path()) {
+                self.browser.pending_select = Some(orig.clone());
+            }
+        }
+        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        if !errs.is_empty() {
+            self.core.toasts.error(format!("Undo: {} item(s) could not be restored - {}", errs.len(), errs[0]));
+        }
+        if ok > 0 {
+            self.core.toasts.success(format!("Undone: {}", op.label));
+        }
+    }
+
+    /// Carry out an action that was waiting on the unsaved-edits question.
+    fn perform_pending(&mut self, a: PendingAction) {
+        match a {
+            PendingAction::OpenFile(p) => self.open_file_now(&p),
+            PendingAction::OpenViewerAt(i) => self.open_viewer_at(i),
+            PendingAction::Exit => {
+                self.allow_close = true;
+                self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            PendingAction::Transfer(files, dest, do_move) => self.transfer_files_now(files, dest, do_move),
+            PendingAction::Delete(files) => {
+                if self.core.settings.confirm_delete {
+                    self.confirm = Some(Confirm::Delete(files));
+                } else {
+                    self.delete_files(files);
+                }
+            }
+        }
+    }
+
+    /// Save / Discard / Cancel for unsaved edits (window close, opening another image, moving the file).
+    fn guard_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_guard.is_none() {
+            return;
+        }
+        let p = self.core.pal;
+        let name = self.viewer.current().map(|c| crate::ui::viewer::file_name(c)).unwrap_or_default();
+        let can_save = self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
+        let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
+        egui::Modal::new(egui::Id::unique("unsaved-guard")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(4.0);
+            ui.label(format!("\"{name}\" has edits that are not saved."));
+            if !can_save {
+                ui.label(RichText::new("This format cannot be saved in place - use Save as from the viewer.").color(p.muted).size(12.0));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can_save, egui::Button::new(format!("{}  Save", I::FLOPPY_DISK))).clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Discard changes").clicked() {
+                    choice = Some(2);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(0);
+                }
+            });
+        });
+        match choice {
+            Some(0) => self.pending_guard = None,
+            Some(1) => {
+                let saved = match (self.viewer.current().cloned(), self.viewer.current_image(&self.core)) {
+                    (Some(path), Some(img)) => {
+                        let fmt = crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(&path));
+                        let loaded = self.viewer.loaded(&self.core);
+                        let mut opts = SaveOptions { jpeg_quality: self.core.settings.jpeg_quality, keep_metadata: self.core.settings.keep_exif_on_save, ..Default::default() };
+                        if let Some(l) = &loaded {
+                            opts.exif = l.decoded.exif.clone();
+                            if !self.core.settings.color_manage {
+                                opts.icc = l.decoded.icc_profile.clone();
+                            }
+                        }
+                        match fmt {
+                            Some(f) => {
+                                opts.format = f;
+                                self.do_save(&path, &img, &opts)
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if saved {
+                    if let Some(a) = self.pending_guard.take() {
+                        self.perform_pending(a);
+                    }
+                } else {
+                    self.pending_guard = None;
+                }
+            }
+            Some(_) => {
+                self.viewer.edit = None;
+                if let Some(a) = self.pending_guard.take() {
+                    self.perform_pending(a);
+                }
+            }
+            None => {}
+        }
+    }
+
     fn apply_theme(&mut self) {
         let dark = match self.core.settings.theme {
             ThemeChoice::Dark => true,
@@ -923,203 +1240,130 @@ impl App {
 
     // ------------------------------------------------------------ shortcuts
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.palette.open || self.prompt.is_some() || self.confirm.is_some() || self.save_dialog.is_some() || self.viewer.confirm_discard {
+    /// eframe's clipboard shortcuts are off (so Ctrl+C / V / X reach the keymap);
+    /// give text boxes their copy / cut / paste events back.
+    fn clipboard_keys(&mut self, ctx: &egui::Context) {
+        if !ctx.egui_wants_keyboard_input() {
             return;
         }
-        let typing = ctx.egui_wants_keyboard_input();
-        let mut fire: Vec<Command> = Vec::new();
-        let ctrl = Modifiers::COMMAND;
-        let shift = Modifiers::SHIFT;
-        let cs = Modifiers::COMMAND | Modifiers::SHIFT;
-        let alt = Modifiers::ALT;
-        let none = Modifiers::NONE;
-        let mut take = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        ctx.input_mut(|i| {
+            let mut extra = Vec::new();
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.command && !modifiers.alt && !modifiers.shift => match key {
+                    Key::C => {
+                        extra.push(egui::Event::Copy);
+                        false
+                    }
+                    Key::X => {
+                        extra.push(egui::Event::Cut);
+                        false
+                    }
+                    Key::V => {
+                        if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                            extra.push(egui::Event::Paste(text));
+                        }
+                        false
+                    }
+                    _ => true,
+                },
+                _ => true,
+            });
+            i.events.extend(extra);
+        });
+    }
 
-        // Global (work even while typing)
-        if take(ctrl, Key::K) {
-            fire.push(Command::CommandPalette);
+    /// True while a modal dialog, prompt or confirmation is showing: no shortcuts,
+    /// no browser keys.
+    fn modal_open(&self) -> bool {
+        self.palette.open
+            || self.prompt.is_some()
+            || self.confirm.is_some()
+            || self.transfer.is_some()
+            || self.save_dialog.is_some()
+            || self.viewer.confirm_discard
+            || self.pending_guard.is_some()
+    }
+
+    fn tool_window_open(&self) -> bool {
+        self.batch_convert.is_some() || self.batch_rename.is_some() || self.contact_sheet.is_some() || self.duplicates.is_some() || self.show_settings || self.show_help || self.show_about
+    }
+
+    /// Remember whether the last click landed in a floating window, so keys typed
+    /// in a tool window (Duplicates, Batch rename, ...) do not drive the browser.
+    fn track_window_focus(&mut self, ctx: &egui::Context) {
+        let over_window = |pos: Option<egui::Pos2>| {
+            pos.and_then(|p| ctx.layer_id_at(p)).map(|l| l.order != egui::Order::Background).unwrap_or(false)
+        };
+        let (pressed, press_pos, hover_pos) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.press_origin(), i.pointer.hover_pos()));
+        if pressed {
+            self.click_in_window = over_window(press_pos.or(hover_pos));
         }
-        if take(none, Key::F11) {
-            fire.push(Command::ToggleFullscreen);
+        self.tool_window_active = self.tool_window_open() && (self.click_in_window || over_window(hover_pos));
+        if !self.tool_window_open() {
+            self.click_in_window = false;
         }
-        if take(ctrl, Key::Comma) {
-            fire.push(Command::Settings);
-        }
-        if take(none, Key::F1) {
-            fire.push(Command::ShortcutsHelp);
-        }
-        if take(cs, Key::O) {
-            fire.push(Command::OpenFolder);
-        }
-        if take(ctrl, Key::O) {
-            fire.push(Command::OpenFile);
-        }
-        if take(cs, Key::T) {
-            fire.push(Command::ToggleTheme);
-        }
-        if take(cs, Key::V) {
-            fire.push(Command::OpenVideoMode);
-        }
-        if typing {
-            for c in fire {
-                self.run(c);
-            }
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::ui::keymap::{self, KeyMode};
+        keymap::set_context(if self.mode == Mode::Viewer { KeyMode::Viewer } else { KeyMode::Browser });
+        self.track_window_focus(ctx);
+        if self.modal_open() || keymap::capturing() {
             return;
         }
-        let mode = self.mode;
-        let viewer_tool = self.viewer.has_tool();
-        match mode {
-            Mode::Browser => {
-                let table: &[(Modifiers, Key, Command)] = &[
-                    (none, Key::F5, Command::Refresh),
-                    (none, Key::Backspace, Command::GoUp),
-                    (alt, Key::ArrowUp, Command::GoUp),
-                    (alt, Key::ArrowLeft, Command::GoBack),
-                    (alt, Key::ArrowRight, Command::GoForward),
-                    (ctrl, Key::A, Command::SelectAll),
-                    (ctrl, Key::D, Command::SelectNone),
-                    (ctrl, Key::I, Command::InvertSelection),
-                    (none, Key::F7, Command::CopyTo),
-                    (none, Key::F8, Command::MoveTo),
-                    (none, Key::Delete, Command::Delete),
-                    (ctrl, Key::F2, Command::BatchRename),
-                    (none, Key::F2, Command::Rename),
-                    (cs, Key::N, Command::NewFolder),
-                    (cs, Key::C, Command::CopyPath),
-                    (ctrl, Key::C, Command::CopyFiles),
-                    (ctrl, Key::V, Command::PasteFiles),
-                    (ctrl, Key::Plus, Command::ThumbBigger),
-                    (ctrl, Key::Equals, Command::ThumbBigger),
-                    (ctrl, Key::Minus, Command::ThumbSmaller),
-                    (ctrl, Key::F, Command::FocusFilter),
-                    (none, Key::F3, Command::BatchConvert),
-                    (cs, Key::D, Command::ToggleDetails),
-                    (cs, Key::P, Command::TogglePreviewPane),
-                    (none, Key::S, Command::Slideshow),
-                    (none, Key::P, Command::Compare),
-                    (none, Key::Space, Command::ToggleFlag),
-                    (none, Key::Backtick, Command::ToggleFlag),
-                    (none, Key::L, Command::RotateLeft),
-                    (none, Key::R, Command::RotateRight),
-                    (none, Key::E, Command::OpenWithEditor),
-                    (alt, Key::Enter, Command::Properties),
-                    (ctrl, Key::W, Command::SetWallpaper),
-                ];
-                for (m, k, c) in table {
-                    if take(*m, *k) {
-                        fire.push(*c);
+        let km = keymap::active();
+        let typing = ctx.egui_wants_keyboard_input();
+        let mode_map = match self.mode {
+            Mode::Browser => Some(KeyMode::Browser),
+            // Edit tools own Enter / Escape and their preview base would go stale on undo.
+            Mode::Viewer if !self.viewer.has_tool() => Some(KeyMode::Viewer),
+            _ => None,
+        };
+        // Mode shortcuts are off while typing or while a tool window has the user's attention.
+        let mode_map = mode_map.filter(|_| !typing && !self.tool_window_active);
+        let typeahead = mode_map == Some(KeyMode::Browser) && self.browser.typeahead_active();
+        let mut fire = ctx.input_mut(|i| {
+            keymap::consume(i, |key, mods| {
+                // Mid-word letters belong to the type-ahead search, not to single-letter commands.
+                let plain = !mods.ctrl && !mods.command && !mods.alt;
+                if typeahead && plain && key.name().len() == 1 {
+                    return None;
+                }
+                if let Some(m) = mode_map {
+                    if let Some(c) = km.lookup(m, key, mods) {
+                        return Some(c);
                     }
                 }
-                for (i, k) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().enumerate() {
-                    if take(none, *k) {
-                        fire.push(Command::Rate(i as u8));
-                    }
-                }
-                for (i, k) in [Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().enumerate() {
-                    if take(none, *k) {
-                        fire.push(Command::Label(i as u8 + 1));
-                    }
-                }
-                // Remaining letter presses start a type-ahead search.
-                let texts: Vec<String> = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
-                if fire.is_empty() {
-                    if let Some(t) = texts.first() {
-                        let c = t.chars().next().unwrap_or(' ');
-                        if c.is_alphabetic() && !"SPLRE".contains(c.to_ascii_uppercase()) {
-                            self.browser.typeahead_start(t);
-                        }
-                    }
+                km.bindings(KeyMode::Global)
+                    .iter()
+                    .find(|(s, _)| keymap::matches(s, key, mods) && (!typing || keymap::works_while_typing(s)))
+                    .map(|(_, c)| *c)
+            })
+        });
+        if self.duplicates.is_some() {
+            // Never trash the browser selection while the duplicate finder is open.
+            fire.retain(|c| *c != Command::Delete);
+        }
+        match mode_map {
+            Some(KeyMode::Viewer) => {
+                let star = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*")));
+                if star {
+                    fire.push(Command::CycleFit);
                 }
             }
-            Mode::Viewer => {
-                if viewer_tool {
-                    // Tools own Enter/Escape; keep undo available.
-                    if take(ctrl, Key::Z) {
-                        fire.push(Command::Undo);
-                    }
-                } else {
-                    let table: &[(Modifiers, Key, Command)] = &[
-                        (none, Key::Escape, Command::CloseViewer),
-                        (none, Key::ArrowRight, Command::NextImage),
-                        (none, Key::PageDown, Command::NextImage),
-                        (none, Key::Space, Command::NextImage),
-                        (none, Key::ArrowLeft, Command::PrevImage),
-                        (none, Key::PageUp, Command::PrevImage),
-                        (none, Key::Backspace, Command::PrevImage),
-                        (shift, Key::Space, Command::PrevImage),
-                        (none, Key::Home, Command::FirstImage),
-                        (none, Key::End, Command::LastImage),
-                        (none, Key::Plus, Command::ZoomIn),
-                        (none, Key::Equals, Command::ZoomIn),
-                        (ctrl, Key::Plus, Command::ZoomIn),
-                        (ctrl, Key::Equals, Command::ZoomIn),
-                        (none, Key::Minus, Command::ZoomOut),
-                        (ctrl, Key::Minus, Command::ZoomOut),
-                        (ctrl, Key::Num0, Command::ZoomActual),
-                        (none, Key::Z, Command::ZoomActual),
-                        (none, Key::Slash, Command::ZoomFit),
-                        (none, Key::L, Command::RotateLeft),
-                        (none, Key::R, Command::RotateRight),
-                        (none, Key::H, Command::FlipHorizontal),
-                        (none, Key::V, Command::FlipVertical),
-                        (none, Key::X, Command::Crop),
-                        (none, Key::C, Command::Crop),
-                        (cs, Key::R, Command::CanvasSize),
-                        (ctrl, Key::R, Command::Resize),
-                        (ctrl, Key::E, Command::AdjustColors),
-                        (ctrl, Key::L, Command::Levels),
-                        (ctrl, Key::M, Command::Curves),
-                        (ctrl, Key::J, Command::Sharpen),
-                        (ctrl, Key::B, Command::Blur),
-                        (cs, Key::E, Command::Effects),
-                        (cs, Key::A, Command::AutoEnhance),
-                        (none, Key::T, Command::AddText),
-                        (cs, Key::Z, Command::Redo),
-                        (ctrl, Key::Z, Command::Undo),
-                        (ctrl, Key::Y, Command::Redo),
-                        (cs, Key::S, Command::SaveAs),
-                        (ctrl, Key::S, Command::Save),
-                        (ctrl, Key::C, Command::CopyImage),
-                        (ctrl, Key::V, Command::PasteImage),
-                        (ctrl, Key::W, Command::SetWallpaper),
-                        (ctrl, Key::P, Command::Print),
-                        (none, Key::I, Command::ToggleInfo),
-                        (ctrl, Key::H, Command::ToggleHistogram),
-                        (none, Key::M, Command::ToggleMagnifier),
-                        (none, Key::F, Command::ToggleFilmstrip),
-                        (none, Key::K, Command::PlayPause),
-                        (none, Key::Period, Command::NextFrame),
-                        (none, Key::Comma, Command::PrevFrame),
-                        (none, Key::E, Command::OpenWithEditor),
-                        (none, Key::Delete, Command::Delete),
-                        (none, Key::F2, Command::Rename),
-                        (none, Key::F7, Command::CopyTo),
-                        (none, Key::F8, Command::MoveTo),
-                        (none, Key::S, Command::Slideshow),
-                        (none, Key::P, Command::Compare),
-                        (none, Key::Backtick, Command::ToggleFlag),
-                        (alt, Key::Enter, Command::Properties),
-                        (none, Key::Enter, Command::ToggleFullscreen),
-                    ];
-                    for (m, k, c) in table {
-                        if take(*m, *k) {
-                            fire.push(*c);
+            Some(KeyMode::Browser) => {
+                // Letters not bound to a command start (or continue) a type-ahead search.
+                let texts: Vec<String> = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
+                let mods = ctx.input(|i| i.modifiers);
+                if fire.is_empty() && !mods.ctrl && !mods.alt {
+                    let bound = km.bound_letters(KeyMode::Browser);
+                    for t in texts {
+                        let Some(c) = t.chars().next() else { continue };
+                        if self.browser.typeahead_active() && c.is_alphanumeric() {
+                            self.browser.typeahead_push(&t);
+                        } else if c.is_alphabetic() && !bound.contains(&c.to_ascii_lowercase()) {
+                            self.browser.typeahead_start(&t);
                         }
-                    }
-                    for (i, k) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().enumerate() {
-                        if take(none, *k) {
-                            fire.push(Command::Rate(i as u8));
-                        }
-                    }
-                    for (i, k) in [Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().enumerate() {
-                        if take(none, *k) {
-                            fire.push(Command::Label(i as u8 + 1));
-                        }
-                    }
-                    let star = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*")));
-                    if star {
-                        fire.push(Command::CycleFit);
                     }
                 }
             }
@@ -1143,6 +1387,7 @@ impl App {
                             let path = path.clone();
                             match fileops::rename(&path, &value) {
                                 Ok(new) => {
+                                    self.push_file_undo(format!("Rename to {}", crate::ui::viewer::file_name(&new)), vec![(path.clone(), new.clone())]);
                                     self.core.tags.moved(&path, &new);
                                     self.core.loader.invalidate(&path);
                                     self.viewer.replace_path(&path, &new);
@@ -1183,6 +1428,26 @@ impl App {
                 Some(true) => {
                     self.confirm = None;
                     self.delete_files(files);
+                }
+                Some(false) => self.confirm = None,
+                None => {}
+            }
+        }
+        if let Some(Confirm::Reencode { files, jpegs, t }) = &self.confirm {
+            let (files, jpegs, t) = (files.clone(), jpegs.clone(), *t);
+            let mut body = format!(
+                "{} will decode and re-encode {} file(s) in place. Some quality or metadata may be lost. Animated, multi-page and 16-bit images and icons are skipped.",
+                t.label(),
+                files.len()
+            );
+            if !jpegs.is_empty() {
+                body += &format!("\n\n{} JPEG file(s) in the selection are rotated losslessly.", jpegs.len());
+            }
+            match widgets::show_confirm(ctx, "Re-encode files?", &body, "Re-encode", false, &p) {
+                Some(true) => {
+                    self.confirm = None;
+                    self.lossless_transform(&jpegs, t);
+                    self.reencode_transform(&files, t);
                 }
                 Some(false) => self.confirm = None,
                 None => {}
@@ -1257,12 +1522,24 @@ impl App {
                 }
             }
         }
+        if !self.show_settings {
+            crate::ui::keymap::set_capturing(false);
+        }
         if self.show_settings {
             let mut open = true;
+            let color_before = self.core.settings.color_manage;
             if crate::ui::settings_window::show(ctx, &mut self.core, &mut open) {
                 self.apply_theme();
+                crate::ui::keymap::install(&self.core.settings);
                 self.core.loader.budget_bytes = self.core.settings.cache_budget_mb.max(256) << 20;
                 self.core.loader.opts.lock().color_manage = self.core.settings.color_manage;
+                if color_before != self.core.settings.color_manage {
+                    // Re-decode everything so the change is visible (keep an image being edited).
+                    let keep: Vec<PathBuf> = if self.viewer.is_dirty() { self.viewer.current().cloned().into_iter().collect() } else { Vec::new() };
+                    self.core.loader.clear_except(&keep);
+                    self.core.thumbs.clear_textures();
+                    self.viewer.reset_view(self.core.settings.fit_mode);
+                }
                 self.core.thumbs.set_disk_cache(self.core.settings.thumb_disk_cache);
             }
             self.show_settings = open;
@@ -1303,6 +1580,12 @@ impl App {
             for (from, to) in &renamed {
                 self.core.tags.moved(from, to);
                 self.viewer.replace_path(from, to);
+                self.core.loader.invalidate(from);
+                self.core.thumbs.forget(from);
+                self.core.meta.forget(from);
+            }
+            if !renamed.is_empty() {
+                self.push_file_undo(format!("Batch rename of {} file(s)", renamed.len()), renamed.clone());
             }
             if !renamed.is_empty() {
                 self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -1327,6 +1610,11 @@ impl App {
                             self.core.thumbs.forget(f);
                             self.viewer.forget_stat(f);
                             self.core.loader.invalidate(f);
+                            self.viewer.remove_path(f);
+                            self.browser.selected.remove(f);
+                        }
+                        if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
+                            self.mode = Mode::Browser;
                         }
                         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                     }
@@ -1342,22 +1630,30 @@ impl App {
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
+        use crate::ui::keymap::{self, KeyMode};
         let p = self.core.pal;
         let mut open = true;
+        let km = keymap::active();
         egui::Window::new("Keyboard shortcuts").open(&mut open).default_size([640.0, 560.0]).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Preset: {}", keymap::Preset::from_id(&self.core.settings.keymap_preset).label())).color(p.muted));
+                if ui.link("Change shortcuts...").clicked() {
+                    self.show_settings = true;
+                    crate::ui::settings_window::open_page(ctx, "Keyboard");
+                }
+            });
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let groups: [(&str, Vec<Command>); 4] = [
-                    ("General", vec![Command::CommandPalette, Command::OpenFile, Command::OpenFolder, Command::Settings, Command::ToggleFullscreen, Command::ToggleTheme, Command::ShortcutsHelp, Command::OpenVideoMode]),
-                    ("Browser", vec![Command::OpenViewer, Command::Refresh, Command::GoUp, Command::GoBack, Command::GoForward, Command::SelectAll, Command::InvertSelection, Command::FocusFilter, Command::CopyFiles, Command::PasteFiles, Command::CopyTo, Command::MoveTo, Command::Rename, Command::BatchRename, Command::Delete, Command::NewFolder, Command::BatchConvert, Command::Slideshow, Command::Compare, Command::ToggleFlag, Command::Rate(3), Command::Label(1), Command::ThumbBigger, Command::ThumbSmaller, Command::ToggleDetails, Command::TogglePreviewPane]),
-                    ("Viewer", vec![Command::CloseViewer, Command::NextImage, Command::PrevImage, Command::FirstImage, Command::LastImage, Command::ZoomIn, Command::ZoomOut, Command::ZoomActual, Command::ZoomFit, Command::CycleFit, Command::ToggleMagnifier, Command::ToggleInfo, Command::ToggleFilmstrip, Command::PlayPause, Command::NextFrame, Command::PrevFrame]),
-                    ("Editing", vec![Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::Crop, Command::Resize, Command::CanvasSize, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::AutoEnhance, Command::AddText, Command::Undo, Command::Redo, Command::Save, Command::SaveAs, Command::CopyImage, Command::SetWallpaper, Command::Print]),
-                ];
-                for (title, cmds) in groups {
-                    widgets::section_title(ui, &p, title);
-                    egui::Grid::new(title).num_columns(2).striped(true).min_col_width(240.0).show(ui, |ui| {
-                        for c in cmds {
+                // Generated from the active keymap, so this list is always correct.
+                for mode in KeyMode::ALL {
+                    widgets::section_title(ui, &p, mode.label());
+                    egui::Grid::new(("help", mode.id())).num_columns(2).striped(true).min_col_width(240.0).show(ui, |ui| {
+                        for c in Command::all() {
+                            let keys = keymap::mode_text(&km, mode, c);
+                            if keys.is_empty() {
+                                continue;
+                            }
                             ui.label(format!("{}  {}", c.icon(), c.label()));
-                            ui.label(RichText::new(c.shortcut()).monospace().color(p.accent));
+                            ui.label(RichText::new(keys).monospace().color(p.accent));
                             ui.end_row();
                         }
                     });
@@ -1413,6 +1709,17 @@ impl App {
                 for c in [Command::ToggleDetails, Command::TogglePreviewPane, Command::ThumbBigger, Command::ThumbSmaller, Command::ShowFlaggedOnly, Command::ToggleFullscreen, Command::ToggleTheme] {
                     item(ui, c, &mut fire);
                 }
+                ui.separator();
+                ui.menu_button(format!("{}   Thumbnail captions", I::TEXTBOX), |ui| {
+                    let s = &mut self.core.settings;
+                    let cur = if s.show_thumb_captions { s.thumb_caption } else { crate::settings::ThumbCaption::None };
+                    for c in crate::settings::ThumbCaption::ALL {
+                        if ui.radio(cur == c, c.label()).clicked() {
+                            s.set_thumb_caption(c);
+                            ui.close();
+                        }
+                    }
+                });
             });
             ui.menu_button(format!("{}   Image", I::IMAGE), |ui| {
                 for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::Crop, Command::Resize, Command::CanvasSize, Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::AddText, Command::AddBorder, Command::Watermark, Command::SetWallpaper, Command::Print] {
@@ -1442,18 +1749,45 @@ impl App {
         if dropped.is_empty() {
             return;
         }
-        let first = dropped[0].clone();
         if self.mode == Mode::Video {
             return; // video mode handles its own drops
         }
-        if first.is_dir() {
-            self.navigate(first);
-        } else if dropped.len() >= 2 && dropped.iter().all(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))) {
-            self.video = Some(crate::video::VideoMode::new(dropped, &self.core));
-            self.mode = Mode::Video;
-        } else {
-            self.open_file(&first);
+        self.open_paths(dropped);
+    }
+
+    /// Open paths handed over by Explorer (a second launch) or dropped on the window:
+    /// a folder is browsed, several videos open in video mode, several images open
+    /// in the viewer as one list, a single file opens normally.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let Some(first) = paths.first().cloned() else { return };
+        if paths.len() == 1 || first.is_dir() {
+            if first.is_dir() {
+                self.navigate(first);
+            } else {
+                self.open_file(&first);
+            }
+            return;
         }
+        let vids: Vec<PathBuf> = paths.iter().filter(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))).cloned().collect();
+        if vids.len() == paths.len() {
+            self.video = Some(crate::video::VideoMode::new(vids, &self.core));
+            self.mode = Mode::Video;
+            return;
+        }
+        let images: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file() && crate::formats::is_image_path(p)).collect();
+        if images.len() < 2 {
+            if let Some(p) = images.first() {
+                self.open_file(p);
+            }
+            return;
+        }
+        if self.viewer.is_dirty() {
+            self.pending_guard = Some(PendingAction::OpenFile(images[0].clone()));
+            return;
+        }
+        self.open_file_now(&images[0]);
+        // Show exactly the handed-over files, in the given order.
+        self.viewer.open(images, 0, self.core.settings.fit_mode);
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -1488,12 +1822,9 @@ impl eframe::App for App {
         }
         // Single instance: open a file/folder another `lumen.exe` launch forwarded
         // to us (see shell.rs), then bring this window to the front.
-        if let Some(p) = crate::shell::poll_forwarded(ctx).pop() {
-            if p.is_dir() {
-                self.navigate(p);
-            } else {
-                self.open_file(&p);
-            }
+        let forwarded = crate::shell::poll_forwarded(ctx);
+        if !forwarded.is_empty() {
+            self.open_paths(forwarded);
             if ctx.input(|i| i.viewport().minimized == Some(true)) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
@@ -1508,9 +1839,18 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Window close (X, Alt+F4, taskbar) with unsaved edits: ask first.
+        if ctx.input(|i| i.viewport().close_requested()) && self.viewer.is_dirty() && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.pending_guard.is_none() {
+                self.pending_guard = Some(PendingAction::Exit);
+            }
+        }
         self.dev_actions(&ctx);
         self.handle_dropped(&ctx);
+        self.clipboard_keys(&ctx);
         self.shortcuts(&ctx);
+        self.browser.suppress_keys = self.modal_open() || self.tool_window_active;
         self.update_title(&ctx);
         let p = self.core.pal;
 
@@ -1566,6 +1906,22 @@ impl eframe::App for App {
                                 self.transfer_files(files, target, !copy);
                             }
                         }
+                        BrowserEvent::DragOut(files) => match fileops::drag_out(&files) {
+                            Ok(fileops::DragOutcome::Moved) => {
+                                // Moved by the drop target: forget the old paths.
+                                for f in &files {
+                                    if !f.exists() {
+                                        self.core.loader.invalidate(f);
+                                        self.core.thumbs.forget(f);
+                                        self.viewer.remove_path(f);
+                                        self.browser.selected.remove(f);
+                                    }
+                                }
+                                self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+                            }
+                            Ok(_) => {}
+                            Err(e) => self.core.toasts.error(e.to_string()),
+                        },
                         BrowserEvent::NewFolderIn(parent) => {
                             self.prompt = Some((Prompt::new("New folder", "New folder", "Folder name"), PendingPrompt::NewFolder(parent)));
                         }
@@ -1607,7 +1963,7 @@ impl eframe::App for App {
                 if !keep {
                     let last = self.slideshow.as_ref().and_then(|s| s.list.get(s.index).cloned());
                     self.slideshow = None;
-                    self.mode = if self.viewer.current().is_some() && self.viewer_from_browser { Mode::Viewer } else { Mode::Browser };
+                    self.mode = if self.viewer.current().is_some() && self.slideshow_from_viewer { Mode::Viewer } else { Mode::Browser };
                     if let Some(l) = last {
                         if self.mode == Mode::Viewer {
                             if let Some(i) = self.viewer.list.iter().position(|p| p == &l) {
@@ -1650,6 +2006,11 @@ impl eframe::App for App {
         }
 
         self.dialogs(&ctx);
+        self.guard_dialog(&ctx);
+        // Leaving video mode by any route stops playback.
+        if self.mode != Mode::Video && self.video.is_some() {
+            self.video = None;
+        }
         let available = |c: Command| -> bool { !matches!(c, Command::Exit) || true };
         if let Some(c) = self.palette.show(&ctx, &p, &available) {
             self.run(c);
@@ -1671,9 +2032,7 @@ impl App {
         for a in self.dev.tick(ctx) {
             match a {
                 crate::devhook::DevAction::Run(name) => {
-                    let mut all = Command::palette();
-                    all.extend([Command::CopyFiles, Command::PasteFiles]);
-                    match all.into_iter().find(|c| format!("{c:?}") == name) {
+                    match Command::from_id(&name) {
                         Some(c) => self.run(c),
                         None => self.dev.write_state(&format!("unknown command {name}")),
                     }

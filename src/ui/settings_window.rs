@@ -7,7 +7,10 @@ use super::icons as I;
 use super::theme::{semibold, Palette};
 use super::widgets::{self, section_title};
 use crate::app::Core;
-use crate::settings::{ExternalEditor, FitMode, Settings, SortKey, ThemeChoice, WheelAction};
+use crate::settings::{ExternalEditor, FitMode, Settings, SortKey, ThemeChoice, ThumbCaption, WheelAction};
+use crate::ui::commands::Command;
+use crate::ui::keymap::{self, KeyMode, Keymap, Preset};
+use egui::KeyboardShortcut;
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use std::path::{Path, PathBuf};
 
@@ -18,6 +21,7 @@ enum Page {
     Viewer,
     Browser,
     Editing,
+    Keyboard,
     Performance,
     Editors,
     Integration,
@@ -26,11 +30,12 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 9] = [
+    const ALL: [Page; 10] = [
         Page::Appearance,
         Page::Viewer,
         Page::Browser,
         Page::Editing,
+        Page::Keyboard,
         Page::Performance,
         Page::Editors,
         Page::Integration,
@@ -43,6 +48,7 @@ impl Page {
             Page::Viewer => "Viewer",
             Page::Browser => "Browser",
             Page::Editing => "Editing & saving",
+            Page::Keyboard => "Keyboard",
             Page::Performance => "Performance & cache",
             Page::Editors => "External editors",
             Page::Integration => "Windows integration",
@@ -56,6 +62,7 @@ impl Page {
             Page::Viewer => I::IMAGE,
             Page::Browser => I::SQUARES_FOUR,
             Page::Editing => I::PENCIL_SIMPLE,
+            Page::Keyboard => I::KEYBOARD,
             Page::Performance => I::GAUGE,
             Page::Editors => I::ARROW_SQUARE_OUT,
             Page::Integration => I::WINDOWS_LOGO,
@@ -69,6 +76,7 @@ impl Page {
             Page::Viewer => "How images open, zoom and navigate",
             Page::Browser => "Thumbnail grid and file listing",
             Page::Editing => "Defaults used when saving edited images",
+            Page::Keyboard => "Click a shortcut to change it, + to add another",
             Page::Performance => "Memory and disk caches",
             Page::Editors => "Programs offered for 'Open in external editor' (E)",
             Page::Integration => "File associations, Explorer menu and single window",
@@ -90,6 +98,12 @@ struct State {
     confirm_reset: bool,
     confirm_clear_cache: bool,
     total_ram: Option<u64>,
+    kb_mode: KeyMode,
+    kb_search: String,
+    capture: Option<Capture>,
+    conflict: Option<PendingConflict>,
+    confirm_reset_keys: bool,
+    confirm_preset: Option<Preset>,
 }
 
 const ACCENTS: [(&str, [u8; 3]); 9] = [
@@ -143,6 +157,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
                                 Page::Viewer => viewer(ui, &p, &mut core.settings),
                                 Page::Browser => browser(ui, &p, &mut core.settings),
                                 Page::Editing => editing(ui, &p, &mut core.settings),
+                                Page::Keyboard => keyboard(ui, &p, core, &mut st),
                                 Page::Performance => performance(ui, &p, core, &mut st),
                                 Page::Editors => editors(ui, &p, core),
                                 Page::Integration => integration(ui, &p, core, &mut st),
@@ -198,6 +213,10 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
         }
     }
 
+    if st.page != Page::Keyboard || !*open {
+        st.capture = None;
+        keymap::set_capturing(false);
+    }
     if !*open {
         // Closing the window: commit a pending scale drag and persist everything now.
         if let Some(s) = st.scale_edit.take() {
@@ -210,6 +229,16 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     }
     ctx.data_mut(|d| d.insert_temp(state_id, st));
     changed
+}
+
+/// Show `page` (by name, e.g. "Keyboard") the next time the settings window draws.
+pub fn open_page(ctx: &egui::Context, page: &str) {
+    let state_id = egui::Id::unique("settings-window-state");
+    let mut st: State = ctx.data_mut(|d| d.get_temp(state_id)).unwrap_or_else(initial_state);
+    if let Some(pg) = Page::ALL.into_iter().find(|p| format!("{p:?}").eq_ignore_ascii_case(page.trim())) {
+        st.page = pg;
+    }
+    ctx.data_mut(|d| d.insert_temp(state_id, st));
 }
 
 /// Fresh state. With the dev automation hook active (`LUMEN_DEV_DIR`), `LUMEN_SETTINGS_PAGE`
@@ -489,7 +518,6 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
             c
         });
         changed |= toggle_row(ui, p, "Checkerboard behind transparency", "Shows a checker pattern where images are transparent.", &mut s.checkerboard_alpha);
-        changed |= toggle_row(ui, p, "Thumbnail captions", "File names under thumbnails in the browser grid.", &mut s.show_thumb_captions);
     });
     changed
 }
@@ -534,6 +562,19 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     card(ui, p, |ui| {
         changed |= row(ui, p, "Thumbnail size", "Also adjustable with Ctrl + mouse wheel in the browser.", |ui| {
             slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.thumb_size, 80.0..=384.0).step_by(4.0).suffix(" px")).changed())
+        });
+        changed |= row(ui, p, "Thumbnail captions", "Text under thumbnails in the grid. Also in the View menu.", |ui| {
+            let mut c = false;
+            let cur = s.caption();
+            egui::ComboBox::from_id_salt("settings-captions").width(210.0).selected_text(cur.label()).show_ui(ui, |ui| {
+                for k in ThumbCaption::ALL {
+                    if ui.selectable_label(cur == k, k.label()).clicked() && cur != k {
+                        s.set_thumb_caption(k);
+                        c = true;
+                    }
+                }
+            });
+            c
         });
         changed |= toggle_row(ui, p, "Show folders in grid", "Sub-folders appear as tiles before the images.", &mut s.show_folders_in_grid);
         changed |= toggle_row(ui, p, "Show hidden files", "Include files and folders marked hidden. Applies when a folder is next opened.", &mut s.show_hidden_files);
@@ -1109,4 +1150,267 @@ mod tests {
         assert_eq!(s.ui_scale, 1.25);
         assert!(s.reuse_window);
     }
+}
+
+// ====================================================================== keyboard
+
+/// Waiting for a key press to (re)bind `cmd` in `mode`; `replace` is the binding being changed.
+#[derive(Clone, Copy, PartialEq)]
+struct Capture {
+    mode: KeyMode,
+    cmd: Command,
+    replace: Option<KeyboardShortcut>,
+}
+
+/// A captured shortcut that is already used elsewhere: replace, keep both or cancel.
+#[derive(Clone)]
+struct PendingConflict {
+    cap: Capture,
+    sc: KeyboardShortcut,
+    others: Vec<(KeyMode, Command)>,
+}
+
+fn set_command_keys(core: &mut Core, mode: KeyMode, cmd: Command, keys: Vec<KeyboardShortcut>) {
+    let preset = Preset::from_id(&core.settings.keymap_preset);
+    let mut km = Keymap::from_settings(&core.settings);
+    km.set_keys(mode, cmd, keys);
+    core.settings.key_overrides = km.diff_from(preset);
+    keymap::install(&core.settings);
+}
+
+/// Bind `sc` to the captured command (replacing the chosen binding), optionally
+/// removing it from the commands it conflicts with.
+fn apply_capture(core: &mut Core, cap: Capture, sc: KeyboardShortcut, steal_from: &[(KeyMode, Command)]) {
+    let preset = Preset::from_id(&core.settings.keymap_preset);
+    let mut km = Keymap::from_settings(&core.settings);
+    for (m, c) in steal_from {
+        let keys: Vec<KeyboardShortcut> = km.keys_for(*m, *c).into_iter().filter(|k| *k != sc).collect();
+        km.set_keys(*m, *c, keys);
+    }
+    let mut keys = km.keys_for(cap.mode, cap.cmd);
+    match cap.replace.and_then(|r| keys.iter().position(|k| *k == r)) {
+        Some(i) => keys[i] = sc,
+        None => keys.push(sc),
+    }
+    km.set_keys(cap.mode, cap.cmd, keys);
+    core.settings.key_overrides = km.diff_from(preset);
+    keymap::install(&core.settings);
+}
+
+fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
+    let mut changed = false;
+    let preset = Preset::from_id(&core.settings.keymap_preset);
+
+    // ---- key capture
+    if let Some(cap) = st.capture {
+        keymap::set_capturing(true);
+        let pressed = ui.input_mut(|i| {
+            let mut got: Option<(egui::Key, egui::Modifiers)> = None;
+            i.events.retain(|e| match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    if got.is_none() {
+                        got = Some((*key, *modifiers));
+                    }
+                    false
+                }
+                egui::Event::Text(_) => false,
+                _ => true,
+            });
+            got
+        });
+        if let Some((key, mods)) = pressed {
+            if key == egui::Key::Escape && mods.is_none() {
+                st.capture = None;
+            } else {
+                let sc = keymap::normalize(KeyboardShortcut::new(mods, key));
+                let km = keymap::active();
+                let others = km.conflicts(cap.mode, sc, cap.cmd);
+                st.capture = None;
+                if others.is_empty() {
+                    apply_capture(core, cap, sc, &[]);
+                    changed = true;
+                } else {
+                    st.conflict = Some(PendingConflict { cap, sc, others });
+                }
+            }
+        }
+    } else {
+        keymap::set_capturing(false);
+    }
+
+    section_title(ui, p, "Preset");
+    card(ui, p, |ui| {
+        row(ui, p, "Shortcut preset", "FastStone compatible adds A / B for actual size / fit and leaves Space and ` free.", |ui| {
+            egui::ComboBox::from_id_salt("settings-keymap-preset").width(200.0).selected_text(preset.label()).show_ui(ui, |ui| {
+                for pr in Preset::ALL {
+                    if ui.selectable_label(pr == preset, pr.label()).clicked() && pr != preset {
+                        if core.settings.key_overrides.is_empty() {
+                            core.settings.keymap_preset = pr.id().to_string();
+                            keymap::install(&core.settings);
+                            changed = true;
+                        } else {
+                            st.confirm_preset = Some(pr);
+                        }
+                    }
+                }
+            });
+            false
+        });
+        let n = core.settings.key_overrides.len();
+        row(ui, p, "Custom shortcuts", &if n == 0 { "None - every key works as in the preset.".to_string() } else { format!("{n} command(s) changed from the preset.") }, |ui| {
+            if ui.add_enabled(n > 0, egui::Button::new(format!("{}  Reset to preset", I::ARROW_COUNTER_CLOCKWISE))).clicked() {
+                st.confirm_reset_keys = true;
+            }
+            false
+        });
+    });
+
+    // ---- conflict prompt
+    if let Some(c) = st.conflict.clone() {
+        let names: Vec<String> = c.others.iter().map(|(m, cmd)| format!("'{}' ({})", cmd.label(), m.label())).collect();
+        egui::Frame::new().fill(p.warn.gamma_multiply(0.12)).stroke(Stroke::new(1.0, p.warn)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("{}  {} is already used by {}.", I::WARNING, keymap::format_shortcut(&c.sc), names.join(", "))).color(p.text));
+            ui.horizontal(|ui| {
+                if ui.button(format!("Use for '{}' only", c.cap.cmd.label())).clicked() {
+                    apply_capture(core, c.cap, c.sc, &c.others);
+                    st.conflict = None;
+                    changed = true;
+                }
+                if ui.button("Keep both").on_hover_text("The binding of the current mode wins; Global shortcuts lose to mode shortcuts.").clicked() {
+                    apply_capture(core, c.cap, c.sc, &[]);
+                    st.conflict = None;
+                    changed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    st.conflict = None;
+                }
+            });
+        });
+        ui.add_space(8.0);
+    }
+
+    // ---- mode tabs + search
+    ui.horizontal(|ui| {
+        for m in KeyMode::ALL {
+            if ui.selectable_label(st.kb_mode == m, m.label()).clicked() {
+                st.kb_mode = m;
+                st.capture = None;
+            }
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new(I::MAGNIFYING_GLASS).color(p.muted));
+        ui.add(egui::TextEdit::singleline(&mut st.kb_search).hint_text("Search commands or keys").desired_width(220.0));
+    });
+    hint(
+        ui,
+        p,
+        match st.kb_mode {
+            KeyMode::Global => "Global shortcuts work in every mode. Those with Ctrl, Alt or an F-key also work while typing in a text box.",
+            KeyMode::Browser => "Used in the thumbnail browser. Arrow keys, Home / End and Page Up / Down always move the selection.",
+            KeyMode::Viewer => "Used while viewing an image. Numpad * always cycles the fit mode.",
+        },
+    );
+    ui.add_space(6.0);
+
+    let km = keymap::active();
+    let base = Keymap::preset(preset);
+    let mode = st.kb_mode;
+    let q = st.kb_search.trim().to_lowercase();
+    card(ui, p, |ui| {
+        let mut first = true;
+        for cmd in Command::all() {
+            let keys = km.keys_for(mode, cmd);
+            let key_text: Vec<String> = keys.iter().map(keymap::format_shortcut).collect();
+            if !q.is_empty() && !cmd.label().to_lowercase().contains(&q) && !key_text.iter().any(|k| k.to_lowercase() == q || k.to_lowercase().contains(&q)) {
+                continue;
+            }
+            if !first {
+                let y = ui.cursor().top();
+                let r = ui.max_rect();
+                ui.painter().hline(r.left()..=r.right(), y, Stroke::new(1.0, p.border.gamma_multiply(0.7)));
+            }
+            first = false;
+            ui.horizontal(|ui| {
+                ui.set_min_height(30.0);
+                ui.allocate_ui_with_layout(Vec2::new(250.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_width(250.0);
+                    ui.label(RichText::new(format!("{}  {}", cmd.icon(), cmd.label())).color(p.text));
+                });
+                for (k, text) in keys.iter().zip(&key_text) {
+                    let capturing_this = st.capture == Some(Capture { mode, cmd, replace: Some(*k) });
+                    let conflicts = km.conflicts(mode, *k, cmd);
+                    let label = if capturing_this { "Press a key...".to_string() } else { text.clone() };
+                    let mut rt = RichText::new(label).monospace().size(12.0);
+                    if !conflicts.is_empty() {
+                        rt = rt.color(p.warn);
+                    }
+                    let mut b = ui.add(egui::Button::new(rt).selected(capturing_this));
+                    if !conflicts.is_empty() {
+                        let names: Vec<String> = conflicts.iter().map(|(m, c)| format!("{} ({})", c.label(), m.label())).collect();
+                        b = b.on_hover_text(format!("Also bound to {}", names.join(", ")));
+                    } else {
+                        b = b.on_hover_text("Click, then press the new key");
+                    }
+                    if b.clicked() {
+                        st.capture = Some(Capture { mode, cmd, replace: Some(*k) });
+                        st.conflict = None;
+                    }
+                    if ui.small_button(I::X).on_hover_text("Remove this shortcut").clicked() {
+                        let rest: Vec<KeyboardShortcut> = keys.iter().copied().filter(|x| x != k).collect();
+                        set_command_keys(core, mode, cmd, rest);
+                        changed = true;
+                    }
+                }
+                let adding = st.capture == Some(Capture { mode, cmd, replace: None });
+                let add_label = if adding { "Press a key...".to_string() } else { I::PLUS.to_string() };
+                if ui.add(egui::Button::new(add_label).selected(adding)).on_hover_text("Add a shortcut").clicked() {
+                    st.capture = Some(Capture { mode, cmd, replace: None });
+                    st.conflict = None;
+                }
+                if keys != base.keys_for(mode, cmd) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button(I::ARROW_COUNTER_CLOCKWISE).on_hover_text("Restore the preset shortcuts for this command").clicked() {
+                            set_command_keys(core, mode, cmd, base.keys_for(mode, cmd));
+                            changed = true;
+                        }
+                    });
+                }
+            });
+        }
+        if first {
+            ui.add_space(8.0);
+            ui.label(RichText::new("No commands match the search").color(p.muted));
+            ui.add_space(8.0);
+        }
+    });
+
+    if st.confirm_reset_keys {
+        match widgets::show_confirm(ui.ctx(), "Reset shortcuts?", "All custom shortcuts are removed and the preset's keys apply again.", "Reset", true, p) {
+            Some(true) => {
+                st.confirm_reset_keys = false;
+                core.settings.key_overrides.clear();
+                keymap::install(&core.settings);
+                core.toasts.success("Shortcuts reset to the preset");
+                changed = true;
+            }
+            Some(false) => st.confirm_reset_keys = false,
+            None => {}
+        }
+    }
+    if let Some(pr) = st.confirm_preset {
+        let body = format!("Switching to '{}' removes your {} custom shortcut(s).", pr.label(), core.settings.key_overrides.len());
+        match widgets::show_confirm(ui.ctx(), "Change preset?", &body, "Switch preset", true, p) {
+            Some(true) => {
+                st.confirm_preset = None;
+                core.settings.key_overrides.clear();
+                core.settings.keymap_preset = pr.id().to_string();
+                keymap::install(&core.settings);
+                changed = true;
+            }
+            Some(false) => st.confirm_preset = None,
+            None => {}
+        }
+    }
+    changed
 }

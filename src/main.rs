@@ -72,6 +72,9 @@ fn main() -> eframe::Result {
         depth_buffer: 0,
         stencil_buffer: 0,
         persist_window: false,
+        // Ctrl+C / Ctrl+V / Ctrl+X must reach the app's keymap (copy files, paste
+        // images); text boxes get them re-injected by the app (see App::clipboard_keys).
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(

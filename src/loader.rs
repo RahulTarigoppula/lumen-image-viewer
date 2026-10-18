@@ -122,6 +122,12 @@ impl Loader {
         self.entries.remove(path);
     }
 
+    /// Drop every decoded image except `keep` (e.g. after the color management setting changed).
+    pub fn clear_except(&mut self, keep: &[PathBuf]) {
+        self.entries.retain(|p, _| keep.contains(p));
+        self.queue.jobs.lock().clear();
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.queue.jobs.lock().clear();

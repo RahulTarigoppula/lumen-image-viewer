@@ -188,6 +188,14 @@ impl ThumbService {
         }
     }
 
+    /// Drop all thumbnail textures so they are rebuilt (settings that change pixels).
+    pub fn clear_textures(&mut self) {
+        self.cancel_all();
+        self.textures.clear();
+        self.pending.clear();
+        self.failed.clear();
+    }
+
     pub fn forget(&mut self, path: &Path) {
         let keys: Vec<ThumbKey> = self.textures.iter().filter(|(k, _)| k.path == path).map(|(k, _)| k.clone()).collect();
         for k in keys {

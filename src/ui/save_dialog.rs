@@ -17,6 +17,10 @@ pub struct SaveDialog {
     est_version: u64,
     version: u64,
     pub error: Option<String>,
+    /// The file being edited: saving over it needs no "replace?" question.
+    original: PathBuf,
+    /// The user was told the target exists; the next Save click replaces it.
+    confirm_replace: bool,
 }
 
 pub enum SaveOutcome {
@@ -30,8 +34,15 @@ impl SaveDialog {
         if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&path)) {
             opts.format = f;
         }
+        let original = path.clone();
         let path = path.with_extension(opts.format.ext());
-        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None }
+        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false }
+    }
+
+    /// The target is an existing file other than the one being edited.
+    fn overwrites_other(&self) -> bool {
+        let same = self.path.to_string_lossy().to_lowercase() == self.original.to_string_lossy().to_lowercase();
+        !same && self.path.exists()
     }
 
     pub fn show(&mut self, ctx: &egui::Context, p: &super::theme::Palette) -> SaveOutcome {
@@ -76,6 +87,14 @@ impl SaveDialog {
                 let mut s = self.path.display().to_string();
                 if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
                     self.path = PathBuf::from(s);
+                    self.confirm_replace = false;
+                    // A typed extension picks the format.
+                    if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&self.path)) {
+                        if f != self.opts.format {
+                            self.opts.format = f;
+                            changed = true;
+                        }
+                    }
                 }
                 if ui.button("Browse...").clicked() {
                     let mut dlg = rfd::FileDialog::new().add_filter(self.opts.format.label(), &[self.opts.format.ext()]);
@@ -87,6 +106,8 @@ impl SaveDialog {
                     }
                     if let Some(p) = dlg.save_file() {
                         self.path = p;
+                        // The system dialog already asked about replacing an existing file.
+                        self.confirm_replace = true;
                         if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&self.path)) {
                             self.opts.format = f;
                             changed = true;
@@ -101,6 +122,7 @@ impl SaveDialog {
                     for f in SaveFormat::ALL {
                         if ui.selectable_value(&mut self.opts.format, f, f.label()).changed() {
                             self.path = self.path.with_extension(f.ext());
+                            self.confirm_replace = false;
                             changed = true;
                         }
                     }
@@ -168,13 +190,23 @@ impl SaveDialog {
                 ui.add_space(6.0);
                 ui.colored_label(p.danger, e);
             }
+            let overwrites = self.overwrites_other();
+            if overwrites && self.confirm_replace {
+                ui.add_space(6.0);
+                ui.colored_label(p.warn, format!("{} already exists. Save again to replace it.", self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+            }
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     out = SaveOutcome::Cancel;
                 }
-                if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(p.accent).min_size(egui::vec2(80.0, 28.0))).clicked() {
-                    out = SaveOutcome::Save(self.path.clone(), self.opts.clone());
+                let label = if overwrites && self.confirm_replace { "Replace" } else { "Save" };
+                if ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(if overwrites && self.confirm_replace { p.danger } else { p.accent }).min_size(egui::vec2(80.0, 28.0))).clicked() {
+                    if overwrites && !self.confirm_replace {
+                        self.confirm_replace = true;
+                    } else {
+                        out = SaveOutcome::Save(self.path.clone(), self.opts.clone());
+                    }
                 }
             });
         });
