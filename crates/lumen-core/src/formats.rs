@@ -52,6 +52,9 @@ pub fn is_jpeg_ext(ext: &str) -> bool {
 
 /// Human readable type name for the details view.
 pub fn type_name(ext: &str) -> String {
+    if crate::video::is_video_ext(ext) {
+        return format!("{} video", ext.to_uppercase());
+    }
     match ext {
         "jpg" | "jpeg" | "jpe" | "jfif" => "JPEG image".into(),
         "png" => "PNG image".into(),
