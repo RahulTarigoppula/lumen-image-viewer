@@ -2,7 +2,7 @@
 
 <h1 align="center">Lumen</h1>
 <p align="center"><b>A fast, private, modern image &amp; video viewer for Windows - a FastStone Image Viewer replacement with a built-in video analysis mode.</b><br>
-One portable <code>Lumen.exe</code>. No installer, no account, no telemetry, no network access.</p>
+One portable <code>Lumen.exe</code>. No installer, no account, no telemetry; Lumen itself never connects to the internet.</p>
 
 <p align="center"><a href="https://github.com/RahulTarigoppula/lumen-image-viewer/releases/latest"><b>⬇ Download Lumen.exe</b></a></p>
 
@@ -69,7 +69,7 @@ See [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md) for the design of the video
 
 ## Privacy
 
-Lumen never opens a network connection. The only exception is explicit: clicking *Open location in browser* for a photo with GPS data opens OpenStreetMap in your default browser.
+Lumen itself never connects to the internet; map links open in your browser only when you ask. *Open location in browser* (or Ctrl+Alt+M, which asks for confirmation first) opens OpenStreetMap in your default browser, which sends the photo's GPS coordinates to that website.
 
 ## License
 

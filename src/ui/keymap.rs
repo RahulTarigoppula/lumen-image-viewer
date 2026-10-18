@@ -316,11 +316,14 @@ impl Keymap {
         let list = self.bindings_mut(mode);
         let pos = list.iter().position(|(_, c)| *c == cmd);
         list.retain(|(_, c)| *c != cmd);
-        let at = pos.unwrap_or(list.len()).min(list.len());
-        for (i, k) in keys.into_iter().enumerate() {
+        // A separate cursor: skipped duplicates must not advance the insert
+        // position past the end of the list.
+        let mut at = pos.unwrap_or(list.len()).min(list.len());
+        for k in keys {
             let k = normalize(k);
-            if !list[..].iter().any(|(s, c)| *s == k && *c == cmd) {
-                list.insert(at + i, (k, cmd));
+            if !list.iter().any(|(s, c)| *s == k && *c == cmd) {
+                list.insert(at.min(list.len()), (k, cmd));
+                at += 1;
             }
         }
     }
@@ -711,6 +714,40 @@ mod tests {
         assert_eq!(km2.keys_for(KeyMode::Viewer, Command::ZoomActual), vec![parse_shortcut("Shift+A").unwrap()]);
         assert!(km2.keys_for(KeyMode::Browser, Command::Slideshow).is_empty());
         assert_eq!(km2.diff_from(Preset::Lumen).len(), 2);
+    }
+
+    #[test]
+    fn set_keys_with_duplicates_does_not_panic() {
+        let mut km = Keymap::preset(Preset::Lumen);
+        let q = parse_shortcut("Q").unwrap();
+        let w = parse_shortcut("Shift+Q").unwrap();
+        // Duplicates in the middle and at the end of the list.
+        km.set_keys(KeyMode::Viewer, Command::ZoomIn, vec![q, q, q, w, w, q]);
+        assert_eq!(km.keys_for(KeyMode::Viewer, Command::ZoomIn), vec![q, w]);
+        // A command that is bound last in the list, with duplicates.
+        let last = km.viewer.last().unwrap().1;
+        km.set_keys(KeyMode::Viewer, last, vec![w, w, w, q]);
+        assert_eq!(km.keys_for(KeyMode::Viewer, last), vec![w, q]);
+        // An unbound command into an empty list.
+        km.viewer.clear();
+        km.set_keys(KeyMode::Viewer, Command::ZoomOut, vec![q, q, w]);
+        assert_eq!(km.keys_for(KeyMode::Viewer, Command::ZoomOut), vec![q, w]);
+    }
+
+    #[test]
+    fn from_settings_never_panics_on_odd_overrides() {
+        let json = r#"{"keymap_preset":"nonsense","key_overrides":[
+            {"mode":"viewer","command":"ZoomIn","keys":["Q","Q","Q","Ctrl+Q","ctrl+q","","+","Ctrl+","Shift+Shift+","é","Ctrl+é"]},
+            {"mode":"viewer","command":"ZoomIn","keys":["Q","Q"]},
+            {"mode":"global","command":"Settings","keys":["F12","F12","F12"]},
+            {"mode":"browser","command":"OpenWithEditorN(99)","keys":["A"]},
+            {"mode":"nope","command":"ZoomIn","keys":["A"]},
+            {"mode":"viewer","command":"","keys":[]}
+        ]}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        let km = Keymap::from_settings(&s);
+        assert_eq!(km.keys_for(KeyMode::Viewer, Command::ZoomIn), vec![parse_shortcut("Q").unwrap()]);
+        assert_eq!(km.keys_for(KeyMode::Global, Command::Settings), vec![parse_shortcut("F12").unwrap()]);
     }
 
     #[test]

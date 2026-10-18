@@ -6,16 +6,19 @@
 //! * `Software\Classes\.<ext>\OpenWithProgids` - puts Lumen in "Open with" for every supported type
 //! * `Software\Classes\Applications\lumen.exe` - friendly name + `SupportedTypes`
 //! * `Software\Lumen\Capabilities` + `Software\RegisteredApplications\Lumen` - lists Lumen in
-//!   Settings › Apps › Default apps (Windows only lets the *user* pick the default there)
+//!   Settings > Apps > Default apps (Windows only lets the *user* pick the default there)
 //! * `Software\Classes\{Directory,Directory\Background,Drive}\shell\Lumen` - "Browse with Lumen"
 //!
 //! Unregistering removes exactly those keys/values again (shared `.ext` keys are only
 //! deleted when they end up empty).
 //!
-//! **Single instance**: the first Lumen process serves the named pipe
-//! `\\.\pipe\lumen-<user>`. A later launch with a file argument connects, hands over the
-//! path, raises the running window and exits. Any failure (no server, busy, timeout, bad
-//! reply) simply lets the new process start normally.
+//! **Single instance**: the first Lumen process owns the named mutex
+//! `Local\lumen-<user>-s<session>` and serves the named pipe
+//! `\\.\pipe\lumen-<user>-s<session>` (current user only). A later launch with a file
+//! argument sees the mutex, waits up to ~2.5 s for the pipe (so ten files opened from
+//! Explorer at once end up in one window), hands over the path, raises the running
+//! window and exits. Any failure (no server, busy, timeout, bad reply) simply lets the
+//! new process start normally.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -440,12 +443,12 @@ fn shell_open(target: &str) -> bool {
     h.0 as isize > 32
 }
 
-/// Open Settings › Default apps, on Lumen's own page when Windows supports it.
+/// Open Settings > Default apps, on Lumen's own page when Windows supports it.
 pub fn open_default_apps() -> anyhow::Result<()> {
     if shell_open(&format!("ms-settings:defaultapps?registeredAppUser={REGISTERED_NAME}")) || shell_open("ms-settings:defaultapps") {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("Could not open Windows Settings › Default apps"))
+        Err(anyhow::anyhow!("Could not open Windows Settings > Default apps"))
     }
 }
 
@@ -455,15 +458,63 @@ const MAGIC: &[u8; 4] = b"LMN1";
 const MAX_MESSAGE: usize = 1 << 20;
 const ACK: u8 = 0x06;
 
-/// Pipe name unique per user: `\\.\pipe\lumen-<user>`.
-pub fn pipe_name() -> String {
-    // Include the Windows session id so separate logon sessions (fast user
-    // switching, RDP) never talk to each other's instances.
+/// `lumen-<user>-s<session>`: separate logon sessions (fast user switching,
+/// RDP) never talk to each other's instances.
+fn instance_id() -> String {
     let mut session = 0u32;
     unsafe {
         let _ = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut session);
     }
-    format!(r"\\.\pipe\lumen-{}-s{session}", sanitize_user(&std::env::var("USERNAME").unwrap_or_default()))
+    format!("lumen-{}-s{session}", sanitize_user(&std::env::var("USERNAME").unwrap_or_default()))
+}
+
+/// Pipe name unique per user and session: `\\.\pipe\lumen-<user>-s<session>`.
+pub fn pipe_name() -> String {
+    format!(r"\\.\pipe\{}", instance_id())
+}
+
+/// Claim the per-user instance mutex. True when this process is the first
+/// Lumen (it then serves the pipe); false when another one already runs. The
+/// mutex lives until this process exits. Errors count as "first".
+pub fn claim_primary() -> bool {
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    static HELD: OnceLock<isize> = OnceLock::new();
+    if HELD.get().is_some() {
+        return true;
+    }
+    let name = wide(&format!(r"Local\{}", instance_id()));
+    match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
+        Ok(h) => {
+            let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+            if existed {
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+                false
+            } else {
+                // Keep the handle open for the life of the process.
+                let _ = HELD.set(h.0 as isize);
+                true
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+/// Security descriptor that lets only the current user (the pipe's owner)
+/// open the instance pipe. Created once and kept for the process lifetime.
+fn owner_only_sd() -> Option<*mut core::ffi::c_void> {
+    use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+    static SD: OnceLock<Option<usize>> = OnceLock::new();
+    let raw = *SD.get_or_init(|| {
+        let sddl = wide("D:P(A;;GA;;;OW)");
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None) }.ok()?;
+        (!sd.0.is_null()).then_some(sd.0 as usize)
+    });
+    raw.map(|r| r as *mut core::ffi::c_void)
 }
 
 /// Make a user name safe for a pipe name (ASCII alnum, `-_.`; others hex-escaped).
@@ -544,7 +595,12 @@ pub fn start_instance_server() -> bool {
 fn create_pipe_instance(first: bool) -> Option<HANDLE> {
     use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
     use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
     let name = wide(&pipe_name());
+    // Never fall back to the default DACL: without the owner-only descriptor
+    // there is no server (launches then simply open their own window).
+    let sd = owner_only_sd()?;
+    let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: false.into() };
     let mut flags = PIPE_ACCESS_DUPLEX;
     if first {
         flags |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -558,7 +614,7 @@ fn create_pipe_instance(first: bool) -> Option<HANDLE> {
             4096,
             4096,
             0,
-            None,
+            Some(&sa),
         )
     };
     if h.is_invalid() {
@@ -575,12 +631,31 @@ pub fn poll_forwarded(ctx: &egui::Context) -> Vec<PathBuf> {
     s.rx.try_iter().flatten().collect()
 }
 
-fn pipe_read_exact(h: HANDLE, buf: &mut [u8]) -> bool {
+/// How long a connected client may take to send its message.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read exactly `buf.len()` bytes before `deadline`. Polls with PeekNamedPipe
+/// and only reads what is available, so a silent client can never pin the
+/// handler thread forever.
+fn pipe_read_exact(h: HANDLE, buf: &mut [u8], deadline: std::time::Instant) -> bool {
     use windows::Win32::Storage::FileSystem::ReadFile;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
     let mut off = 0;
     while off < buf.len() {
+        let mut avail = 0u32;
+        if unsafe { PeekNamedPipe(h, None, 0, None, Some(&mut avail), None) }.is_err() {
+            return false; // client gone
+        }
+        if avail == 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let want = (buf.len() - off).min(avail as usize);
         let mut n = 0u32;
-        if unsafe { ReadFile(h, Some(&mut buf[off..]), Some(&mut n), None) }.is_err() || n == 0 {
+        if unsafe { ReadFile(h, Some(&mut buf[off..off + want]), Some(&mut n), None) }.is_err() || n == 0 {
             return false;
         }
         off += n as usize;
@@ -629,12 +704,13 @@ fn serve(first: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: std::s
 fn handle_client(h: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: std::sync::Arc<OnceLock<egui::Context>>) {
     use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
     use windows::Win32::System::Pipes::DisconnectNamedPipe;
+    let deadline = std::time::Instant::now() + CLIENT_TIMEOUT;
     let mut len = [0u8; 4];
-    if pipe_read_exact(h, &mut len) {
+    if pipe_read_exact(h, &mut len, deadline) {
         let n = u32::from_le_bytes(len) as usize;
         if n <= MAX_MESSAGE {
             let mut body = vec![0u8; n];
-            if pipe_read_exact(h, &mut body) {
+            if pipe_read_exact(h, &mut body, deadline) {
                 if let Some(paths) = decode_body(&body) {
                     if !paths.is_empty() && tx.send(paths).is_ok() {
                         if let Some(c) = ctx.get() {
@@ -655,9 +731,15 @@ fn handle_client(h: HANDLE, tx: crossbeam_channel::Sender<Vec<PathBuf>>, ctx: st
     }
 }
 
+/// How long a launch that lost the instance mutex waits for the first
+/// process to open its pipe.
+const PIPE_WAIT: Duration = Duration::from_millis(2500);
+
 /// Hand `paths` to a running Lumen and raise its window. True = the running
-/// instance accepted them and this process should exit.
-pub fn forward_to_running(paths: &[PathBuf]) -> bool {
+/// instance accepted them and this process should exit. `wait_for_server`:
+/// another process owns the instance mutex, so keep retrying while its pipe
+/// does not exist yet (it may still be starting up).
+pub fn forward_to_running(paths: &[PathBuf], wait_for_server: bool) -> bool {
     if paths.is_empty() {
         return false;
     }
@@ -665,24 +747,29 @@ pub fn forward_to_running(paths: &[PathBuf]) -> bool {
     let msg = encode_message(&paths);
     let name = pipe_name();
     let (tx, rx) = crossbeam_channel::bounded(1);
+    let wait = if wait_for_server { PIPE_WAIT } else { Duration::from_millis(2500) };
     let spawned = std::thread::Builder::new().name("lumen-forward".into()).spawn(move || {
-        let _ = tx.send(try_forward(&name, &msg));
+        let _ = tx.send(try_forward(&name, &msg, wait, wait_for_server));
     });
     // A hung instance must never block this launch: give up after a few seconds.
-    spawned.is_ok() && matches!(rx.recv_timeout(Duration::from_secs(3)), Ok(true))
+    spawned.is_ok() && matches!(rx.recv_timeout(wait + Duration::from_secs(3)), Ok(true))
 }
 
-fn try_forward(name: &str, msg: &[u8]) -> bool {
+fn try_forward(name: &str, msg: &[u8], wait: Duration, wait_for_server: bool) -> bool {
     use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + wait;
     let mut file = None;
-    for _ in 0..50 {
+    while file.is_none() {
         match std::fs::OpenOptions::new().read(true).write(true).open(name) {
-            Ok(f) => {
-                file = Some(f);
-                break;
+            Ok(f) => file = Some(f),
+            Err(e) => {
+                let busy = e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32);
+                let starting = wait_for_server && e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.0 as i32);
+                if !(busy || starting) || std::time::Instant::now() >= deadline {
+                    return false; // no running instance (or it never came up)
+                }
+                std::thread::sleep(Duration::from_millis(if busy { 20 } else { 50 }));
             }
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return false, // no running instance
         }
     }
     let Some(mut f) = file else { return false };

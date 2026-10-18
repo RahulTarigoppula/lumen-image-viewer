@@ -331,7 +331,7 @@ impl EditTool for FreeRotate {
         c |= slider_ex(ui, "Angle", &mut self.angle, -45.0..=45.0, 0.0, "°", 0.1, 1, false);
         row(ui, "", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            for (label, d) in [("−1°", -1.0f32), ("−0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
+            for (label, d) in [("-1°", -1.0f32), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
                 if ui.small_button(label).clicked() {
                     self.angle = ((self.angle + d) * 10.0).round() / 10.0;
                     self.angle = self.angle.clamp(-45.0, 45.0);

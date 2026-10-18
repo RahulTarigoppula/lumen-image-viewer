@@ -804,7 +804,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                 ui.add_space(6.0);
             }
         }
-        row(ui, p, "Make Lumen the default viewer", "Windows only lets you choose defaults yourself. Register first, then pick Lumen for the types you want in Settings › Default apps.", |ui| {
+        row(ui, p, "Make Lumen the default viewer", "Windows only lets you choose defaults yourself. Register first, then pick Lumen for the types you want in Settings > Default apps.", |ui| {
             if ui.add_enabled(status.file_types, egui::Button::new(format!("{}  Open Default apps", I::ARROW_SQUARE_OUT))).clicked() {
                 if let Err(e) = crate::shell::open_default_apps() {
                     core.toasts.error(e.to_string());

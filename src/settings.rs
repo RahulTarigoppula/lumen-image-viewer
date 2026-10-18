@@ -2,7 +2,7 @@
 //! or next to the executable when a `portable.txt` file is present there.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeChoice {
@@ -185,6 +185,8 @@ pub struct Settings {
     pub thumb_caption: ThumbCaption,
     /// Viewer: slide-in panels when the mouse touches a screen edge.
     pub edge_panels: bool,
+    /// Skip the "this sends the coordinates to openstreetmap.org" confirmation.
+    pub gps_map_no_confirm: bool,
 }
 
 /// "In `mode`, `command` uses exactly `keys`" (empty = unbound). Plain strings so a
@@ -273,6 +275,7 @@ impl Default for Settings {
             key_overrides: Vec::new(),
             thumb_caption: ThumbCaption::NameDetails,
             edge_panels: true,
+            gps_map_no_confirm: false,
         }
     }
 }
@@ -304,14 +307,40 @@ pub fn cache_dir() -> PathBuf {
         .join("Lumen")
 }
 
+/// Rename a data file that failed to parse to `<name>.bad-<timestamp>.json`
+/// next to it, so defaults can be used without overwriting the user's data.
+/// Returns the new path.
+pub fn quarantine_bad_file(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let dir = path.parent()?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut target = dir.join(format!("{stem}.bad-{stamp}.json"));
+    let mut n = 1;
+    while target.exists() {
+        target = dir.join(format!("{stem}.bad-{stamp}-{n}.json"));
+        n += 1;
+    }
+    std::fs::rename(path, &target).ok()?;
+    Some(target)
+}
+
 impl Settings {
     fn path() -> PathBuf {
         data_dir().join("settings.json")
     }
 
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        let path = Self::path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Keep the unreadable file so the next save does not destroy it.
+                    log::warn!("settings.json is unreadable ({e}); using defaults");
+                    quarantine_bad_file(&path);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
