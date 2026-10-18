@@ -3,8 +3,10 @@
 //! All heavy lifting happens on background threads (see `convert.rs`); the
 //! windows only poll channels and draw progress.
 
+pub mod advanced;
 pub mod convert;
 pub mod logic;
+pub mod pipeline;
 
 use self::convert::{ConflictPolicy, ConvertSettings, DestMode, Estimate, FileStatus};
 use self::logic::{CaseChange, ExtCase, NameInfo, RenameIssue, RenameSettings, ResizeMode};
@@ -17,7 +19,7 @@ use crate::ui::icons as I;
 use crate::ui::theme::Palette;
 use crossbeam_channel::Receiver;
 use egui::{Color32, CornerRadius, RichText, Ui, Vec2};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -132,12 +134,28 @@ pub struct BatchConvert {
     cache: convert::DecodeCache,
     adding: Option<Receiver<Vec<PathBuf>>>,
     total_bytes: Option<u64>,
+    total_rx: Option<Receiver<(u64, u64)>>,
+    /// Bumped when the file list changes.
+    files_version: u64,
+    /// The files version the running/last total computation is for.
+    total_for: u64,
+    /// Settings/files version the overwrite check below was computed for.
+    overwrite_checked: u64,
+    /// Converting can replace originals (Overwrite policy into a source folder).
+    overwrites: bool,
     job: Option<convert::Job>,
     job_files: Vec<PathBuf>,
     statuses: Vec<FileStatus>,
     only_problems: bool,
     confirm_overwrite: bool,
     toasted: bool,
+    adv_selected: Option<usize>,
+    /// 0 = basic settings, 1 = advanced steps.
+    tab: u8,
+    presets: advanced::PresetUi,
+    /// Index of the file shown in the before/after preview.
+    preview_index: usize,
+    preview_tex: Option<(egui::TextureHandle, egui::TextureHandle)>,
 }
 
 impl BatchConvert {
@@ -157,18 +175,29 @@ impl BatchConvert {
             cache: Default::default(),
             adding: None,
             total_bytes: None,
+            total_rx: None,
+            files_version: 1,
+            total_for: 0,
+            overwrite_checked: 0,
+            overwrites: false,
             job: None,
             job_files: Vec::new(),
             statuses: Vec::new(),
             only_problems: false,
             confirm_overwrite: false,
             toasted: false,
+            adv_selected: None,
+            tab: convert::load_prefs().convert_tab.min(1),
+            presets: advanced::PresetUi::new(),
+            preview_index: 0,
+            preview_tex: None,
         }
     }
 
     fn files_changed(&mut self) {
         self.selected.clear();
         self.total_bytes = None;
+        self.files_version += 1;
         self.version += 1;
     }
 
@@ -187,36 +216,69 @@ impl BatchConvert {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        use crossbeam_channel::TryRecvError;
         if let Some(rx) = &self.adding {
-            if let Ok(v) = rx.try_recv() {
-                self.adding = None;
-                self.add_files(v);
+            match rx.try_recv() {
+                Ok(v) => {
+                    self.adding = None;
+                    self.add_files(v);
+                }
+                Err(TryRecvError::Disconnected) => self.adding = None,
+                Err(TryRecvError::Empty) => {}
             }
         }
         if self.s != self.last_s {
             self.last_s = self.s.clone();
             self.version += 1;
         }
+        if self.overwrite_checked != self.version {
+            self.overwrite_checked = self.version;
+            self.overwrites = self.s.overwrites_originals(&self.files);
+        }
         if let Some(rx) = &self.est_rx {
-            if let Ok((v, r)) = rx.try_recv() {
-                if v == self.version {
-                    self.estimate = Some(r);
+            match rx.try_recv() {
+                Ok((v, mut r)) => {
+                    if v == self.version {
+                        if let Ok(e) = &mut r {
+                            if let (Some(b), Some(a)) = (e.before.take(), e.after.take()) {
+                                let tex = |name: &str, img: &image::RgbaImage| ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()), egui::TextureOptions::LINEAR);
+                                self.preview_tex = Some((tex("bc-before", &b), tex("bc-after", &a)));
+                            }
+                        } else {
+                            self.preview_tex = None;
+                        }
+                        self.estimate = Some(r);
+                    }
+                    self.est_version = v;
+                    self.est_rx = None;
                 }
-                self.est_version = v;
-                self.est_rx = None;
+                Err(TryRecvError::Disconnected) => {
+                    self.estimate = Some(Err("The preview could not be rendered".into()));
+                    self.est_version = self.version;
+                    self.est_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
-        if self.job.is_none() && self.est_rx.is_none() && self.est_version < self.version {
-            match self.files.first().cloned() {
+        // The preview follows the selected file (the first one when nothing is selected).
+        let want_preview = self.selected.iter().min().copied().unwrap_or(0).min(self.files.len().saturating_sub(1));
+        if want_preview != self.preview_index {
+            self.preview_index = want_preview;
+            self.version += 1;
+        }
+        if self.job.is_none() && self.est_rx.is_none() && self.est_version < self.version && !ctx.egui_is_using_pointer() {
+            match self.files.get(self.preview_index).cloned() {
                 None => {
                     self.estimate = None;
+                    self.preview_tex = None;
                     self.est_version = self.version;
                 }
                 Some(first) => {
                     let (tx, rx) = crossbeam_channel::bounded(1);
-                    let (s, v, cache, c) = (self.s.clone(), self.version, self.cache.clone(), ctx.clone());
+                    let (s, v, cache, c, idx) = (self.s.clone(), self.version, self.cache.clone(), ctx.clone(), self.preview_index);
                     std::thread::spawn(move || {
-                        let r = convert::estimate(&first, &s, &cache);
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| convert::estimate(&first, idx, &s, &cache)))
+                            .unwrap_or_else(|e| Err(format!("Preview failed: {}", convert::panic_message(&*e))));
                         let _ = tx.send((v, r));
                         c.request_repaint();
                     });
@@ -224,8 +286,29 @@ impl BatchConvert {
                 }
             }
         }
-        if self.total_bytes.is_none() && self.files.len() <= 20_000 {
-            self.total_bytes = Some(self.files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum());
+        // Total size of the list, summed on a worker (20k stat calls take a while).
+        if let Some(rx) = &self.total_rx {
+            match rx.try_recv() {
+                Ok((v, bytes)) => {
+                    if v == self.files_version {
+                        self.total_bytes = Some(bytes);
+                    }
+                    self.total_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => self.total_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.total_bytes.is_none() && self.total_rx.is_none() && self.total_for != self.files_version {
+            self.total_for = self.files_version;
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (files, v, c) = (self.files.clone(), self.files_version, ctx.clone());
+            std::thread::spawn(move || {
+                let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+                let _ = tx.send((v, bytes));
+                c.request_repaint();
+            });
+            self.total_rx = Some(rx);
         }
         if let Some(job) = &mut self.job {
             while let Ok((i, st)) = job.rx.try_recv() {
@@ -299,8 +382,11 @@ impl BatchConvert {
             if let Some(job) = &self.job {
                 job.progress.cancel.store(true, Ordering::SeqCst);
             }
-            let s = self.s.clone();
-            convert::save_prefs(|p| p.convert = s);
+            let (s, tab) = (self.s.clone(), self.tab);
+            convert::save_prefs(|p| {
+                p.convert = s;
+                p.convert_tab = tab;
+            });
         }
         still_open
     }
@@ -317,7 +403,7 @@ impl BatchConvert {
                     let label = format!("{}  Convert {} file{}", I::PLAY, n, if n == 1 { "" } else { "s" });
                     let ok = n > 0 && !(self.s.dest == DestMode::Folder && self.s.out_folder.is_none());
                     if primary_button(ui, p, ok, &label).clicked() {
-                        if self.s.may_overwrite_originals() {
+                        if self.overwrites {
                             self.confirm_overwrite = true;
                         } else {
                             self.start(ui.ctx());
@@ -329,12 +415,36 @@ impl BatchConvert {
                 });
             });
         });
+        egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let active = self.s.advanced.steps.iter().filter(|e| e.enabled).count();
+                let adv = if self.s.use_advanced && active > 0 { format!("{}  Advanced ({active})", I::SLIDERS_HORIZONTAL) } else { format!("{}  Advanced", I::SLIDERS_HORIZONTAL) };
+                ui.selectable_value(&mut self.tab, 0, format!("{}  Basic", I::GEAR));
+                ui.selectable_value(&mut self.tab, 1, adv);
+            });
+        });
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.tab == 1 {
+                // Steps on the left, live before/after preview on the right.
+                ui.columns(2, |cols| {
+                    egui::ScrollArea::vertical().id_salt("bc-adv-scroll").auto_shrink([false, false]).show(&mut cols[0], |ui| {
+                        self.advanced_card(ui, p);
+                        ui.add_space(8.0);
+                        self.presets_card(ui, p);
+                    });
+                    egui::ScrollArea::vertical().id_salt("bc-adv-preview").auto_shrink([false, false]).show(&mut cols[1], |ui| {
+                        self.estimate_card(ui, p);
+                    });
+                });
+                return;
+            }
             egui::ScrollArea::vertical().id_salt("bc-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.columns(2, |cols| {
                     self.sources_card(&mut cols[0], p);
                     cols[0].add_space(8.0);
                     self.destination_card(&mut cols[0], p);
+                    cols[0].add_space(8.0);
+                    self.presets_card(&mut cols[0], p);
                     self.format_card(&mut cols[1], p);
                     cols[1].add_space(8.0);
                     self.resize_card(&mut cols[1], p);
@@ -460,7 +570,7 @@ impl BatchConvert {
                     }
                 });
             });
-            if self.s.may_overwrite_originals() {
+            if self.overwrites {
                 ui.label(RichText::new(format!("{}  Originals with the same name and format will be replaced.", I::WARNING)).size(12.0).color(p.danger));
             }
         });
@@ -587,15 +697,77 @@ impl BatchConvert {
         });
     }
 
+    fn presets_card(&mut self, ui: &mut Ui, p: &Palette) {
+        card(ui, p, I::BOOKMARK_SIMPLE, "Presets", |ui| {
+            self.presets.ui(ui, p, &mut self.s);
+            hint(ui, p, "A preset stores the format, resize, adjustments, destination and advanced steps.");
+        });
+    }
+
+    fn advanced_card(&mut self, ui: &mut Ui, p: &Palette) {
+        card(ui, p, I::SLIDERS_HORIZONTAL, "Advanced steps", |ui| {
+            ui.checkbox(&mut self.s.use_advanced, "Apply these steps to every image (after the basic resize and adjustments)");
+            ui.add_enabled_ui(self.s.use_advanced, |ui| {
+                advanced::pipeline_ui(ui, p, &mut self.s.advanced, &mut self.adv_selected);
+            });
+        });
+    }
+
+    fn preview_images(&mut self, ui: &mut Ui, p: &Palette) {
+        let Some((before, after)) = &self.preview_tex else { return };
+        let avail = ui.available_width();
+        // Side by side when there is room, otherwise one above the other.
+        let side = avail > 520.0;
+        let h_max = if side { 300.0f32 } else { 240.0 };
+        let slot_w = if side { (avail - 12.0) / 2.0 } else { avail };
+        let fit = |t: &egui::TextureHandle| {
+            let sz = t.size_vec2();
+            let s = (slot_w / sz.x).min(h_max / sz.y).min(1.5);
+            sz * s
+        };
+        let show = |ui: &mut Ui, t: &egui::TextureHandle, label: &str| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(label).size(11.0).color(p.faint).strong());
+                ui.add(egui::Image::new((t.id(), fit(t))).corner_radius(CornerRadius::same(4)));
+            });
+        };
+        if side {
+            ui.horizontal_top(|ui| {
+                show(ui, before, "BEFORE");
+                ui.add_space(8.0);
+                show(ui, after, "AFTER");
+            });
+        } else {
+            show(ui, before, "BEFORE");
+            show(ui, after, "AFTER");
+        }
+    }
+
     fn estimate_card(&mut self, ui: &mut Ui, p: &Palette) {
-        card(ui, p, I::EYE, "Preview of the first file", |ui| {
-            let Some(first) = self.files.first() else {
+        let title = if self.selected.is_empty() { "Preview (first file)" } else { "Preview (selected file)" };
+        card(ui, p, I::EYE, title, |ui| {
+            let Some(first) = self.files.get(self.preview_index).cloned() else {
                 hint(ui, p, "Add files to see the expected result.");
                 return;
             };
+            let first = &first;
             let pending = self.est_version < self.version;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(file_name(first)).strong());
+                if self.files.len() > 1 && self.files.len() <= 5000 {
+                    // Pick the preview file without going back to the source list.
+                    let mut idx = self.preview_index;
+                    egui::ComboBox::from_id_salt("bc-preview-file").width(180.0).truncate().selected_text(file_name(first)).show_ui(ui, |ui| {
+                        for (i, f) in self.files.iter().enumerate() {
+                            ui.selectable_value(&mut idx, i, file_name(f));
+                        }
+                    });
+                    if idx != self.preview_index {
+                        self.selected.clear();
+                        self.selected.insert(idx);
+                    }
+                } else {
+                    ui.label(RichText::new(file_name(first)).strong());
+                }
                 match &self.estimate {
                     Some(Ok(e)) => {
                         ui.label(RichText::new(format!("{} × {} · {}", e.in_dims.0, e.in_dims.1, human_size(e.in_bytes))).color(p.muted));
@@ -612,6 +784,10 @@ impl BatchConvert {
                     ui.spinner();
                 }
             });
+            if matches!(self.estimate, Some(Ok(_))) {
+                ui.add_space(4.0);
+                self.preview_images(ui, p);
+            }
             if let (Some(Ok(e)), n) = (&self.estimate, self.files.len()) {
                 if n > 1 && e.in_bytes > 0 {
                     if let Some(total) = self.total_bytes {
@@ -869,6 +1045,30 @@ pub struct BatchRename {
     last_batch: Vec<(PathBuf, PathBuf)>,
     status: Option<(bool, String)>,
     only_changed: bool,
+    /// Lower-case names present in each folder, read once per file list
+    /// (refreshed after a rename) instead of one stat per target per keystroke.
+    dir_names: HashMap<PathBuf, HashSet<String>>,
+}
+
+/// Finish any batch rename that was interrupted by a crash or power cut (from
+/// the journal in the data folder). Returns messages for the user; call once
+/// at startup. The batch rename window also calls it when it opens.
+pub fn recover_pending_renames() -> Vec<String> {
+    logic::recover_journal(&logic::journal_path())
+}
+
+fn list_dir_names(dirs: impl Iterator<Item = PathBuf>) -> HashMap<PathBuf, HashSet<String>> {
+    let mut out = HashMap::new();
+    for d in dirs {
+        if out.contains_key(&d) {
+            continue;
+        }
+        let names: HashSet<String> = std::fs::read_dir(&d)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
+            .unwrap_or_default();
+        out.insert(d, names);
+    }
+    out
 }
 
 fn start_meta(files: Vec<PathBuf>, full: bool, ctx: egui::Context) -> MetaJob {
@@ -886,13 +1086,19 @@ fn start_meta(files: Vec<PathBuf>, full: bool, ctx: egui::Context) -> MetaJob {
                 return;
             }
             let p = &files[i];
-            let modified = std::fs::metadata(p).ok().and_then(|m| m.modified().ok()).map(logic::systime_to_naive);
-            let (dims, taken) = if full {
-                (Some(crate::decode::probe_dimensions(p)), Some(crate::meta::read_exif(p).and_then(|e| e.taken_ts).and_then(logic::ts_to_naive)))
-            } else {
-                (None, None)
-            };
-            let _ = tx.send(InfoUpdate { index: i, modified, dims, taken });
+            // A panic while reading one file's metadata must still count it as done.
+            let r = std::panic::catch_unwind(|| {
+                let modified = std::fs::metadata(p).ok().and_then(|m| m.modified().ok()).map(logic::systime_to_naive);
+                let (dims, taken) = if full {
+                    (Some(crate::decode::probe_dimensions(p)), Some(crate::meta::read_exif(p).and_then(|e| e.taken_ts).and_then(logic::ts_to_naive)))
+                } else {
+                    (None, None)
+                };
+                InfoUpdate { index: i, modified, dims, taken }
+            });
+            if let Ok(u) = r {
+                let _ = tx.send(u);
+            }
             let n = d.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 64 == 0 || n == files.len() {
                 ctx.request_repaint();
@@ -902,6 +1108,8 @@ fn start_meta(files: Vec<PathBuf>, full: bool, ctx: egui::Context) -> MetaJob {
             Ok(pool) => pool.install(|| (0..files.len()).into_par_iter().for_each(work)),
             Err(_) => (0..files.len()).for_each(work),
         }
+        // Cancelled runs skip files; mark everything done so the UI never waits forever.
+        d.store(files.len(), Ordering::SeqCst);
         ctx.request_repaint();
     });
     MetaJob { rx, done, total, cancel, full }
@@ -909,8 +1117,10 @@ fn start_meta(files: Vec<PathBuf>, full: bool, ctx: egui::Context) -> MetaJob {
 
 impl BatchRename {
     pub fn new(files: Vec<PathBuf>, core: &Core) -> Self {
+        let recovered = recover_pending_renames();
         let infos = files.iter().map(|p| NameInfo::from_path(p)).collect();
         let meta = Some(start_meta(files.clone(), false, core.ctx.clone()));
+        let dir_names = list_dir_names(files.iter().filter_map(|f| f.parent().map(Path::to_path_buf)));
         BatchRename {
             files,
             infos,
@@ -922,8 +1132,9 @@ impl BatchRename {
             have_full: false,
             job: None,
             last_batch: Vec::new(),
-            status: None,
+            status: if recovered.is_empty() { None } else { Some((!recovered.iter().any(|m| m.starts_with("Could not")), recovered.join("; "))) },
             only_changed: false,
+            dir_names,
         }
     }
 
@@ -965,9 +1176,17 @@ impl BatchRename {
             self.meta = Some(start_meta(self.files.clone(), true, ctx.clone()));
         }
         if let Some(job) = &self.job {
-            if let Ok(out) = job.rx.try_recv() {
+            let out = match job.rx.try_recv() {
+                Ok(out) => Some(out),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(logic::RenameOutcome { done: Vec::new(), errors: vec!["The rename stopped unexpectedly; check the folder (it is repaired the next time this window opens)".into()] })
+                }
+                Err(_) => None,
+            };
+            if let Some(out) = out {
                 let undo = job.undo;
                 self.job = None;
+                self.dir_names = list_dir_names(self.files.iter().chain(out.done.iter().map(|(_, t)| t)).filter_map(|f| f.parent().map(Path::to_path_buf)));
                 // Update our own list to the new paths.
                 for (from, to) in &out.done {
                     if let Some(i) = self.files.iter().position(|f| f == from) {
@@ -1002,7 +1221,14 @@ impl BatchRename {
         let pad = logic::auto_pad(&self.s, self.files.len());
         let names: Vec<String> = self.infos.iter().enumerate().map(|(i, info)| logic::new_file_name(&self.s, info, i, pad)).collect();
         let targets: Vec<PathBuf> = self.files.iter().zip(&names).map(|(f, n)| f.with_file_name(n)).collect();
-        let issues = logic::check_targets(&self.files, &targets, |p| p.exists());
+        let dir_names = &self.dir_names;
+        let issues = logic::check_targets(&self.files, &targets, |p| {
+            let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return p.exists() };
+            match dir_names.get(dir) {
+                Some(names) => names.contains(&name.to_string_lossy().to_lowercase()),
+                None => p.exists(),
+            }
+        });
         self.rows = names
             .into_iter()
             .zip(targets)
@@ -1023,11 +1249,20 @@ impl BatchRename {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (pr, c) = (progress.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let out = logic::execute_plan(&plan, |n| {
-                pr.store(n, Ordering::Relaxed);
-                if n % 50 == 0 {
-                    c.request_repaint();
-                }
+            let journal = logic::journal_path();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                logic::execute_plan_journaled(&plan, Some(&journal), |n| {
+                    pr.store(n, Ordering::Relaxed);
+                    if n % 50 == 0 {
+                        c.request_repaint();
+                    }
+                })
+            }));
+            let out = r.unwrap_or_else(|e| {
+                // Repair right away from the journal so no file keeps a temporary name.
+                let mut errors = vec![format!("The rename failed unexpectedly: {}", convert::panic_message(&*e))];
+                errors.extend(logic::recover_journal(&journal));
+                logic::RenameOutcome { done: Vec::new(), errors }
             });
             let _ = tx.send(out);
             c.request_repaint();

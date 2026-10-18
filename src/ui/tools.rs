@@ -1,8 +1,15 @@
 //! Utility windows: contact sheet, duplicate finder and printing.
 
 pub mod dupes;
+pub mod multipage;
+pub mod output_ui;
+pub mod pdf;
 pub mod print;
+pub mod print_ui;
 pub mod sheet;
+
+pub use output_ui::{MultiPageWindow, StripWindow, ZipWindow};
+pub use print_ui::PrintWindow;
 
 use self::dupes::{Group, GroupKind, KeepRule, ScanItem};
 use self::sheet::{SheetItem, SheetSettings};
@@ -56,6 +63,20 @@ fn job_pool() -> Option<rayon::ThreadPool> {
 // ============================================================ contact sheet
 
 type ThumbCache = Arc<Mutex<HashMap<(PathBuf, u32, u32, bool), Arc<RgbaImage>>>>;
+
+/// Longest side of the contact sheet preview image.
+const PREVIEW_MAX: f32 = 1400.0;
+
+/// Run `f`, turning a panic into an error message so a background job always reports back.
+pub(crate) fn guarded<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown error".into());
+            Err(format!("{what} failed unexpectedly: {msg}"))
+        }
+    }
+}
 
 struct SheetJob {
     progress: Arc<Progress>,
@@ -126,10 +147,19 @@ impl ContactSheet {
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.items_rx {
-            if let Ok(v) = rx.try_recv() {
-                self.items = Some(Arc::new(v));
-                self.items_rx = None;
-                self.version += 1;
+            match rx.try_recv() {
+                Ok(v) => {
+                    self.items = Some(Arc::new(v));
+                    self.items_rx = None;
+                    self.version += 1;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // The info thread died: fall back to bare paths.
+                    self.items = Some(Arc::new(self.files.iter().map(|p| SheetItem { path: p.clone(), dims: None, size: 0, modified: None }).collect()));
+                    self.items_rx = None;
+                    self.version += 1;
+                }
+                Err(_) => {}
             }
         }
         if self.s != self.last_s {
@@ -137,13 +167,20 @@ impl ContactSheet {
             self.version += 1;
         }
         if let Some(rx) = &self.preview_rx {
-            if let Ok((v, img, dims)) = rx.try_recv() {
-                if v == self.version {
-                    let tex = ctx.load_texture("contact-sheet-preview", img, egui::TextureOptions::LINEAR);
-                    self.preview = Some((tex, dims));
+            match rx.try_recv() {
+                Ok((v, img, dims)) => {
+                    if v == self.version {
+                        let tex = ctx.load_texture("contact-sheet-preview", img, egui::TextureOptions::LINEAR);
+                        self.preview = Some((tex, dims));
+                    }
+                    self.preview_version = v;
+                    self.preview_rx = None;
                 }
-                self.preview_version = v;
-                self.preview_rx = None;
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.preview_version = self.version;
+                    self.preview_rx = None;
+                }
+                Err(_) => {}
             }
         }
         if let (Some(items), None) = (&self.items, &self.preview_rx) {
@@ -152,13 +189,19 @@ impl ContactSheet {
                 let (s, v, items, cache, c) = (self.s.clone(), self.version, items.clone(), self.cache.clone(), ctx.clone());
                 std::thread::spawn(move || {
                     use rayon::prelude::*;
-                    let l = sheet::layout(&s, items.len());
-                    let page: Vec<SheetItem> = items.iter().take(l.per_page).cloned().collect();
-                    let thumbs: Vec<Option<RgbaImage>> = page.par_iter().map(|it| cached_thumb(&cache, &it.path, &s).map(|t| (*t).clone())).collect();
-                    let img = sheet::render_page(&s, &l, &page, &thumbs, 0);
-                    let small = crate::imaging::resize_to_fit(&img, 1400, 1400);
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
-                    let _ = tx.send((v, ci, (l.width, l.height)));
+                    let full = sheet::layout(&s, items.len());
+                    // Render the preview at a reduced scale: a full-size page can be gigabytes.
+                    let f = (PREVIEW_MAX / full.width.max(full.height).max(1) as f32).min(1.0);
+                    let ps = s.scaled(f);
+                    let l = sheet::layout(&ps, items.len());
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let page: Vec<SheetItem> = items.iter().take(l.per_page).cloned().collect();
+                        let thumbs: Vec<Option<RgbaImage>> = page.par_iter().map(|it| cached_thumb(&cache, &it.path, &ps).map(|t| (*t).clone())).collect();
+                        let img = sheet::render_page(&ps, &l, &page, &thumbs, 0);
+                        egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+                    }));
+                    let ci = r.unwrap_or_else(|_| egui::ColorImage::filled([1, 1], Color32::TRANSPARENT));
+                    let _ = tx.send((v, ci, (full.width, full.height)));
                     c.request_repaint();
                 });
                 self.preview_rx = Some(rx);
@@ -166,8 +209,10 @@ impl ContactSheet {
         }
         if let Some(job) = &mut self.job {
             if job.result.is_none() {
-                if let Ok(r) = job.rx.try_recv() {
-                    job.result = Some(r);
+                match job.rx.try_recv() {
+                    Ok(r) => job.result = Some(r),
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => job.result = Some(Err("The contact sheet job stopped unexpectedly".into())),
+                    Err(_) => {}
                 }
             }
         }
@@ -186,6 +231,9 @@ impl ContactSheet {
             use rayon::prelude::*;
             let run = || -> Result<Vec<PathBuf>, String> {
                 let l = sheet::layout(&s, items.len());
+                if let Some(e) = sheet::page_limit_error(s.format, &l) {
+                    return Err(e);
+                }
                 std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
                 let paths = sheet::page_paths(&s, &dir, l.pages);
                 let pool = job_pool();
@@ -226,7 +274,7 @@ impl ContactSheet {
                 }
                 Ok(written)
             };
-            let _ = tx.send(run());
+            let _ = tx.send(guarded("Contact sheet", run));
             c.request_repaint();
         });
         self.job = Some(SheetJob { progress, rx, result: None });
@@ -304,7 +352,7 @@ impl ContactSheet {
                         }
                     } else {
                         let label = format!("{}  Create {} page{}", I::FLOPPY_DISK, l.pages, if l.pages == 1 { "" } else { "s" });
-                        let ok = n > 0 && self.items.is_some() && self.s.out_dir.is_some();
+                        let ok = n > 0 && self.items.is_some() && self.s.out_dir.is_some() && sheet::page_limit_error(self.s.format, &l).is_none();
                         if primary_button(ui, p, ok, &label).clicked() {
                             start = true;
                         }
@@ -398,6 +446,9 @@ impl ContactSheet {
                 ui.end_row();
             });
             hint(ui, p, &format!("{} per page · {} page{} · {} × {} px", l.per_page, l.pages, if l.pages == 1 { "" } else { "s" }, l.width, l.height));
+            if let Some(e) = sheet::page_limit_error(s.format, l) {
+                ui.label(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger));
+            }
         });
         ui.add_space(8.0);
         card(ui, p, I::TEXT_T, "Captions & colors", |ui| {
@@ -503,6 +554,14 @@ pub struct Duplicates {
     scanned: Option<(bool, bool)>,
     groups: Vec<Group>,
     grouped_for: Option<(bool, u32)>,
+    /// Grouping runs on a worker: (parameters, scan generation, result).
+    group_rx: Option<Receiver<((bool, u32), u64, Vec<Group>)>>,
+    /// Bumped whenever `items` changes so stale grouping results are dropped.
+    items_gen: u64,
+    /// When the grouping parameters last changed (for debouncing the slider).
+    want_changed: Option<((bool, u32), std::time::Instant)>,
+    /// Let "Mark all but the best" also mark similar (not identical) groups.
+    bulk_similar: bool,
     marked: HashSet<PathBuf>,
     keep_rule: KeepRule,
     confirm_delete: bool,
@@ -526,7 +585,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             .par_iter()
             .filter_map(|p| {
                 let m = std::fs::metadata(p).ok()?;
-                Some(ScanItem { path: p.clone(), size: m.len(), modified: m.modified().ok(), dims: None, content: None, dhash: None })
+                Some(ScanItem { path: p.clone(), size: m.len(), modified: m.modified().ok(), dims: None, content: None, dhash: None, detail: 0.0 })
             })
             .filter(|it| it.size > 0)
             .collect();
@@ -543,7 +602,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
                 if prog.cancelled() {
                     return (i, None);
                 }
-                let h = dupes::file_hash(&items[i].path).ok();
+                let h = std::panic::catch_unwind(|| dupes::file_hash(&items[i].path).ok()).ok().flatten();
                 prog.done.fetch_add(1, Ordering::Relaxed);
                 ctx.request_repaint();
                 (i, h)
@@ -568,15 +627,20 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             (0..items.len()).filter(|&i| items[i].content.is_some_and(|c| seen[&(items[i].size, c)] > 1)).collect()
         };
         prog.set_phase(if similar { "Analyzing images" } else { "Reading image sizes" }, need.len());
-        let info: Vec<(usize, Option<(u32, u32)>, Option<u64>)> = need
+        let info: Vec<(usize, Option<(u32, u32)>, Option<(u64, f32)>)> = need
             .par_iter()
             .map(|&i| {
                 if prog.cancelled() {
                     return (i, None, None);
                 }
                 let p = &items[i].path;
-                let dims = crate::decode::probe_dimensions(p);
-                let h = if similar { crate::decode::decode_thumbnail(p, 256).ok().map(|t| dupes::dhash(&t)) } else { None };
+                // A decoder panic on one broken file must not take the whole scan down.
+                let r = std::panic::catch_unwind(|| {
+                    let dims = crate::decode::probe_dimensions(p);
+                    let h = if similar { crate::decode::decode_thumbnail(p, 256).ok().map(|t| dupes::dhash_detail(&t)) } else { None };
+                    (dims, h)
+                });
+                let (dims, h) = r.unwrap_or((None, None));
                 prog.done.fetch_add(1, Ordering::Relaxed);
                 ctx.request_repaint();
                 (i, dims, h)
@@ -584,7 +648,10 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             .collect();
         for (i, d, h) in info {
             items[i].dims = d;
-            items[i].dhash = h;
+            if let Some((h, detail)) = h {
+                items[i].dhash = Some(h);
+                items[i].detail = detail;
+            }
         }
         if prog.cancelled() {
             return Err("Cancelled".to_string());
@@ -607,6 +674,10 @@ impl Duplicates {
             scanned: None,
             groups: Vec::new(),
             grouped_for: None,
+            group_rx: None,
+            items_gen: 0,
+            want_changed: None,
+            bulk_similar: false,
             marked: HashSet::new(),
             keep_rule: KeepRule::Resolution,
             confirm_delete: false,
@@ -625,7 +696,7 @@ impl Duplicates {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (files, folder, rec, sim, prog, c) = (self.files.clone(), self.folder.clone(), self.include_subfolders, self.find_similar, progress.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let r = scan(files, folder, rec, sim, prog, c.clone());
+            let r = guarded("Scanning", || scan(files, folder, rec, sim, prog, c.clone()));
             let _ = tx.send(r);
             c.request_repaint();
         });
@@ -635,12 +706,18 @@ impl Duplicates {
 
     fn poll(&mut self, events: &mut Vec<DupEvent>, core: &mut Core) {
         if let Some(job) = &self.scan {
-            if let Ok(r) = job.rx.try_recv() {
+            let r = match job.rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err("The scan stopped unexpectedly".to_string())),
+                Err(_) => None,
+            };
+            if let Some(r) = r {
                 let sim = job.similar;
                 self.scan = None;
                 match r {
                     Ok(items) => {
                         self.items = Arc::new(items);
+                        self.items_gen += 1;
                         self.scanned = Some((sim, self.include_subfolders));
                         self.marked.clear();
                         self.grouped_for = None;
@@ -650,30 +727,80 @@ impl Duplicates {
                 }
             }
         }
+        if let Some(rx) = &self.group_rx {
+            match rx.try_recv() {
+                Ok((want, generation, groups)) => {
+                    self.group_rx = None;
+                    if generation == self.items_gen {
+                        self.groups = groups;
+                        self.grouped_for = Some(want);
+                        let present: HashSet<&PathBuf> = self.groups.iter().flat_map(|g| g.members.iter().map(|&i| &self.items[i].path)).collect();
+                        self.marked.retain(|m| present.contains(m));
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.group_rx = None;
+                    self.error = Some("Grouping failed unexpectedly".into());
+                    self.grouped_for = Some((self.find_similar, dupes::threshold_for_pct(self.similarity)));
+                }
+                Err(_) => {}
+            }
+        }
         let want = (self.find_similar && self.scanned.is_some_and(|s| s.0), dupes::threshold_for_pct(self.similarity));
-        if self.scanned.is_some() && self.grouped_for != Some(want) {
-            self.groups = dupes::group(&self.items, want.0, want.1);
-            self.grouped_for = Some(want);
-            let present: HashSet<&PathBuf> = self.groups.iter().flat_map(|g| g.members.iter().map(|&i| &self.items[i].path)).collect();
-            self.marked.retain(|m| present.contains(m));
+        if self.scanned.is_some() && self.grouped_for != Some(want) && self.group_rx.is_none() {
+            // Debounce: wait until the slider has rested for a moment.
+            let now = std::time::Instant::now();
+            let since = match self.want_changed {
+                Some((w, t)) if w == want => t,
+                _ => {
+                    self.want_changed = Some((want, now));
+                    now
+                }
+            };
+            let first = self.grouped_for.is_none();
+            if first || now.duration_since(since) >= std::time::Duration::from_millis(250) {
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let (items, generation, c) = (self.items.clone(), self.items_gen, core.ctx.clone());
+                std::thread::spawn(move || {
+                    if let Ok(groups) = std::panic::catch_unwind(|| dupes::group(&items, want.0, want.1)) {
+                        let _ = tx.send((want, generation, groups));
+                    }
+                    c.request_repaint();
+                });
+                self.group_rx = Some(rx);
+            } else {
+                core.ctx.request_repaint_after(std::time::Duration::from_millis(260));
+            }
         }
         if let Some(rx) = &self.deleting {
-            if let Ok(r) = rx.try_recv() {
+            let r = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err("Deleting stopped unexpectedly".to_string())),
+                Err(_) => None,
+            };
+            if let Some(r) = r {
                 self.deleting = None;
+                // Whatever happened, files that no longer exist leave the list
+                // (a partial failure can still have removed some of them).
+                let gone: Vec<PathBuf> = self.items.iter().filter(|it| self.marked.contains(&it.path) && !it.path.exists()).map(|it| it.path.clone()).collect();
+                if !gone.is_empty() {
+                    let set: HashSet<&PathBuf> = gone.iter().collect();
+                    let items: Vec<ScanItem> = self.items.iter().filter(|it| !set.contains(&it.path)).cloned().collect();
+                    self.items = Arc::new(items);
+                    self.items_gen += 1;
+                    self.grouped_for = None;
+                    self.marked.retain(|m| !set.contains(m));
+                }
                 match r {
-                    Ok(paths) => {
-                        let gone: HashSet<&PathBuf> = paths.iter().collect();
-                        let items: Vec<ScanItem> = self.items.iter().filter(|it| !gone.contains(&it.path)).cloned().collect();
-                        self.items = Arc::new(items);
-                        self.grouped_for = None;
-                        self.marked.retain(|m| !gone.contains(m));
-                        core.toasts.success(format!("Moved {} file{} to the Recycle Bin", paths.len(), if paths.len() == 1 { "" } else { "s" }));
-                        events.push(DupEvent::Deleted(paths));
-                    }
+                    Ok(_) => core.toasts.success(format!("Moved {} file{} to the Recycle Bin", gone.len(), if gone.len() == 1 { "" } else { "s" })),
                     Err(e) => {
-                        core.toasts.error(e.clone());
-                        self.error = Some(e);
+                        let msg = if gone.is_empty() { e } else { format!("{e} ({} file{} were moved to the Recycle Bin)", gone.len(), if gone.len() == 1 { "" } else { "s" }) };
+                        core.toasts.error(msg.clone());
+                        self.error = Some(msg);
                     }
+                }
+                if !gone.is_empty() {
+                    events.push(DupEvent::Deleted(gone));
                 }
             }
         }
@@ -819,7 +946,16 @@ impl Duplicates {
                 }
                 return;
             }
+            if self.group_rx.is_some() || self.grouped_for.is_none() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Grouping...").color(p.muted));
+                });
+            }
             if self.groups.is_empty() {
+                if self.grouped_for.is_none() {
+                    return;
+                }
                 empty_state(ui, p, I::CHECK_CIRCLE, "No duplicates found", &format!("{} images checked. Try a lower similarity or include subfolders.", self.items.len()));
                 return;
             }
@@ -840,9 +976,11 @@ impl Duplicates {
                     if ui.add_enabled(!self.marked.is_empty(), egui::Button::new("Clear marks")).clicked() {
                         self.marked.clear();
                     }
-                    if ui.button(format!("{}  Mark all but the best", I::LIST_CHECKS)).on_hover_text("In every group, mark all copies except the one to keep").clicked() {
+                    if ui.button(format!("{}  Mark all but the best", I::LIST_CHECKS)).on_hover_text("In every identical group (and, if allowed, every similar group), mark all copies except the one to keep").clicked() {
                         mark_all = true;
                     }
+                    ui.checkbox(&mut self.bulk_similar, "Include similar groups")
+                        .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure");
                     egui::ComboBox::from_id_salt("dup-keep").selected_text(self.keep_rule.label()).show_ui(ui, |ui| {
                         for r in KeepRule::ALL {
                             ui.selectable_value(&mut self.keep_rule, r, r.label());
@@ -853,7 +991,10 @@ impl Duplicates {
             });
             if mark_all {
                 for gi in 0..self.groups.len() {
-                    self.mark_best(gi);
+                    // Similar groups are only bulk-marked on explicit opt-in.
+                    if self.groups[gi].kind == GroupKind::Identical || self.bulk_similar {
+                        self.mark_best(gi);
+                    }
                 }
             }
             ui.add_space(4.0);
