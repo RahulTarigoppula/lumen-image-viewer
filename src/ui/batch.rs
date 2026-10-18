@@ -1202,9 +1202,11 @@ impl BatchRename {
                 let undo = job.undo;
                 self.job = None;
                 self.dir_names = list_dir_names(self.files.iter().chain(out.done.iter().map(|(_, t)| t)).filter_map(|f| f.parent().map(Path::to_path_buf)));
-                // Update our own list to the new paths.
+                // Update our own list to the new paths. Look up by the paths as they
+                // were before the batch, so chains (1->2, 2->3) map each file once.
+                let index: HashMap<PathBuf, usize> = self.files.iter().cloned().enumerate().map(|(i, f)| (f, i)).collect();
                 for (from, to) in &out.done {
-                    if let Some(i) = self.files.iter().position(|f| f == from) {
+                    if let Some(&i) = index.get(from) {
                         self.files[i] = to.clone();
                         let mut info = NameInfo::from_path(to);
                         let old = &self.infos[i];

@@ -1,7 +1,7 @@
 //! Saving images, metadata preservation and lossless JPEG rotation.
 
 use crate::formats::SaveFormat;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use image::RgbaImage;
 use std::path::Path;
 
@@ -115,6 +115,16 @@ pub fn encode(img: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
             } else {
                 let rgb = flatten_rgb(img, [0, 0, 0]);
                 enc.write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)?;
+            }
+            if opts.keep_metadata {
+                if let Some(exif) = &opts.exif {
+                    // EXIF in an eXIf chunk; the pixels are already upright.
+                    let mut e = strip_exif_header(exif).to_vec();
+                    exif_set_orientation(&mut e, 1);
+                    if let Some(with) = png_with_exif(&out, e) {
+                        out = with;
+                    }
+                }
             }
         }
         SaveFormat::Ico => {
@@ -236,17 +246,130 @@ pub fn save(img: &RgbaImage, path: &Path, opts: &SaveOptions) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}.lumen-tmp",
-        path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
-    ));
-    std::fs::write(&tmp, bytes).with_context(|| format!("Cannot write {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow!("Cannot replace {}: {e}", path.display()));
+/// Like [`save`], but when re-saving a JPEG over (or from) the JPEG `source`,
+/// carry its comment, XMP and IPTC segments over (EXIF and ICC come from `opts`).
+/// For any other format this is the same as [`save`].
+pub fn save_from(img: &RgbaImage, path: &Path, opts: &SaveOptions, source: Option<&Path>) -> Result<()> {
+    let mut bytes = encode(img, opts)?;
+    if opts.format == SaveFormat::Jpeg && opts.keep_metadata {
+        if let Some(orig) = source.filter(|s| crate::formats::is_jpeg_ext(&crate::formats::ext_of(s))).and_then(|s| std::fs::read(s).ok()) {
+            if let Some(merged) = copy_jpeg_extras(&bytes, &orig) {
+                bytes = merged;
+            }
+        }
     }
-    Ok(())
+    write_atomic(path, &bytes)
+}
+
+fn png_with_exif(png: &[u8], exif: Vec<u8>) -> Option<Vec<u8>> {
+    use img_parts::{png::Png, Bytes, ImageEXIF};
+    if exif.len() < 8 || !(exif.starts_with(b"II") || exif.starts_with(b"MM")) {
+        return None;
+    }
+    let mut p = Png::from_bytes(Bytes::copy_from_slice(png)).ok()?;
+    p.set_exif(Some(Bytes::from(exif)));
+    let mut buf = Vec::with_capacity(png.len() + 1024);
+    p.encoder().write_to(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// True for the APP1 payloads that hold XMP (standard or extended), not EXIF.
+fn is_xmp_app1(contents: &[u8]) -> bool {
+    contents.starts_with(b"http://ns.adobe.com/xap/1.0/\0") || contents.starts_with(b"http://ns.adobe.com/xmp/extension/\0")
+}
+
+/// Copy COM (comment), APP1 XMP and APP13 (IPTC / Photoshop) segments of the
+/// JPEG `original` into the freshly encoded JPEG `encoded`, after its own APPn
+/// segments. Returns `None` when either file cannot be parsed or nothing to copy.
+pub fn copy_jpeg_extras(encoded: &[u8], original: &[u8]) -> Option<Vec<u8>> {
+    use img_parts::jpeg::{markers, Jpeg, JpegSegment};
+    use img_parts::Bytes;
+    let orig = Jpeg::from_bytes(Bytes::copy_from_slice(original)).ok()?;
+    let extras: Vec<JpegSegment> = orig
+        .segments()
+        .iter()
+        .filter(|s| match s.marker() {
+            markers::COM | markers::APP13 => true,
+            markers::APP1 => is_xmp_app1(s.contents()),
+            _ => false,
+        })
+        .map(|s| JpegSegment::new_with_contents(s.marker(), s.contents().clone()))
+        .collect();
+    if extras.is_empty() {
+        return None;
+    }
+    let mut out = Jpeg::from_bytes(Bytes::copy_from_slice(encoded)).ok()?;
+    let segs = out.segments_mut();
+    let at = segs.iter().position(|s| !(markers::APP0..=markers::APP15).contains(&s.marker())).unwrap_or(segs.len());
+    for (i, s) in extras.into_iter().enumerate() {
+        segs.insert(at + i, s);
+    }
+    let mut buf = Vec::with_capacity(encoded.len() + 1024);
+    out.encoder().write_to(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Write `bytes` to `path` without ever leaving a half-written or missing file:
+/// write a uniquely named temp file next to it, flush it to disk, then swap it in.
+/// An existing target keeps its attributes and creation date (ReplaceFileW).
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}-{n}.lumen-tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("Cannot write {}: {e}", tmp.display()));
+    }
+    // A reader (thumbnailer, antivirus) holding the target briefly makes the
+    // swap fail with a sharing error: retry a few times before giving up.
+    let mut res = replace_file(&tmp, path);
+    for attempt in 1..=5u64 {
+        if res.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15 * attempt));
+        res = replace_file(&tmp, path);
+    }
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Only drop the temp copy while the original is still in place.
+            if path.exists() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Err(anyhow!("Cannot replace {}: {e}", path.display()))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
+    let (src, dst) = (HSTRING::from(tmp.as_os_str()), HSTRING::from(path.as_os_str()));
+    if path.exists() {
+        // SAFETY: both strings are valid NUL-terminated wide paths for the call's duration.
+        let r = unsafe { ReplaceFileW(&dst, &src, PCWSTR::null(), REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, None, None) };
+        if r.is_ok() {
+            return Ok(());
+        }
+    }
+    // SAFETY: as above.
+    unsafe { MoveFileExW(&src, &dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }.map_err(|e| std::io::Error::other(e.message()))
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
 }
 
 pub fn flatten_rgb(img: &RgbaImage, bg: [u8; 3]) -> Vec<u8> {
@@ -435,6 +558,79 @@ mod tests {
                 assert_eq!((back.width(), back.height()), (17, 9), "{f:?}");
             }
         }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("lumen-encode-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let d = temp_dir("atomic");
+        let p = d.join("a.bin");
+        write_atomic(&p, b"one").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"one");
+        write_atomic(&p, b"second").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+        // Concurrent writers in one folder never collide on temp names.
+        std::thread::scope(|s| {
+            for i in 0..8u8 {
+                let d = &d;
+                s.spawn(move || {
+                    for _ in 0..4 {
+                        write_atomic(&d.join(format!("c{i}.bin")), &[i; 64]).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read(d.join("c3.bin")).unwrap(), vec![3u8; 64]);
+        let names: Vec<String> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names.len(), 9, "{names:?}");
+        assert!(names.iter().all(|n| !n.ends_with(".lumen-tmp")), "{names:?}");
+        // A failed write (target folder missing) leaves nothing behind.
+        assert!(write_atomic(&d.join("missing").join("b.bin"), b"x").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn jpeg_resave_keeps_comment_xmp_and_iptc() {
+        use img_parts::jpeg::{markers, Jpeg, JpegSegment};
+        use img_parts::Bytes;
+        let img = RgbaImage::from_pixel(16, 16, image::Rgba([90, 120, 30, 255]));
+        let opts = SaveOptions { format: SaveFormat::Jpeg, keep_metadata: true, exif: Some(minimal_exif(6)), ..Default::default() };
+        let base = encode(&img, &opts).unwrap();
+        let mut orig = Jpeg::from_bytes(Bytes::from(base.clone())).unwrap();
+        let xmp = Bytes::from_static(b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>");
+        orig.segments_mut().insert(1, JpegSegment::new_with_contents(markers::APP1, xmp.clone()));
+        orig.segments_mut().insert(1, JpegSegment::new_with_contents(markers::APP13, Bytes::from_static(b"Photoshop 3.0\0iptc")));
+        orig.segments_mut().insert(1, JpegSegment::new_with_contents(markers::COM, Bytes::from_static(b"hello")));
+        let mut orig_bytes = Vec::new();
+        orig.encoder().write_to(&mut orig_bytes).unwrap();
+
+        let merged = copy_jpeg_extras(&base, &orig_bytes).unwrap();
+        let j = Jpeg::from_bytes(Bytes::from(merged.clone())).unwrap();
+        assert_eq!(j.segments_by_marker(markers::COM).next().unwrap().contents().as_ref(), b"hello");
+        assert!(j.segments_by_marker(markers::APP13).next().is_some());
+        assert!(j.segments_by_marker(markers::APP1).any(|s| s.contents() == &xmp));
+        // Our own EXIF is still there, exactly once, and the file still decodes.
+        assert_eq!(j.segments_by_marker(markers::APP1).filter(|s| s.contents().starts_with(b"Exif")).count(), 1);
+        assert_eq!(image::load_from_memory(&merged).unwrap().width(), 16);
+        // Nothing to carry over: None.
+        assert!(copy_jpeg_extras(&base, &base).is_none());
+    }
+
+    #[test]
+    fn png_keeps_exif() {
+        use img_parts::{png::Png, Bytes, ImageEXIF};
+        let img = RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+        let opts = SaveOptions { format: SaveFormat::Png, keep_metadata: true, exif: Some(minimal_exif(6)), ..Default::default() };
+        let bytes = encode(&img, &opts).unwrap();
+        let p = Png::from_bytes(Bytes::from(bytes.clone())).unwrap();
+        assert_eq!(crate::decode::exif_orientation(&p.exif().unwrap()), 1);
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 4);
     }
 }
 

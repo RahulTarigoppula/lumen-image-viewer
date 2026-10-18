@@ -852,7 +852,7 @@ impl VideoMode {
                 widgets::separator_v(ui);
                 ui.label(RichText::new("B offset").color(p.muted).size(12.0));
                 let mut off = self.offset_frames;
-                if ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2)).on_hover_text("Shift B in frames (+ / − keys; Ctrl ×10)").changed() {
+                if ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)").changed() {
                     self.set_offset(off);
                 }
                 if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
@@ -1096,7 +1096,7 @@ impl VideoMode {
                         painter.add(egui::Shape::mesh(mesh));
                     }
                     if let Some((mean, max)) = self.diff_stats {
-                        let txt = format!("|A−B| × {:.0}   mean {:.2}   max {:.0}", self.gain, mean, max);
+                        let txt = format!("|A-B| x {:.0}   mean {:.2}   max {:.0}", self.gain, mean, max);
                         let g = painter.layout_no_wrap(txt, FontId::proportional(12.0), Color32::WHITE);
                         let r = Rect::from_min_size(view.min + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
                         painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(170));

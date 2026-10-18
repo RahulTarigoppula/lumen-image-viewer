@@ -162,11 +162,13 @@ pub struct Prompt {
     pub value: String,
     pub hint: String,
     pub focus_requested: bool,
+    /// Shown under the field (e.g. "a file with that name exists"); the prompt stays open.
+    pub error: Option<String>,
 }
 
 impl Prompt {
     pub fn new(title: &str, value: &str, hint: &str) -> Self {
-        Prompt { title: title.into(), value: value.into(), hint: hint.into(), focus_requested: false }
+        Prompt { title: title.into(), value: value.into(), hint: hint.into(), focus_requested: false, error: None }
     }
 }
 
@@ -188,9 +190,18 @@ pub fn show_prompt(ctx: &egui::Context, prompt: &mut Prompt) -> Option<bool> {
                 state.store(ui.ctx(), te.id);
             }
             prompt.focus_requested = true;
+        } else if prompt.error.is_some() && !te.has_focus() && !te.lost_focus() {
+            te.request_focus();
+        }
+        if te.changed() {
+            prompt.error = None;
         }
         if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             result = Some(true);
+        }
+        if let Some(e) = &prompt.error {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(e).color(ui.visuals().error_fg_color).size(12.5));
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {

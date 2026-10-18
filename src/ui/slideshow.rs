@@ -5,7 +5,7 @@
 //!   Space / P / click  pause or resume (FastStone convention: Space pauses)
 //!   → / PgDn / wheel ↓ next      ← / PgUp / wheel ↑ previous
 //!   Home / End         first / last
-//!   + / −              longer / shorter interval
+//!   + / -              longer / shorter interval
 //!   C caption, K Ken Burns, S shuffle, L loop, H help, Esc exit.
 //!
 //! Rendering never builds new textures during a transition: the next slide is
@@ -1198,7 +1198,7 @@ impl Slideshow {
         widgets::separator_v(&mut child);
 
         let cfg = &mut core.settings.slideshow;
-        child.label(RichText::new(I::TIMER).size(15.0).color(Color32::from_gray(190))).on_hover_text("Time per slide  (+ / −)");
+        child.label(RichText::new(I::TIMER).size(15.0).color(Color32::from_gray(190))).on_hover_text("Time per slide  (+ / -)");
         egui::ComboBox::from_id_salt("ss-interval").width(62.0).selected_text(fmt_secs(cfg.interval_secs)).show_ui(&mut child, |ui| {
             for v in INTERVALS {
                 ui.selectable_value(&mut cfg.interval_secs, v, fmt_secs(v));
@@ -1266,7 +1266,7 @@ impl Slideshow {
             ("←  PgUp  wheel ↑", "Previous image"),
             ("Right-click", "Previous image"),
             ("Home / End", "First / last image"),
-            ("+ / −", "Longer / shorter interval"),
+            ("+ / -", "Longer / shorter interval"),
             ("C", "Show / hide caption"),
             ("K", "Ken Burns pan & zoom"),
             ("S", "Shuffle"),

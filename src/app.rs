@@ -18,8 +18,11 @@ use crate::ui::save_dialog::{SaveDialog, SaveOutcome};
 use crate::ui::theme::{self, Palette};
 use crate::ui::viewer::{Viewer, ViewerEvent};
 use crate::ui::widgets::{self, Prompt, Toasts};
+use crossbeam_channel::{Receiver, Sender};
 use egui::{Key, RichText, Vec2};
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Services shared by every mode.
@@ -118,6 +121,34 @@ pub struct App {
     /// The running slideshow was started from the viewer (return there when it ends).
     slideshow_from_viewer: bool,
     first_frame_marked: bool,
+    /// Copy / move / paste / rotate jobs running off the UI thread.
+    file_jobs: FileJobs,
+    /// Ctrl+Alt+M asked to open this map link: waiting for the privacy
+    /// confirmation (url, "don't ask again" checkbox).
+    gps_confirm: Option<(String, bool)>,
+    /// Open floating windows, oldest first (Esc closes the last one).
+    window_stack: Vec<Win>,
+    /// Full screen was entered from the viewer: leave it when the viewer closes.
+    fullscreen_from_viewer: bool,
+    /// The window was maximized before going full screen.
+    maximized_before_fullscreen: bool,
+}
+
+/// Floating windows that Esc can close, most recently opened first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Win {
+    Help,
+    About,
+    Settings,
+    BatchConvert,
+    BatchRename,
+    ContactSheet,
+    Duplicates,
+    Metadata,
+    Print,
+    MultiPage,
+    Strip,
+    Zip,
 }
 
 impl App {
@@ -191,6 +222,11 @@ impl App {
             file_undo: Vec::new(),
             slideshow_from_viewer: false,
             first_frame_marked: false,
+            file_jobs: FileJobs::new(ctx.clone()),
+            gps_confirm: None,
+            window_stack: Vec::new(),
+            fullscreen_from_viewer: false,
+            maximized_before_fullscreen: false,
         };
         crate::ui::keymap::install(&app.core.settings);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -308,14 +344,25 @@ impl App {
         }
         self.viewer.edit = None;
         self.mode = Mode::Browser;
-        if self.fullscreen && self.core.settings.open_viewer_fullscreen {
+        if self.fullscreen && (self.core.settings.open_viewer_fullscreen || self.fullscreen_from_viewer) {
             self.set_fullscreen(false);
         }
     }
 
     fn set_fullscreen(&mut self, on: bool) {
+        let was = self.fullscreen;
+        if on && !was {
+            self.maximized_before_fullscreen = self.core.ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            self.fullscreen_from_viewer = self.mode == Mode::Viewer;
+        }
         self.fullscreen = on;
         self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if !on && was {
+            self.fullscreen_from_viewer = false;
+            if self.maximized_before_fullscreen {
+                self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
     }
 
     /// Keep the viewer's file list in sync with the browser after a listing refresh.
@@ -497,9 +544,8 @@ impl App {
                 }
                 match fileops::paste_files_from_clipboard() {
                     Ok(files) if !files.is_empty() => {
-                        let (done, errs) = fileops::transfer(&files, &self.browser.folder.clone(), false, fileops::Conflict::Rename);
-                        self.report_transfer(done.len(), errs, false);
-                        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+                        let dest = self.browser.folder.clone();
+                        self.file_jobs.submit(format!("Pasting {} item(s)", files.len()), transfer_job(files, dest, false));
                     }
                     _ => {
                         // Maybe an image bitmap: save it as a new PNG.
@@ -765,7 +811,8 @@ impl App {
             SaveAs => self.save(true),
             CopyImage => {
                 let img = if self.mode == Mode::Viewer { self.viewer.current_image(&self.core) } else { None };
-                let img = img.or_else(|| self.targets().first().and_then(|p| crate::decode::decode_file(p, Default::default()).ok()).map(|d| d.image));
+                let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
+                let img = img.or_else(|| self.targets().first().and_then(|p| crate::decode::decode_file(p, first_frame).ok()).map(|d| d.image));
                 match img {
                     Some(img) => match fileops::copy_image_to_clipboard(&img) {
                         Ok(()) => self.core.toasts.info("Image copied to clipboard"),
@@ -857,8 +904,11 @@ impl App {
                 match crate::meta::read_exif(&p).and_then(|e| e.gps) {
                     Some((lat, lon)) => {
                         let url = format!("https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}");
-                        if let Err(e) = std::process::Command::new("explorer.exe").arg(&url).spawn() {
-                            self.core.toasts.error(format!("Could not open the map: {e}"));
+                        if self.core.settings.gps_map_no_confirm {
+                            self.open_map_url(&url);
+                        } else {
+                            // The coordinates leave this PC: ask first.
+                            self.gps_confirm = Some((url, false));
                         }
                     }
                     None => self.core.toasts.info("This image has no GPS location"),
@@ -896,7 +946,9 @@ impl App {
             let targets: Vec<PathBuf> = self.media_targets().into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
             let (jpegs, others): (Vec<PathBuf>, Vec<PathBuf>) = targets.into_iter().partition(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p)));
             if others.is_empty() {
-                self.lossless_transform(&jpegs, t);
+                if !jpegs.is_empty() {
+                    self.file_jobs.submit(format!("{} ({} files)", t.label(), jpegs.len()), rotate_job(jpegs, Vec::new(), t, self.core.settings.jpeg_quality));
+                }
             } else {
                 self.confirm = Some(Confirm::Reencode { files: others, jpegs, t });
             }
@@ -947,61 +999,6 @@ impl App {
         ok
     }
 
-    /// Decode, transform and re-save non-JPEG files in place (after confirmation).
-    /// Animations, multi-page files, high bit depth images and icons are refused,
-    /// since re-encoding would lose frames or precision.
-    fn reencode_transform(&mut self, files: &[PathBuf], t: Transform) {
-        let mut ok = 0;
-        let mut skipped: Vec<String> = Vec::new();
-        let mut errs: Vec<String> = Vec::new();
-        for p in files {
-            let name = crate::ui::viewer::file_name(p);
-            let ext = crate::formats::ext_of(p);
-            if ext == "ico" || ext == "cur" {
-                skipped.push(format!("{name} (icon)"));
-                continue;
-            }
-            let Some(fmt) = crate::formats::SaveFormat::from_ext(&ext) else {
-                skipped.push(format!("{name} (format cannot be saved)"));
-                continue;
-            };
-            let d = match crate::decode::decode_file(p, Default::default()) {
-                Ok(d) => d,
-                Err(e) => {
-                    errs.push(format!("{name}: {e}"));
-                    continue;
-                }
-            };
-            if d.frame_count > 1 || d.frames.is_some() {
-                skipped.push(format!("{name} (animated or multi-page)"));
-                continue;
-            }
-            let ci = d.color_info.to_ascii_lowercase();
-            if ci.contains("16-bit") || ci.contains("32-bit") || ci.contains("float") {
-                skipped.push(format!("{name} (more than 8 bits per channel)"));
-                continue;
-            }
-            let out = t.apply(&d.image);
-            let opts = SaveOptions { format: fmt, jpeg_quality: self.core.settings.jpeg_quality, exif: d.exif.clone(), ..Default::default() };
-            match crate::encode::save(&out, p, &opts) {
-                Ok(()) => {
-                    ok += 1;
-                    self.forget_file(p);
-                }
-                Err(e) => errs.push(format!("{name}: {e}")),
-            }
-        }
-        if !skipped.is_empty() {
-            self.core.toasts.info(format!("Skipped {} file(s): {}", skipped.len(), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
-        }
-        if !errs.is_empty() {
-            self.core.toasts.error(format!("{} file(s) failed: {}", errs.len(), errs[0]));
-        }
-        if ok > 0 {
-            self.core.toasts.info(format!("{} applied to {ok} file(s)", t.label()));
-        }
-    }
-
     fn save(&mut self, save_as: bool) {
         let Some(path) = self.viewer.current().cloned().filter(|_| self.mode == Mode::Viewer) else {
             self.core.toasts.info("Open an image in the viewer to save it");
@@ -1026,12 +1023,22 @@ impl App {
             self.core.toasts.info("No changes to save");
             return;
         }
+        // Saving in place writes one 8-bit frame: never do that silently over an
+        // animation, a multi-page file or a high bit depth source.
+        if let Some(why) = lossy_resave_reason(loaded.as_ref().map(|l| &l.decoded), &path) {
+            let mut dlg = SaveDialog::new(edited_copy_name(&path), img, opts);
+            dlg.error = Some(format!("{why} Save the edited image under a new name to keep the original."));
+            self.save_dialog = Some(dlg);
+            return;
+        }
         opts.format = fmt.unwrap();
         self.do_save(&path, &img, &opts);
     }
 
     fn do_save(&mut self, path: &Path, img: &image::RgbaImage, opts: &SaveOptions) -> bool {
-        match crate::encode::save(img, path, opts) {
+        // The open file is the source of the comment / XMP / IPTC carried into a JPEG.
+        let source = self.viewer.current().cloned();
+        match crate::encode::save_from(img, path, opts, source.as_deref()) {
             Ok(()) => {
                 let same = self.viewer.current().map(|c| c == path).unwrap_or(false);
                 if same {
@@ -1075,7 +1082,8 @@ impl App {
         let target = match target {
             Some(t) => t,
             None => {
-                let img = img.or_else(|| path.as_ref().and_then(|p| crate::decode::decode_file(p, Default::default()).ok()).map(|d| d.image));
+                let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
+                let img = img.or_else(|| path.as_ref().and_then(|p| crate::decode::decode_file(p, first_frame).ok()).map(|d| d.image));
                 let Some(img) = img else { return };
                 let out = crate::settings::data_dir().join("wallpaper.jpg");
                 let _ = std::fs::create_dir_all(crate::settings::data_dir());
@@ -1137,24 +1145,86 @@ impl App {
     }
 
     fn transfer_files_now(&mut self, files: Vec<PathBuf>, dest: PathBuf, do_move: bool) {
-        let (done, errs) = fileops::transfer(&files, &dest, do_move, fileops::Conflict::Rename);
+        self.core.settings.copy_move_targets.retain(|p| p != &dest);
+        self.core.settings.copy_move_targets.insert(0, dest.clone());
+        self.core.settings.copy_move_targets.truncate(10);
+        let label = format!("{} {} item(s)", if do_move { "Moving" } else { "Copying" }, files.len());
+        self.file_jobs.submit(label, transfer_job(files, dest, do_move));
+    }
+
+    /// A background file job finished: update caches, tags, undo and the views.
+    fn finish_file_job(&mut self, res: JobResult) {
+        match res {
+            JobResult::Transfer { done, errs, dest, do_move } => self.finish_transfer(done, errs, dest, do_move),
+            JobResult::Rotate { label, lossless, reencoded, skipped, errs } => {
+                for p in lossless.iter().chain(&reencoded) {
+                    self.forget_file(p);
+                }
+                if !skipped.is_empty() {
+                    self.core.toasts.info(format!("Skipped {} file(s): {}", skipped.len(), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+                }
+                if !errs.is_empty() {
+                    self.core.toasts.error(format!("{} file(s) not changed - {}", errs.len(), errs[0]));
+                }
+                let ok = lossless.len() + reencoded.len();
+                if ok > 0 {
+                    let how = if reencoded.is_empty() { " - lossless" } else { "" };
+                    self.core.toasts.info(format!("{label}{how}{}", if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                }
+            }
+            JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
+        }
+    }
+
+    /// Small "Copying 3 of 10" card while background file jobs run.
+    fn file_job_progress(&mut self, ctx: &egui::Context, p: &Palette) {
+        if self.file_jobs.queued == 0 {
+            return;
+        }
+        let (label, done, total) = {
+            let s = self.file_jobs.status.lock();
+            (s.label.clone(), s.done, s.total)
+        };
+        let more = self.file_jobs.queued.saturating_sub(1);
+        egui::Area::new(egui::Id::new("file_job_progress"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(16.0, -16.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        let mut text = if total > 1 { format!("{label}: {} of {total}", (done + 1).min(total)) } else { format!("{label}...") };
+                        if more > 0 {
+                            text += &format!(" ({more} more queued)");
+                        }
+                        ui.label(RichText::new(text).color(p.text));
+                    });
+                    if total > 1 {
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(220.0));
+                    }
+                });
+            });
+    }
+
+    fn finish_transfer(&mut self, done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool) {
         if do_move && !done.is_empty() {
             let label = format!("Move {} item(s) to {}", done.len(), dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string()));
             self.push_file_undo(label, done.clone());
         }
+        if do_move {
+            self.core.tags.moved_many(&done);
+        }
         for (from, to) in &done {
             if do_move {
-                self.core.tags.moved(from, to);
                 self.core.loader.invalidate(from);
+                self.core.thumbs.forget(from);
                 self.viewer.remove_path(from);
             } else {
                 self.core.tags.copied(from, to);
             }
         }
         self.report_transfer(done.len(), errs, do_move);
-        self.core.settings.copy_move_targets.retain(|p| p != &dest);
-        self.core.settings.copy_move_targets.insert(0, dest.clone());
-        self.core.settings.copy_move_targets.truncate(10);
         self.browser.tree.invalidate(&dest);
         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
         if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
@@ -1239,14 +1309,17 @@ impl App {
         }
         let p = self.core.pal;
         let name = self.viewer.current().map(|c| crate::ui::viewer::file_name(c)).unwrap_or_default();
-        let can_save = self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
+        let lossy = self.viewer.current().and_then(|c| lossy_resave_reason(self.viewer.loaded(&self.core).as_ref().map(|l| &l.decoded), c));
+        let can_save = lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
         let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
         egui::Modal::new(egui::Id::unique("unsaved-guard")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("Unsaved changes");
             ui.add_space(4.0);
             ui.label(format!("\"{name}\" has edits that are not saved."));
-            if !can_save {
+            if let Some(why) = &lossy {
+                ui.label(RichText::new(format!("{why} Use Save as from the viewer.")).color(p.muted).size(12.0));
+            } else if !can_save {
                 ui.label(RichText::new("This format cannot be saved in place - use Save as from the viewer.").color(p.muted).size(12.0));
             }
             ui.add_space(10.0);
@@ -1359,6 +1432,7 @@ impl App {
             || self.save_dialog.is_some()
             || self.viewer.confirm_discard
             || self.pending_guard.is_some()
+            || self.gps_confirm.is_some()
     }
 
     fn tool_window_open(&self) -> bool {
@@ -1376,6 +1450,86 @@ impl App {
             || self.show_about
     }
 
+    fn open_windows(&self) -> Vec<Win> {
+        let mut v = Vec::new();
+        for (open, w) in [
+            (self.show_help, Win::Help),
+            (self.show_about, Win::About),
+            (self.show_settings, Win::Settings),
+            (self.batch_convert.is_some(), Win::BatchConvert),
+            (self.batch_rename.is_some(), Win::BatchRename),
+            (self.contact_sheet.is_some(), Win::ContactSheet),
+            (self.duplicates.is_some(), Win::Duplicates),
+            (self.metadata_dialog.is_some(), Win::Metadata),
+            (self.print_window.is_some(), Win::Print),
+            (self.multipage.is_some(), Win::MultiPage),
+            (self.strip.is_some(), Win::Strip),
+            (self.zip.is_some(), Win::Zip),
+        ] {
+            if open {
+                v.push(w);
+            }
+        }
+        v
+    }
+
+    /// Keep `window_stack` in opening order: drop closed windows, append new ones.
+    fn update_window_stack(&mut self) {
+        let open = self.open_windows();
+        self.window_stack.retain(|w| open.contains(w));
+        for w in open {
+            if !self.window_stack.contains(&w) {
+                self.window_stack.push(w);
+            }
+        }
+    }
+
+    /// Close one floating window the way its own close button does.
+    fn close_window(&mut self, w: Win) {
+        let reload = match w {
+            Win::Help => {
+                self.show_help = false;
+                false
+            }
+            Win::About => {
+                self.show_about = false;
+                false
+            }
+            Win::Settings => {
+                self.show_settings = false;
+                false
+            }
+            Win::BatchConvert => self.batch_convert.take().is_some(),
+            Win::BatchRename => {
+                self.batch_rename = None;
+                false
+            }
+            Win::ContactSheet => self.contact_sheet.take().is_some(),
+            Win::Duplicates => {
+                self.duplicates = None;
+                false
+            }
+            Win::Metadata => {
+                if let Some((_, files)) = self.metadata_dialog.take() {
+                    for f in &files {
+                        self.forget_file(f);
+                    }
+                }
+                true
+            }
+            Win::Print => {
+                self.print_window = None;
+                false
+            }
+            Win::MultiPage => self.multipage.take().is_some(),
+            Win::Strip => self.strip.take().is_some(),
+            Win::Zip => self.zip.take().is_some(),
+        };
+        if reload {
+            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        }
+    }
+
     /// Remember whether the last click landed in a floating window, so keys typed
     /// in a tool window (Duplicates, Batch rename, ...) do not drive the browser.
     fn track_window_focus(&mut self, ctx: &egui::Context) {
@@ -1386,7 +1540,9 @@ impl App {
         if pressed {
             self.click_in_window = over_window(press_pos.or(hover_pos));
         }
-        self.tool_window_active = self.tool_window_open() && (self.click_in_window || over_window(hover_pos));
+        // Help and About show text only: they never take keys from the viewer.
+        let capturing = self.open_windows().iter().any(|w| !matches!(w, Win::Help | Win::About));
+        self.tool_window_active = capturing && (self.click_in_window || over_window(hover_pos));
         if !self.tool_window_open() {
             self.click_in_window = false;
         }
@@ -1398,6 +1554,16 @@ impl App {
         self.track_window_focus(ctx);
         if self.modal_open() || keymap::capturing() {
             return;
+        }
+        self.update_window_stack();
+        // Esc closes the most recently opened floating window first.
+        if !ctx.egui_wants_keyboard_input() {
+            if let Some(&w) = self.window_stack.last() {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                    self.close_window(w);
+                    self.window_stack.pop();
+                }
+            }
         }
         let km = keymap::active();
         let typing = ctx.egui_wants_keyboard_input();
@@ -1467,12 +1633,59 @@ impl App {
 
     // ------------------------------------------------------------ dialogs
 
+    fn open_map_url(&mut self, url: &str) {
+        if let Err(e) = std::process::Command::new("explorer.exe").arg(url).spawn() {
+            self.core.toasts.error(format!("Could not open the map: {e}"));
+        }
+    }
+
+    /// "Open this location on openstreetmap.org?" (Ctrl+Alt+M), with "Don't ask again".
+    fn gps_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some((_, dont_ask)) = &mut self.gps_confirm else { return };
+        let mut choice: Option<bool> = None;
+        let resp = egui::Modal::new(egui::Id::new("gps-confirm")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Open map in browser?");
+            ui.add_space(4.0);
+            ui.label("Open this location on openstreetmap.org in your browser? This sends the coordinates to that website.");
+            ui.add_space(6.0);
+            ui.checkbox(dont_ask, "Don't ask again");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(format!("{}  Open map", I::MAP_PIN)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if resp.should_close() && choice.is_none() {
+            choice = Some(false);
+        }
+        match choice {
+            Some(true) => {
+                let (url, dont_ask) = self.gps_confirm.take().unwrap_or_default();
+                if dont_ask {
+                    self.core.settings.gps_map_no_confirm = true;
+                    self.core.settings.save();
+                }
+                self.open_map_url(&url);
+            }
+            Some(false) => self.gps_confirm = None,
+            None => {}
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.gps_confirm_dialog(ctx);
         let p = self.core.pal;
         if let Some((prompt, kind)) = &mut self.prompt {
             match widgets::show_prompt(ctx, prompt) {
                 Some(true) => {
                     let value = prompt.value.clone();
+                    // An error keeps the prompt open with the typed text.
+                    let mut error: Option<String> = None;
                     match kind {
                         PendingPrompt::Rename(path) => {
                             let path = path.clone();
@@ -1485,7 +1698,7 @@ impl App {
                                     self.browser.pending_select = Some(new);
                                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                                 }
-                                Err(e) => self.core.toasts.error(e.to_string()),
+                                Err(e) => error = Some(e.to_string()),
                             }
                         }
                         PendingPrompt::NewFolder(parent) => {
@@ -1498,11 +1711,18 @@ impl App {
                                         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                                     }
                                 }
-                                Err(e) => self.core.toasts.error(e.to_string()),
+                                Err(e) => error = Some(e.to_string()),
                             }
                         }
                     }
-                    self.prompt = None;
+                    match error {
+                        Some(e) => {
+                            if let Some((prompt, _)) = &mut self.prompt {
+                                prompt.error = Some(e);
+                            }
+                        }
+                        None => self.prompt = None,
+                    }
                 }
                 Some(false) => self.prompt = None,
                 None => {}
@@ -1537,8 +1757,8 @@ impl App {
             match widgets::show_confirm(ctx, "Re-encode files?", &body, "Re-encode", false, &p) {
                 Some(true) => {
                     self.confirm = None;
-                    self.lossless_transform(&jpegs, t);
-                    self.reencode_transform(&files, t);
+                    let n = jpegs.len() + files.len();
+                    self.file_jobs.submit(format!("{} ({n} files)", t.label()), rotate_job(jpegs, files, t, self.core.settings.jpeg_quality));
                 }
                 Some(false) => self.confirm = None,
                 None => {}
@@ -1652,7 +1872,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.label("A fast, private image & video viewer, browser, editor and converter for Windows.");
                 ui.add_space(4.0);
-                ui.label(RichText::new(format!("{}  100% offline. No telemetry, no accounts, no network access.", I::SHIELD_CHECK)).color(p.ok));
+                ui.label(RichText::new(format!("{}  No telemetry, no accounts. Lumen itself never connects to the internet; map links open in your browser only when you ask.", I::SHIELD_CHECK)).color(p.ok));
                 ui.add_space(8.0);
                 ui.hyperlink_to("github.com/RahulTarigoppula/lumen-image-viewer", "https://github.com/RahulTarigoppula/lumen-image-viewer");
                 ui.label(RichText::new("MIT licensed. Icons: Phosphor (MIT). Video decoding: FFmpeg (LGPL).").size(11.5).color(p.faint));
@@ -1668,8 +1888,8 @@ impl App {
         }
         if let Some(w) = &mut self.batch_rename {
             let (open, renamed) = w.show(ctx, &mut self.core);
+            self.core.tags.moved_many(&renamed);
             for (from, to) in &renamed {
-                self.core.tags.moved(from, to);
                 self.viewer.replace_path(from, to);
                 self.core.loader.invalidate(from);
                 self.core.thumbs.forget(from);
@@ -1762,7 +1982,7 @@ impl App {
         let p = self.core.pal;
         let mut open = true;
         let km = keymap::active();
-        egui::Window::new("Keyboard shortcuts").open(&mut open).default_size([640.0, 560.0]).show(ctx, |ui| {
+        egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).default_size([640.0, 560.0]).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Preset: {}", keymap::Preset::from_id(&self.core.settings.keymap_preset).label())).color(p.muted));
                 if ui.link("Change shortcuts...").clicked() {
@@ -1770,35 +1990,44 @@ impl App {
                     crate::ui::settings_window::open_page(ctx, "Keyboard");
                 }
             });
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // One grid for every section, so the key column lines up at the same x.
                 // Generated from the active keymap, so this list is always correct.
-                for mode in KeyMode::ALL {
-                    widgets::section_title(ui, &p, mode.label());
-                    egui::Grid::new(("help", mode.id())).num_columns(2).striped(true).min_col_width(240.0).show(ui, |ui| {
+                let no_wrap = |t: RichText| egui::Label::new(t).wrap_mode(egui::TextWrapMode::Extend);
+                let title = |ui: &mut egui::Ui, t: &str| {
+                    ui.add_space(8.0);
+                    ui.add(no_wrap(RichText::new(t).strong().size(13.5).color(p.text)));
+                    ui.end_row();
+                };
+                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 6.0]).show(ui, |ui| {
+                    for mode in KeyMode::ALL {
+                        title(ui, mode.label());
                         for c in Command::all() {
                             let keys = keymap::mode_text(&km, mode, c);
                             if keys.is_empty() {
                                 continue;
                             }
-                            ui.label(format!("{}  {}", c.icon(), c.label()));
-                            ui.label(RichText::new(keys).monospace().color(p.accent));
+                            ui.add(no_wrap(RichText::new(format!("{}  {}", c.icon(), c.label()))));
+                            ui.add(no_wrap(RichText::new(keys).monospace().color(p.accent)));
                             ui.end_row();
                         }
-                    });
-                    ui.add_space(8.0);
-                }
-                widgets::section_title(ui, &p, "Mouse");
-                for (k, v) in [
-                    ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
-                    ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
-                    ("Drag", "Pan a zoomed image"),
-                    ("Press & hold", "Magnifier loupe (when the image fits the window)"),
-                    ("Middle click", "Toggle fit / 100%"),
-                    ("Double click", "Back to the browser"),
-                    ("Back / forward buttons", "Previous / next image"),
-                ] {
-                    widgets::kv_row(ui, &p, k, v);
-                }
+                    }
+                    title(ui, "Mouse");
+                    for (k, v) in [
+                        ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
+                        ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
+                        ("Drag", "Pan a zoomed image"),
+                        ("Press & hold", "Magnifier loupe (when the image fits the window)"),
+                        ("Middle click", "Toggle fit / 100%"),
+                        ("Double click", "Back to the browser"),
+                        ("Back / forward buttons", "Previous / next image"),
+                    ] {
+                        ui.add(no_wrap(RichText::new(v)));
+                        ui.add(no_wrap(RichText::new(k).monospace().color(p.accent)));
+                        ui.end_row();
+                    }
+                });
             });
         });
         self.show_help = open;
@@ -1944,7 +2173,7 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let protect: Vec<PathBuf> = self.viewer.current().cloned().into_iter().collect();
+        let protect = self.viewer.protected_paths();
         let changed = self.core.loader.poll(&protect);
         let _ = changed;
         if self.core.meta.poll() && matches!(self.core.settings.sort_key, crate::settings::SortKey::Dimensions | crate::settings::SortKey::DateTaken) && self.core.meta.pending() == 0 {
@@ -1965,6 +2194,13 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.fullscreen && self.fullscreen_from_viewer && self.mode == Mode::Browser {
+            self.set_fullscreen(false);
+        }
+        while let Ok(res) = self.file_jobs.rx.try_recv() {
+            self.file_jobs.queued = self.file_jobs.queued.saturating_sub(1);
+            self.finish_file_job(res);
         }
         if self.last_save.elapsed().as_secs() > 5 {
             self.core.tags.save_if_dirty();
@@ -2015,7 +2251,7 @@ impl eframe::App for App {
                             ui.label(RichText::new(self.browser.status_text(&self.core)).size(12.0).color(p.muted));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new(format!("{} Offline & private", I::SHIELD_CHECK)).size(11.5).color(p.faint))
-                                    .on_hover_text("Lumen never connects to the internet. Ratings and tags are stored locally.");
+                                    .on_hover_text("Lumen itself never connects to the internet; map links open in your browser only when you ask. Ratings and tags are stored locally.");
                                 if self.browser.loading {
                                     ui.spinner();
                                 }
@@ -2172,6 +2408,7 @@ impl eframe::App for App {
         if let Some(c) = self.palette.show(&ctx, &p, &available) {
             self.run(c);
         }
+        self.file_job_progress(&ctx, &p);
         self.core.toasts.show(&ctx, &p);
         crate::devhook::prof("ui_total", frame_start);
     }
@@ -2181,6 +2418,19 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Let running copy / move jobs finish (bounded) so their tags and undo
+        // records are not lost.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while self.file_jobs.queued > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.file_jobs.rx.recv_timeout(left) {
+                Ok(res) => {
+                    self.file_jobs.queued -= 1;
+                    self.finish_file_job(res);
+                }
+                Err(_) => break,
+            }
+        }
         self.persist();
     }
 }
@@ -2241,3 +2491,188 @@ impl App {
 
 #[allow(dead_code)]
 fn _unused(_: &catalog::Entry) {}
+
+/// Why saving an edit in place over `path` would lose data (frames, pages or
+/// bit depth), or `None` when an in-place save is safe. Without decode info
+/// (evicted from the cache) formats that can hold more than one frame are
+/// treated as unsafe.
+fn lossy_resave_reason(decoded: Option<&crate::decode::Decoded>, path: &Path) -> Option<String> {
+    match decoded {
+        Some(d) if d.frames.is_some() => Some("This file is animated: saving it in place would keep only one frame.".into()),
+        Some(d) if d.frame_count > 1 => Some(format!("This file has {} pages: saving it in place would keep only one page.", d.frame_count)),
+        Some(d) if d.bit_depth > 8 => Some(format!("This image has {} bits per channel: saving it in place would reduce it to 8 bits.", d.bit_depth)),
+        Some(_) => None,
+        None => {
+            let ext = crate::formats::ext_of(path);
+            matches!(ext.as_str(), "gif" | "tif" | "tiff" | "webp" | "apng").then(|| "This file may be animated or have several pages: saving it in place could keep only one frame.".into())
+        }
+    }
+}
+
+/// "photo.gif" -> "photo edited.gif" (or "photo edited (2).gif" when taken).
+fn edited_copy_name(path: &Path) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image".into());
+    let name = match path.extension() {
+        Some(e) => format!("{stem} edited.{}", e.to_string_lossy()),
+        None => format!("{stem} edited"),
+    };
+    fileops::unique_path(&path.with_file_name(name))
+}
+
+// ------------------------------------------------------------ background file jobs
+
+/// Progress of the background file job that is running now.
+#[derive(Default)]
+struct JobStatus {
+    label: String,
+    done: usize,
+    total: usize,
+}
+
+/// What a finished background file job hands back to the UI thread.
+enum JobResult {
+    Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool },
+    Rotate { label: &'static str, lossless: Vec<PathBuf>, reencoded: Vec<PathBuf>, skipped: Vec<String>, errs: Vec<String> },
+    Panicked(String),
+}
+
+struct JobProgress {
+    status: Arc<Mutex<JobStatus>>,
+    ctx: egui::Context,
+}
+
+impl JobProgress {
+    fn set(&self, done: usize, total: usize) {
+        {
+            let mut s = self.status.lock();
+            s.done = done;
+            s.total = total;
+        }
+        self.ctx.request_repaint();
+    }
+}
+
+type FileJob = Box<dyn FnOnce(&JobProgress) -> JobResult + Send>;
+
+/// Copy / move / paste / rotate run on one worker thread, one job after the
+/// other: the UI never blocks and two jobs never touch the same file at once.
+struct FileJobs {
+    tx: Sender<(String, FileJob)>,
+    rx: Receiver<JobResult>,
+    status: Arc<Mutex<JobStatus>>,
+    /// Submitted jobs whose result has not been handled yet.
+    queued: usize,
+}
+
+impl FileJobs {
+    fn new(ctx: egui::Context) -> Self {
+        let (tx, jobs) = crossbeam_channel::unbounded::<(String, FileJob)>();
+        let (res_tx, rx) = crossbeam_channel::unbounded();
+        let status = Arc::new(Mutex::new(JobStatus::default()));
+        let st = status.clone();
+        let spawned = std::thread::Builder::new().name("lumen-file-jobs".into()).spawn(move || {
+            for (label, job) in jobs {
+                *st.lock() = JobStatus { label: label.clone(), done: 0, total: 0 };
+                let progress = JobProgress { status: st.clone(), ctx: ctx.clone() };
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&progress))).unwrap_or(JobResult::Panicked(label));
+                if res_tx.send(res).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+        if let Err(e) = spawned {
+            log::error!("cannot start the file job thread: {e}");
+        }
+        FileJobs { tx, rx, status, queued: 0 }
+    }
+
+    fn submit(&mut self, label: impl Into<String>, job: FileJob) {
+        if self.tx.send((label.into(), job)).is_ok() {
+            self.queued += 1;
+        }
+    }
+}
+
+/// Copy or move `files` into `dest` one by one, reporting progress.
+fn transfer_job(files: Vec<PathBuf>, dest: PathBuf, do_move: bool) -> FileJob {
+    Box::new(move |pr| {
+        let total = files.len();
+        let (mut done, mut errs) = (Vec::new(), Vec::new());
+        for (i, f) in files.iter().enumerate() {
+            pr.set(i, total);
+            let (d, e) = fileops::transfer(std::slice::from_ref(f), &dest, do_move, fileops::Conflict::Rename);
+            done.extend(d);
+            errs.extend(e);
+        }
+        JobResult::Transfer { done, errs, dest, do_move }
+    })
+}
+
+/// Lossless JPEG rotation of `jpegs`, then decode / transform / re-encode of
+/// `others` in place. Animations, multi-page files, high bit depth images and
+/// icons are skipped, since re-encoding would lose frames or precision.
+fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_quality: u8) -> FileJob {
+    Box::new(move |pr| {
+        let total = jpegs.len() + others.len();
+        let (mut lossless, mut reencoded, mut skipped, mut errs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, p) in jpegs.iter().enumerate() {
+            pr.set(i, total);
+            match crate::encode::lossless_jpeg_transform(p, t) {
+                Ok(_) => lossless.push(p.clone()),
+                Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
+            }
+        }
+        for (i, p) in others.iter().enumerate() {
+            pr.set(jpegs.len() + i, total);
+            let name = crate::ui::viewer::file_name(p);
+            let ext = crate::formats::ext_of(p);
+            if ext == "ico" || ext == "cur" {
+                skipped.push(format!("{name} (icon)"));
+                continue;
+            }
+            let Some(fmt) = crate::formats::SaveFormat::from_ext(&ext) else {
+                skipped.push(format!("{name} (format cannot be saved)"));
+                continue;
+            };
+            let d = match crate::decode::decode_file(p, Default::default()) {
+                Ok(d) => d,
+                Err(e) => {
+                    errs.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            if d.frame_count > 1 || d.frames.is_some() {
+                skipped.push(format!("{name} (animated or multi-page)"));
+                continue;
+            }
+            let ci = d.color_info.to_ascii_lowercase();
+            if d.bit_depth > 8 || ci.contains("16-bit") || ci.contains("32-bit") || ci.contains("float") {
+                skipped.push(format!("{name} (more than 8 bits per channel)"));
+                continue;
+            }
+            let out = t.apply(&d.image);
+            let opts = SaveOptions { format: fmt, jpeg_quality, exif: d.exif.clone(), ..Default::default() };
+            match crate::encode::save_from(&out, p, &opts, Some(p)) {
+                Ok(()) => reencoded.push(p.clone()),
+                Err(e) => errs.push(format!("{name}: {e}")),
+            }
+        }
+        JobResult::Rotate { label: t.label(), lossless, reencoded, skipped, errs }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edited_copy_names() {
+        let d = std::env::temp_dir().join(format!("lumen-app-names-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        assert_eq!(edited_copy_name(&d.join("a.gif")), d.join("a edited.gif"));
+        assert_eq!(lossy_resave_reason(None, Path::new("x.png")), None);
+        assert!(lossy_resave_reason(None, Path::new("x.GIF")).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
