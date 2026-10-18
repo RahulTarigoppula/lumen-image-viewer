@@ -114,8 +114,7 @@ pub fn encode(img: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
             }
         }
         SaveFormat::Ico => {
-            let s = crate::imaging::resize_to_fit(img, 256, 256);
-            image::DynamicImage::ImageRgba8(s).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Ico)?;
+            out = encode_ico(img)?;
         }
         other => {
             let fmt = match other {
@@ -135,6 +134,96 @@ pub fn encode(img: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Standard icon sizes written into saved .ico files.
+pub const ICO_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+
+/// Multi-resolution ICO: every standard size up to the source's long side
+/// (at least 16), each a square PNG-compressed RGBA entry (Vista+ format).
+pub fn encode_ico(img: &RgbaImage) -> Result<Vec<u8>> {
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Err(anyhow!("Cannot save an empty image as ICO"));
+    }
+    let long = w.max(h);
+    let mut sizes: Vec<u32> = ICO_SIZES.iter().copied().filter(|&s| s <= long).collect();
+    if sizes.is_empty() {
+        sizes.push(16);
+    }
+    let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
+    for &side in &sizes {
+        let fitted = crate::imaging::resize_to_fit(img, side, side);
+        // Center on a transparent square canvas.
+        let mut canvas = RgbaImage::new(side, side);
+        let ox = (side - fitted.width().min(side)) / 2;
+        let oy = (side - fitted.height().min(side)) / 2;
+        image::imageops::overlay(&mut canvas, &fitted, ox as i64, oy as i64);
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png).write_image(canvas.as_raw(), side, side, image::ExtendedColorType::Rgba8)?;
+        entries.push((side, png));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0, 0, 1, 0]);
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * entries.len();
+    for (side, png) in &entries {
+        let b = if *side >= 256 { 0 } else { *side as u8 };
+        out.extend_from_slice(&[b, b, 0, 0]);
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bpp
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += png.len();
+    }
+    for (_, png) in entries {
+        out.extend_from_slice(&png);
+    }
+    Ok(out)
+}
+
+/// True when WebP `bytes` use the lossless (VP8L) codec, so callers can keep
+/// lossless sources lossless when re-saving.
+pub fn webp_is_lossless(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+    // Walk the chunks: simple files start with VP8 / VP8L, extended (VP8X)
+    // ones carry the image chunk (or ANMF frames) later.
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]) as usize;
+        match id {
+            b"VP8L" => return true,
+            b"VP8 " => return false,
+            b"ANMF" => {
+                // Frame header is 16 bytes, then the frame's own chunks.
+                let inner = pos + 8 + 16;
+                if inner + 4 <= bytes.len() {
+                    return &bytes[inner..inner + 4] == b"VP8L";
+                }
+                return false;
+            }
+            _ => {}
+        }
+        pos = match pos.checked_add(8 + len + (len & 1)) {
+            Some(p) => p,
+            None => return false,
+        };
+    }
+    false
+}
+
+/// Path of a WebP file whose existing encoding is lossless.
+pub fn webp_file_is_lossless(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut head = vec![0u8; 64 * 1024];
+    let n = f.read(&mut head).unwrap_or(0);
+    webp_is_lossless(&head[..n])
 }
 
 /// Save atomically (write temp file, then replace) so a failure never destroys the original.
@@ -259,7 +348,7 @@ pub fn lossless_jpeg_transform(path: &Path, op: crate::edit::Transform) -> Resul
 }
 
 /// A tiny little-endian TIFF block containing only the orientation tag.
-fn minimal_exif(orientation: u16) -> Vec<u8> {
+pub(crate) fn minimal_exif(orientation: u16) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"II*\0");
     v.extend_from_slice(&8u32.to_le_bytes());
@@ -294,6 +383,33 @@ mod tests {
         let mut e = minimal_exif(1);
         assert!(exif_set_orientation(&mut e, 6));
         assert_eq!(crate::decode::exif_orientation(&e), 6);
+    }
+
+    #[test]
+    fn webp_lossless_detection() {
+        let img = RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        let lossy = encode(&img, &SaveOptions { format: SaveFormat::WebP, webp_lossless: false, ..Default::default() }).unwrap();
+        let lossless = encode(&img, &SaveOptions { format: SaveFormat::WebP, webp_lossless: true, ..Default::default() }).unwrap();
+        assert!(!webp_is_lossless(&lossy));
+        assert!(webp_is_lossless(&lossless));
+        assert!(!webp_is_lossless(b"RIFF"));
+        assert!(!webp_is_lossless(&[]));
+        assert_eq!(SaveFormat::WebP.label(), "WebP");
+    }
+
+    #[test]
+    fn ico_has_all_sizes() {
+        let img = RgbaImage::from_pixel(300, 150, image::Rgba([10, 200, 30, 255]));
+        let bytes = encode(&img, &SaveOptions { format: SaveFormat::Ico, ..Default::default() }).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 7);
+        let d = crate::decode::decode_bytes(&bytes, "ico", Default::default()).unwrap();
+        assert_eq!(d.image.dimensions(), (256, 256));
+        assert_eq!(d.frame_count, 7);
+        // Letterboxed: top rows transparent, middle opaque.
+        assert_eq!(d.image.get_pixel(128, 2).0[3], 0);
+        assert_eq!(d.image.get_pixel(128, 128).0, [10, 200, 30, 255]);
+        let small = encode(&RgbaImage::new(20, 20), &SaveOptions { format: SaveFormat::Ico, ..Default::default() }).unwrap();
+        assert_eq!(u16::from_le_bytes([small[4], small[5]]), 1);
     }
 
     #[test]
