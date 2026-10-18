@@ -56,17 +56,20 @@ jobs:
           if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) { choco install llvm -y --no-progress }
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+      - name: Check UI text uses plain punctuation
+        run: python tools/scrub_text.py --check src
+
       - name: Test
         run: cargo test --release
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --profile dist
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\lumen.exe dist\Lumen.exe
+          Copy-Item target\dist\lumen.exe dist\Lumen.exe
           Copy-Item LICENSE dist\
           Copy-Item THIRD-PARTY-NOTICES.md dist\
           Compress-Archive -Path dist\* -DestinationPath dist\Lumen-portable.zip

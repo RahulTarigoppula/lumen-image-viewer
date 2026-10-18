@@ -67,10 +67,17 @@ winresource = "0.1"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 8
 panic = "unwind"
 strip = true
+debug = false
+
+# Published binaries: slower to build, smallest and fastest exe.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [profile.dev]
 opt-level = 1
