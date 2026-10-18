@@ -126,6 +126,29 @@ pub struct App {
     /// Ctrl+Alt+M asked to open this map link: waiting for the privacy
     /// confirmation (url, "don't ask again" checkbox).
     gps_confirm: Option<(String, bool)>,
+    /// Open floating windows, oldest first (Esc closes the last one).
+    window_stack: Vec<Win>,
+    /// Full screen was entered from the viewer: leave it when the viewer closes.
+    fullscreen_from_viewer: bool,
+    /// The window was maximized before going full screen.
+    maximized_before_fullscreen: bool,
+}
+
+/// Floating windows that Esc can close, most recently opened first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Win {
+    Help,
+    About,
+    Settings,
+    BatchConvert,
+    BatchRename,
+    ContactSheet,
+    Duplicates,
+    Metadata,
+    Print,
+    MultiPage,
+    Strip,
+    Zip,
 }
 
 impl App {
@@ -201,6 +224,9 @@ impl App {
             first_frame_marked: false,
             file_jobs: FileJobs::new(ctx.clone()),
             gps_confirm: None,
+            window_stack: Vec::new(),
+            fullscreen_from_viewer: false,
+            maximized_before_fullscreen: false,
         };
         crate::ui::keymap::install(&app.core.settings);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -318,14 +344,25 @@ impl App {
         }
         self.viewer.edit = None;
         self.mode = Mode::Browser;
-        if self.fullscreen && self.core.settings.open_viewer_fullscreen {
+        if self.fullscreen && (self.core.settings.open_viewer_fullscreen || self.fullscreen_from_viewer) {
             self.set_fullscreen(false);
         }
     }
 
     fn set_fullscreen(&mut self, on: bool) {
+        let was = self.fullscreen;
+        if on && !was {
+            self.maximized_before_fullscreen = self.core.ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            self.fullscreen_from_viewer = self.mode == Mode::Viewer;
+        }
         self.fullscreen = on;
         self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if !on && was {
+            self.fullscreen_from_viewer = false;
+            if self.maximized_before_fullscreen {
+                self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
     }
 
     /// Keep the viewer's file list in sync with the browser after a listing refresh.
@@ -1413,6 +1450,86 @@ impl App {
             || self.show_about
     }
 
+    fn open_windows(&self) -> Vec<Win> {
+        let mut v = Vec::new();
+        for (open, w) in [
+            (self.show_help, Win::Help),
+            (self.show_about, Win::About),
+            (self.show_settings, Win::Settings),
+            (self.batch_convert.is_some(), Win::BatchConvert),
+            (self.batch_rename.is_some(), Win::BatchRename),
+            (self.contact_sheet.is_some(), Win::ContactSheet),
+            (self.duplicates.is_some(), Win::Duplicates),
+            (self.metadata_dialog.is_some(), Win::Metadata),
+            (self.print_window.is_some(), Win::Print),
+            (self.multipage.is_some(), Win::MultiPage),
+            (self.strip.is_some(), Win::Strip),
+            (self.zip.is_some(), Win::Zip),
+        ] {
+            if open {
+                v.push(w);
+            }
+        }
+        v
+    }
+
+    /// Keep `window_stack` in opening order: drop closed windows, append new ones.
+    fn update_window_stack(&mut self) {
+        let open = self.open_windows();
+        self.window_stack.retain(|w| open.contains(w));
+        for w in open {
+            if !self.window_stack.contains(&w) {
+                self.window_stack.push(w);
+            }
+        }
+    }
+
+    /// Close one floating window the way its own close button does.
+    fn close_window(&mut self, w: Win) {
+        let reload = match w {
+            Win::Help => {
+                self.show_help = false;
+                false
+            }
+            Win::About => {
+                self.show_about = false;
+                false
+            }
+            Win::Settings => {
+                self.show_settings = false;
+                false
+            }
+            Win::BatchConvert => self.batch_convert.take().is_some(),
+            Win::BatchRename => {
+                self.batch_rename = None;
+                false
+            }
+            Win::ContactSheet => self.contact_sheet.take().is_some(),
+            Win::Duplicates => {
+                self.duplicates = None;
+                false
+            }
+            Win::Metadata => {
+                if let Some((_, files)) = self.metadata_dialog.take() {
+                    for f in &files {
+                        self.forget_file(f);
+                    }
+                }
+                true
+            }
+            Win::Print => {
+                self.print_window = None;
+                false
+            }
+            Win::MultiPage => self.multipage.take().is_some(),
+            Win::Strip => self.strip.take().is_some(),
+            Win::Zip => self.zip.take().is_some(),
+        };
+        if reload {
+            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        }
+    }
+
     /// Remember whether the last click landed in a floating window, so keys typed
     /// in a tool window (Duplicates, Batch rename, ...) do not drive the browser.
     fn track_window_focus(&mut self, ctx: &egui::Context) {
@@ -1423,7 +1540,9 @@ impl App {
         if pressed {
             self.click_in_window = over_window(press_pos.or(hover_pos));
         }
-        self.tool_window_active = self.tool_window_open() && (self.click_in_window || over_window(hover_pos));
+        // Help and About show text only: they never take keys from the viewer.
+        let capturing = self.open_windows().iter().any(|w| !matches!(w, Win::Help | Win::About));
+        self.tool_window_active = capturing && (self.click_in_window || over_window(hover_pos));
         if !self.tool_window_open() {
             self.click_in_window = false;
         }
@@ -1435,6 +1554,16 @@ impl App {
         self.track_window_focus(ctx);
         if self.modal_open() || keymap::capturing() {
             return;
+        }
+        self.update_window_stack();
+        // Esc closes the most recently opened floating window first.
+        if !ctx.egui_wants_keyboard_input() {
+            if let Some(&w) = self.window_stack.last() {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                    self.close_window(w);
+                    self.window_stack.pop();
+                }
+            }
         }
         let km = keymap::active();
         let typing = ctx.egui_wants_keyboard_input();
@@ -1555,6 +1684,8 @@ impl App {
             match widgets::show_prompt(ctx, prompt) {
                 Some(true) => {
                     let value = prompt.value.clone();
+                    // An error keeps the prompt open with the typed text.
+                    let mut error: Option<String> = None;
                     match kind {
                         PendingPrompt::Rename(path) => {
                             let path = path.clone();
@@ -1567,7 +1698,7 @@ impl App {
                                     self.browser.pending_select = Some(new);
                                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                                 }
-                                Err(e) => self.core.toasts.error(e.to_string()),
+                                Err(e) => error = Some(e.to_string()),
                             }
                         }
                         PendingPrompt::NewFolder(parent) => {
@@ -1580,11 +1711,18 @@ impl App {
                                         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                                     }
                                 }
-                                Err(e) => self.core.toasts.error(e.to_string()),
+                                Err(e) => error = Some(e.to_string()),
                             }
                         }
                     }
-                    self.prompt = None;
+                    match error {
+                        Some(e) => {
+                            if let Some((prompt, _)) = &mut self.prompt {
+                                prompt.error = Some(e);
+                            }
+                        }
+                        None => self.prompt = None,
+                    }
                 }
                 Some(false) => self.prompt = None,
                 None => {}
@@ -1844,7 +1982,7 @@ impl App {
         let p = self.core.pal;
         let mut open = true;
         let km = keymap::active();
-        egui::Window::new("Keyboard shortcuts").open(&mut open).default_size([640.0, 560.0]).show(ctx, |ui| {
+        egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).default_size([640.0, 560.0]).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Preset: {}", keymap::Preset::from_id(&self.core.settings.keymap_preset).label())).color(p.muted));
                 if ui.link("Change shortcuts...").clicked() {
@@ -1852,35 +1990,44 @@ impl App {
                     crate::ui::settings_window::open_page(ctx, "Keyboard");
                 }
             });
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // One grid for every section, so the key column lines up at the same x.
                 // Generated from the active keymap, so this list is always correct.
-                for mode in KeyMode::ALL {
-                    widgets::section_title(ui, &p, mode.label());
-                    egui::Grid::new(("help", mode.id())).num_columns(2).striped(true).min_col_width(240.0).show(ui, |ui| {
+                let no_wrap = |t: RichText| egui::Label::new(t).wrap_mode(egui::TextWrapMode::Extend);
+                let title = |ui: &mut egui::Ui, t: &str| {
+                    ui.add_space(8.0);
+                    ui.add(no_wrap(RichText::new(t).strong().size(13.5).color(p.text)));
+                    ui.end_row();
+                };
+                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 6.0]).show(ui, |ui| {
+                    for mode in KeyMode::ALL {
+                        title(ui, mode.label());
                         for c in Command::all() {
                             let keys = keymap::mode_text(&km, mode, c);
                             if keys.is_empty() {
                                 continue;
                             }
-                            ui.label(format!("{}  {}", c.icon(), c.label()));
-                            ui.label(RichText::new(keys).monospace().color(p.accent));
+                            ui.add(no_wrap(RichText::new(format!("{}  {}", c.icon(), c.label()))));
+                            ui.add(no_wrap(RichText::new(keys).monospace().color(p.accent)));
                             ui.end_row();
                         }
-                    });
-                    ui.add_space(8.0);
-                }
-                widgets::section_title(ui, &p, "Mouse");
-                for (k, v) in [
-                    ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
-                    ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
-                    ("Drag", "Pan a zoomed image"),
-                    ("Press & hold", "Magnifier loupe (when the image fits the window)"),
-                    ("Middle click", "Toggle fit / 100%"),
-                    ("Double click", "Back to the browser"),
-                    ("Back / forward buttons", "Previous / next image"),
-                ] {
-                    widgets::kv_row(ui, &p, k, v);
-                }
+                    }
+                    title(ui, "Mouse");
+                    for (k, v) in [
+                        ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
+                        ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
+                        ("Drag", "Pan a zoomed image"),
+                        ("Press & hold", "Magnifier loupe (when the image fits the window)"),
+                        ("Middle click", "Toggle fit / 100%"),
+                        ("Double click", "Back to the browser"),
+                        ("Back / forward buttons", "Previous / next image"),
+                    ] {
+                        ui.add(no_wrap(RichText::new(v)));
+                        ui.add(no_wrap(RichText::new(k).monospace().color(p.accent)));
+                        ui.end_row();
+                    }
+                });
             });
         });
         self.show_help = open;
@@ -2047,6 +2194,9 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.fullscreen && self.fullscreen_from_viewer && self.mode == Mode::Browser {
+            self.set_fullscreen(false);
         }
         while let Ok(res) = self.file_jobs.rx.try_recv() {
             self.file_jobs.queued = self.file_jobs.queued.saturating_sub(1);

@@ -43,7 +43,7 @@ impl Default for SaveOptions {
     fn default() -> Self {
         SaveOptions {
             format: SaveFormat::Jpeg,
-            jpeg_quality: 92,
+            jpeg_quality: 90,
             jpeg_progressive: false,
             jpeg_chroma: Chroma::S420,
             webp_quality: 88.0,
