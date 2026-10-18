@@ -6,7 +6,7 @@ args = [a for a in sys.argv[1:] if a != "--check"]
 roots = args or ["src", "README.md", "THIRD-PARTY-NOTICES.md", "docs"]
 # Curly double quotes map to a single quote: a bare " would end a Rust string literal.
 REPL = [(" — ", " - "), ("—", " - "), (" – ", " - "), ("–", "-"), ("…", "..."),
-        ("“", "'"), ("”", "'"), ("‘", "'"), ("’", "'")]
+        ("“", "'"), ("”", "'"), ("‘", "'"), ("’", "'"), ("−", "-"), ("›", ">"), ("‹", "<")]
 changed = 0
 for r in roots:
     p = pathlib.Path(r)
