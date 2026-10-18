@@ -34,6 +34,10 @@ if (VCPKG_TARGET_ARCHITECTURE STREQUAL "x86" OR VCPKG_TARGET_ARCHITECTURE STREQU
 endif()
 
 set(OPTIONS "--enable-pic --disable-doc --enable-runtime-cpudetect --disable-autodetect --disable-encoders --disable-muxers --disable-devices --disable-filters --disable-network --disable-protocols --enable-protocol=file --disable-decoder=sanm")  # Lumen: decode-only build (sanm hangs MSVC 2019)
+if(VCPKG_TARGET_IS_WINDOWS AND NOT VCPKG_TARGET_IS_MINGW)
+    # Lumen: stdalign.h shim for older Windows SDKs (see msvc-shim/stdalign.h)
+    string(APPEND OPTIONS " --extra-cflags=-I${CMAKE_CURRENT_LIST_DIR}/msvc-shim")
+endif()
 
 if(VCPKG_TARGET_IS_MINGW)
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x86")
