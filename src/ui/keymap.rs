@@ -180,7 +180,13 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+B", Blur),
             ("Ctrl+Shift+E", Effects),
             ("Ctrl+Shift+A", AutoEnhance),
-            ("T", AddText),
+            ("T", DrawBoard),
+            ("Shift+T", AddText),
+            ("J", CloneStamp),
+            ("Shift+J", HealingBrush),
+            ("Y", RedEye),
+            ("Shift+M", Selection),
+            ("B", BlurRegion),
             ("Ctrl+Z", Undo),
             ("Ctrl+Y", Redo),
             ("Ctrl+Shift+Z", Redo),
@@ -252,7 +258,7 @@ fn faststone_extras(mode: KeyMode) -> Vec<(&'static str, Command)> {
     match mode {
         KeyMode::Global => vec![],
         KeyMode::Browser => vec![],
-        KeyMode::Viewer => vec![("A", ZoomActual), ("B", ZoomFit)],
+        KeyMode::Viewer => vec![("A", ZoomActual)],
     }
 }
 

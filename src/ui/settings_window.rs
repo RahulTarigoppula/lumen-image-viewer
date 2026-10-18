@@ -1241,7 +1241,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
 
     section_title(ui, p, "Preset");
     card(ui, p, |ui| {
-        row(ui, p, "Shortcut preset", "FastStone compatible adds A / B for actual size / fit and leaves Space and ` free.", |ui| {
+        row(ui, p, "Shortcut preset", "FastStone compatible adds A for actual size and leaves Space and ` free.", |ui| {
             egui::ComboBox::from_id_salt("settings-keymap-preset").width(200.0).selected_text(preset.label()).show_ui(ui, |ui| {
                 for pr in Preset::ALL {
                     if ui.selectable_label(pr == preset, pr.label()).clicked() && pr != preset {

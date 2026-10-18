@@ -109,6 +109,12 @@ pub enum Command {
     CreateMultiPage,
     ImageStrip,
     CreateZip,
+    DrawBoard,
+    CloneStamp,
+    HealingBrush,
+    RedEye,
+    BlurRegion,
+    Selection,
 }
 
 use Command::*;
@@ -218,6 +224,12 @@ impl Command {
             CreateMultiPage => "Create multi-page file (PDF/TIFF/GIF)...".into(),
             ImageStrip => "Join images (strip)...".into(),
             CreateZip => "Create ZIP archive...".into(),
+            DrawBoard => "Draw board...".into(),
+            CloneStamp => "Clone stamp...".into(),
+            HealingBrush => "Healing brush...".into(),
+            RedEye => "Red-eye removal...".into(),
+            BlurRegion => "Blur / pixelate region...".into(),
+            Selection => "Selection...".into(),
         }
     }
 
@@ -329,6 +341,12 @@ impl Command {
             CreateMultiPage => I::FILES,
             ImageStrip => I::COLUMNS,
             CreateZip => I::FILE_ZIP,
+            DrawBoard => I::SCRIBBLE,
+            CloneStamp => I::COPY,
+            HealingBrush => I::BANDAIDS,
+            RedEye => I::EYE,
+            BlurRegion => I::DOTS_NINE,
+            Selection => I::SELECTION,
         }
     }
 
@@ -345,7 +363,8 @@ impl Command {
             Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, Exit,
+            CreateMultiPage, ImageStrip, CreateZip, DrawBoard, CloneStamp, HealingBrush, RedEye, BlurRegion, Selection,
+            Exit,
         ];
         for n in 0..=5 {
             v.push(Rate(n));
@@ -371,7 +390,7 @@ impl Command {
             ShowFlaggedOnly, OpenVideoMode, OpenViewer, CloseViewer, NextImage, PrevImage, FirstImage, LastImage, ZoomIn,
             ZoomOut, ZoomActual, ZoomFit, CycleFit, FitWidth, FitHeight, ToggleLockZoom, RotateLeft, RotateRight, FlipHorizontal,
             FlipVertical, Crop, Resize, CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance,
-            AddText, AddBorder, Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper,
+            AddText, AddBorder, Watermark, FreeRotate, DrawBoard, CloneStamp, HealingBrush, RedEye, BlurRegion, Selection, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper,
             Print, ToggleInfo, ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, NextFrame, PrevFrame,
             OpenWithEditor,
         ]);
