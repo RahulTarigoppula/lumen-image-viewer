@@ -24,6 +24,7 @@ mod video;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    devhook::mark("main");
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
         let dir = settings::data_dir();
@@ -36,6 +37,7 @@ fn main() -> eframe::Result {
     let initial: Option<PathBuf> = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
     let settings = settings::Settings::load();
+    devhook::mark("settings");
 
     // Single instance: if Lumen is already running, hand it the file and exit.
     // Any failure falls through to a normal start (see shell.rs).
@@ -74,6 +76,7 @@ fn main() -> eframe::Result {
         persist_window: false,
         ..Default::default()
     };
+    devhook::mark("run_native");
     eframe::run_native(
         "Lumen",
         options,
