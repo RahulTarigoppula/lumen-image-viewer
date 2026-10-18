@@ -177,7 +177,7 @@ impl EditTool for Selection {
         c |= slider_ex(ui, "Feather", &mut self.feather, 0.0..=(short / 10.0).max(5.0), (short / 200.0).round().max(1.0), " px", 0.5, 1, true);
         ui.horizontal(|ui| {
             ui.add_space(super::LABEL_W + 4.0);
-            c |= ui.checkbox(&mut self.invert, "Invert (outside)").changed();
+            c |= ui.checkbox(&mut self.invert, "Invert").on_hover_text("Adjust everything outside the selection").changed();
             ui.checkbox(&mut self.show_outline, "Show outline");
         });
         section(ui, cx, &format!("Areas ({})", self.ed.shapes.len()));
@@ -323,6 +323,13 @@ impl EditTool for RedEye {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Selection {
+        pub fn push_shape_for_bench(&mut self, s: Shape) {
+            self.inner = Box::new(super::super::AdjustColors { brightness: 30.0, ..Default::default() });
+            self.ed.push(s);
+        }
+    }
 
     #[test]
     fn selection_limits_effect() {

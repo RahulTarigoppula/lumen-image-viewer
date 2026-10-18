@@ -439,6 +439,57 @@ mod tests {
         assert!(make_tool_by_name("nope").is_none());
     }
 
+    /// Timing of the interactive tools' final render on 50 MP:
+    /// `cargo test bench_tools_50mp -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_tools_50mp() {
+        use crate::edit::mask::Shape;
+        use crate::edit::raster::{DrawObj, Kind};
+        use crate::edit::retouch::{self, BrushStroke, Obscure};
+        let img = RgbaImage::from_fn(8660, 5774, |x, y| image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x ^ y) % 256) as u8, 255]));
+        let t = |name: &str, f: &dyn Fn() -> RgbaImage| {
+            let s = std::time::Instant::now();
+            let o = f();
+            eprintln!("{name:>16}: {:>6} ms  ({}x{})", s.elapsed().as_millis(), o.width(), o.height());
+        };
+        let objs = vec![
+            DrawObj { kind: Kind::Arrow, pts: vec![[100.0, 100.0], [8000.0, 5000.0]], width: 40.0, shadow: true, ..Default::default() },
+            DrawObj { kind: Kind::Rect, pts: vec![[50.0, 50.0], [8600.0, 5700.0]], width: 30.0, ..Default::default() },
+            DrawObj { kind: Kind::Highlighter, pts: vec![[100.0, 3000.0], [8500.0, 3100.0]], width: 200.0, color: [255, 230, 0, 255], ..Default::default() },
+            DrawObj { kind: Kind::Number, pts: vec![[4000.0, 2000.0]], font_px: 400.0, number: 3, ..Default::default() },
+        ];
+        t("draw board", &|| crate::edit::raster::render_all(&img, &objs, 1.0));
+        let stroke = |heal| BrushStroke { pts: (0..60).map(|i| [2000.0 + i as f32 * 40.0, 3000.0 + (i as f32 * 0.2).sin() * 300.0]).collect(), radius: 150.0, hardness: 0.5, opacity: 1.0, offset: [-800.0, -600.0], heal };
+        t("clone stroke", &|| {
+            let mut o = img.clone();
+            retouch::apply_strokes(&mut o, &[stroke(false)], 1.0);
+            o
+        });
+        t("heal stroke", &|| {
+            let mut o = img.clone();
+            retouch::apply_strokes(&mut o, &[stroke(true)], 1.0);
+            o
+        });
+        let shapes = vec![Shape::Rect([500.0, 500.0, 3500.0, 2500.0]), Shape::Ellipse([4000.0, 3000.0, 7000.0, 5000.0])];
+        for (n, m) in [("pixelate", Obscure::Pixelate(60.0)), ("blur region", Obscure::Blur(40.0)), ("fill region", Obscure::Fill([0, 0, 0, 255]))] {
+            t(n, &|| {
+                let mut o = img.clone();
+                retouch::obscure(&mut o, &shapes, m, 6.0, 1.0);
+                o
+            });
+        }
+        t("red eye", &|| {
+            let mut o = img.clone();
+            retouch::red_eye(&mut o, &[[3000.0, 2000.0, 3400.0, 2400.0]], 1.0, 0.5, 0.5);
+            o
+        });
+        let mut sel = region::Selection::default();
+        sel.push_shape_for_bench(Shape::Ellipse([1000.0, 1000.0, 7000.0, 5000.0]));
+        t("selection", &|| sel.apply(&img, 1.0));
+        t("shadows/highl.", &|| AdjustColors { shadows: 60.0, highlights: 40.0, ..Default::default() }.apply(&img, 1.0));
+    }
+
     #[test]
     fn adjust_colors_shadows_highlights() {
         let img = RgbaImage::from_fn(64, 32, |x, _| if x < 32 { image::Rgba([25, 25, 25, 255]) } else { image::Rgba([240, 240, 240, 255]) });

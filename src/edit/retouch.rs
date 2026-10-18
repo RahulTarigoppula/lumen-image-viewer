@@ -212,8 +212,13 @@ pub fn red_eye(img: &mut RgbaImage, boxes: &[[f32; 4]], scale: f32, sensitivity:
                 *v = e * red;
             }
         });
-        // Soften the weight map a little so the correction has no speckles.
-        mask::blur_plane(&mut wgt, wu, hu, (rx.min(ry) * 0.06).clamp(0.6, 6.0));
+        // Fill speckles and grow the weight slightly so the anti-aliased rim of
+        // the pupil is corrected too (a plain blur would leave a red ring).
+        let mut soft = wgt.clone();
+        mask::blur_plane(&mut soft, wu, hu, (rx.min(ry) * 0.06).clamp(0.6, 6.0));
+        for (w, s) in wgt.iter_mut().zip(&soft) {
+            *w = w.max((s * 2.0).min(1.0));
+        }
         let stride = iw as usize * 4;
         img.as_mut().par_chunks_mut(stride).enumerate().skip(y0 as usize).take(hu).for_each(|(y, row)| {
             for x in x0 as usize..x0 as usize + wu {

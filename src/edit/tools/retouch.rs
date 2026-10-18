@@ -80,7 +80,7 @@ impl EditTool for CloneStamp {
             self.hardness = hard / 100.0;
         }
         let mut op = self.opacity * 100.0;
-        if slider(ui, "Opacity", &mut op, 1.0..=100.0, 100.0, " %") {
+        if slider_ex(ui, "Opacity", &mut op, 1.0..=100.0, 100.0, " %", 1.0, 0, false) {
             self.opacity = op / 100.0;
         }
         ui.horizontal(|ui| {
