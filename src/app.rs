@@ -83,12 +83,15 @@ pub struct App {
     last_title: String,
     effective_dark: bool,
     dev: crate::devhook::DevHook,
+    first_frame_marked: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, initial: Option<PathBuf>) -> Self {
         let ctx = cc.egui_ctx.clone();
+        crate::devhook::mark("app_new");
         theme::install_fonts(&ctx);
+        crate::devhook::mark("fonts");
         let dark = match settings.theme {
             ThemeChoice::Dark => true,
             ThemeChoice::Light => false,
@@ -97,6 +100,7 @@ impl App {
         let pal = Palette::new(dark, settings.accent);
         theme::apply(&ctx, &pal, settings.ui_scale);
         egui_extras::install_image_loaders(&ctx);
+        crate::devhook::mark("theme");
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let mut loader = Loader::new(ctx.clone(), (cores / 4).clamp(2, 4));
@@ -105,6 +109,7 @@ impl App {
         let thumbs = ThumbService::new(ctx.clone(), cores.saturating_sub(2).clamp(2, 12), crate::settings::cache_dir().join("thumbs"));
         thumbs.set_disk_cache(settings.thumb_disk_cache);
         let meta = MetaService::new(ctx.clone());
+        crate::devhook::mark("services");
 
         let start_folder = settings
             .last_folder
@@ -140,6 +145,7 @@ impl App {
             last_title: String::new(),
             effective_dark: dark,
             dev: crate::devhook::DevHook::new(),
+            first_frame_marked: false,
         };
         app.viewer.show_info = app.core.settings.show_info_overlay && false;
         match initial {
@@ -1508,6 +1514,11 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let frame_start = std::time::Instant::now();
+        if !self.first_frame_marked {
+            self.first_frame_marked = true;
+            crate::devhook::mark("first_frame");
+        }
         self.dev_actions(&ctx);
         self.handle_dropped(&ctx);
         self.shortcuts(&ctx);
@@ -1547,13 +1558,17 @@ impl eframe::App for App {
                     .size_range(180.0..=560.0)
                     .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin { left: 0, right: 2, top: 4, bottom: 0 }))
                     .show(ui, |ui| {
+                        let t = std::time::Instant::now();
                         self.core.settings.tree_width = ui.available_width() + 2.0;
                         self.browser.sidebar(ui, &mut self.core, &mut ev);
+                        crate::devhook::prof("sidebar", t);
                     });
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin { left: 4, right: 4, top: 6, bottom: 0 }))
                     .show(ui, |ui| {
+                        let t = std::time::Instant::now();
                         self.browser.central(ui, &mut self.core, &mut ev);
+                        crate::devhook::prof("central", t);
                     });
                 for e in ev {
                     match e {
@@ -1655,6 +1670,7 @@ impl eframe::App for App {
             self.run(c);
         }
         self.core.toasts.show(&ctx, &p);
+        crate::devhook::prof("ui_total", frame_start);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
@@ -1686,6 +1702,7 @@ impl App {
                     }
                 }
                 crate::devhook::DevAction::State => {
+                    self.dev.write_state(&format!("startup: {}", crate::devhook::DevHook::startup_report()));
                     let cur = self.viewer.current().map(|p| p.display().to_string()).unwrap_or_default();
                     let st = match self.viewer.current().and_then(|p| self.core.loader.state(p)) {
                         Some(crate::loader::LoadState::Ready(l)) => format!("ready {}x{} {}ms", l.decoded.width(), l.decoded.height(), l.load_ms),
