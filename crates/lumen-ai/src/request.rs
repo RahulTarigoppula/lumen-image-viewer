@@ -190,7 +190,8 @@ pub struct BodyMode {
     /// Send `response_format: json_schema` (else the schema goes into the
     /// system prompt).
     pub response_format: bool,
-    /// Send vLLM extensions (`chat_template_kwargs`, `continue_final_message`...).
+    /// Send vLLM extensions (`chat_template_kwargs`, `continue_final_message`,
+    /// `stream_options.continuous_usage_stats`...).
     pub extensions: bool,
     pub stream: bool,
 }
@@ -269,7 +270,8 @@ impl PreparedRequest {
                 "stream": mode.stream,
             });
             if mode.stream {
-                b["stream_options"] = json!({"include_usage": true});
+                // vLLM's continuous usage gives a live token count while streaming.
+                b["stream_options"] = if mode.extensions { json!({"include_usage": true, "continuous_usage_stats": true}) } else { json!({"include_usage": true}) };
             }
             if let (true, Some(schema)) = (mode.response_format, &self.schema) {
                 let name = if self.output == OutputKind::ComparisonJson { "lumen_comparison_report" } else { "lumen_quality_report" };

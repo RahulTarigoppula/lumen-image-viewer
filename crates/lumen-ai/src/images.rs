@@ -312,6 +312,20 @@ pub fn overview_size(w: u32, h: u32, max_side: u32) -> (u32, u32) {
     }
 }
 
+/// ", padded to 800x1216 (edge pixels repeated at the bottom)" when the
+/// content is padded to a multiple of 32, else "". The model's coordinates
+/// are relative to the padded image, so it has to know the content ends
+/// before the edge.
+fn pad_note(content: (u32, u32), padded: (u32, u32)) -> String {
+    let where_ = match (padded.0 > content.0, padded.1 > content.1) {
+        (true, true) => "right and bottom",
+        (true, false) => "right",
+        (false, true) => "bottom",
+        (false, false) => return String::new(),
+    };
+    format!(", padded to {}x{} (edge pixels repeated at the {where_})", padded.0, padded.1)
+}
+
 fn fmt_factor(f: f64) -> String {
     let s = format!("{f:.2}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
@@ -325,10 +339,11 @@ pub fn overview(img: &RgbaImage, label: ImageLabel, max_side: u32) -> SentImage 
     let content = if (tw, th) == (w, h) { img.clone() } else { extract(img, Roi::full(w, h).to_f(), tw, th) };
     let factor = (w as f64 / tw as f64).max(h as f64 / th as f64);
     let pixels = pad_to_multiple(&content, ALIGN);
+    let pad = pad_note((tw, th), pixels.dimensions());
     let description = if (tw, th) == (w, h) {
-        format!("{} full view, {}x{}, native resolution", label.as_str(), w, h)
+        format!("{} full view, {}x{}, native resolution{pad}", label.as_str(), w, h)
     } else {
-        format!("{} full view, {}x{}, downscaled {} from {}x{}", label.as_str(), tw, th, fmt_factor(factor), w, h)
+        format!("{} full view, {}x{}, downscaled {} from {}x{}{pad}", label.as_str(), tw, th, fmt_factor(factor), w, h)
     };
     SentImage {
         role: ImageRole::Overview,
@@ -422,11 +437,13 @@ pub fn roi_tiles(img: &RgbaImage, label: ImageLabel, roi: Roi, side: u32, max_ti
             let index = i as u32 + 1;
             let (x0, y0) = (src.x.round() as u64, src.y.round() as u64);
             let (x1, y1) = ((src.x + src.w).round() as u64, (src.y + src.h).round() as u64);
+            let pixels = pad_to_multiple(&content, ALIGN);
+            let pad = pad_note((tw, th), pixels.dimensions());
             let description = if plan.factor <= 1.0 + 1e-9 {
-                format!("{} ROI tile {index}/{count}: native pixels x={x0}..{x1}, y={y0}..{y1}", label.as_str())
+                format!("{} ROI tile {index}/{count}: native pixels x={x0}..{x1}, y={y0}..{y1}{pad}", label.as_str())
             } else {
                 format!(
-                    "{} ROI tile {index}/{count}: source pixels x={x0}..{x1}, y={y0}..{y1}, downscaled {}",
+                    "{} ROI tile {index}/{count}: source pixels x={x0}..{x1}, y={y0}..{y1}, downscaled {}{pad}",
                     label.as_str(),
                     fmt_factor(plan.factor)
                 )
@@ -435,7 +452,7 @@ pub fn roi_tiles(img: &RgbaImage, label: ImageLabel, roi: Roi, side: u32, max_ti
                 role: ImageRole::RoiTile { index, count },
                 label: Some(label),
                 tile: index,
-                pixels: pad_to_multiple(&content, ALIGN),
+                pixels,
                 regions: vec![Placement { label, src, content_w: tw, content_h: th, offset_x: 0, offset_y: 0 }],
                 description,
             }
@@ -453,10 +470,12 @@ pub fn matching(b: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32)) -> Ve
             let pa = ai.regions[0];
             let src = pa.src.rescaled(a_size, b.dimensions());
             let content = extract(b, src, pa.content_w, pa.content_h);
+            let pixels = pad_to_multiple(&content, ALIGN);
+            let pad = pad_note((pa.content_w, pa.content_h), pixels.dimensions());
             let description = match ai.role {
                 ImageRole::RoiTile { index, count } if same => format!("B ROI tile {index}/{count}: same region"),
                 ImageRole::RoiTile { index, count } => format!(
-                    "B ROI tile {index}/{count}: same relative region, source pixels x={}..{}, y={}..{} of {}x{}",
+                    "B ROI tile {index}/{count}: same relative region, source pixels x={}..{}, y={}..{} of {}x{}{pad}",
                     src.x.round(),
                     (src.x + src.w).round(),
                     src.y.round(),
@@ -464,9 +483,9 @@ pub fn matching(b: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32)) -> Ve
                     b.width(),
                     b.height()
                 ),
-                _ if same => "B full view, same scaling".to_string(),
+                _ if same => format!("B full view, same scaling{pad}"),
                 _ => format!(
-                    "B full view, {}x{}, resampled from {}x{} to match A",
+                    "B full view, {}x{}, resampled from {}x{} to match A{pad}",
                     pa.content_w,
                     pa.content_h,
                     b.width(),
@@ -477,7 +496,7 @@ pub fn matching(b: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32)) -> Ve
                 role: ai.role,
                 label: Some(ImageLabel::B),
                 tile: ai.tile,
-                pixels: pad_to_multiple(&content, ALIGN),
+                pixels,
                 regions: vec![Placement { label: ImageLabel::B, src, ..pa }],
                 description,
             }
@@ -676,6 +695,11 @@ mod tests {
         let small = overview(&gradient(1000, 700), ImageLabel::A, 1536);
         assert_eq!(small.pixels.dimensions(), (1024, 704));
         assert_eq!(small.regions[0].content_w, 1000);
+        // Padding is named, since box coordinates are relative to the padded image.
+        let tall = overview(&gradient(800, 1200), ImageLabel::A, 1536);
+        assert_eq!(tall.description, "A full view, 800x1200, native resolution, padded to 800x1216 (edge pixels repeated at the bottom)");
+        let bottom = tall.map_bbox(ImageLabel::A, [0.0, 0.0, 1000.0, 1200.0 / 1216.0 * 1000.0], CoordConvention::Relative1000).unwrap();
+        assert!((bottom.y1 - 1200.0).abs() < 1e-6, "{bottom:?}");
     }
 
     #[test]

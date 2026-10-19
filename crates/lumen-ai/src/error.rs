@@ -28,10 +28,16 @@ pub enum AiError {
     NotLocal { addr: IpAddr },
     /// A public address over plain HTTP.
     PublicNeedsHttps { addr: IpAddr },
+    /// A host name resolved to addresses that are not allowed (`addrs`),
+    /// either outside the local network or public over plain HTTP.
+    HostNotLocal { host: String, addrs: Vec<IpAddr>, needs_https: bool },
     /// Connection refused, reset, or the host is unreachable.
     Unreachable { target: String, detail: String },
     /// TLS handshake or certificate failure.
     Tls(String),
+    /// HTTPS is on but the server answered in plain HTTP (vLLM without
+    /// `--ssl-certfile`). Holds the TLS library's message.
+    PlainHttpServer(String),
     Timeout(TimeoutKind, Duration),
     /// 401 or 403.
     Unauthorized { status: u16, message: String, key_sent: bool },
@@ -81,7 +87,9 @@ impl AiError {
     /// The server's own words, when they add something to `Display`.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            AiError::Dns { detail, .. } | AiError::Unreachable { detail, .. } => Some(detail),
+            AiError::Dns { detail, .. } | AiError::Unreachable { detail, .. } | AiError::PlainHttpServer(detail) => Some(detail),
+            // "Unauthorized" or "Forbidden" only repeats the status.
+            AiError::Unauthorized { message, .. } if ["unauthorized", "forbidden", "not authenticated"].contains(&message.trim().to_ascii_lowercase().as_str()) => None,
             AiError::Unauthorized { message, .. }
             | AiError::Busy { message, .. }
             | AiError::Http { message, .. }
@@ -111,10 +119,22 @@ impl fmt::Display for AiError {
             AiError::PublicNeedsHttps { addr } => {
                 write!(f, "{addr} is a public address: turn on HTTPS to send images to it")
             }
+            AiError::HostNotLocal { host, addrs, needs_https } => {
+                let list = addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                if *needs_https {
+                    write!(f, "{host} ({list}) is a public server: turn on HTTPS to send images to it")
+                } else {
+                    write!(
+                        f,
+                        "{host} resolves to {list}, outside the local network. Untick 'Only allow local network servers' to allow it (HTTPS required)"
+                    )
+                }
+            }
             AiError::Unreachable { target, .. } => write!(f, "Server not reachable at {target}"),
             AiError::Tls(m) => write!(f, "Server not reachable: TLS failed ({m})"),
+            AiError::PlainHttpServer(_) => write!(f, "The server speaks plain HTTP: turn HTTPS off"),
             AiError::Timeout(TimeoutKind::Connect, d) => {
-                write!(f, "Server not reachable: no connection within {} s", d.as_secs())
+                write!(f, "Server not reachable: no answer within {} s (is the computer on, and the address right?)", d.as_secs())
             }
             AiError::Timeout(TimeoutKind::FirstToken, d) => write!(
                 f,
@@ -123,9 +143,9 @@ impl fmt::Display for AiError {
             ),
             AiError::Timeout(TimeoutKind::Total, d) => write!(f, "Request took longer than {} s and was stopped", d.as_secs()),
             AiError::Unauthorized { status, key_sent: false, .. } => {
-                write!(f, "Server requires an API key ({status})")
+                write!(f, "Server requires an API key ({status}): type it under API key in Settings > AI")
             }
-            AiError::Unauthorized { status, .. } => write!(f, "API key rejected ({status})"),
+            AiError::Unauthorized { status, .. } => write!(f, "API key rejected ({status}): check the key in Settings > AI"),
             AiError::ModelNotFound(_) => write!(f, "Model not loaded on server (refresh the list)"),
             AiError::ContextLength(_) => write!(f, "Request too large: reduce max image side or tiles"),
             AiError::ImageLimit { limit: Some(n), .. } => write!(f, "Server accepts at most {n} image(s) per request"),
