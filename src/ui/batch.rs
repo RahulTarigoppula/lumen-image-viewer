@@ -16,7 +16,8 @@ use crate::encode::Chroma;
 use crate::formats::SaveFormat;
 use crate::imaging::Filter;
 use crate::ui::icons as I;
-use crate::ui::theme::Palette;
+use crate::ui::theme::{radius, size, text, Palette};
+use crate::ui::widgets;
 use crossbeam_channel::Receiver;
 use egui::{Color32, CornerRadius, RichText, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -26,18 +27,18 @@ use std::sync::Arc;
 
 // ---------------------------------------------------------------- UI helpers
 
-/// A titled card used to group settings.
+/// A titled card used to group settings: 13 pt semibold title with a 14 pt accent icon.
 pub(crate) fn card<R>(ui: &mut Ui, p: &Palette, icon: &str, title: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .fill(if p.dark { p.panel } else { p.bg })
         .stroke(egui::Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(radius::CARD))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).color(p.accent).size(15.0));
-                ui.label(RichText::new(title).font(crate::ui::theme::semibold(14.0)).color(p.text));
+                ui.label(RichText::new(icon).color(p.accent_text).size(size::ICON));
+                ui.label(RichText::new(title).font(text::subtitle()).color(p.text));
             });
             ui.add_space(4.0);
             add(ui)
@@ -45,18 +46,17 @@ pub(crate) fn card<R>(ui: &mut Ui, p: &Palette, icon: &str, title: &str, add: im
         .inner
 }
 
-/// Filled accent button with white text.
+/// The window's primary action (see [`widgets::primary_button_enabled`]).
 pub(crate) fn primary_button(ui: &mut Ui, p: &Palette, enabled: bool, text: &str) -> egui::Response {
-    let fill = if enabled { p.accent } else { p.accent.gamma_multiply(0.45) };
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(text).color(Color32::WHITE).strong()).fill(fill).min_size(Vec2::new(120.0, 30.0)))
+    widgets::primary_button_enabled(ui, p, enabled, text)
 }
 
 pub(crate) fn danger_button(ui: &mut Ui, p: &Palette, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(p.danger).min_size(Vec2::new(96.0, 30.0)))
+    widgets::danger_button(ui, p, text)
 }
 
-pub(crate) fn hint(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.label(RichText::new(text).size(11.5).color(p.muted));
+pub(crate) fn hint(ui: &mut Ui, p: &Palette, t: &str) {
+    ui.label(RichText::new(t).size(text::SMALL).color(p.muted));
 }
 
 /// Centered empty-state message.
@@ -65,16 +65,10 @@ pub(crate) fn empty_state(ui: &mut Ui, p: &Palette, icon: &str, title: &str, bod
         ui.add_space(18.0);
         ui.label(RichText::new(icon).size(34.0).color(p.faint));
         ui.add_space(4.0);
-        ui.label(RichText::new(title).font(crate::ui::theme::semibold(14.0)).color(p.text));
+        ui.label(RichText::new(title).font(text::subtitle()).color(p.text));
         ui.label(RichText::new(body).color(p.muted));
         ui.add_space(18.0);
     });
-}
-
-/// Default window size clamped to the screen so nothing overflows small displays.
-pub(crate) fn window_size(ctx: &egui::Context, w: f32, h: f32) -> Vec2 {
-    let s = ctx.content_rect().size();
-    Vec2::new(w.min(s.x - 40.0).max(320.0), h.min(s.y - 60.0).max(240.0))
 }
 
 /// Tool window contents laid out in exactly the window's current size: whatever does
@@ -394,14 +388,10 @@ impl BatchConvert {
         }
         let mut open = true;
         let mut close = false;
-        egui::Window::new(format!("{}  Batch convert & resize", I::STACK))
+        widgets::app_window("batch-convert", "Batch convert & resize")
             .open(&mut open)
-            .default_size(window_size(ctx, 780.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .min_size(crate::ui::batch::window_size(ctx, 520.0, 360.0))
-            .resizable(true)
-            .collapsible(false)
+            .default_size(780.0, 680.0)
+            .min_size(520.0, 360.0)
             .show(ctx, |ui| {
                 window_body(ui, |ui| {
                     if self.job.is_some() {
@@ -463,19 +453,16 @@ impl BatchConvert {
                             self.start(ui.ctx());
                         }
                     }
-                    if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
                         close = true;
                     }
                 },
             );
         });
-        egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let active = self.s.advanced.steps.iter().filter(|e| e.enabled).count();
-                let adv = if self.s.use_advanced && active > 0 { format!("{}  Advanced ({active})", I::SLIDERS_HORIZONTAL) } else { format!("{}  Advanced", I::SLIDERS_HORIZONTAL) };
-                ui.selectable_value(&mut self.tab, 0, format!("{}  Basic", I::GEAR));
-                ui.selectable_value(&mut self.tab, 1, adv);
-            });
+        egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 10 })).show(ui, |ui| {
+            let active = self.s.advanced.steps.iter().filter(|e| e.enabled).count();
+            let adv = if self.s.use_advanced && active > 0 { format!("Advanced ({active})") } else { "Advanced".to_string() };
+            widgets::segmented_value(ui, &mut self.tab, &[(0, "Basic"), (1, adv.as_str())]);
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.tab == 1 {
@@ -550,12 +537,12 @@ impl BatchConvert {
                     });
                     self.files_changed();
                 }
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new(I::BROOM)).on_hover_text("Clear the list").clicked() {
+                if ui.add_enabled(!self.files.is_empty(), egui::Button::new(format!("{}  Clear", I::BROOM))).on_hover_text("Remove every file from the list").clicked() {
                     self.files.clear();
                     self.files_changed();
                 }
             });
-            ui.checkbox(&mut self.s.include_subfolders, "Include subfolders when adding a folder");
+            crate::ui::widgets::checkbox(ui, &mut self.s.include_subfolders, "Include subfolders when adding a folder");
             ui.add_space(4.0);
             egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -598,13 +585,13 @@ impl BatchConvert {
 
     fn destination_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::FOLDER_OPEN, "Destination", |ui| {
-            ui.radio_value(&mut self.s.dest, DestMode::Same, "Same folder as the original");
+            crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Same, "Same folder as the original");
             ui.horizontal(|ui| {
-                ui.radio_value(&mut self.s.dest, DestMode::Subfolder, "Subfolder");
+                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Subfolder, "Subfolder");
                 ui.add_enabled(self.s.dest == DestMode::Subfolder, egui::TextEdit::singleline(&mut self.s.subfolder).desired_width(140.0).hint_text("Converted"));
             });
             ui.horizontal(|ui| {
-                ui.radio_value(&mut self.s.dest, DestMode::Folder, "Folder");
+                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Folder, "Folder");
                 let label = self.s.out_folder.as_ref().map(|f| f.display().to_string()).unwrap_or_else(|| "Choose...".into());
                 let r = ui.add(egui::Button::new(format!("{}  {}", I::FOLDER, label)).truncate());
                 if r.clicked() {
@@ -627,12 +614,12 @@ impl BatchConvert {
             token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{width}", "{height}", "{ext}"]);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Counter starts at").color(p.muted));
-                ui.add(egui::DragValue::new(&mut self.s.start).range(0..=1_000_000));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(0..=1_000_000));
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("If the file exists").color(p.muted));
-                egui::ComboBox::from_id_salt("bc-conflict").width(200.0).selected_text(self.s.conflict.label()).show_ui(ui, |ui| {
+                crate::ui::widgets::combo("bc-conflict").width(200.0).selected_text(self.s.conflict.label()).show_ui(ui, |ui| {
                     for c in ConflictPolicy::ALL {
                         ui.selectable_value(&mut self.s.conflict, c, c.label());
                     }
@@ -647,7 +634,7 @@ impl BatchConvert {
     fn format_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::FILE_IMAGE, "Output format", |ui| {
             let current = if self.s.keep_format { "Keep original format" } else { format_label(self.s.format) };
-            egui::ComboBox::from_id_salt("bc-format").width(200.0).selected_text(current).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("bc-format").width(200.0).selected_text(current).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.s.keep_format, true, "Keep original format");
                 for f in SaveFormat::ALL {
                     if ui.selectable_label(!self.s.keep_format && self.s.format == f, format_label(f)).clicked() {
@@ -673,32 +660,32 @@ impl BatchConvert {
             egui::Grid::new("bc-format-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 if fmt.is_none() || fmt == Some(SaveFormat::Jpeg) {
                     ui.label("JPEG quality");
-                    ui.add(egui::Slider::new(&mut self.s.jpeg_quality, 1..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut self.s.jpeg_quality, 1..=100));
                     ui.end_row();
                     ui.label("Chroma");
-                    egui::ComboBox::from_id_salt("bc-chroma").selected_text(self.s.jpeg_chroma.label()).show_ui(ui, |ui| {
+                    crate::ui::widgets::combo("bc-chroma").selected_text(self.s.jpeg_chroma.label()).show_ui(ui, |ui| {
                         for c in [Chroma::S444, Chroma::S422, Chroma::S420] {
                             ui.selectable_value(&mut self.s.jpeg_chroma, c, c.label());
                         }
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.s.jpeg_progressive, "Progressive");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.jpeg_progressive, "Progressive");
                     ui.end_row();
                 }
                 if fmt.is_none() || fmt == Some(SaveFormat::WebP) {
                     ui.label("WebP");
-                    ui.checkbox(&mut self.s.webp_lossless, "Lossless");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.webp_lossless, "Lossless");
                     ui.end_row();
                     if !self.s.webp_lossless {
                         ui.label("WebP quality");
-                        ui.add(egui::Slider::new(&mut self.s.webp_quality, 1.0..=100.0).fixed_decimals(0));
+                        ui.add(crate::ui::widgets::Slider::new(&mut self.s.webp_quality, 1.0..=100.0).fixed_decimals(0));
                         ui.end_row();
                     }
                 }
                 if fmt.is_none() || fmt == Some(SaveFormat::Png) {
                     ui.label("PNG");
-                    ui.checkbox(&mut self.s.png_best, "Best compression (slower)");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.png_best, "Best compression (slower)");
                     ui.end_row();
                 }
                 if fmt == Some(SaveFormat::Ico) {
@@ -715,7 +702,7 @@ impl BatchConvert {
             let r = &mut self.s.resize;
             egui::Grid::new("bc-resize-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Mode");
-                egui::ComboBox::from_id_salt("bc-resize-mode").width(160.0).selected_text(r.mode.label()).show_ui(ui, |ui| {
+                crate::ui::widgets::combo("bc-resize-mode").width(160.0).selected_text(r.mode.label()).show_ui(ui, |ui| {
                     for m in ResizeMode::ALL {
                         ui.selectable_value(&mut r.mode, m, m.label());
                     }
@@ -725,37 +712,37 @@ impl BatchConvert {
                     ResizeMode::None => {}
                     ResizeMode::Percent => {
                         ui.label("Scale");
-                        ui.add(egui::DragValue::new(&mut r.percent).range(1.0..=1000.0).speed(0.5).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.percent).range(1.0..=1000.0).speed(0.5).suffix(" %"));
                         ui.end_row();
                     }
                     ResizeMode::Fit => {
                         ui.label("Box");
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
                             ui.label("×");
-                            ui.add(egui::DragValue::new(&mut r.b).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.b).range(1..=60000).suffix(" px"));
                         });
                         ui.end_row();
                     }
                     _ => {
                         ui.label("Size");
-                        ui.add(egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
                         ui.end_row();
                     }
                 }
                 if r.mode != ResizeMode::None {
                     ui.label("");
-                    ui.checkbox(&mut r.no_upscale, "Don't enlarge smaller images");
+                    crate::ui::widgets::checkbox(ui, &mut r.no_upscale, "Don't enlarge smaller images");
                     ui.end_row();
                     ui.label("Filter");
-                    egui::ComboBox::from_id_salt("bc-filter").width(160.0).selected_text(self.s.filter.label()).show_ui(ui, |ui| {
+                    crate::ui::widgets::combo("bc-filter").width(160.0).selected_text(self.s.filter.label()).show_ui(ui, |ui| {
                         for f in Filter::ALL {
                             ui.selectable_value(&mut self.s.filter, f, f.label());
                         }
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.s.sharpen, "Light sharpening after downscale");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.sharpen, "Light sharpening after downscale");
                     ui.end_row();
                 }
             });
@@ -767,10 +754,10 @@ impl BatchConvert {
 
     fn adjust_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::MAGIC_WAND, "Adjustments & metadata", |ui| {
-            ui.checkbox(&mut self.s.auto_enhance, "Auto enhance (levels)");
-            ui.checkbox(&mut self.s.grayscale, "Convert to grayscale");
-            ui.checkbox(&mut self.s.keep_exif, "Keep EXIF metadata").on_hover_text("Camera data, date taken, GPS... (written to JPEG output)");
-            ui.checkbox(&mut self.s.preserve_date, "Keep the original modified date");
+            crate::ui::widgets::checkbox(ui, &mut self.s.auto_enhance, "Auto enhance (levels)");
+            crate::ui::widgets::checkbox(ui, &mut self.s.grayscale, "Convert to grayscale");
+            crate::ui::widgets::checkbox(ui, &mut self.s.keep_exif, "Keep EXIF metadata").on_hover_text("Camera data, date taken, GPS... (written to JPEG output)");
+            crate::ui::widgets::checkbox(ui, &mut self.s.preserve_date, "Keep the original modified date");
             hint(ui, p, "Photos are rotated upright using their EXIF orientation.");
         });
     }
@@ -784,7 +771,7 @@ impl BatchConvert {
 
     fn advanced_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::SLIDERS_HORIZONTAL, "Advanced steps", |ui| {
-            ui.checkbox(&mut self.s.use_advanced, "Apply these steps to every image (after the basic resize and adjustments)");
+            crate::ui::widgets::checkbox(ui, &mut self.s.use_advanced, "Apply these steps to every image (after the basic resize and adjustments)");
             ui.add_enabled_ui(self.s.use_advanced, |ui| {
                 advanced::pipeline_ui(ui, p, &mut self.s.advanced, &mut self.adv_selected);
             });
@@ -805,19 +792,19 @@ impl BatchConvert {
         };
         let show = |ui: &mut Ui, t: &egui::TextureHandle, label: &str| {
             ui.vertical(|ui| {
-                ui.label(RichText::new(label).size(11.0).color(p.faint).strong());
+                ui.label(RichText::new(label).font(text::caption()).color(p.muted));
                 ui.add(egui::Image::new((t.id(), fit(t))).corner_radius(CornerRadius::same(4)));
             });
         };
         if side {
             ui.horizontal_top(|ui| {
-                show(ui, before, "BEFORE");
+                show(ui, before, "Before");
                 ui.add_space(8.0);
-                show(ui, after, "AFTER");
+                show(ui, after, "After");
             });
         } else {
-            show(ui, before, "BEFORE");
-            show(ui, after, "AFTER");
+            show(ui, before, "Before");
+            show(ui, after, "After");
         }
     }
 
@@ -834,7 +821,7 @@ impl BatchConvert {
                 if self.files.len() > 1 && self.files.len() <= 5000 {
                     // Pick the preview file without going back to the source list.
                     let mut idx = self.preview_index;
-                    egui::ComboBox::from_id_salt("bc-preview-file").width(180.0).truncate().selected_text(file_name(first)).show_ui(ui, |ui| {
+                    crate::ui::widgets::combo("bc-preview-file").width(180.0).truncate().selected_text(file_name(first)).show_ui(ui, |ui| {
                         for (i, f) in self.files.iter().enumerate() {
                             ui.selectable_value(&mut idx, i, file_name(f));
                         }
@@ -911,12 +898,12 @@ impl BatchConvert {
                         if primary_button(ui, p, true, "Done").clicked() {
                             close = true;
                         }
-                        if ui.add(egui::Button::new(format!("{}  Back to settings", I::ARROW_U_UP_LEFT)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                        if ui.add(egui::Button::new(format!("{}  Back to settings", I::ARROW_U_UP_LEFT)).min_size(Vec2::new(0.0, size::CONTROL))).clicked() {
                             back = true;
                         }
                         let first_out = self.statuses.iter().find_map(|s| if let FileStatus::Done { out, .. } = s { Some(out.clone()) } else { None });
                         if let Some(out) = first_out {
-                            if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                            if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, size::CONTROL))).clicked() {
                                 open_folder = Some(out);
                             }
                         }
@@ -950,7 +937,7 @@ impl BatchConvert {
             };
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon).size(22.0).color(color));
-                ui.add(egui::Label::new(RichText::new(title).font(crate::ui::theme::semibold(17.0))).wrap());
+                ui.add(egui::Label::new(RichText::new(title).font(text::title())).wrap());
             });
             ui.add_space(6.0);
             let frac = if total == 0 { 1.0 } else { done as f32 / total as f32 };
@@ -975,7 +962,7 @@ impl BatchConvert {
                 }
                 stat(ui, I::TIMER, p.faint, fmt_duration(elapsed));
                 if skipped + failed > 0 {
-                    ui.toggle_value(&mut self.only_problems, "Show only problems");
+                    widgets::checkbox(ui, &mut self.only_problems, "Show only problems");
                 }
             });
             ui.add_space(6.0);
@@ -1056,7 +1043,7 @@ fn list_row(ui: &mut Ui, p: &Palette, selected: bool, text: &str, h: f32) -> egu
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let bg = if selected {
-            p.accent.gamma_multiply(0.35)
+            p.selected_bg
         } else if resp.hovered() {
             p.hover
         } else {
@@ -1367,14 +1354,10 @@ impl BatchRename {
         }
         let mut open = true;
         let mut close = false;
-        egui::Window::new(format!("{}  Batch rename", I::TEXTBOX))
+        widgets::app_window("batch-rename", "Batch rename")
             .open(&mut open)
-            .default_size(window_size(ctx, 820.0, 640.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0))
-            .resizable(true)
-            .collapsible(false)
+            .default_size(820.0, 640.0)
+            .min_size(520.0, 380.0)
             .show(ctx, |ui| {
                 close = window_body(ui, |ui| self.ui(ui, &p));
             });
@@ -1424,10 +1407,10 @@ impl BatchRename {
                     if primary_button(ui, p, !busy && conflicts == 0 && changes > 0, &label).clicked() {
                         do_rename = true;
                     }
-                    if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                    if widgets::secondary_button(ui, "Close").clicked() {
                         close = true;
                     }
-                    if last_batch && ui.add_enabled(!busy, egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE)).min_size(Vec2::new(0.0, 30.0))).on_hover_text("Restore the names from the last rename").clicked() {
+                    if last_batch && ui.add_enabled(!busy, egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE)).min_size(Vec2::new(0.0, size::CONTROL))).on_hover_text("Restore the names from the last rename").clicked() {
                         do_undo = true;
                     }
                 },
@@ -1469,11 +1452,11 @@ impl BatchRename {
                     token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{taken}", "{width}", "{height}", "{folder}"]);
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Start").color(p.muted));
-                        ui.add(egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000));
                         ui.label(RichText::new("Step").color(p.muted));
-                        ui.add(egui::DragValue::new(&mut self.s.step).range(-1000..=1000));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.step).range(-1000..=1000));
                         ui.label(RichText::new("Digits").color(p.muted));
-                        ui.add(egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }));
                     });
                     hint(ui, p, "The extension is kept. {date:%Y%m%d} accepts a custom date format.");
                 });
@@ -1487,17 +1470,17 @@ impl BatchRename {
                         ui.add(egui::TextEdit::singleline(&mut self.s.replace).desired_width(f32::INFINITY));
                         ui.end_row();
                         ui.label("");
-                        ui.checkbox(&mut self.s.ignore_case, "Ignore case");
+                        crate::ui::widgets::checkbox(ui, &mut self.s.ignore_case, "Ignore case");
                         ui.end_row();
                         ui.label("Name case");
-                        egui::ComboBox::from_id_salt("br-case").selected_text(self.s.case.label()).show_ui(ui, |ui| {
+                        crate::ui::widgets::combo("br-case").selected_text(self.s.case.label()).show_ui(ui, |ui| {
                             for c in CaseChange::ALL {
                                 ui.selectable_value(&mut self.s.case, c, c.label());
                             }
                         });
                         ui.end_row();
                         ui.label("Extension");
-                        egui::ComboBox::from_id_salt("br-ext").selected_text(self.s.ext_case.label()).show_ui(ui, |ui| {
+                        crate::ui::widgets::combo("br-ext").selected_text(self.s.ext_case.label()).show_ui(ui, |ui| {
                             for c in ExtCase::ALL {
                                 ui.selectable_value(&mut self.s.ext_case, c, c.label());
                             }
@@ -1512,9 +1495,9 @@ impl BatchRename {
     fn preview_header(&mut self, ui: &mut Ui, p: &Palette) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.toggle_value(&mut self.only_changed, "Only changed / conflicts");
+                widgets::checkbox(ui, &mut self.only_changed, "Only changed or conflicting");
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("PREVIEW").size(11.0).color(p.faint).strong());
+                    ui.label(RichText::new("Preview").font(text::caption()).color(p.muted));
                     if let Some(m) = &self.meta {
                         if m.full {
                             ui.spinner();
