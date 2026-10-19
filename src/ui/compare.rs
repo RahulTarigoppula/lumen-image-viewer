@@ -712,6 +712,30 @@ impl Compare {
         self.zoom_step(src, rects, ppp, 1.0 / z, None);
     }
 
+    /// What the Analysis panel works on: panes A and B.
+    pub fn analysis_subject(&self) -> crate::analysis_ui::Subject {
+        use crate::analysis_ui::{Pixels, Subject, SubjectImage, SubjectKind};
+        let img = |p: &Pane| SubjectImage {
+            path: p.path.clone(),
+            size: p.loaded.as_ref().map(|l| l.decoded.image.dimensions()),
+            pixels: p.loaded.as_ref().map(|l| Pixels::Ready(l.decoded.image.clone())).unwrap_or(Pixels::Pending),
+            frame: None,
+        };
+        Subject { kind: SubjectKind::Pair, a: self.panes.first().map(img), b: self.panes.get(1).map(img) }
+    }
+
+    /// Shows `r` (fractions 0..1 of pane `i`'s image) in every synced pane.
+    pub fn zoom_to_region(&mut self, i: usize, r: [f32; 4], ppp: f32) {
+        let rects = self.layout(self.last_area);
+        let (Some(d), Some(&pane)) = (self.panes.get(i).and_then(|p| p.dims()), rects.get(i)) else { return };
+        let (w, h) = (d.0 as f32, d.1 as f32);
+        let (rw, rh) = (((r[2] - r[0]) * w).max(16.0), ((r[3] - r[1]) * h).max(16.0));
+        let z = ((pane.width() * ppp / rw).min(pane.height() * ppp / rh) * 0.6).min(8.0);
+        let c = Vec2::new((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+        let basis = self.basis;
+        self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, c));
+    }
+
     fn pan(&mut self, src: usize, rects: &[Rect], ppp: f32, delta_pt: Vec2) {
         let (Some(d), Some(&r)) = (self.panes.get(src).and_then(|p| p.dims()), rects.get(src)) else { return };
         let fr = self.fit_ref(rects, ppp);
@@ -948,6 +972,11 @@ impl Compare {
         let p = core.pal;
         let (z, c, d) = self.effective(i, rects, ppp, fit_ref)?;
         let dest = dest_rect(rect, ppp, d, z, c);
+        // Panes A and B for the Analysis panel's overlays.
+        let slot = [crate::analysis_ui::canvas::Slot::A, crate::analysis_ui::canvas::Slot::B].get(i).copied();
+        if let Some(slot) = slot {
+            crate::analysis_ui::canvas::publish(ui.ctx(), slot, dest, d, clip);
+        }
         let painter = ui.painter().with_clip_rect(clip);
         let pane = &mut self.panes[i];
         if pane.loaded.as_ref().is_some_and(|l| l.decoded.has_alpha) && core.settings.checkerboard_alpha {

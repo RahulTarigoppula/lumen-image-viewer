@@ -45,6 +45,9 @@ build = "build.rs"
 
 [dependencies]
 lumen-core.workspace = true
+# Remote AI critique (feature `ai`): the only network code, see crates/lumen-ai.
+lumen-ai = { workspace = true, optional = true }
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"], optional = true }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 egui = { version = "0.37", features = ["bytemuck"] }
 egui_extras = { version = "0.37", features = ["image"] }
@@ -107,8 +110,11 @@ features = [
 ]
 
 [features]
-default = ["video"]
+default = ["video", "ai"]
 video = ["dep:ffmpeg-next", "dep:ffmpeg-sys-next", "dep:cpal"]
+# Remote AI analysis against the user's own vLLM server (off at run time
+# until enabled in Settings > AI). Without it the AI parts of the UI are hidden.
+ai = ["dep:lumen-ai", "dep:egui_commonmark"]
 
 [build-dependencies]
 winresource = "0.1"
