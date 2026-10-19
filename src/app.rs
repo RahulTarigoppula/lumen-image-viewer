@@ -405,6 +405,7 @@ impl App {
         // back to it is instant.
         let keep: Vec<PathBuf> = self.viewer.current().filter(|p| self.core.loader.bytes_of(p).is_some_and(|b| b <= KEEP_AFTER_VIEWER)).cloned().into_iter().collect();
         self.core.loader.clear_except(&keep);
+        self.viewer.release_gpu_over(KEEP_AFTER_VIEWER);
         self.mode = Mode::Browser;
         if self.fullscreen && (self.core.settings.open_viewer_fullscreen || self.fullscreen_from_viewer) {
             self.set_fullscreen(false);

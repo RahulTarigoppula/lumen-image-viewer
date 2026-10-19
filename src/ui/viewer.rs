@@ -443,6 +443,15 @@ impl Viewer {
     }
 
     /// Anything leaving this image would lose: unsaved edits or unapplied tool work.
+    /// Drop the on-screen image's GPU tiles and mip pyramid when it is larger
+    /// than `max_bytes` (RGBA), so leaving the viewer frees huge photos.
+    pub fn release_gpu_over(&mut self, max_bytes: u64) {
+        if self.gpu.as_ref().is_some_and(|(_, _, g)| g.width as u64 * g.height as u64 * 4 > max_bytes) {
+            self.gpu = None;
+            self.gpu_build = None;
+        }
+    }
+
     pub fn has_unsaved_work(&self) -> bool {
         self.is_dirty() || self.tool_has_work()
     }
