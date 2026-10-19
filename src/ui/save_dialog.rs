@@ -78,7 +78,7 @@ impl SaveDialog {
             self.est_rx = Some(rx);
         }
 
-        egui::Modal::new(egui::Id::new("save-dialog")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("save-dialog")).show(ctx, |ui| {
             // Wide enough for typical paths; the path field takes all the room
             // the Browse button leaves.
             let w = (ctx.content_rect().width() * 0.8).clamp(360.0, 640.0);

@@ -472,7 +472,7 @@ impl Browser {
     fn address_bar(&mut self, ui: &mut Ui, width: f32, p: &Palette, ev: &mut Vec<BrowserEvent>) {
         let h = 28.0;
         if let Some(text) = &mut self.address {
-            let r = ui.add_sized([width, h], egui::TextEdit::singleline(text).hint_text("Type a folder path...").vertical_align(egui::Align::Center));
+            let r = ui.add_sized([width, h], egui::TextEdit::singleline(text).hint_text("Type a folder path...").align(egui::Align2::LEFT_CENTER));
             if !r.has_focus() && !r.lost_focus() {
                 r.request_focus();
             }
@@ -718,7 +718,7 @@ impl Browser {
                 let row = f / cols;
                 let y = row as f32 * (cell.y + ui.spacing().item_spacing.y);
                 let id = ui.make_persistent_id(("grid", &self.folder));
-                let offset = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.offset().y).unwrap_or(0.0);
+                let offset = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
                 let view_h = ui.available_height();
                 if y < offset {
                     scroll = scroll.vertical_scroll_offset(y);
@@ -742,7 +742,7 @@ impl Browser {
         // when the window opened would otherwise stay on top of it.
         let tips = pointer_here && self.tips_after_drag && !super::overlay_open(ui.ctx());
         // Registered before the cells so cells take precedence for clicks.
-        let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("grid-bg"), Sense::click());
+        let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click());
         scroll.show_rows(ui, cell.y, rows, |ui, range| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for row in range {
@@ -988,7 +988,7 @@ impl Browser {
         let mut double = None;
         let mut ctx_for = None;
         let mut sort_click: Option<SortKey> = None;
-        let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("details-bg"), Sense::click());
+        let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("details-bg"), Sense::click());
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -1118,7 +1118,7 @@ impl Browser {
     }
 
     fn context_menu(&mut self, ui: &mut Ui, bg: &egui::Response, core: &mut Core, ev: &mut Vec<BrowserEvent>, open_now: bool) {
-        let popup_id = ui.id().with("item-context");
+        let popup_id = ui.scope_id().with("item-context");
         if open_now {
             egui::Popup::open_id(ui.ctx(), popup_id);
         }

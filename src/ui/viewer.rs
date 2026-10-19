@@ -22,9 +22,6 @@ use std::time::{Duration, Instant};
 pub enum ViewerEvent {
     Command(Command),
     Close,
-    /// The current file changed on disk (saved / rotated / deleted).
-    FileChanged(PathBuf),
-    IndexChanged(PathBuf),
 }
 
 struct Anim {
@@ -526,11 +523,6 @@ impl Viewer {
         self.after_index_change(fit);
     }
 
-    pub fn discard_edits(&mut self) {
-        self.edit = None;
-        self.gpu = None;
-    }
-
     /// Remove `path` from the list (after delete/move) and keep a sensible index.
     pub fn remove_path(&mut self, path: &Path) {
         if let Some(pos) = self.list.iter().position(|p| p == path) {
@@ -778,7 +770,7 @@ impl Viewer {
                 .resizable(false)
                 .exact_size(96.0)
                 .frame(egui::Frame::NONE.fill(p.panel.gamma_multiply(0.96)).inner_margin(egui::Margin::symmetric(6, 6)))
-                .show(ui, |ui| self.filmstrip(ui, core, &mut ev));
+                .show(ui, |ui| self.filmstrip(ui, core));
         }
 
         let view = ui.available_rect_before_wrap();
@@ -926,8 +918,6 @@ impl Viewer {
                         image_size: sz,
                         dest,
                         view,
-                        zoom: self.zoom,
-                        pixels_per_point: ppp,
                         preview: t.base.as_ref().map(|b| &*b.image),
                         preview_scale: t.scale(),
                         preview_current: t.preview_version >= t.version,
@@ -1397,7 +1387,7 @@ impl Viewer {
                         ui.set_max_size(inner);
                         match edge {
                             Edge::Top => {
-                                ui.allocate_ui(inner, |ui| self.filmstrip(ui, core, ev));
+                                ui.allocate_ui(inner, |ui| self.filmstrip(ui, core));
                             }
                             Edge::Right => self.info_panel(ui, core, ev),
                             Edge::Left => self.edge_tool_menu(ui, ev),
@@ -1586,7 +1576,7 @@ impl Viewer {
         }
     }
 
-    fn filmstrip(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
+    fn filmstrip(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
         let h = ui.available_height();
         let cell = Vec2::new(h * 1.25, h);
@@ -1630,7 +1620,6 @@ impl Viewer {
                     }
                     if resp.clicked() {
                         self.go_to(i, core.settings.fit_mode);
-                        ev.push(ViewerEvent::IndexChanged(self.list[i].clone()));
                     }
                 }
             });
@@ -1723,7 +1712,7 @@ impl Viewer {
                 egui::CollapsingHeader::new(RichText::new(format!("All metadata ({})", ex.all.len())).color(p.muted)).show(ui, |ui| {
                     egui::Grid::new("exif-all").num_columns(2).striped(true).show(ui, |ui| {
                         for (g, k, v) in &ex.all {
-                            ui.label(RichText::new(format!("{k}")).size(11.5).color(p.muted)).on_hover_text(g);
+                            ui.label(RichText::new(k.as_str()).size(11.5).color(p.muted)).on_hover_text(g);
                             ui.add(egui::Label::new(RichText::new(v).size(11.5)).wrap());
                             ui.end_row();
                         }
@@ -2178,7 +2167,7 @@ impl Viewer {
         }
         // 0 keep / cancel, 1 discard, 2 save
         let mut choice: Option<u8> = None;
-        egui::Modal::new(egui::Id::new("discard-edits")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("discard-edits")).show(ctx, |ui| {
             ui.set_width(380.0);
             match &tool_title {
                 Some(title) => {

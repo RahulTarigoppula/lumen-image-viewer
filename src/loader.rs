@@ -185,12 +185,9 @@ impl Loader {
         self.queue.jobs.lock().clear();
     }
 
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.queue.jobs.lock().clear();
-    }
-
-    /// Insert an already-decoded image (e.g. pasted from clipboard / edited result).
+    /// Insert an already-decoded image. Only tests seed the cache this way; the
+    /// app always decodes through `request`.
+    #[cfg(test)]
     pub fn insert(&mut self, path: &Path, img: LoadedImage) {
         let generation = self.next_generation;
         self.next_generation += 1;
@@ -370,7 +367,6 @@ mod tests {
         // ... but an explicit on-screen request always goes through.
         l.request(&prev, 0, None);
         assert!(matches!(l.state(&prev), Some(LoadState::Loading)));
-        l.clear();
     }
 
     #[test]

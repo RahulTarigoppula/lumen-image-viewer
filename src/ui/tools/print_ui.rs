@@ -52,7 +52,7 @@ impl PrintWindow {
 
     /// Print an image that is already in memory (e.g. the edited image in the viewer).
     pub fn with_image(img: Arc<RgbaImage>, name: String, core: &Core) -> Self {
-        Self::build(vec![PrintSource::Image { img, name: name.clone() }], name, core)
+        Self::build(vec![PrintSource::Image(img)], name, core)
     }
 
     fn build(sources: Vec<PrintSource>, title: String, core: &Core) -> Self {
@@ -350,7 +350,7 @@ impl PrintWindow {
         let m = self.opts.margin_mm / 25.4 * 100.0 * s;
         painter.rect_stroke(rect.shrink(m), CornerRadius::ZERO, egui::Stroke::new(1.0, Color32::from_gray(225)), egui::StrokeKind::Inside);
         if self.mem_tex.is_none() {
-            if let Some(PrintSource::Image { img, .. }) = self.sources.first() {
+            if let Some(PrintSource::Image(img)) = self.sources.first() {
                 let small = crate::imaging::resize_to_fit(img, 1024, 1024);
                 let ci = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
                 self.mem_tex = Some(ui.ctx().load_texture("print-preview", ci, egui::TextureOptions::LINEAR));
@@ -363,7 +363,7 @@ impl PrintWindow {
             let (sx, sy, sw, sh) = pl.src;
             let uv = Rect::from_min_max(egui::pos2(sx as f32 / iw as f32, sy as f32 / ih as f32), egui::pos2((sx + sw) as f32 / iw as f32, (sy + sh) as f32 / ih as f32));
             let tex = match &self.sources[i] {
-                PrintSource::Image { .. } => self.mem_tex.as_ref().map(|t| t.id()),
+                PrintSource::Image(_) => self.mem_tex.as_ref().map(|t| t.id()),
                 PrintSource::File(path) => {
                     let key = crate::thumbs::ThumbKey::new(path, infos[i].size, infos[i].modified);
                     match core.thumbs.get(&key) {

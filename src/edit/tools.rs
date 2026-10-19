@@ -57,9 +57,6 @@ pub fn make_tool_by_name(name: &str) -> Option<Box<dyn EditTool>> {
     })
 }
 
-/// Names accepted by [`make_tool_by_name`].
-pub const TOOL_NAMES: [&str; 6] = ["draw_board", "clone_stamp", "heal", "red_eye", "blur_region", "selection"];
-
 /// Width of the label column used by every tool row.
 pub const LABEL_W: f32 = 96.0;
 
@@ -426,7 +423,8 @@ mod tests {
 
     #[test]
     fn named_tools_defaults_safe() {
-        for name in TOOL_NAMES {
+        // Every name `make_tool_by_name` accepts.
+        for name in ["draw_board", "clone_stamp", "heal", "red_eye", "blur_region", "selection"] {
             let mut tool = make_tool_by_name(name).expect("tool registered");
             assert!(tool.wants_canvas(), "{name}");
             assert!(!tool.undo(), "{name}: nothing to undo yet");

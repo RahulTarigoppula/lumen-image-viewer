@@ -73,10 +73,6 @@ impl DevHook {
         DevHook { dir: std::env::var_os("LUMEN_DEV_DIR").map(PathBuf::from), last_check: Instant::now(), queue: Vec::new(), wait_until: None, bench_left: 0 }
     }
 
-    pub fn dir(&self) -> Option<&PathBuf> {
-        self.dir.as_ref()
-    }
-
     pub fn tick(&mut self, ctx: &egui::Context) -> Vec<DevAction> {
         let Some(dir) = self.dir.clone() else { return Vec::new() };
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
