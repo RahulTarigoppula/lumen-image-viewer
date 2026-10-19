@@ -19,9 +19,11 @@
 pub mod adapters;
 pub mod canvas;
 pub mod heatmap_view;
+pub mod look;
 pub mod metrics_view;
 pub mod panel;
 pub mod plots;
+pub mod summary;
 
 #[cfg(feature = "ai")]
 pub mod ai;
@@ -152,7 +154,7 @@ pub enum PanelRequest {
 /// icon), shown selected while the panel is open.
 pub fn toolbar_button(ui: &mut egui::Ui, core: &mut crate::app::Core) {
     let cmd = crate::ui::commands::Command::ToggleAnalysis;
-    let tip = format!("Analysis: metrics and AI  ({})", cmd.shortcut());
+    let tip = format!("Analysis: quality metrics and AI review  ({})", cmd.shortcut());
     if crate::ui::widgets::icon_button(ui, cmd.icon(), &tip, core.analysis_open).clicked() {
         core.analysis_request = Some(PanelRequest::Toggle);
     }
@@ -178,7 +180,7 @@ pub fn network_badge(ui: &mut egui::Ui, core: &crate::app::Core) -> bool {
         if let Some(server) = core.ai.sending_to() {
             let text = format!("{}  Sending to {server}", crate::ui::icons::WIFI_HIGH);
             ui.label(egui::RichText::new(text).size(11.5).color(core.pal.accent))
-                .on_hover_text("An AI analysis request is in flight to the server set in Settings > AI. Nothing else leaves this computer.");
+                .on_hover_text("An AI analysis request is in flight to the server set in Settings > AI review. Nothing else leaves this computer.");
             return true;
         }
     }
@@ -191,7 +193,7 @@ pub fn network_badge(ui: &mut egui::Ui, core: &crate::app::Core) -> bool {
 pub fn privacy_note(core: &crate::app::Core) -> &'static str {
     #[cfg(feature = "ai")]
     if core.ai.settings.enabled {
-        return "Lumen connects only to the AI server set in Settings > AI, and only when you run an analysis. Map links open in your browser only when you ask. Ratings and tags are stored locally.";
+        return "Lumen connects only to the AI server set in Settings > AI review, and only when you run an analysis. Map links open in your browser only when you ask. Ratings and tags are stored locally.";
     }
     let _ = core;
     "Lumen itself never connects to the internet; map links open in your browser only when you ask. Ratings and tags are stored locally."

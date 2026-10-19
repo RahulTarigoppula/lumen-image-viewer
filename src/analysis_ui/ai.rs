@@ -449,15 +449,15 @@ impl AiState {
         }
         self.error = None;
         if !self.settings.enabled {
-            self.error = Some("Remote AI analysis is off. Turn it on in Settings > AI.".into());
+            self.error = Some("AI review is off: set up your server in the AI review tab.".into());
             return;
         }
         if self.settings.host.trim().is_empty() {
-            self.error = Some("Set your server in Settings > AI, then press Test connection.".into());
+            self.error = Some("Enter your server in the AI review tab and press Test & connect.".into());
             return;
         }
         let Some(model) = self.settings.model.clone().filter(|m| !m.trim().is_empty()) else {
-            self.error = Some("Pick a model first (Settings > AI, Test connection lists them).".into());
+            self.error = Some("Pick a model first (Test lists the models the server has).".into());
             return;
         };
         let (Some(file_key), Some(a)) = (r.subject.file_key(), r.subject.a.as_ref()) else {
@@ -491,7 +491,7 @@ impl AiState {
                 // "Do not ask again for this server": the plan's rule is that
                 // the first request to a server is confirmed, and every one
                 // while Always confirm is on.
-                self.notes.push((false, format!("No send preview for {} from now on (Settings > AI to undo)", req.server)));
+                self.notes.push((false, format!("No send preview for {} from now on (Settings > AI review to undo)", req.server)));
             }
             // Only this server is trusted; "Always confirm" stays as it is.
             if self.settings.confirmed(&req.server_key, trust) {

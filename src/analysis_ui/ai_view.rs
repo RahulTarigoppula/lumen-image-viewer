@@ -9,6 +9,7 @@ use lumen_ai::{all_presets, AiReport, ImageLabel, OutputKind, Preference, Preset
 
 use super::ai::{Outcome, Phase, RunRecord, RunRequest};
 use super::canvas::{Pane, Slot};
+use super::look;
 use super::{PanelAction, Subject, SubjectKind};
 use crate::app::Core;
 use crate::ui::icons as I;
@@ -58,11 +59,15 @@ fn score_color(p: &Palette, score: u8) -> Color32 {
 }
 
 impl AiView {
-    /// The preset the tab would run for `kind`.
+    /// The mode the tab would run for `kind`: the one picked for this kind
+    /// of view, else the one that fits it (critique for an image, A vs B for
+    /// a pair, frame review for a video).
     pub fn preset(&self, kind: SubjectKind, core: &Core) -> Preset {
         let list = presets_for(kind, &core.ai.settings.custom_presets);
-        let want = self.presets.get(&kind).cloned().unwrap_or_else(|| core.ai.settings.preset.clone());
-        list.iter().find(|p| p.id == want).cloned().unwrap_or_else(|| list[0].clone())
+        match self.presets.get(&kind) {
+            Some(want) => list.iter().find(|p| &p.id == want).cloned().unwrap_or_else(|| list[0].clone()),
+            None => list[0].clone(),
+        }
     }
 
     pub fn set_preset(&mut self, kind: SubjectKind, id: &str) {
@@ -86,19 +91,12 @@ impl AiView {
     /// The tab's contents.
     pub fn ui(&mut self, ui: &mut Ui, core: &mut Core, subject: &Subject, roi: Option<(u32, u32, u32, u32)>, metrics: Vec<(String, f64, String)>, out: &mut Vec<PanelAction>) {
         let p = core.pal;
-        if !core.ai.settings.enabled {
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("{}  Remote AI analysis is off", I::SPARKLE)).font(semibold(14.0)).color(p.text));
-            ui.add_space(2.0);
-            ui.add(egui::Label::new(RichText::new("Send the image (or a region of it) to your own vision model server, for example Qwen on vLLM, and get a scored critique with marked problem areas. Nothing is sent until you turn it on and press Run.").size(12.0).color(p.muted)).wrap());
-            ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new(format!("{}  Set up in Settings > AI", I::GEAR_SIX)).color(Color32::WHITE)).fill(p.accent)).clicked() {
-                out.push(PanelAction::OpenSettings("Ai"));
-            }
+        ui.spacing_mut().item_spacing.y = 6.0;
+        if !core.ai.settings.enabled || core.ai.settings.host.trim().is_empty() {
+            self.setup_card(ui, core, out);
             return;
         }
         self.server_row(ui, core, out);
-        ui.add_space(4.0);
         self.preset_row(ui, core, subject.kind);
         let preset = self.preset(subject.kind, core);
         // Free-form needs a question; the other presets take optional extra
@@ -108,24 +106,72 @@ impl AiView {
         } else if preset.output != OutputKind::QuickScore {
             ui.add(egui::TextEdit::singleline(&mut self.question).hint_text("Extra instructions (optional)").desired_width(f32::INFINITY));
         }
-        ui.add_space(6.0);
         self.run_row(ui, core, subject, roi, metrics);
         if let Some(e) = core.ai.error.clone() {
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(12.0).color(p.danger)).wrap());
+            ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
         }
         if matches!(core.ai.phase, Phase::Running { .. }) {
             self.live(ui, core);
         }
         let Some(key) = subject.file_key() else { return };
         let Some(shown) = core.ai.shown_index(&key) else { return };
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         self.history_row(ui, core, &key, shown);
         if let Some(rec) = core.ai.shown_record(&key).cloned() {
             self.card(ui, &p, &rec, subject, out);
         }
     }
 
+    /// AI is off or has no server yet: what it does, the address and Test &
+    /// connect, right here (Settings > AI has everything else).
+    fn setup_card(&mut self, ui: &mut Ui, core: &mut Core, out: &mut Vec<PanelAction>) {
+        let p = core.pal;
+        let ai = &mut core.ai;
+        look::card(ui, &p, |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(RichText::new("Get an AI opinion from your own server").font(semibold(13.5)).color(p.text));
+            look::note(ui, &p, "Lumen asks a vision model you run, for example Qwen on vLLM, for a critique with the problem areas marked. Nothing is sent until you press Run AI review, and you see what is sent first.");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Server address").size(12.0).color(p.muted));
+            let mut connect = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().interact_size.y = look::CONTROL_H;
+                let field_w = (ui.available_width() - 118.0).max(100.0);
+                let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(field_w).margin(Vec2::new(6.0, 5.0)));
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    connect = true;
+                }
+                let busy = ai.testing();
+                if look::primary(ui, &p, if busy { "Connecting" } else { "Test & connect" }, !busy, 112.0).on_hover_text("Turn on AI review, check the server and pick a vision model").clicked() {
+                    connect = true;
+                }
+            });
+            let hint = match ai.endpoint() {
+                Some(e) if !ai.settings.host.is_empty() && ai.host_edit.trim() == ai.settings.host => format!("Connects to {}", e.display()),
+                _ => "IP address or host name; port 8000 unless you add one (host:port).".into(),
+            };
+            ui.label(RichText::new(hint).size(11.0).color(p.faint));
+            if connect {
+                if ai.apply_host() {
+                    ai.settings.enabled = true;
+                    ai.dirty = true;
+                    ai.error = None;
+                    ai.test_connection();
+                } else if ai.host_error.is_none() {
+                    ai.host_error = Some("Enter the server's IP address or host name".into());
+                }
+            }
+            if let Some(e) = &ai.host_error {
+                ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
+            }
+            if ui.add(egui::Button::new(RichText::new("All AI settings").size(12.0).color(p.accent)).frame(false)).on_hover_text("API key, HTTPS, timeouts and privacy options").clicked() {
+                out.push(PanelAction::OpenSettings("Ai"));
+            }
+        });
+    }
+
+    /// Status dot, server and settings; the model below.
     fn server_row(&mut self, ui: &mut Ui, core: &mut Core, out: &mut Vec<PanelAction>) {
         let p = core.pal;
         let ai = &mut core.ai;
@@ -138,23 +184,43 @@ impl AiView {
             (false, None, _) => (p.faint, "Not tested yet: press Test".to_string()),
         };
         ui.horizontal(|ui| {
-            let (r, resp) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-            ui.painter().circle_filled(r.center(), 5.0, dot);
-            resp.on_hover_text(tip.clone());
-            ui.label(RichText::new(server.clone().unwrap_or_else(|| "No server".into())).size(12.5).color(p.text)).on_hover_text(tip);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            look::dot(ui, dot).on_hover_text(tip.clone());
+            ui.add(egui::Label::new(RichText::new(server.clone().unwrap_or_else(|| "No server".into())).size(12.5).color(p.text)).truncate()).on_hover_text(tip.clone());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if crate::ui::widgets::icon_button_sized(ui, I::GEAR_SIX, "Settings > AI", false, 24.0, 14.0).clicked() {
+                if crate::ui::widgets::icon_button_sized(ui, I::GEAR_SIX, "All AI settings", false, 24.0, 14.0).clicked() {
                     out.push(PanelAction::OpenSettings("Ai"));
                 }
-                if server.is_some() && ui.add_enabled(!ai.testing(), egui::Button::new("Test").small()).on_hover_text("Test connection and list the models").clicked() {
+                if ai.testing() {
+                    ui.spinner();
+                } else if server.is_some() && ui.add(egui::Button::new(RichText::new("Test").size(12.0).color(p.accent)).frame(false)).on_hover_text("Test the connection and list the models").clicked() {
                     ai.test_connection();
                 }
             });
         });
-        // Model picker: the server's list after a test, or the stored id.
+        if let (false, Some((false, m))) = (ai.testing(), ai.connected()) {
+            ui.add(egui::Label::new(RichText::new(m).size(11.5).color(p.danger)).wrap());
+        }
+    }
+
+    /// Model and mode, as two aligned rows.
+    fn preset_row(&mut self, ui: &mut Ui, core: &mut Core, kind: SubjectKind) {
+        let p = core.pal;
+        let list = presets_for(kind, &core.ai.settings.custom_presets);
+        let cur = self.preset(kind, core);
+        let mut pick = None;
+        let label_w = 46.0;
+        let label = |ui: &mut Ui, text: &str| {
+            ui.allocate_ui_with_layout(Vec2::new(label_w, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(label_w);
+                ui.label(RichText::new(text).size(12.0).color(p.muted));
+            });
+        };
+        // The server's model list after a test, or the stored id.
+        let ai = &mut core.ai;
         let current = ai.settings.model.clone().unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Model").size(12.0).color(p.muted));
+            label(ui, "Model");
             if ai.models.is_empty() {
                 let resp = ui.add(egui::TextEdit::singleline(&mut ai.model_edit).hint_text("Test lists the models").desired_width(ui.available_width()));
                 if resp.lost_focus() {
@@ -178,19 +244,11 @@ impl AiView {
                     ai.set_model(&m);
                 }
             }
-        });
-        if !current.is_empty() {
-            ui.label(RichText::new(ai.vision_label(&current)).size(11.0).color(p.faint));
-        }
-    }
-
-    fn preset_row(&mut self, ui: &mut Ui, core: &mut Core, kind: SubjectKind) {
-        let p = core.pal;
-        let list = presets_for(kind, &core.ai.settings.custom_presets);
-        let cur = self.preset(kind, core);
-        let mut pick = None;
+        })
+        .response
+        .on_hover_text(if current.is_empty() { String::new() } else { ai.vision_label(&current) });
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Preset").size(12.0).color(p.muted));
+            label(ui, "Mode");
             egui::ComboBox::from_id_salt(("ai-preset", kind)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
                 for pr in &list {
                     if ui.selectable_label(pr.id == cur.id, &pr.name).on_hover_text(&pr.description).clicked() {
@@ -199,7 +257,10 @@ impl AiView {
                 }
             });
         });
-        ui.label(RichText::new(&cur.description).size(11.0).color(p.faint));
+        ui.horizontal(|ui| {
+            ui.add_space(label_w + ui.spacing().item_spacing.x);
+            ui.add(egui::Label::new(RichText::new(&cur.description).size(11.5).color(p.faint)).wrap());
+        });
         if let Some(id) = pick {
             self.set_preset(kind, &id);
             if core.ai.settings.preset != id {
@@ -212,37 +273,41 @@ impl AiView {
     fn run_row(&mut self, ui: &mut Ui, core: &mut Core, subject: &Subject, roi: Option<(u32, u32, u32, u32)>, metrics: Vec<(String, f64, String)>) {
         let p = core.pal;
         let busy = core.ai.busy();
+        let w = ui.available_width();
         ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = look::CONTROL_H;
             if busy {
-                if ui.add(egui::Button::new(RichText::new(format!("{}  Cancel", I::STOP)).color(Color32::WHITE)).fill(p.danger).min_size(Vec2::new(96.0, 28.0))).clicked() {
-                    core.ai.cancel();
+                let status = match &core.ai.phase {
+                    Phase::Idle => String::new(),
+                    Phase::Preparing { .. } => "Preparing the images".to_string(),
+                    Phase::Preview { .. } => "Check what will be sent".to_string(),
+                    Phase::Running { server, .. } => match (&core.ai.live.status, core.ai.live.connected) {
+                        (Some(s), _) => s.clone(),
+                        (None, false) => format!("Waiting for {server}"),
+                        (None, true) => "Receiving the answer".to_string(),
+                    },
+                };
+                if !matches!(core.ai.phase, Phase::Preview { .. }) {
+                    ui.spinner();
                 }
+                ui.add_sized(Vec2::new((w - 120.0).max(60.0), look::CONTROL_H), egui::Label::new(RichText::new(status).size(12.0).color(p.muted)).truncate());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(78.0, look::CONTROL_H))).clicked() {
+                        core.ai.cancel();
+                    }
+                });
             } else {
                 let ready = subject.a.is_some();
-                let resp = ui
-                    .add_enabled(ready, egui::Button::new(RichText::new(format!("{}  Run", I::SPARKLE)).color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(96.0, 28.0)))
-                    .on_hover_text(format!("Analyze {} ({})", if roi.is_some() { "the region" } else { "the whole image" }, crate::ui::commands::Command::RunAi.shortcut()));
+                let what = if roi.is_some() { "the region" } else if subject.kind.is_pair() { "A and B" } else if subject.kind.is_video() { "the frame on screen" } else { "the whole image" };
+                let resp = look::primary(ui, &p, "Run AI review", ready, w).on_hover_text(format!("Send {what} to your AI server ({})", crate::ui::commands::Command::RunAi.shortcut()));
                 if resp.clicked() {
                     self.run(core, subject, roi, metrics);
                 }
             }
-            let status = match &core.ai.phase {
-                Phase::Idle => None,
-                Phase::Preparing { .. } => Some("Preparing images...".to_string()),
-                Phase::Preview { .. } => Some("Check what will be sent".to_string()),
-                Phase::Running { server, .. } => Some(match (&core.ai.live.status, core.ai.live.connected) {
-                    (Some(s), _) => s.clone(),
-                    (None, false) => format!("Waiting for {server}..."),
-                    (None, true) => "Receiving...".to_string(),
-                }),
-            };
-            if let Some(s) = status {
-                if !matches!(core.ai.phase, Phase::Preview { .. }) {
-                    ui.spinner();
-                }
-                ui.add(egui::Label::new(RichText::new(s).size(11.5).color(p.muted)).truncate());
-            }
         });
+        let server_key = core.ai.endpoint().map(|e| e.server_key()).unwrap_or_default();
+        let note = if core.ai.settings.needs_confirmation(&server_key) { "You see exactly what is sent before it leaves this computer." } else { "Sends without a preview to this server (Settings > AI review to change)." };
+        ui.label(RichText::new(format!("{}  {note}", I::SHIELD_CHECK)).size(11.0).color(p.faint));
     }
 
     fn live(&mut self, ui: &mut Ui, core: &mut Core) {

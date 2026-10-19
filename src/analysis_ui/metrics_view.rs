@@ -13,10 +13,12 @@
 use super::adapters;
 use super::heatmap_view::HeatmapView;
 use super::plots::{self, PlotAction, Plots, Series};
+use super::look;
+use super::summary;
 use crate::ui::icons as I;
 use crate::ui::roi::ImageTransform;
 use crate::ui::theme::Palette;
-use egui::{CursorIcon, Painter, RichText, Sense, Ui, Vec2};
+use egui::{CursorIcon, Painter, RichText, Sense, Stroke, Ui, Vec2};
 use image::RgbaImage;
 use lumen_analysis::cache::{CacheKey, DiskCache, DEFAULT_MAX_BYTES};
 use lumen_analysis::metrics::{self, Direction, MetricKind, Unit};
@@ -316,6 +318,15 @@ impl Subject {
             _ => None,
         }
     }
+
+    /// The A-B loop in A frames (inclusive).
+    fn loop_ab(&self) -> Option<(usize, usize)> {
+        match self {
+            #[cfg(feature = "video")]
+            Subject::Video(v) => v.loop_ab,
+            _ => None,
+        }
+    }
 }
 
 /// A region drawn on a video displayed rotated by `rotation` degrees, in the
@@ -337,7 +348,8 @@ pub fn native_roi(r: Roi, rotation: i32, size: (u32, u32)) -> Roi {
 
 // ------------------------------------------------------------------ prefs and history
 
-/// Remembered metric choices per kind of subject, and the last stride.
+/// Remembered metric choices per kind of subject, the last stride typed
+/// and how fast range runs went (for the automatic stride).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Prefs {
@@ -346,6 +358,12 @@ struct Prefs {
     video: Option<Vec<String>>,
     video_pair: Option<Vec<String>>,
     stride: Option<String>,
+    /// `false`: the stride typed in Details is used for whole-video runs.
+    stride_auto: Option<bool>,
+    /// Milliseconds per measured frame and megapixel of the last range runs
+    /// of one video and of a pair.
+    speed_video: Option<f64>,
+    speed_pair: Option<f64>,
 }
 
 fn prefs_path() -> PathBuf {
@@ -376,17 +394,26 @@ impl Prefs {
     }
 }
 
-/// Metric set before the user chose one.
+/// The recommended metric set (before the user chose one): everything the
+/// summary talks about, and cheap enough for one click. Pairs get the
+/// metrics with a heatmap for "Show where"; video ranges stay fast.
 fn default_metrics(k: Kind) -> Vec<String> {
     let ids: &[&str] = match k {
         Kind::None => &[],
-        Kind::Image => metrics::preset("photo_technical"),
-        Kind::Compare => &["psnr", "ssim.gauss", "deltae.2000", "diff.abs"],
-        Kind::Video => &["sharpness.laplacian", "noise", "blockiness", "banding", "temporal.freeze", "temporal.scene"],
-        Kind::VideoPair => &["psnr", "ssim.fast", "temporal.freeze", "temporal.scene"],
+        Kind::Image => &["sharpness.laplacian", "noise", "exposure", "color_cast", "blockiness", "banding"],
+        Kind::Compare => &["psnr", "ssim.gauss", "deltae.2000"],
+        Kind::Video => &["sharpness.laplacian", "noise", "exposure", "blockiness", "banding", "temporal.freeze", "temporal.scene"],
+        Kind::VideoPair => &["psnr", "ssim.fast"],
     };
     ids.iter().map(|s| s.to_string()).collect()
 }
+
+/// Range speed (ms per measured frame and megapixel) before any run: what
+/// the recommended sets take on a 1.5 MP screen recording (8 threads).
+const SPEED_VIDEO: f64 = 16.0;
+const SPEED_PAIR: f64 = 10.0;
+/// A whole-video run with the automatic stride aims at this many seconds.
+const RANGE_BUDGET_S: f64 = 30.0;
 
 /// One earlier run of the subject's file, stored in the analysis cache.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -478,9 +505,17 @@ pub fn unit_text(u: Unit) -> &'static str {
 
 /// A human name for value `key` (relative, `"mse_avg"`) of metric `id`.
 pub fn key_label(id: &str, key: &str) -> String {
-    if let Some(k) = key.strip_suffix("_b") {
+    // B's sequence of a temporal metric; elsewhere `_b` is the blue channel.
+    if let Some(k) = key.strip_suffix("_b").filter(|_| id.starts_with("temporal.")) {
         return format!("B: {}", key_label(id, k));
     }
+    let channel = |p: &str| match p {
+        "r" => "Red".to_string(),
+        "g" => "Green".to_string(),
+        "b" => "Blue".to_string(),
+        "avg" => "Average".to_string(),
+        other => other.to_uppercase(),
+    };
     let plane = |p: &str| match p {
         "y" => "Y",
         "u" => "U",
@@ -553,10 +588,10 @@ pub fn key_label(id: &str, key: &str) -> String {
         return fixed.to_string();
     }
     if let Some(p) = key.strip_prefix("mse_") {
-        return format!("MSE {}", plane(p));
+        return format!("{} MSE", channel(p));
     }
     if let Some(p) = key.strip_prefix("maxabs_") {
-        return format!("Max abs error {}", plane(p));
+        return format!("{} max difference", channel(p));
     }
     if let Some(n) = key.strip_prefix("cs") {
         return format!("Contrast-structure, scale {n}");
@@ -843,6 +878,16 @@ enum Temporal {
     Range,
 }
 
+/// What a video run measures (the scope choice of the tab). `Custom` is the
+/// range typed in Details or dragged on a graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoScope {
+    Frame,
+    Loop,
+    Whole,
+    Custom,
+}
+
 struct Run {
     handle: JobHandle,
     key: CacheKey,
@@ -873,6 +918,9 @@ pub struct MetricsTab {
     kind: Kind,
     file_a: Option<PathBuf>,
     temporal: Temporal,
+    scope: VideoScope,
+    /// The stride is picked so a range run takes about `RANGE_BUDGET_S`.
+    stride_auto: bool,
     range_text: [String; 3],
     selected: BTreeSet<String>,
     run: Option<Run>,
@@ -915,6 +963,16 @@ pub struct MetricsTab {
     dev_scroll: f32,
     /// Why full-reference metrics cannot run (videos of different sizes).
     size_mismatch: Option<String>,
+    /// The plain-language summary of `report` (built when first shown).
+    summary: Option<summary::Summary>,
+    /// Sharpest tiles of the shown sharpness map (see `summary::Facts`).
+    sharp_peak: Option<f64>,
+    /// Frame rate of the video shown (summary times).
+    fps: f64,
+    /// Dev hook: open the "All numbers" and "Details and options" sections.
+    dev_open: Option<bool>,
+    /// Frames waited for the paused frame's planes (see `run_video`).
+    frame_tries: u8,
 }
 
 impl Default for MetricsTab {
@@ -927,6 +985,7 @@ impl MetricsTab {
     pub fn new() -> MetricsTab {
         let prefs = Prefs::load();
         let stride = prefs.stride.clone().unwrap_or_else(|| "1".into());
+        let stride_auto = prefs.stride_auto.unwrap_or(true);
         MetricsTab {
             analyzer: None,
             cache_dir: crate::settings::cache_dir().join("analysis"),
@@ -935,6 +994,8 @@ impl MetricsTab {
             kind: Kind::None,
             file_a: None,
             temporal: Temporal::Frame,
+            scope: VideoScope::Frame,
+            stride_auto,
             range_text: [String::new(), String::new(), stride],
             selected: BTreeSet::new(),
             run: None,
@@ -964,6 +1025,11 @@ impl MetricsTab {
             run_requested: false,
             dev_scroll: 0.0,
             size_mismatch: None,
+            summary: None,
+            sharp_peak: None,
+            fps: 25.0,
+            dev_open: None,
+            frame_tries: 0,
         }
     }
 
@@ -1037,14 +1103,36 @@ impl MetricsTab {
         match verb {
             "preset" => self.selected = metrics::preset(rest).iter().map(|s| s.to_string()).collect(),
             "select" => self.selected = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            "frames" => self.temporal = if rest == "range" { Temporal::Range } else { Temporal::Frame },
+            "frames" => self.set_scope(if rest == "range" { VideoScope::Custom } else { VideoScope::Frame }),
             "range" => {
                 let v: Vec<&str> = rest.split_whitespace().collect();
                 for (i, t) in v.iter().take(3).enumerate() {
                     self.range_text[i] = if *t == "end" { String::new() } else { t.to_string() };
                 }
-                self.temporal = Temporal::Range;
+                // A typed stride is used as it is.
+                if v.len() > 2 {
+                    self.stride_auto = false;
+                }
+                self.set_scope(VideoScope::Custom);
             }
+            // `scope frame|loop|whole`: the tab's scope choice.
+            "scope" => self.set_scope(match rest {
+                "loop" => VideoScope::Loop,
+                "whole" => VideoScope::Whole,
+                _ => VideoScope::Frame,
+            }),
+            // `stride <n>` or `stride auto`.
+            "stride" => match rest.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    self.range_text[2] = n.to_string();
+                    self.stride_auto = false;
+                }
+                _ => self.stride_auto = true,
+            },
+            "recommended" => self.selected = default_metrics(self.kind).into_iter().collect(),
+            "where" => self.show_where(),
+            // `details [close]`: open (or close) the collapsed sections.
+            "details" => self.dev_open = Some(rest != "close"),
             "run" => self.request_run(),
             "cancel" => self.cancel(),
             "scroll" => self.dev_scroll = rest.parse().unwrap_or(0.0),
@@ -1084,9 +1172,16 @@ impl MetricsTab {
             .as_ref()
             .map(|r| rows_of_report(r).iter().filter_map(|row| row.cells.first().map(|c| format!("{}={}", c.key, c.value.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into())))).collect())
             .unwrap_or_default();
+        let summary = self.summary.as_ref().map(|s| {
+            let mut v: Vec<String> = s.head.iter().map(|h| format!("{} ({})", h.title, h.detail)).collect();
+            v.extend(s.lines.iter().map(|l| format!("{:?} {} {}", l.level, l.label, l.value)));
+            v.join("; ")
+        });
         format!(
-            "metrics: kind={:?} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} notes={} history={} worst={:?}",
+            "metrics: kind={:?} scope={:?} stride_auto={} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} visible={} notes={} history={} worst={:?} summary=[{}]",
             self.kind,
+            self.scope,
+            self.stride_auto,
             self.run.is_some(),
             self.stale(),
             self.status.as_ref().map(|s| s.0.clone()),
@@ -1094,9 +1189,11 @@ impl MetricsTab {
             self.selected.iter().cloned().collect::<Vec<_>>().join(","),
             values.join(" "),
             self.heat.id(),
+            self.heat.visible,
             self.report.as_ref().map(|r| r.notes.len()).unwrap_or(0),
             self.history.len(),
             self.plots.worst_frames(&self.series),
+            summary.unwrap_or_default(),
         )
     }
 
@@ -1196,10 +1293,14 @@ impl MetricsTab {
         self.maps.clear();
         self.result_roi = None;
         self.status = None;
+        self.summary = None;
+        self.sharp_peak = None;
         self.expanded.clear();
-        if !s.is_video() {
-            self.temporal = Temporal::Frame;
-        }
+        // A new video starts on the frame on screen; a range typed for the
+        // last file may not exist in this one.
+        self.set_scope(VideoScope::Frame);
+        self.range_text[0].clear();
+        self.range_text[1].clear();
         let chosen = self.prefs.slot(self.kind).and_then(|s| s.clone()).unwrap_or_else(|| default_metrics(self.kind));
         self.selected = chosen.into_iter().collect();
         self.history = self.file_a.as_ref().and_then(|a| self.cache().get::<Vec<HistoryEntry>>(&history_key(a))).unwrap_or_default();
@@ -1211,7 +1312,62 @@ impl MetricsTab {
             *slot = Some(sel);
         }
         self.prefs.stride = Some(self.range_text[2].clone());
+        self.prefs.stride_auto = Some(self.stride_auto);
         self.prefs.save();
+    }
+
+    fn set_scope(&mut self, scope: VideoScope) {
+        self.scope = scope;
+        self.temporal = if scope == VideoScope::Frame { Temporal::Frame } else { Temporal::Range };
+    }
+
+    /// Range speed for the automatic stride (ms per frame and megapixel).
+    fn speed(&self) -> f64 {
+        match self.kind {
+            Kind::VideoPair => self.prefs.speed_pair.unwrap_or(SPEED_PAIR),
+            _ => self.prefs.speed_video.unwrap_or(SPEED_VIDEO),
+        }
+    }
+
+    /// The frames a range run of `s` would measure: the scope's range with
+    /// the typed or the automatic stride.
+    fn planned_range(&self, s: &Subject, roi: Option<Roi>) -> Result<RangeSel, String> {
+        let total = s.frames();
+        let (start, end) = match self.scope {
+            VideoScope::Whole | VideoScope::Frame => (String::new(), String::new()),
+            VideoScope::Loop => match s.loop_ab() {
+                Some((a, b)) => (a.to_string(), (b + 1).to_string()),
+                None => return Err("Set an A-B loop first (Ctrl+L)".into()),
+            },
+            VideoScope::Custom => (self.range_text[0].clone(), self.range_text[1].clone()),
+        };
+        let stride = if self.stride_auto { "1" } else { self.range_text[2].as_str() };
+        let mut r = parse_range(&start, &end, stride, s.fps(), total)?;
+        if let (true, Some(n), Some((w, h))) = (self.stride_auto, total, s.size()) {
+            let (w, h) = roi.map(|r| (r.w, r.h)).unwrap_or((w, h));
+            r.stride = summary::auto_stride(range_frames(r, n), w as f64 * h as f64 / 1e6, self.speed(), RANGE_BUDGET_S);
+        }
+        Ok(r)
+    }
+
+    /// "Every 4th frame, about 25 s" for the scope choice, or why it cannot run.
+    fn range_hint(&self, s: &Subject, roi: Option<Roi>) -> Result<String, String> {
+        let r = self.planned_range(s, roi)?;
+        let Some(n) = s.frames() else { return Ok("Indexing the video".into()) };
+        let frames = range_frames(r, n);
+        let (w, h) = roi.map(|r| (r.w, r.h)).or(s.size()).unwrap_or((1920, 1080));
+        let secs = summary::estimate_secs(frames, 1, w as f64 * h as f64 / 1e6, self.speed());
+        let time = if secs < 1.5 { "about 1 s".to_string() } else if secs < 90.0 { format!("about {secs:.0} s") } else { format!("about {:.0} min", secs / 60.0) };
+        Ok(format!("{}, {frames} frames, {time}", summary::every(r.stride)))
+    }
+
+    /// "Show where": the heatmap the summary points at, on the image.
+    fn show_where(&mut self) {
+        let Some(summary::Action::ShowMap { id, .. }) = self.summary.as_ref().and_then(|s| s.action.clone()) else { return };
+        if let Some(m) = self.map_of(&id) {
+            self.heat.set_map(&id, m);
+            self.heat.visible = true;
+        }
     }
 
     /// Why metric `id` cannot run on this subject and scope, if it cannot.
@@ -1258,7 +1414,8 @@ impl MetricsTab {
         self.update_size_mismatch(&ctx.subject);
         let ids = self.runnable();
         if ids.is_empty() {
-            self.set_status("Choose at least one metric that applies here", true);
+            let why = self.size_mismatch.clone().unwrap_or_else(|| "Choose at least one metric that applies here (Details and options)".into());
+            self.set_status(why, true);
             return;
         }
         let roi = ctx.roi;
@@ -1311,9 +1468,20 @@ impl MetricsTab {
                 return;
             };
             let Some(a) = v.a.native.clone().and_then(|f| adapters::NativeFrame::new(f, v.a.color)) else {
-                self.set_status("Pause on a frame first (native planes are not ready)", true);
+                // Video mode copies the paused frame's planes once the tab is
+                // on screen: try again for a moment (Shift+Q with the panel
+                // closed), then say what is missing.
+                if self.frame_tries < 40 {
+                    self.frame_tries += 1;
+                    self.run_requested = true;
+                    egui_ctx.request_repaint();
+                } else {
+                    self.frame_tries = 0;
+                    self.set_status("Pause the video to analyze the frame on screen", true);
+                }
                 return;
             };
+            self.frame_tries = 0;
             let b = match &v.b {
                 Some(sb) => match sb.native.clone().and_then(|f| adapters::NativeFrame::new(f, sb.color)) {
                     Some(f) => Some(f),
@@ -1331,13 +1499,16 @@ impl MetricsTab {
             return;
         }
         let total = v.a.frames();
-        let r = match parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], v.a.fps, total) {
+        let r = match self.planned_range(&Subject::Video(v.clone()), panel_roi) {
             Ok(r) => r,
             Err(e) => {
                 self.set_status(e, true);
                 return;
             }
         };
+        if self.stride_auto {
+            self.range_text[2] = r.stride.to_string();
+        }
         let req = adapters::VideoRangeRequest {
             a: v.a.side(),
             b: v.b.as_ref().map(|b| b.side()),
@@ -1424,6 +1595,10 @@ impl MetricsTab {
                 }
                 let ms = run.started.elapsed().as_secs_f32() * 1000.0;
                 self.set_status(format!("Done in {}", fmt_cost(ms.max(1.0))), false);
+                #[cfg(feature = "video")]
+                if run.decode.is_some() {
+                    self.learn_speed(&report, ms as f64);
+                }
                 self.finish(report, Some((run.key, run.history)));
                 self.result_roi = Some(run.roi);
             }
@@ -1440,6 +1615,23 @@ impl MetricsTab {
             }
             Err(e) => self.set_status(e, true),
         }
+    }
+
+    /// Remembers how fast a range run went (for the automatic stride),
+    /// smoothed over runs; short runs say little.
+    #[cfg(feature = "video")]
+    fn learn_speed(&mut self, r: &AnalysisReport, ms: f64) {
+        let n = r.frames.len();
+        let (w, h) = r.scope.roi.map(|r| (r.w, r.h)).unwrap_or((r.scope.width, r.scope.height));
+        let mpix = w as f64 * h as f64 / 1e6;
+        if n < 30 || mpix <= 0.0 {
+            return;
+        }
+        let k = ((ms - 500.0).max(ms * 0.5) / (n as f64 * mpix)).clamp(0.5, 500.0);
+        let pair = self.kind == Kind::VideoPair;
+        let slot = if pair { &mut self.prefs.speed_pair } else { &mut self.prefs.speed_video };
+        *slot = Some(slot.map(|old| 0.5 * old + 0.5 * k).unwrap_or(k));
+        self.prefs.save();
     }
 
     /// Show a finished report and store it in the history (`store`).
@@ -1462,9 +1654,20 @@ impl MetricsTab {
                 self.plot_span = (f.start, f.end.saturating_sub(1).max(f.start));
             }
         }
-        // Keep the overlay of the same metric, else show a difference map;
-        // no-reference tile maps only when asked (they cover the photo).
-        let pick = self.heat.id().and_then(|id| self.map_of(id).map(|m| (id.to_string(), m))).or_else(|| {
+        self.summary = None;
+        self.sharp_peak = self.map_of("sharpness.laplacian").and_then(|m| {
+            let mut v: Vec<f32> = m.data.iter().copied().filter(|x| x.is_finite()).collect();
+            let i = (v.len() * 9 / 10).min(v.len().checked_sub(1)?);
+            Some(*v.select_nth_unstable_by(i, f32::total_cmp).1 as f64)
+        });
+        // Keep the overlay of the same metric on screen; else ready a
+        // difference map, shown when asked ("Show where", the map buttons).
+        // No-reference tile maps only when asked (they cover the photo).
+        let same = self.heat.id().and_then(|id| self.map_of(id).map(|m| (id.to_string(), m)));
+        if same.is_none() {
+            self.heat.visible = false;
+        }
+        let pick = same.or_else(|| {
             ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().find_map(|id| self.map_of(id).map(|m| (id.to_string(), m)))
         });
         match pick {
@@ -1550,10 +1753,10 @@ impl MetricsTab {
         match a {
             PlotAction::Seek(f) => self.seek = Some(f),
             PlotAction::Range(s, e) => {
-                self.temporal = Temporal::Range;
+                self.set_scope(VideoScope::Custom);
                 self.range_text[0] = s.to_string();
                 self.range_text[1] = e.to_string();
-                self.set_status(format!("Range set to frames {s}-{}; press Run to measure it", e.saturating_sub(1)), false);
+                self.set_status(format!("Range set to frames {s}-{}; press Analyze to measure it", e.saturating_sub(1)), false);
             }
         }
     }
@@ -1566,120 +1769,144 @@ impl MetricsTab {
         self.sync(&ctx.subject);
         self.update_size_mismatch(&ctx.subject);
         self.cur_roi = ctx.roi;
+        self.fps = ctx.subject.fps();
         self.poll(ui.ctx());
         if std::mem::take(&mut self.run_requested) && self.kind != Kind::None {
             self.run(ctx, ui.ctx());
         }
         if self.kind == Kind::None {
-            ui.add_space(8.0);
-            ui.label(RichText::new("Open an image, compare two images or open a video to measure it.").color(p.muted));
+            ui.add_space(10.0);
+            ui.label(RichText::new("Nothing to analyze yet").font(crate::ui::theme::semibold(13.5)).color(p.text));
+            look::note(ui, &p, "Open an image, compare two images (select them in the browser and press P) or open a video.");
             return;
         }
-        self.scope_bar(ui, &p, &ctx.subject);
-        ui.add_space(6.0);
-        self.picker(ui, &p, &ctx.subject, ctx.roi);
-        ui.add_space(6.0);
+        if self.report.is_some() && self.summary.is_none() {
+            self.summary = self.facts().map(|f| summary::summarize(&f));
+        }
+        ui.spacing_mut().item_spacing.y = 6.0;
+        self.scope_bar(ui, &p, &ctx.subject, ctx.roi);
         self.run_row(ui, &p, ctx);
-        ui.add_space(6.0);
         if self.report.is_none() && self.live.is_empty() && self.run.is_none() && self.status.is_none() {
-            ui.label(RichText::new(format!("{}  Pick metrics and press Run, or draw a region with R", I::INFO)).color(p.muted));
+            self.intro(ui, &p);
         }
-        self.results(ui, &p);
-        if !self.stale() && (self.heat.map().is_some() || !self.maps.is_empty()) {
-            ui.add_space(6.0);
-            self.heatmap_section(ui, &p);
-        }
+        self.summary_card(ui, &p);
+        self.heatmap_row(ui, &p);
+        let force = self.dev_open.take();
         #[cfg(feature = "video")]
         if !self.series.is_empty() {
-            ui.add_space(6.0);
-            self.worst_section(ui, &p, &ctx.subject);
+            self.worst_section(ui, &p, &ctx.subject, force);
         }
-        ui.add_space(6.0);
-        self.history_section(ui, &p);
+        ui.add_space(2.0);
+        if self.report.is_some() || !self.live.is_empty() {
+            look::section("All numbers", &p).id_salt("metrics-all-numbers").default_open(false).open(force).show(ui, |ui| self.results(ui, &p));
+        }
+        look::section("Details and options", &p).id_salt("metrics-details").default_open(false).open(force).show(ui, |ui| {
+            self.picker(ui, &p, &ctx.subject, ctx.roi);
+            if ctx.subject.is_video() {
+                self.range_fields(ui, &p, &ctx.subject, ctx.roi);
+            }
+            self.history_section(ui, &p);
+        });
         if self.dev_scroll != 0.0 {
             ui.scroll_with_delta(Vec2::new(0.0, -std::mem::take(&mut self.dev_scroll)));
         }
     }
 
-    fn scope_bar(&mut self, ui: &mut Ui, p: &Palette, s: &Subject) {
+    /// Video: the scope choice (frame on screen, A-B loop, whole video) and
+    /// what a range run would measure.
+    fn scope_bar(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
         if !s.is_video() {
             return;
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.label(RichText::new("Frames").size(12.0).color(p.muted));
-            ui.selectable_value(&mut self.temporal, Temporal::Frame, "Current frame").on_hover_text("The paused frame");
-            ui.selectable_value(&mut self.temporal, Temporal::Range, "Range").on_hover_text("A range of frames");
-        });
-        if s.is_video() && self.temporal == Temporal::Range {
-            let total = s.frames();
-            ui.horizontal(|ui| {
-                let field = |ui: &mut Ui, label: &str, text: &mut String, hint: &str| {
-                    ui.label(RichText::new(label).color(p.muted));
-                    ui.add(egui::TextEdit::singleline(text).desired_width(64.0).hint_text(hint)).on_hover_text("Frame number, seconds (4.5s) or minutes:seconds (1:02)").changed()
-                };
-                let mut edited = field(ui, "Start", &mut self.range_text[0], "0");
-                edited |= field(ui, "End", &mut self.range_text[1], "end");
-                if field(ui, "Stride", &mut self.range_text[2], "1") {
-                    self.save_selection();
-                    edited = true;
-                }
-                // "Range set to frames ..." from a plot drag no longer applies.
-                if edited {
-                    self.status = None;
-                }
-            });
-            ui.horizontal(|ui| {
-                #[cfg(feature = "video")]
-                let loop_ab = match s {
-                    Subject::Video(v) => v.loop_ab,
-                    _ => None,
-                };
-                #[cfg(not(feature = "video"))]
-                let loop_ab: Option<(usize, usize)> = None;
-                if ui.add_enabled(loop_ab.is_some(), egui::Button::new("Use A-B loop").small()).on_disabled_hover_text("Set an A-B loop first (Ctrl+L)").clicked() {
-                    if let Some((a, b)) = loop_ab {
-                        self.range_text[0] = a.to_string();
-                        self.range_text[1] = (b + 1).to_string();
-                        self.set_status(format!("Range set to the A-B loop, frames {a}-{b}"), false);
-                    }
-                }
-                if ui.small_button("Whole file").clicked() {
-                    self.range_text[0].clear();
-                    self.range_text[1].clear();
-                    self.status = None;
-                }
-                match parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], s.fps(), total) {
-                    Ok(r) => {
-                        if let Some(n) = total {
-                            ui.label(RichText::new(format!("{} frames", range_frames(r, n))).color(p.faint));
-                        }
-                    }
-                    Err(e) => {
-                        ui.label(RichText::new(e).color(p.danger));
-                    }
-                }
-            });
+        let has_loop = s.loop_ab().is_some();
+        let items = [
+            ("Current frame", true, "The frame on screen"),
+            ("A-B loop", has_loop, if has_loop { "The frames of the A-B loop" } else { "Set an A-B loop first (Ctrl+L)" }),
+            ("Whole video", true, "The whole file; long videos are sampled to keep it under about 30 s"),
+        ];
+        let sel = match self.scope {
+            VideoScope::Frame => Some(0),
+            VideoScope::Loop => Some(1),
+            VideoScope::Whole => Some(2),
+            VideoScope::Custom => None,
+        };
+        if let Some(i) = look::segmented(ui, p, "metrics-scope", &items, sel) {
+            self.set_scope([VideoScope::Frame, VideoScope::Loop, VideoScope::Whole][i]);
+            self.status = None;
+        }
+        if self.scope != VideoScope::Frame {
+            let (text, color) = match self.range_hint(s, roi) {
+                Ok(t) if self.scope == VideoScope::Custom => (format!("Custom range: {t}"), p.muted),
+                Ok(t) => (t, p.muted),
+                Err(e) => (e, p.danger),
+            };
+            let r = ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
+            if self.stride_auto {
+                r.on_hover_text("Long videos are sampled so the run takes about 30 s. Set a fixed stride in Details and options.");
+            }
         }
     }
 
     /// Frames a run will measure (1 unless a video range).
-    fn frames_to_measure(&self, s: &Subject) -> usize {
+    fn frames_to_measure(&self, s: &Subject, roi: Option<Roi>) -> usize {
         if !s.is_video() || self.temporal == Temporal::Frame {
             return 1;
         }
         let total = s.frames().unwrap_or(0);
-        parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], s.fps(), s.frames()).map(|r| range_frames(r, total)).unwrap_or(0)
+        self.planned_range(s, roi).map(|r| range_frames(r, total)).unwrap_or(0)
+    }
+
+    /// Start, end and stride of a custom range (Details and options).
+    fn range_fields(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Frame range").font(crate::ui::theme::semibold(12.5)).color(p.text));
+        let mut edited = false;
+        ui.horizontal_wrapped(|ui| {
+            let field = |ui: &mut Ui, label: &str, text: &mut String, hint: &str, enabled: bool| {
+                ui.label(RichText::new(label).size(12.0).color(p.muted));
+                ui.add_enabled(enabled, egui::TextEdit::singleline(text).desired_width(56.0).hint_text(hint)).on_hover_text("Frame number, seconds (4.5s) or minutes:seconds (1:02)").changed()
+            };
+            edited |= field(ui, "Start", &mut self.range_text[0], "0", true);
+            edited |= field(ui, "End", &mut self.range_text[1], "end", true);
+        });
+        if edited {
+            self.set_scope(VideoScope::Custom);
+            self.status = None;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Stride").size(12.0).color(p.muted));
+            if self.stride_auto {
+                let auto = self.planned_range(s, roi).map(|r| r.stride.to_string()).unwrap_or_else(|_| "-".into());
+                let mut shown = auto;
+                ui.add_enabled(false, egui::TextEdit::singleline(&mut shown).desired_width(56.0));
+            } else if ui.add(egui::TextEdit::singleline(&mut self.range_text[2]).desired_width(56.0).hint_text("1")).on_hover_text("Measure every Nth frame").changed() {
+                self.save_selection();
+                self.status = None;
+            }
+            if ui.checkbox(&mut self.stride_auto, "Auto").on_hover_text("Pick the stride so a run takes about 30 s").changed() {
+                self.save_selection();
+            }
+        });
+        let total = s.frames();
+        if let Err(e) = parse_range(&self.range_text[0], &self.range_text[1], if self.stride_auto { "1" } else { &self.range_text[2] }, s.fps(), total) {
+            ui.label(RichText::new(e).size(11.5).color(p.danger));
+        }
     }
 
     fn picker(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(RichText::new("Presets").color(p.muted));
-            for (name, id) in [("Quick", "quick"), ("Encode QA", "encode_qa"), ("Photo technical", "photo_technical")] {
-                if ui.small_button(name).clicked() {
-                    self.selected = metrics::preset(id).iter().map(|s| s.to_string()).collect();
+            let mut presets: Vec<(&str, Vec<String>, &str)> = vec![("Recommended", default_metrics(self.kind), "What the summary uses: quick and covers the basics")];
+            if matches!(self.kind, Kind::Compare | Kind::VideoPair) {
+                presets.push(("Quick", metrics::preset("quick").iter().map(|s| s.to_string()).collect(), "PSNR, fast SSIM and the absolute difference"));
+            }
+            presets.push(("Encode QA", metrics::preset("encode_qa").iter().map(|s| s.to_string()).collect(), "Fidelity, blocking and banding for encodes"));
+            presets.push(("Photo technical", metrics::preset("photo_technical").iter().map(|s| s.to_string()).collect(), "Sharpness, noise, exposure and color cast"));
+            for (name, ids, tip) in presets {
+                let on = self.selected == ids.iter().cloned().collect::<BTreeSet<String>>();
+                if ui.add(egui::Button::selectable(on, name).small()).on_hover_text(tip).clicked() {
+                    self.selected = ids.into_iter().collect();
                     changed = true;
                 }
             }
@@ -1690,7 +1917,7 @@ impl MetricsTab {
         });
         let (w, h) = s.size().unwrap_or((1920, 1080));
         let (w, h) = roi.map(|r| (r.w, r.h)).unwrap_or((w, h));
-        let frames = self.frames_to_measure(s).max(1) as f32;
+        let frames = self.frames_to_measure(s, roi).max(1) as f32;
         let threads = analysis_threads() as f32;
         // Frames run in parallel in range jobs.
         let scale = if frames > 1.0 { frames / threads } else { 1.0 };
@@ -1705,10 +1932,10 @@ impl MetricsTab {
             } else {
                 metrics::all().iter().filter(|m| m.info().kind == kind && self.selected.contains(m.id())).count()
             };
-            let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).color(if blocked.is_some() { p.faint } else { p.text });
+            let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).size(12.5).color(if blocked.is_some() { p.faint } else { p.text });
             egui::CollapsingHeader::new(head).id_salt(("metrics-group", title)).default_open(false).show(ui, |ui| {
                 if let Some(why) = &blocked {
-                    ui.label(RichText::new(why).size(11.0).color(p.faint));
+                    ui.add(egui::Label::new(RichText::new(why).size(11.0).color(p.faint)).wrap());
                 }
                 let mut entries: Vec<(&'static str, &'static str, &'static str, Option<f32>, bool)> = Vec::new();
                 if kind == MetricKind::Temporal {
@@ -1725,7 +1952,7 @@ impl MetricsTab {
                 for (id, name, desc, cost, heavy) in entries {
                     ui.horizontal(|ui| {
                         let mut on = self.selected.contains(id);
-                        let resp = ui.add_enabled(blocked.is_none(), egui::Checkbox::new(&mut on, name)).on_hover_text(desc);
+                        let resp = ui.add_enabled(blocked.is_none(), egui::Checkbox::new(&mut on, RichText::new(name).size(12.5))).on_hover_text(desc);
                         if resp.changed() {
                             if on {
                                 self.selected.insert(id.to_string());
@@ -1747,42 +1974,219 @@ impl MetricsTab {
         }
         if changed {
             self.save_selection();
+            self.status = None;
         }
     }
 
+    /// Analyze (or Cancel with progress), the export menu and the status line.
     fn run_row(&mut self, ui: &mut Ui, p: &Palette, ctx: &MetricsCtx) {
+        let w = ui.available_width();
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().interact_size.y = look::CONTROL_H;
             if let Some(run) = &self.run {
-                if ui.button(format!("{}  Cancel", I::STOP)).clicked() {
-                    run.handle.cancel();
-                }
                 let prog = run.handle.progress();
                 let frac = prog.fraction().unwrap_or(0.0);
                 let eta = prog.eta().map(fmt_eta).unwrap_or_default();
-                let text = if prog.total() > 1 { format!("{} / {}  {eta}", prog.done(), prog.total()) } else { eta };
-                ui.add(egui::ProgressBar::new(frac).fill(p.accent).desired_height(14.0).text(RichText::new(text).size(11.0)));
+                let text = if prog.total() > 1 { format!("{} of {}  {eta}", prog.done(), prog.total()) } else if eta.is_empty() { "Analyzing".to_string() } else { eta };
+                let bar_w = (w - 84.0).max(80.0);
+                ui.add(egui::ProgressBar::new(frac).fill(p.accent).desired_width(bar_w).desired_height(look::CONTROL_H).corner_radius(6).text(RichText::new(text).size(11.5)));
+                if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(78.0, look::CONTROL_H))).clicked() {
+                    run.handle.cancel();
+                }
             } else {
                 let n = self.runnable().len();
-                let run = ui.add_enabled(n > 0, egui::Button::new(RichText::new(format!("{}  Run", I::PLAY)).strong())).on_hover_text("Shift+Q");
-                if run.clicked() {
+                let what = match (self.kind, ctx.roi.is_some(), self.scope) {
+                    (Kind::Video | Kind::VideoPair, _, VideoScope::Whole) => "the whole video",
+                    (Kind::Video | Kind::VideoPair, _, VideoScope::Loop) => "the A-B loop",
+                    (Kind::Video | Kind::VideoPair, _, VideoScope::Custom) => "the range",
+                    (_, true, _) => "the region",
+                    (Kind::Video | Kind::VideoPair, false, _) => "the frame on screen",
+                    (Kind::Compare, false, _) => "B against A",
+                    _ => "the whole image",
+                };
+                let tip = format!("Measure {what} with {n} metric{} (Shift+Q)", if n == 1 { "" } else { "s" });
+                if look::primary(ui, p, "Analyze", n > 0, (w - 38.0).max(80.0)).on_hover_text(tip).on_disabled_hover_text("No metric applies here: choose some in Details and options").clicked() {
                     self.run(ctx, ui.ctx());
                 }
-                ui.label(RichText::new(format!("{n} metric{}", if n == 1 { "" } else { "s" })).color(p.faint));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.export_menu(ui);
-                });
+                self.export_menu(ui);
             }
         });
         if self.stale() && self.run.is_none() && self.report.is_some() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}  Region changed: Run again", I::WARNING)).color(p.warn));
-                if ui.small_button("Run").on_hover_text("Shift+Q").clicked() {
-                    self.run(ctx, ui.ctx());
-                }
-            });
+            ui.label(RichText::new(format!("{}  The region changed: Analyze again to update", I::WARNING)).size(11.5).color(p.warn));
         } else if let Some((msg, err)) = &self.status {
-            ui.label(RichText::new(msg).size(12.0).color(if *err { p.danger } else { p.muted }));
+            ui.add(egui::Label::new(RichText::new(msg).size(11.5).color(if *err { p.danger } else { p.faint })).wrap());
+        } else if let (Some(m), Kind::VideoPair) = (&self.size_mismatch, self.kind) {
+            ui.add(egui::Label::new(RichText::new(m).size(11.5).color(p.warn)).wrap());
         }
+    }
+
+    /// What the tab does, before the first run.
+    fn intro(&self, ui: &mut Ui, p: &Palette) {
+        let what = match self.kind {
+            Kind::Compare => "Shows how close B is to A, and where they differ.",
+            Kind::Video => "Checks the frame on screen, the A-B loop or the whole video.",
+            Kind::VideoPair => "Compares B with A on the frame on screen, the A-B loop or the whole video.",
+            _ => "Checks sharpness, noise, exposure, color and compression in one click.",
+        };
+        look::note(ui, p, what);
+        ui.label(RichText::new("Press R and drag on the image to check only a region.").size(11.5).color(p.faint));
+    }
+
+    /// The facts the summary is written from (the shown report).
+    fn facts(&self) -> Option<summary::Facts> {
+        let r = self.report.as_ref()?;
+        let mut f = summary::Facts {
+            pair: r.scope.file_b.is_some(),
+            video: r.scope.kind != ScopeKind::Image,
+            fps: self.fps,
+            rescaled: r.scope.rescaled,
+            sharp_peak: self.sharp_peak,
+            maps: self.maps.iter().map(|m| m.0.clone()).collect(),
+            ..Default::default()
+        };
+        for row in rows_of_report(r) {
+            for c in row.cells {
+                if let Some(v) = c.value {
+                    f.values.insert(c.key, v);
+                }
+            }
+        }
+        match r.scope.kind {
+            ScopeKind::VideoRange => {
+                f.frames = r.frames.len();
+                f.stride = r.scope.frames.map(|x| x.stride.max(1) as usize).unwrap_or(1);
+                for s in &r.summary {
+                    let lower = r.columns.iter().find(|c| c.key == s.key).is_some_and(|c| c.direction == Direction::LowerIsBetter);
+                    if let (Some(i), Some(lo), Some(hi)) = (s.worst_idx, s.min, s.max) {
+                        f.worst.insert(s.key.clone(), (i, if lower { hi } else { lo }));
+                    }
+                }
+                f.low_frames = r.series("psnr.y").iter().filter(|(_, v)| v.is_some_and(|v| v < summary::PSNR_POOR)).count();
+                f.cuts = r.series("temporal.scene.cut").iter().filter(|(_, v)| v.is_some_and(|v| v > 0.5)).map(|x| x.0).collect();
+            }
+            ScopeKind::VideoFrame => {
+                f.frame = r.scope.frames.map(|x| x.start);
+                f.frames = 1;
+            }
+            ScopeKind::Image => {}
+        }
+        Some(f)
+    }
+
+    /// The plain-language result: headline, one line per check, and the
+    /// one follow-up (Show where, Show worst frame).
+    fn summary_card(&mut self, ui: &mut Ui, p: &Palette) {
+        let Some(s) = self.summary.clone() else { return };
+        if s.head.is_none() && s.lines.is_empty() {
+            return;
+        }
+        let stale = self.stale();
+        let mut toggle_map = false;
+        let mut seek = None;
+        look::card(ui, p, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            if let Some(h) = &s.head {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    look::dot(ui, if stale { p.faint } else { look::level_color(p, h.level) });
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.add(egui::Label::new(RichText::new(&h.title).font(crate::ui::theme::semibold(13.5)).color(if stale { p.faint } else { p.text })).wrap());
+                        ui.add(egui::Label::new(RichText::new(&h.detail).size(12.0).color(p.muted)).wrap());
+                    });
+                });
+                if !s.lines.is_empty() {
+                    ui.add_space(5.0);
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(r.x_range(), r.top(), Stroke::new(1.0, p.border));
+                    ui.add_space(5.0);
+                }
+            }
+            for l in &s.lines {
+                look::status_row(ui, p, look::level_color(p, l.level), &l.label, &l.value, &l.tip, stale);
+            }
+            if !s.cuts.is_empty() {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.add_space(18.0);
+                    ui.label(RichText::new("Cuts at").size(11.5).color(p.muted));
+                    for &c in s.cuts.iter().take(16) {
+                        let t = summary::fmt_clock(c as f64 / self.fps.max(1.0));
+                        if ui.add(egui::Button::new(RichText::new(t).size(11.5).color(p.accent)).frame(false)).on_hover_text(format!("Show frame {c}")).clicked() {
+                            seek = Some(c);
+                        }
+                    }
+                    if s.cuts.len() > 16 {
+                        ui.label(RichText::new(format!("and {} more", s.cuts.len() - 16)).size(11.5).color(p.faint));
+                    }
+                });
+            }
+            let action = s.action.clone().filter(|_| !stale);
+            if action.is_some() || !s.notes.is_empty() {
+                ui.add_space(4.0);
+            }
+            for n in &s.notes {
+                ui.label(RichText::new(n).size(11.0).color(p.faint));
+            }
+            match action {
+                Some(summary::Action::ShowMap { id, why }) => {
+                    let on = self.heat.visible && self.heat.id() == Some(id.as_str());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Biggest difference: {why}")).size(12.0).color(p.muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let text = if on { "Hide" } else { "Show where" };
+                            if ui.button(text).on_hover_text("Color the image by how much B differs from A there").clicked() {
+                                toggle_map = true;
+                            }
+                        });
+                    });
+                }
+                Some(summary::Action::Seek { frame }) => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Worst: frame {frame}")).size(12.0).color(p.muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Show worst frame").on_hover_text("Pause on the worst frame").clicked() {
+                                seek = Some(frame);
+                            }
+                        });
+                    });
+                }
+                None => {}
+            }
+        });
+        if toggle_map {
+            if self.heat.visible && self.heat.id().is_some() && matches!(&s.action, Some(summary::Action::ShowMap { id, .. }) if self.heat.id() == Some(id.as_str())) {
+                self.heat.visible = false;
+            } else {
+                self.show_where();
+            }
+        }
+        if seek.is_some() {
+            self.seek = seek;
+        }
+    }
+
+    /// While a heatmap is on the image: its name, Hide, and its options.
+    fn heatmap_row(&mut self, ui: &mut Ui, p: &Palette) {
+        if self.stale() || !self.heat.active() {
+            return;
+        }
+        let name = self.heat.id().and_then(|id| self.maps.iter().find(|m| m.0 == id).map(|m| m.1.clone())).unwrap_or_else(|| "Heatmap".into());
+        // The summary's "Show where" already toggles its own map.
+        let from_card = matches!(self.summary.as_ref().and_then(|s| s.action.as_ref()), Some(summary::Action::ShowMap { id, .. }) if self.heat.id() == Some(id.as_str()));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Heatmap on the image: {name}")).size(12.0).color(p.muted));
+            if !from_card {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Hide").clicked() {
+                        self.heat.visible = false;
+                    }
+                });
+            }
+        });
+        look::section("Heatmap options", p).id_salt("metrics-heatmap").default_open(false).show(ui, |ui| self.heatmap_controls(ui, p));
     }
 
     fn chip(ui: &mut Ui, p: &Palette, g: Option<Grade>) {
@@ -1802,8 +2206,10 @@ impl MetricsTab {
             Direction::LowerIsBetter => (I::ARROW_DOWN, "Lower is better"),
             Direction::Neutral => ("", ""),
         };
-        let r = ui.label(RichText::new(icon).size(11.0).color(p.faint));
+        // A fixed column, so the values line up.
+        let (rect, r) = ui.allocate_exact_size(Vec2::new(10.0, 16.0), Sense::hover());
         if !tip.is_empty() {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(11.0), p.faint);
             r.on_hover_text(tip);
         }
     }
@@ -1826,59 +2232,84 @@ impl MetricsTab {
         let mut toggle: Option<String> = None;
         let mut show_map: Option<String> = None;
         let mut seek: Option<u64> = None;
-        egui::Grid::new("metrics-results").num_columns(4).spacing(Vec2::new(6.0, 3.0)).show(ui, |ui| {
-            for row in &rows {
-                let Some(head) = row.cells.first() else { continue };
-                let open = self.expanded.contains(&row.id);
+        // Rows fit the panel: the value and arrow sit at the right edge, the
+        // name takes what is left and is cut short when the panel is narrow.
+        let name_job = |name: &str, key: Option<&str>, color: egui::Color32, size: f32, width: f32| {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(name, 0.0, egui::TextFormat::simple(egui::FontId::proportional(size), color));
+            if let Some(k) = key {
+                job.append(&format!("  {k}"), 0.0, egui::TextFormat::simple(egui::FontId::proportional(11.0), p.faint));
+            }
+            job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(20.0));
+            job
+        };
+        let right = egui::Layout::right_to_left(egui::Align::Center);
+        let left = egui::Layout::left_to_right(egui::Align::Center);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for row in &rows {
+            let Some(head) = row.cells.first() else { continue };
+            let open = self.expanded.contains(&row.id);
+            let many = row.cells.len() > 1;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().interact_size.y = 20.0;
                 Self::chip(ui, p, head.value.filter(|_| !stale).and_then(|v| grade(&head.key, v)));
-                ui.horizontal(|ui| {
-                    let many = row.cells.len() > 1;
-                    let caret = if many { if open { I::CARET_DOWN } else { I::CARET_RIGHT } } else { " " };
-                    let name = ui.add(egui::Label::new(RichText::new(format!("{caret} {}", row.name)).color(text)).sense(Sense::click()));
-                    if name.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        toggle = Some(row.id.clone());
+                ui.with_layout(right, |ui| {
+                    Self::arrow(ui, p, head.direction);
+                    let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
+                    if let Some(t) = &head.tip {
+                        if v.on_hover_text(t).clicked() {
+                            seek = head.worst;
+                        }
                     }
-                    // Which value the row shows (PSNR: avg, Exposure: clip_pct).
-                    if many {
-                        ui.label(RichText::new(key_label(&row.id, short_key(&row.id, &head.key))).size(11.0).color(p.faint));
+                    if row.has_map {
+                        let on = self.heat.visible && self.heat.id() == Some(row.id.as_str());
+                        if ui.add(egui::Button::new(RichText::new(I::SELECTION).size(12.0)).selected(on).small()).on_hover_text("Show its heatmap on the image").clicked() {
+                            show_map = Some(row.id.clone());
+                        }
                     }
                     if row.preview {
                         ui.label(RichText::new("preview").size(10.0).color(p.warn));
                     }
-                    if row.has_map {
-                        let on = self.heat.id() == Some(row.id.as_str());
-                        if ui.add(egui::Button::new(RichText::new(I::SELECTION).size(12.0)).selected(on).small()).on_hover_text("Show its heatmap").clicked() {
-                            show_map = Some(row.id.clone());
+                    ui.with_layout(left, |ui| {
+                        let caret = if many { if open { I::CARET_DOWN } else { I::CARET_RIGHT } } else { " " };
+                        // Which value the row shows (PSNR: average, Exposure: clipping).
+                        let key = many.then(|| key_label(&row.id, short_key(&row.id, &head.key)));
+                        let job = name_job(&format!("{caret} {}", row.name), key.as_deref(), text, 13.0, ui.available_width());
+                        let name = ui.add(egui::Label::new(job).sense(Sense::click())).on_hover_text(&row.name);
+                        if many && name.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            toggle = Some(row.id.clone());
                         }
-                    }
+                    });
                 });
-                let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
-                if let Some(t) = &head.tip {
-                    if v.on_hover_text(t).clicked() {
-                        seek = head.worst;
-                    }
-                }
-                Self::arrow(ui, p, head.direction);
-                ui.end_row();
-                if open {
-                    // Every value with its key, the headline too.
-                    for c in &row.cells {
+            });
+            if open {
+                // Every value with its key, the headline too.
+                for c in &row.cells {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().interact_size.y = 18.0;
                         Self::chip(ui, p, c.value.filter(|_| !stale).and_then(|v| grade(&c.key, v)));
-                        let short = key_label(&row.id, short_key(&row.id, &c.key));
-                        let lab = ui.add(egui::Label::new(RichText::new(format!("    {short}")).color(muted).size(12.0)).sense(Sense::click()));
-                        if c.worst.is_some() && lab.on_hover_text("Click to show the worst frame").clicked() {
-                            seek = c.worst;
-                        }
-                        let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(12.0));
-                        if let Some(t) = &c.tip {
-                            v.on_hover_text(t);
-                        }
-                        Self::arrow(ui, p, c.direction);
-                        ui.end_row();
-                    }
+                        ui.with_layout(right, |ui| {
+                            Self::arrow(ui, p, c.direction);
+                            let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(12.0));
+                            if let Some(t) = &c.tip {
+                                v.on_hover_text(t);
+                            }
+                            ui.with_layout(left, |ui| {
+                                ui.add_space(14.0);
+                                let short = key_label(&row.id, short_key(&row.id, &c.key));
+                                let job = name_job(&short, None, muted, 12.0, ui.available_width());
+                                let lab = ui.add(egui::Label::new(job).sense(Sense::click()));
+                                if c.worst.is_some() && lab.on_hover_text("Click to show the worst frame").clicked() {
+                                    seek = c.worst;
+                                }
+                            });
+                        });
+                    });
                 }
             }
-        });
+        }
         if let Some(id) = toggle {
             if !self.expanded.remove(&id) {
                 self.expanded.insert(id);
@@ -1902,9 +2333,10 @@ impl MetricsTab {
         }
     }
 
-    fn heatmap_section(&mut self, ui: &mut Ui, p: &Palette) {
+    /// Which map, colormap, range, opacity and threshold.
+    fn heatmap_controls(&mut self, ui: &mut Ui, p: &Palette) {
         let maps: Vec<(String, String)> = self.maps.iter().map(|m| (m.0.clone(), m.1.clone())).collect();
-        egui::CollapsingHeader::new(RichText::new("Heatmap").color(p.text)).id_salt("metrics-heatmap").default_open(true).show(ui, |ui| {
+        {
             if !maps.is_empty() {
                 let cur = self.heat.id().map(str::to_string).unwrap_or_default();
                 let name = maps.iter().find(|m| m.0 == cur).map(|m| m.1.clone()).unwrap_or_else(|| "Choose".into());
@@ -1923,23 +2355,26 @@ impl MetricsTab {
                 }
             }
             self.heat.controls(ui, p);
-        });
+        }
     }
 
     #[cfg(feature = "video")]
-    fn worst_section(&mut self, ui: &mut Ui, p: &Palette, s: &Subject) {
+    fn worst_section(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, force: Option<bool>) {
         let Some(vr) = self.video_run.clone() else { return };
         let Subject::Video(_) = s else { return };
-        egui::CollapsingHeader::new(RichText::new("Worst frames").color(p.text)).id_salt("metrics-worst").default_open(true).show(ui, |ui| {
+        look::section("Worst frames", p).id_salt("metrics-worst").default_open(false).open(force).show(ui, |ui| {
             let b_path = vr.b.as_ref().map(|b| b.path.as_path());
             if self.thumbs.as_ref().is_none_or(|t| !t.shows(&vr.a.path, b_path, vr.offset, vr.region)) {
                 self.thumbs = Some(adapters::VideoThumbs::new(vr.a.clone(), vr.b.clone(), vr.offset, vr.region));
             }
-            let thumbs = self.thumbs.as_mut().map(|t| t as &mut dyn plots::FrameThumbs);
+            // Thumbnails once the run is done: while rows arrive the list
+            // keeps changing, and each new entry would be decoded.
+            let done = self.run.is_none();
+            let thumbs = self.thumbs.as_mut().filter(|_| done).map(|t| t as &mut dyn plots::FrameThumbs);
             if let Some(a) = self.plots.worst_ui(ui, p, &self.series, thumbs) {
                 self.plot_action(a);
             }
-            if ui.button(format!("{}  Export worst frames as PNG pairs", I::DOWNLOAD_SIMPLE)).clicked() {
+            if !self.plots.worst_frames(&self.series).is_empty() && ui.button(format!("{}  Export worst frames as PNG pairs", I::DOWNLOAD_SIMPLE)).clicked() {
                 self.export_worst(None);
             }
         });
@@ -1991,7 +2426,7 @@ impl MetricsTab {
         #[cfg(not(feature = "video"))]
         let has_frames = false;
         ui.add_enabled_ui(has_report, |ui| {
-            ui.menu_button(format!("{}  Export", I::EXPORT), |ui| {
+            let menu = ui.menu_button(RichText::new(I::EXPORT).size(15.0), |ui| {
                 if ui.button("CSV").clicked() {
                     ui.close();
                     self.export_report(true, None);
@@ -2018,6 +2453,7 @@ impl MetricsTab {
                     self.bundle_request = Some(None);
                 }
             });
+            menu.response.on_hover_text("Export: CSV, JSON, heatmaps or a report folder").on_disabled_hover_text("Analyze first, then export the results");
         });
     }
 
@@ -2222,7 +2658,11 @@ mod tests {
         let cuts = &rows[2].cells[0];
         assert_eq!((cuts.key.as_str(), cuts.value, cuts.worst), ("temporal.scene.cuts", Some(1.0), Some(2)));
         assert_eq!(key_label("temporal.freeze", "duplicates_b"), "B: Duplicate frames");
-        assert_eq!(key_label("psnr", "mse_avg"), "MSE average");
+        assert_eq!(key_label("psnr", "mse_avg"), "Average MSE");
+        // `_b` is the blue channel outside temporal metrics.
+        assert_eq!(key_label("psnr", "mse_b"), "Blue MSE");
+        assert_eq!(key_label("psnr", "maxabs_b"), "Blue max difference");
+        assert_eq!(key_label("psnr", "mse_y"), "Y MSE");
         assert!(scope_label(&r).starts_with("Image"));
     }
 

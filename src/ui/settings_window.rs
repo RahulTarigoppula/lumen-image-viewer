@@ -57,7 +57,7 @@ impl Page {
             Page::Editors => "External editors",
             Page::Integration => "Windows integration",
             #[cfg(feature = "ai")]
-            Page::Ai => "AI analysis",
+            Page::Ai => "AI review",
             Page::Privacy => "Privacy & data",
             Page::About => "About",
         }
@@ -89,7 +89,7 @@ impl Page {
             Page::Editors => "Programs offered for 'Open in external editor' (E)",
             Page::Integration => "File associations, Explorer menu and single window",
             #[cfg(feature = "ai")]
-            Page::Ai => "Your own vision model server (vLLM) for image critique",
+            Page::Ai => "Get an opinion on your pictures from your own vision model server",
             Page::Privacy => "What Lumen stores, and where",
             Page::About => "Version, license and open-source credits",
         }
@@ -965,7 +965,7 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
                 ui.label(RichText::new("Lumen never connects to the internet").font(semibold(14.0)).color(p.text));
                 hint(ui, p, "No telemetry, no analytics, no accounts, no update checks and no cloud. Your pictures, tags and ratings never leave this PC.");
                 #[cfg(feature = "ai")]
-                hint(ui, p, "The optional AI analysis (off by default) talks only to the server you set in Settings > AI, and only when you press Run.");
+                hint(ui, p, "The optional AI analysis (off by default) talks only to the server you set in Settings > AI review, and only when you press Run.");
             });
         });
         ui.add_space(10.0);
@@ -1015,13 +1015,13 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
 fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
     use lumen_ai::{CoordConvention, ImageEncoding, StepStatus, TestStep};
     let ai = &mut core.ai;
-    section_title(ui, p, "Remote AI analysis");
+    section_title(ui, p, "General");
     card(ui, p, |ui| {
         if toggle_row(
             ui,
             p,
-            "Enable remote AI analysis",
-            "Lets the Analysis panel (Ctrl+Q) ask your own vision model server for a critique of the image you are viewing.",
+            "Turn on AI review",
+            "Lets the Analysis panel (Ctrl+Q) ask your own vision model server, for example Qwen on vLLM, about the picture you are viewing.",
             &mut ai.settings.enabled,
         ) {
             ai.dirty = true;
@@ -1029,7 +1029,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         hint(
             ui,
             p,
-            "What is sent, and only when you press Run: the pixels you choose (the image, or the region you draw), downscaled and re-encoded by Lumen without EXIF, GPS or color profile, and the prompt text. File names and capture settings only if you turn them on below. Every request goes to the server below and nowhere else, and is shown to you before it is sent.",
+            "Only when you press Run AI review, Lumen sends the pixels you choose (the picture or the region you draw), downscaled and re-encoded without EXIF, GPS or color profile, and the prompt. File names and capture settings only if you turn them on under Advanced. Requests go to the server below and nowhere else, and you see them before they are sent.",
         );
         ui.add_space(8.0);
     });
@@ -1038,7 +1038,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
     section_title(ui, p, "Server");
     card(ui, p, |ui| {
         ui.add_enabled_ui(enabled, |ui| {
-            row(ui, p, "Server address", "IP address, host:port or URL of your vLLM server, for example 192.168.1.20", |ui| {
+            row(ui, p, "Server address", "IP address or host name, for example 192.168.1.20 (host:port or a URL also work)", |ui| {
                 let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(230.0));
                 if resp.lost_focus() {
                     ai.apply_host();
@@ -1052,35 +1052,13 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                 ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
                 ui.add_space(4.0);
             }
-            row(ui, p, "Port", "Used when the address has no port (vLLM's default is 8000)", |ui| {
-                let r = ui.add(egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
-                if r.changed() {
-                    ai.port_edited();
-                }
-                false
-            });
-            if toggle_row(ui, p, "Use HTTPS", "For a server behind TLS (a reverse proxy, or vLLM with --ssl-certfile)", &mut ai.settings.https) {
-                ai.https_edited();
-            }
-            if toggle_row(
-                ui,
-                p,
-                "Only allow local network servers",
-                "Loopback, 10.x, 172.16-31.x, 192.168.x, link-local and IPv6 ULA addresses. Public servers also need HTTPS.",
-                &mut ai.settings.lan_only,
-            ) {
-                ai.dirty = true;
-            }
-            if ai.settings.lan_only && toggle_row(ui, p, "Also allow Tailscale addresses", "100.64.0.0/10 (CGNAT)", &mut ai.settings.allow_cgnat) {
-                ai.dirty = true;
-            }
             let has_key = ai.has_key();
             let key_desc = if has_key {
                 "Saved in Windows Credential Manager (or an encrypted file in the data folder), never in settings.json."
             } else if ai.typed_key() {
                 "Used for Test connection and Run until Lumen closes. Save keeps it in Windows Credential Manager."
             } else {
-                "Optional: only when vllm serve runs with --api-key."
+                "Only if your server needs one (vllm serve --api-key)."
             };
             row(ui, p, "API key", key_desc, |ui| {
                 if has_key {
@@ -1107,7 +1085,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             for w in ai.settings.warnings(key_in_use) {
                 ui.add(egui::Label::new(RichText::new(format!("{}  {w}", I::WARNING)).size(11.5).color(p.warn)).wrap());
             }
-            row(ui, p, "Test connection", "Connects, checks the server, lists its models and picks one that takes images", |ui| {
+            row(ui, p, "Test connection", "Checks the server, lists its models and picks one that accepts images", |ui| {
                 let testing = ai.testing();
                 if ui.add_enabled(!testing, egui::Button::new(RichText::new(format!("{}  Test connection", I::PLUGS_CONNECTED)).color(Color32::WHITE)).fill(p.accent)).clicked() {
                     ai.test_connection();
@@ -1188,6 +1166,34 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                 }
                 false
             });
+        });
+    });
+
+    section_title(ui, p, "Connection");
+    card(ui, p, |ui| {
+        ui.add_enabled_ui(enabled, |ui| {
+            row(ui, p, "Port", "Used when the address has no port (vLLM's default is 8000)", |ui| {
+                let r = ui.add(egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
+                if r.changed() {
+                    ai.port_edited();
+                }
+                false
+            });
+            if toggle_row(ui, p, "Use HTTPS", "For a server behind TLS (a reverse proxy, or vLLM with --ssl-certfile)", &mut ai.settings.https) {
+                ai.https_edited();
+            }
+            if toggle_row(
+                ui,
+                p,
+                "Only allow local network servers",
+                "Loopback, 10.x, 172.16-31.x, 192.168.x, link-local and IPv6 ULA addresses. Public servers also need HTTPS.",
+                &mut ai.settings.lan_only,
+            ) {
+                ai.dirty = true;
+            }
+            if ai.settings.lan_only && toggle_row(ui, p, "Also allow Tailscale addresses", "100.64.0.0/10 (CGNAT)", &mut ai.settings.allow_cgnat) {
+                ai.dirty = true;
+            }
         });
     });
 

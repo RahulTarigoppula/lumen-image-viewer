@@ -31,6 +31,9 @@ pub enum Tab {
     Ai,
 }
 
+/// Narrowest the panel gets (its rows wrap below this).
+const PANEL_MIN: f32 = 280.0;
+
 pub struct AnalysisPanel {
     pub open: bool,
     pub tab: Tab,
@@ -55,9 +58,7 @@ impl Default for AnalysisPanel {
         opts.esc_clears = false;
         AnalysisPanel {
             open: false,
-            #[cfg(feature = "ai")]
-            tab: Tab::Ai,
-            #[cfg(not(feature = "ai"))]
+            // Metrics give an answer in one click without any setup.
             tab: Tab::Metrics,
             use_roi: false,
             roi: RoiEditor::new((1.0, 1.0), opts),
@@ -149,11 +150,15 @@ impl AnalysisPanel {
             return out;
         }
         let p = core.pal;
+        // At most 40% of the window, so the modes' toolbars keep their room
+        // (and their overflow menus) in narrow windows.
+        let window = ui.ctx().content_rect().width();
+        let max = (window * 0.4).clamp(PANEL_MIN, 620.0);
         egui::Panel::right("analysis-panel")
             .resizable(true)
-            .default_size(360.0)
-            .size_range(300.0..=620.0)
-            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(Margin::same(12)))
+            .default_size(340.0_f32.min(max))
+            .size_range(PANEL_MIN..=max)
+            .frame(egui::Frame::NONE.fill(p.panel).inner_margin(Margin { left: 12, right: 4, top: 10, bottom: 8 }))
             .show(ui, |ui| self.contents(ui, core, subject, &mut out));
         if std::mem::take(&mut self.run_ai) {
             #[cfg(feature = "ai")]
@@ -170,72 +175,99 @@ impl AnalysisPanel {
         #[cfg(not(feature = "ai"))]
         let _ = &out;
         let p = core.pal;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(I::CHART_LINE).size(17.0).color(p.accent));
-            ui.label(RichText::new("Analysis").font(semibold(15.5)).color(p.text));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let tip = format!("Close ({})", crate::ui::commands::Command::ToggleAnalysis.shortcut());
-                if crate::ui::widgets::icon_button_sized(ui, I::X, &tip, false, 24.0, 14.0).clicked() {
-                    self.toggle();
-                }
-                super::network_badge(ui, core);
+        // Content keeps a right margin, so the scroll bar never covers it.
+        let pad = Margin { left: 0, right: 8, top: 0, bottom: 0 };
+        egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(I::CHART_LINE).size(15.0).color(p.accent));
+                ui.label(RichText::new("Analysis").font(semibold(14.5)).color(p.text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let tip = format!("Close ({})", crate::ui::commands::Command::ToggleAnalysis.shortcut());
+                    if crate::ui::widgets::icon_button_sized(ui, I::X, &tip, false, 24.0, 14.0).clicked() {
+                        self.toggle();
+                    }
+                    super::network_badge(ui, core);
+                });
             });
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.selectable_value(&mut self.tab, Tab::Metrics, format!("{}  Metrics", I::GAUGE));
-            #[cfg(feature = "ai")]
-            ui.selectable_value(&mut self.tab, Tab::Ai, format!("{}  AI", I::SPARKLE));
-        });
-        ui.add_space(4.0);
-        self.scope_row(ui, core, subject);
-        ui.separator();
-        egui::ScrollArea::vertical().id_salt(("analysis-tab", self.tab)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match self.tab {
-                Tab::Metrics => self.metrics_tab(ui, core, subject),
+            ui.add_space(4.0);
+            let tabs: &[(&str, Tab, &str)] = &[
+                ("Metrics", Tab::Metrics, "Measure the picture on this computer"),
                 #[cfg(feature = "ai")]
-                Tab::Ai => {
-                    let roi = self.roi_pixels();
-                    let metrics = core.metrics.metric_context(subject, roi);
-                    self.ai.ui(ui, core, subject, roi, metrics, out);
-                }
+                ("AI review", Tab::Ai, "Ask your own vision model server for an opinion"),
+            ];
+            let items: Vec<(&str, bool, &str)> = tabs.iter().map(|t| (t.0, true, t.2)).collect();
+            if let Some(i) = super::look::segmented(ui, &p, "analysis-tabs", &items, tabs.iter().position(|t| t.1 == self.tab)) {
+                self.tab = tabs[i].1;
             }
+            ui.add_space(2.0);
+            self.scope_row(ui, core, subject);
+        });
+        ui.add_space(2.0);
+        let r = ui.available_rect_before_wrap();
+        ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, p.border));
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().id_salt(("analysis-tab", self.tab)).auto_shrink([false, false]).show(ui, |ui| {
+            egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match self.tab {
+                    Tab::Metrics => self.metrics_tab(ui, core, subject),
+                    #[cfg(feature = "ai")]
+                    Tab::Ai => {
+                        let roi = self.roi_pixels();
+                        let metrics = core.metrics.metric_context(subject, roi);
+                        self.ai.ui(ui, core, subject, roi, metrics, out);
+                    }
+                }
+            });
         });
     }
 
-    /// Whole image or ROI, with the ROI's size and how to draw it.
+    /// What is analyzed: the whole picture, or the region drawn on it
+    /// (R draws one, Esc clears it), in one compact line.
     fn scope_row(&mut self, ui: &mut Ui, core: &Core, subject: &Subject) {
         let p = core.pal;
-        let whole = if subject.kind.is_video() { "Whole frame" } else { "Whole image" };
+        let whole = match subject.kind {
+            k if k.is_video() => "Whole frame",
+            k if k.is_pair() => "Whole image, B against A",
+            _ => "Whole image",
+        };
+        let rect = self.roi.pixel_rect().filter(|_| self.use_roi && !self.drawing);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Region").size(12.0).color(p.muted));
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.selectable_value(&mut self.use_roi, false, whole);
-            if ui.selectable_value(&mut self.use_roi, true, "ROI").clicked() && self.roi.rect().is_none() {
-                self.drawing = true;
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (text, color) = match rect {
+                _ if self.drawing => ("Drag on the image to select a region".to_string(), p.accent),
+                Some((_, _, w, h)) => (format!("Region {w} x {h} px"), p.text),
+                None => (whole.to_string(), p.muted),
+            };
+            ui.label(RichText::new(I::SELECTION).size(13.0).color(color));
+            let l = ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).truncate());
+            if let Some((x, y, _, _)) = rect {
+                l.on_hover_text(format!("At {x}, {y} in A's pixels"));
             }
-        });
-        if !self.use_roi {
-            return;
-        }
-        ui.horizontal(|ui| match self.roi.pixel_rect() {
-            Some((x, y, w, h)) if !self.drawing => {
-                ui.label(RichText::new(format!("{w} x {h} px at {x}, {y}")).size(11.5).color(p.text));
-                if ui.small_button("Redraw").on_hover_text("Or press R").clicked() {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(12.0).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
+                if self.drawing {
+                    if link(ui, "Cancel", "Esc") {
+                        self.drawing = false;
+                        self.use_roi = self.roi.rect().is_some();
+                    }
+                } else if rect.is_some() {
+                    if link(ui, "Clear", "Analyze the whole picture again (Esc)") {
+                        self.roi.clear();
+                        self.use_roi = false;
+                    }
+                    if link(ui, "Redraw", "R") {
+                        self.roi.clear();
+                        self.drawing = true;
+                        self.use_roi = true;
+                    }
+                } else if link(ui, "Select region", "Analyze only part of the picture (R, then drag)") {
                     self.roi.clear();
                     self.drawing = true;
+                    self.use_roi = true;
                 }
-                if ui.small_button("Clear").on_hover_text("Or press Esc").clicked() {
-                    self.roi.clear();
-                    self.use_roi = false;
-                }
-            }
-            _ => {
-                let text = if self.drawing { "Drag on the image to draw the region (Esc stops)" } else { "Press R, then drag on the image" };
-                ui.label(RichText::new(text).size(11.5).color(p.accent));
-            }
+            });
         });
     }
 

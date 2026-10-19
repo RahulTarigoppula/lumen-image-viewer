@@ -143,6 +143,13 @@ impl Series {
         out
     }
 
+    /// The value every frame of `key` has, when they all have the same one.
+    pub fn all_equal(&self, key: &str) -> Option<f64> {
+        let d = &self.data[self.cols.iter().position(|c| c.key == key)?];
+        let (lo, hi) = d.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.1), b.max(p.1)));
+        (!d.is_empty() && hi - lo <= 1e-9 * hi.abs().max(1.0)).then_some(lo)
+    }
+
     /// Spacing of the worst-frames list: 1/(4 n) of the frames covered, at
     /// least 3 frames.
     pub fn worst_gap(&self, n: usize) -> u64 {
@@ -306,28 +313,48 @@ impl Plots {
     #[allow(clippy::too_many_arguments)]
     fn family_plot(&mut self, ui: &mut Ui, p: &Palette, s: &Series, fam: &Family, span: (u64, u64), current: Option<u64>, height: f32) -> Option<PlotAction> {
         let thr = self.threshold_for(fam, s);
-        // Header: name, series legend, threshold field.
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&fam.name).size(12.0).strong().color(p.text));
-            for (n, &i) in fam.cols.iter().enumerate() {
-                let c = &s.cols[i];
-                let short = c.key.strip_prefix(&fam.id).map(|k| k.trim_start_matches('.')).unwrap_or(&c.key);
-                ui.label(RichText::new(format!("- {}", key_label(&fam.id, short))).size(11.0).color(SERIES_COLORS[n % SERIES_COLORS.len()]));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut on = thr.is_some();
-                let mut v = thr.unwrap_or_else(|| s.data[fam.cols[0]].iter().map(|p| p.1).sum::<f64>() / s.data[fam.cols[0]].len().max(1) as f64);
-                let mut changed = false;
-                if on {
-                    changed |= ui.add(egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
-                }
-                changed |= ui.checkbox(&mut on, RichText::new("Threshold").size(11.0)).changed();
-                if changed {
-                    self.thresholds.insert(fam.id.clone(), on.then_some(v));
-                }
-            });
-        });
+        // Header: name, series legend, threshold field, in exactly the
+        // width of the graph (nested layouts here would grow the row in a
+        // scroll area and push the video transport bar off screen).
         let width = ui.available_width();
+        let left = ui.cursor().min.x;
+        ui.allocate_ui_with_layout(Vec2::new(width, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_max_width(width);
+            let mut on = thr.is_some();
+            let sp = ui.spacing();
+            let check_w = sp.icon_width + sp.icon_spacing + ui.painter().layout_no_wrap("Threshold".into(), FontId::proportional(11.0), p.text).size().x;
+            let need = check_w + if on { sp.item_spacing.x + sp.interact_size.x.max(48.0) } else { 0.0 } + 2.0;
+            ui.label(RichText::new(&fam.name).size(12.0).strong().color(p.text));
+            // As many series names as fit; the rest are counted (Exposure has 20).
+            let names: Vec<String> = fam
+                .cols
+                .iter()
+                .map(|&i| {
+                    let c = &s.cols[i];
+                    key_label(&fam.id, c.key.strip_prefix(&fam.id).map(|k| k.trim_start_matches('.')).unwrap_or(&c.key))
+                })
+                .collect();
+            for (n, name) in names.iter().enumerate() {
+                let text = format!("- {name}");
+                let w = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(11.0), p.text).size().x + ui.spacing().item_spacing.x;
+                let room = width - (ui.cursor().min.x - left) - need - 40.0;
+                if w > room && n + 1 < names.len() {
+                    ui.label(RichText::new(format!("+{}", names.len() - n)).size(11.0).color(p.muted)).on_hover_text(names[n..].join(", "));
+                    break;
+                }
+                ui.label(RichText::new(text).size(11.0).color(SERIES_COLORS[n % SERIES_COLORS.len()]));
+            }
+            // Threshold controls at the right edge.
+            let mut v = thr.unwrap_or_else(|| s.data[fam.cols[0]].iter().map(|p| p.1).sum::<f64>() / s.data[fam.cols[0]].len().max(1) as f64);
+            ui.add_space((width - (ui.cursor().min.x - left) - need).max(0.0));
+            let mut changed = ui.checkbox(&mut on, RichText::new("Threshold").size(11.0)).changed();
+            if on {
+                changed |= ui.add(egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
+            }
+            if changed {
+                self.thresholds.insert(fam.id.clone(), on.then_some(v));
+            }
+        });
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
         let painter = ui.painter_at(rect.expand(1.0));
         painter.rect_filled(rect, 3.0, p.raised);
@@ -455,9 +482,10 @@ impl Plots {
         }
         let mut key = self.rank_key.clone().unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Worst frames by").color(p.muted));
+            ui.label(RichText::new("Rank by").size(12.0).color(p.muted));
             let label = |k: &str| format!("{}, {}", metric_name(metric_of(k)), key_label(metric_of(k), k.rsplit_once('.').map(|x| x.1).unwrap_or(k)));
-            egui::ComboBox::from_id_salt("worst-key").selected_text(label(&key)).show_ui(ui, |ui| {
+            // Fits the panel: long metric names are cut short.
+            egui::ComboBox::from_id_salt("worst-key").selected_text(label(&key)).width(ui.available_width().max(80.0)).truncate().show_ui(ui, |ui| {
                 for k in &keys {
                     ui.selectable_value(&mut key, k.clone(), label(k));
                 }
@@ -467,6 +495,13 @@ impl Plots {
         let mut action = None;
         let mut thumbs = thumbs;
         let unit = s.cols.iter().find(|c| c.key == key).map(|c| c.unit).unwrap_or(Unit::Score);
+        // Every frame tied (identical files): no frame is worse than another,
+        // and listing (and decoding) arbitrary ones would only mislead.
+        if let Some(lo) = s.all_equal(&key) {
+            let text = if unit == Unit::Db && lo >= lumen_analysis::PSNR_CAP_DB { "All frames identical".to_string() } else { format!("All frames score the same ({} {})", fmt_axis(lo, unit), unit_text(unit)) };
+            ui.label(RichText::new(text).size(12.0).color(p.muted));
+            return None;
+        }
         for (f, v) in s.worst_spaced(&key, self.worst_n, s.worst_gap(self.worst_n)) {
             let r = ui
                 .horizontal(|ui| {
@@ -498,6 +533,9 @@ impl Plots {
     pub fn worst_frames(&self, s: &Series) -> Vec<u64> {
         let key = self.rank_key.clone().or_else(|| s.default_rank_key()).unwrap_or_default();
         let n = if self.worst_n == 0 { 8 } else { self.worst_n };
+        if s.all_equal(&key).is_some() {
+            return Vec::new();
+        }
         s.worst_spaced(&key, n, s.worst_gap(n)).into_iter().map(|w| w.0).collect()
     }
 }
@@ -568,6 +606,19 @@ mod tests {
         assert_eq!(w[0], 100);
         assert!(w.contains(&300), "{w:?}");
         assert!(w.windows(2).all(|p| p[0].abs_diff(p[1]) >= 24));
+    }
+
+    #[test]
+    fn identical_files_list_no_worst_frames() {
+        let mut s = Series::default();
+        for i in 0..300u64 {
+            s.push(&row(i, &[("psnr.y", f64::INFINITY, Unit::Db, Direction::HigherIsBetter), ("ssim.fast.y", 0.9 + (i % 3) as f64 * 0.01, Unit::Index, Direction::HigherIsBetter)]));
+        }
+        assert_eq!(s.all_equal("psnr.y"), Some(lumen_analysis::PSNR_CAP_DB));
+        assert_eq!(s.all_equal("ssim.fast.y"), None);
+        assert_eq!(s.all_equal("nope"), None);
+        let p = Plots { rank_key: Some("psnr.y".into()), ..Default::default() };
+        assert!(p.worst_frames(&s).is_empty());
     }
 
     #[test]
