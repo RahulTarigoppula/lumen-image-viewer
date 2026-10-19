@@ -345,6 +345,9 @@ struct Pane {
 
 // ---------------------------------------------------------------- culling
 
+/// Between the parts of a pane caption (name, size, file size, zoom).
+const CAPTION_SEP: &str = "  ·  ";
+
 /// Colour label used to mark rejected images ("Red").
 pub const REJECT_LABEL: u8 = 1;
 
@@ -1080,10 +1083,31 @@ impl Compare {
         }
     }
 
-    fn pill(ui: &Ui, pos: Pos2, anchor: Align2, text: &str, badge: Option<(&str, Color32)>) -> Rect {
+    /// A caption pill at most `max_w` points wide, so captions never run
+    /// into a neighbour's: trailing "  ·  " parts are left out first (the
+    /// file name stays), then the name is cut at the end with "...".
+    fn pill(ui: &Ui, pos: Pos2, anchor: Align2, text: &str, badge: Option<(&str, Color32)>, max_w: f32) -> Rect {
         let font = FontId::proportional(12.0);
-        let g = ui.painter().layout_no_wrap(text.to_string(), font.clone(), Color32::from_white_alpha(235));
         let badge_w = if badge.is_some() { 22.0 } else { 0.0 };
+        let layout = |t: String| ui.painter().layout_no_wrap(t, font.clone(), Color32::from_white_alpha(235));
+        let room = (max_w - 20.0 - badge_w).max(0.0);
+        let parts: Vec<&str> = text.split(CAPTION_SEP).collect();
+        let fitting = (1..=parts.len()).rev().map(|n| layout(parts[..n].join(CAPTION_SEP))).find(|g| g.size().x <= room);
+        let g = fitting.unwrap_or_else(|| {
+            // The longest start of the name that fits with the dots.
+            let chars: Vec<char> = parts[0].chars().collect();
+            let cut = |n: usize| format!("{}...", chars[..n].iter().collect::<String>().trim_end());
+            let (mut lo, mut hi) = (0, chars.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if layout(cut(mid)).size().x <= room {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            layout(if lo == 0 { String::new() } else { cut(lo) })
+        });
         let size = Vec2::new(g.size().x + 20.0 + badge_w, 24.0);
         let r = anchor.anchor_size(pos, size);
         ui.painter().rect_filled(r, CornerRadius::same(12), Color32::from_black_alpha(150));
@@ -1110,7 +1134,7 @@ impl Compare {
         if let Some(z) = zoom {
             parts.push(format!("{:.0}%", z * 100.0));
         }
-        parts.join("  ·  ")
+        parts.join(CAPTION_SEP)
     }
 
     fn badge_color(core: &Core, i: usize) -> Color32 {
@@ -1131,7 +1155,7 @@ impl Compare {
             self.view_input(ui, &resp, i, rects, ppp);
             // Caption pill.
             let text = self.caption_text(i, zoom);
-            Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))));
+            Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))), rect.width() - 20.0);
             if self.show_hist {
                 let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
                 self.paint_hist(ui, core, i, hr);
@@ -1299,8 +1323,10 @@ impl Compare {
                 ui.painter().text(knob.center(), Align2::CENTER_CENTER, I::ARROWS_HORIZONTAL, FontId::proportional(15.0), Color32::WHITE);
                 let ta = self.caption_text(0, za);
                 let tb = self.caption_text(1, zb);
-                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))));
-                Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))));
+                // Each caption keeps to its half, wherever the divider is.
+                let half = (area.width() - 30.0) / 2.0;
+                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))), half);
+                Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))), half);
                 if self.show_hist {
                     let ha = if self.show_exif { Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 30.0)) } else { area };
                     self.paint_hist(ui, core, 1, ha);
@@ -1329,9 +1355,9 @@ impl Compare {
                     self.placeholder(ui, core, i, area);
                 }
                 let t = self.caption_text(i, z);
-                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))));
+                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))), area.width() - 20.0);
                 let hint = if self.flicker_auto { format!("Auto flicker every {:.1} s", self.flicker_secs) } else { "Tab / Space to switch".to_string() };
-                Self::pill(ui, Pos2::new(area.center().x, area.max.y - if self.show_exif { 40.0 } else { 14.0 }), Align2::CENTER_BOTTOM, &hint, None);
+                Self::pill(ui, Pos2::new(area.center().x, area.max.y - if self.show_exif { 40.0 } else { 14.0 }), Align2::CENTER_BOTTOM, &hint, None, area.width() - 20.0);
                 if self.show_hist {
                     self.paint_hist(ui, core, i, area);
                 }
@@ -1367,14 +1393,14 @@ impl Compare {
                 if let Some(z) = zshow {
                     text.push_str(&format!("  ·  {:.0}%", z * 100.0));
                 }
-                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, None);
+                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, None, area.width() - 20.0);
                 if let Some(s) = self.diff.stats {
                     let psnr = if s.psnr.is_infinite() { "∞ (identical)".to_string() } else { format!("{:.2} dB", s.psnr) };
                     let mut st = format!("PSNR {psnr}  ·  mean Δ {:.2}  ·  max Δ {}  ·  {:.2}% pixels differ", s.mean, s.max, s.changed_pct);
                     if let Some(n) = &self.diff.note {
                         st.push_str(&format!("  ·  {n}"));
                     }
-                    Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None);
+                    Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None, area.width() - 20.0);
                 }
                 let src = 0;
                 self.view_input(ui, &resp, src, rects, ppp);

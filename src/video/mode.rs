@@ -371,6 +371,94 @@ fn shorten(name: &str, max: usize) -> String {
     format!("{head}...{end}")
 }
 
+/// Playback speeds offered in the transport bar.
+const SPEEDS: [f64; 7] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0];
+
+/// A monospace readout of the transport bar, centered on its digits: a
+/// label centers its line box, which leaves digits above the icons'
+/// middle. With a click sense it highlights on hover like a flat button.
+fn readout(ui: &mut Ui, text: String, color: Color32, sense: Sense) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(text, FontId::monospace(12.5), color);
+    let pad = if sense.senses_click() { 4.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 2.0 * pad, 26.0), sense);
+    if pad > 0.0 && resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let y = rect.center().y - g.mesh_bounds.center().y;
+    ui.painter().galley(Pos2::new(rect.min.x + pad, y), g, color);
+    resp
+}
+
+/// Why a video did not open, in a few words for the error card: the
+/// innermost cause (FFmpeg's or the system's message), in sentence case.
+fn open_reason(e: &anyhow::Error) -> String {
+    let root = e.root_cause().to_string();
+    let low = root.to_lowercase();
+    let text = if low.contains("no such file") || low.contains("cannot find") {
+        "The file was not found.".to_string()
+    } else if low.contains("permission denied") || low.contains("access is denied") {
+        "Access to the file was denied.".to_string()
+    } else if low.contains("invalid data") {
+        "The file is damaged or not a video FFmpeg can read.".to_string()
+    } else if low.contains("no video stream") {
+        "The file has no video stream.".to_string()
+    } else {
+        let t = root.trim().trim_end_matches('.');
+        let mut c = t.chars();
+        match c.next() {
+            Some(f) => format!("{}{}.", f.to_uppercase(), c.as_str()),
+            None => "The decoder could not read it.".to_string(),
+        }
+    };
+    shorten(&text, 160)
+}
+
+/// The "Cannot open the video" card of the empty view, laid out for a width.
+struct ErrorCard {
+    title: Arc<egui::Galley>,
+    name: Arc<egui::Galley>,
+    why: Arc<egui::Galley>,
+    size: Vec2,
+}
+
+impl ErrorCard {
+    const PAD: f32 = 16.0;
+    const ICON: f32 = 28.0;
+
+    fn layout(painter: &egui::Painter, p: &Palette, name: &str, why: &str, width: f32) -> ErrorCard {
+        let text_w = (width - 2.0 * Self::PAD - Self::ICON).max(40.0);
+        let wrapped = |text: &str, font: FontId, color: Color32, rows: usize| {
+            let mut job = egui::text::LayoutJob::simple(text.to_string(), font, color, text_w);
+            job.wrap.max_rows = rows;
+            job.wrap.break_anywhere = rows == 1;
+            job.wrap.overflow_character = None;
+            painter.layout_job(job)
+        };
+        let title = wrapped("Cannot open the video", crate::ui::theme::semibold(14.0), p.text, 1);
+        // A long name keeps its start and extension.
+        let max_chars = (text_w / 6.5) as usize;
+        let name = wrapped(&shorten(name, max_chars.max(12)), FontId::proportional(12.5), p.text, 1);
+        let why = wrapped(why, FontId::proportional(12.0), p.muted, 3);
+        let h = Self::PAD * 2.0 + title.size().y + 6.0 + name.size().y + 4.0 + why.size().y;
+        ErrorCard { title, name, why, size: Vec2::new(width, h) }
+    }
+
+    fn paint(self, painter: &egui::Painter, p: &Palette, min: Pos2) {
+        let r = Rect::from_min_size(min, self.size);
+        painter.rect(r, CornerRadius::same(10), p.panel, Stroke::new(1.0, p.danger.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+        let icon = Pos2::new(r.min.x + Self::PAD + 9.0, r.min.y + Self::PAD + self.title.size().y / 2.0);
+        painter.text(icon, Align2::CENTER_CENTER, I::WARNING_CIRCLE, FontId::proportional(18.0), p.danger);
+        let x = r.min.x + Self::PAD + Self::ICON;
+        let mut y = r.min.y + Self::PAD;
+        let (th, nh) = (self.title.size().y, self.name.size().y);
+        painter.galley(Pos2::new(x, y), self.title, p.text);
+        y += th + 6.0;
+        painter.galley(Pos2::new(x, y), self.name, p.text);
+        y += nh + 4.0;
+        painter.galley(Pos2::new(x, y), self.why, p.muted);
+    }
+}
+
 /// Parts of the transport bar shown at its width (see `VideoMode::transport_fit`).
 #[derive(Clone, Copy, Debug)]
 struct TransportFit {
@@ -429,7 +517,10 @@ pub struct VideoMode {
     scrubbing: bool,
     hover_view: bool,
     last_out_req: Instant,
-    message: Option<String>,
+    /// The last video that failed to open: (file name, short reason).
+    open_error: Option<(String, String)>,
+    /// "Close video" in the picture's menu: leave video mode this frame.
+    close_requested: bool,
     pending_swap: Option<(PathBuf, PathBuf, f64)>,
     snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
     /// (index entries, columns, per-column bars from `timeline_columns`, built at)
@@ -494,7 +585,8 @@ impl VideoMode {
             scrubbing: false,
             hover_view: false,
             last_out_req: Instant::now(),
-            message: None,
+            open_error: None,
+            close_requested: false,
             pending_swap: None,
             snap_rx: None,
             timeline_cache: None,
@@ -507,18 +599,21 @@ impl VideoMode {
             metrics_native: false,
         };
         for p in paths.into_iter().take(2) {
-            vm.add_source(&p, &core.ctx, &mut None);
+            vm.add_source(&p, &core.ctx);
         }
         vm
     }
 
-    fn add_source(&mut self, path: &Path, ctx: &egui::Context, err: &mut Option<String>) {
+    /// Open `path` as A (or as B when A is open). A failure is kept in
+    /// `open_error` for the empty view's card (or a toast, see `ui`).
+    fn add_source(&mut self, path: &Path, ctx: &egui::Context) {
         if self.sources.len() >= 2 {
             self.sources.truncate(1);
         }
         let audio = if self.sources.is_empty() { self.audio.as_ref().map(|a| a.shared.clone()) } else { None };
         match Source::open(path, audio, ctx) {
             Ok(mut s) => {
+                self.open_error = None;
                 if self.sources.len() == 1 {
                     // B renders at A's output size so pixels line up.
                     s.player.send(Cmd::Native(true));
@@ -530,9 +625,8 @@ impl VideoMode {
                 self.auto_fit = true;
             }
             Err(e) => {
-                let msg = format!("{}: {e:#}", path.display());
-                *err = Some(msg.clone());
-                self.message = Some(msg);
+                let name = crate::ui::viewer::file_name(path);
+                self.open_error = Some((if name.is_empty() { path.display().to_string() } else { name }, open_reason(&e)));
             }
         }
     }
@@ -768,7 +862,7 @@ impl VideoMode {
                 self.sources.clear();
             }
             for d in dropped.into_iter().take(2) {
-                self.add_source(&d, &ctx, &mut None);
+                self.add_source(&d, &ctx);
             }
         }
 
@@ -797,6 +891,13 @@ impl VideoMode {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        // A file that failed to open while another plays: say so (the
+        // empty view shows a card instead).
+        if !self.sources.is_empty() {
+            if let Some((name, why)) = self.open_error.take() {
+                core.toasts.error(format!("Cannot open {name}: {why}"));
+            }
+        }
         // Keys first, so this frame already shows their effect (B offset,
         // panels, compare mode) instead of the state before the press.
         let mut keep = self.keys(&ctx, core);
@@ -827,6 +928,7 @@ impl VideoMode {
         if self.goto.is_some() {
             self.goto_dialog(&ctx);
         }
+        keep &= !std::mem::take(&mut self.close_requested);
         if !keep {
             self.pause();
         }
@@ -917,13 +1019,20 @@ impl VideoMode {
                     _ => "Add B to compare...".into(),
                 });
                 let color = if i == 0 { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(90, 190, 255) };
-                let resp = if tiny {
-                    ui.add(egui::Button::new(RichText::new(*label).strong().color(color)).min_size(Vec2::new(30.0, 24.0))).on_hover_text(if full.is_empty() { name.clone() } else { format!("{full}\nChoose a file") })
-                } else {
-                    ui.label(RichText::new(*label).strong().color(color));
-                    let tip = if full != name { format!("{full}\nChoose a file") } else { "Choose a file".into() };
-                    ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text(tip)
+                // One chip per side: the colored letter, then the file name
+                // (muted while it only invites to open one).
+                let mut job = egui::text::LayoutJob::default();
+                let format = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
+                job.append(label, 0.0, format(crate::ui::theme::semibold(12.5), color));
+                if !tiny {
+                    job.append(&name, 7.0, format(FontId::proportional(12.5), if full.is_empty() { p.muted } else { p.text }));
+                }
+                let tip = match (full.is_empty(), tiny || full != name) {
+                    (true, _) => name.clone(),
+                    (false, true) => format!("{full}\nChoose a file"),
+                    (false, false) => "Choose a file".into(),
                 };
+                let resp = ui.add(egui::Button::new(job).min_size(Vec2::new(if tiny { 30.0 } else { 60.0 }, 26.0))).on_hover_text(tip);
                 if resp.clicked() {
                     let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                     if let Some(f) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_file() {
@@ -932,7 +1041,7 @@ impl VideoMode {
                         } else {
                             self.sources.truncate(1);
                         }
-                        self.add_source(&f, &core.ctx, &mut None);
+                        self.add_source(&f, &core.ctx);
                     }
                 }
                 if i == 1 && self.sources.len() == 2 && !tiny && widgets::icon_button(ui, I::X, "Remove B", false).clicked() {
@@ -991,7 +1100,7 @@ impl VideoMode {
 
     /// Points the compare controls take in the top bar.
     fn compare_controls_width(&self) -> f32 {
-        let modes = CompareMode::ALL.len() as f32 * 34.0;
+        let modes = CompareMode::ALL.len() as f32 * 31.0 + 3.0;
         let gain = if self.mode == CompareMode::Difference { 190.0 } else { 0.0 };
         modes + gain + 13.0 + 64.0 + 70.0 + 34.0
     }
@@ -1001,6 +1110,10 @@ impl VideoMode {
     fn compare_controls(&mut self, ui: &mut Ui, p: &Palette, menu: bool) {
         let p = *p;
         let mut modes = |ui: &mut Ui| {
+            let gap = ui.spacing().item_spacing.x;
+            if !menu {
+                ui.spacing_mut().item_spacing.x = 1.0;
+            }
             for m in CompareMode::ALL {
                 let tip = format!("{} ({})", m.label(), m.key());
                 let clicked = if menu {
@@ -1012,6 +1125,7 @@ impl VideoMode {
                     self.mode = m;
                 }
             }
+            ui.spacing_mut().item_spacing.x = gap;
         };
         if menu {
             modes(ui);
@@ -1083,8 +1197,8 @@ impl VideoMode {
 
     fn viewport(&mut self, ui: &mut Ui, core: &mut Core) {
         if let Some((a, b, t)) = self.pending_swap.take() {
-            self.add_source(&a, &core.ctx, &mut None);
-            self.add_source(&b, &core.ctx, &mut None);
+            self.add_source(&a, &core.ctx);
+            self.add_source(&b, &core.ctx);
             self.seek_all(t, true);
         }
         let p = core.pal;
@@ -1092,19 +1206,41 @@ impl VideoMode {
         let resp = ui.allocate_rect(view, Sense::click_and_drag());
         self.hover_view = resp.hovered();
         if self.sources.is_empty() {
-            let c = view.center();
-            ui.painter().text(c - Vec2::new(0.0, 40.0), Align2::CENTER_CENTER, I::FILM_STRIP, FontId::proportional(56.0), p.faint);
-            ui.painter().text(c + Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, "Drop one video to play it, or two videos to compare them", FontId::proportional(15.0), p.text);
-            ui.painter().text(c + Vec2::new(0.0, 36.0), Align2::CENTER_CENTER, "Frame-accurate stepping · wipe / flicker / difference · PSNR & SSIM · scopes", FontId::proportional(12.5), p.muted);
-            if let Some(m) = &self.message {
-                ui.painter().text(c + Vec2::new(0.0, 70.0), Align2::CENTER_CENTER, m, FontId::proportional(12.0), p.danger);
+            // The hero (icon and hints), the error card when a file failed to
+            // open, then the button: one column centered in the view.
+            let painter = ui.painter().with_clip_rect(view);
+            let wrap = (view.width() - 32.0).max(40.0);
+            let line = |text: &str, size: f32, color: Color32| {
+                let mut job = egui::text::LayoutJob::simple(text.to_string(), FontId::proportional(size), color, wrap);
+                job.halign = egui::Align::Center;
+                painter.layout_job(job)
+            };
+            let hint = line("Drop one video to play it, or two videos to compare them", 15.0, p.text);
+            let sub = line("Frame-accurate stepping · wipe / flicker / difference · PSNR & SSIM · scopes", 12.5, p.muted);
+            let card = self.open_error.as_ref().map(|(name, why)| ErrorCard::layout(&painter, &p, name, why, wrap.min(440.0)));
+            let icon_h = 64.0;
+            let card_h = card.as_ref().map(|c| c.size.y + 20.0).unwrap_or(0.0);
+            let total = icon_h + 14.0 + hint.size().y + 8.0 + sub.size().y + 20.0 + card_h + 34.0;
+            let mut y = (view.center().y - total / 2.0).max(view.min.y + 16.0);
+            let cx = view.center().x;
+            painter.text(Pos2::new(cx, y + icon_h / 2.0), Align2::CENTER_CENTER, I::FILM_STRIP, FontId::proportional(56.0), p.faint);
+            y += icon_h + 14.0;
+            let (hint_h, sub_h) = (hint.size().y, sub.size().y);
+            painter.galley(Pos2::new(cx, y), hint, p.text);
+            y += hint_h + 8.0;
+            painter.galley(Pos2::new(cx, y), sub, p.muted);
+            y += sub_h + 20.0;
+            if let Some(card) = card {
+                let size = card.size;
+                card.paint(&painter, &p, Pos2::new(cx - size.x / 2.0, y));
+                y += size.y + 20.0;
             }
-            let br = Rect::from_center_size(c + Vec2::new(0.0, 110.0), Vec2::new(200.0, 34.0));
+            let br = Rect::from_min_size(Pos2::new(cx - 100.0, y), Vec2::new(200.0, 34.0));
             if ui.put(br, egui::Button::new(RichText::new(format!("{}  Open video...", I::FOLDER_OPEN)).color(Color32::WHITE)).fill(p.accent)).clicked() {
                 let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                 if let Some(files) = rfd::FileDialog::new().add_filter("Videos", &exts).pick_files() {
                     for f in files.into_iter().take(2) {
-                        self.add_source(&f, &core.ctx, &mut None);
+                        self.add_source(&f, &core.ctx);
                     }
                 }
             }
@@ -1142,7 +1278,9 @@ impl VideoMode {
                 self.zoom = 1.0;
             }
         }
-        if resp.clicked() && !compare {
+        // A click that only dismisses the picture's menu (or another popup)
+        // does not also play or pause.
+        if resp.clicked() && !compare && !egui::Popup::is_any_open(ui.ctx()) {
             self.toggle_play();
         }
         // Request an output size matching the on-screen size (saves decode→upload bandwidth).
@@ -1216,7 +1354,8 @@ impl VideoMode {
                 }
                 CompareMode::Wipe => {
                     let dest = dest_in(view, self.center, self.zoom);
-                    if !self.wipe_frozen && !ui.input(|i| i.modifiers.shift) {
+                    // Not while the pointer is over a menu above the picture.
+                    if !self.wipe_frozen && !ui.input(|i| i.modifiers.shift) && self.hover_view {
                         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                             if view.contains(pos) {
                                 self.wipe_pos = ((pos.x - view.min.x) / view.width()).clamp(0.0, 1.0);
@@ -1325,10 +1464,17 @@ impl VideoMode {
         if let Some(e) = &a.error {
             hud = format!("{hud}   ⚠ {e}");
         }
-        let g = painter.layout_no_wrap(hud, FontId::monospace(12.0), Color32::from_white_alpha(230));
-        let r = Rect::from_min_size(Pos2::new(view.max.x - g.size().x - 30.0, view.max.y - 36.0), g.size() + Vec2::new(16.0, 8.0));
-        painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(150));
-        painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+        // In a narrow view the readout shortens (the transport bar has the
+        // same numbers), down to nothing, rather than running off the left.
+        let fits = |t: &str| {
+            let g = painter.layout_no_wrap(t.to_string(), FontId::monospace(12.0), Color32::from_white_alpha(230));
+            (g.size().x + 46.0 <= view.width()).then_some(g)
+        };
+        if let Some(g) = fits(&hud).or_else(|| fits(&format!("frame {f}   {}", kind_name(kind)))) {
+            let r = Rect::from_min_size(Pos2::new(view.max.x - g.size().x - 30.0, view.max.y - 36.0), g.size() + Vec2::new(16.0, 8.0));
+            painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(150));
+            painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+        }
         // A slow seek (long GOP) keeps the last frame on screen with a badge,
         // so stepping never looks frozen.
         if let Some(t0) = a.seek_started {
@@ -1350,6 +1496,79 @@ impl VideoMode {
             if let Some(e) = &self.audio_error {
                 painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  No audio output: {e}", I::SPEAKER_SLASH), FontId::proportional(11.5), p.muted);
             }
+        }
+        resp.context_menu(|ui| self.canvas_menu(ui, core));
+    }
+
+    /// The picture's right-click menu, laid out like the viewer's: the
+    /// transport, snapshots, compare modes (two videos), panels and leaving.
+    /// Esc closes only the menu (see `keys`).
+    fn canvas_menu(&mut self, ui: &mut Ui, core: &mut Core) {
+        ui.set_min_width(230.0);
+        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| ui.add(egui::Button::new(format!("{icon}   {label}")).shortcut_text(key)).clicked();
+        let check = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| ui.add(egui::Button::new(format!("{icon}   {label}")).selected(on).shortcut_text(key)).clicked();
+        let (icon, label) = if self.playing { (I::PAUSE, "Pause") } else { (I::PLAY, "Play") };
+        if item(ui, icon, label, "Space") {
+            self.toggle_play();
+            ui.close();
+        }
+        if item(ui, I::CARET_LEFT, "Previous frame", ",") {
+            self.step(-1);
+            ui.close();
+        }
+        if item(ui, I::CARET_RIGHT, "Next frame", ".") {
+            self.step(1);
+            ui.close();
+        }
+        if item(ui, I::HASH, "Go to frame...", "G") {
+            self.goto = Some(String::new());
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, I::CAMERA, "Save frame as PNG...", "Ctrl+S") {
+            ui.close();
+            self.snapshot(false, core);
+        }
+        if item(ui, I::COPY, "Copy frame", "Ctrl+C") {
+            ui.close();
+            self.snapshot(true, core);
+        }
+        if self.sources.len() == 2 {
+            ui.separator();
+            ui.menu_button(format!("{}   Compare", self.mode.icon()), |ui| {
+                ui.set_min_width(210.0);
+                for m in CompareMode::ALL {
+                    if check(ui, m.icon(), m.label(), m.key(), self.mode == m) {
+                        self.mode = m;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
+                    self.swap();
+                    ui.close();
+                }
+            });
+        }
+        ui.separator();
+        // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
+        let analysis = crate::ui::commands::Command::ToggleAnalysis;
+        if item(ui, analysis.icon(), "Analyze...", &analysis.shortcut()) {
+            core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
+            ui.close();
+        }
+        if check(ui, I::INFO, "Media info", "I", self.show_info) {
+            self.show_info = !self.show_info;
+            ui.close();
+        }
+        if check(ui, I::WAVEFORM, "Scopes", "F2", self.show_scopes) {
+            self.show_scopes = !self.show_scopes;
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, I::X, "Close video", "Esc") {
+            self.close_requested = true;
+            ui.close();
         }
     }
 
@@ -1496,7 +1715,10 @@ impl VideoMode {
             egui::ScrollArea::vertical().id_salt("video-metric-plots").max_height(170.0).show(ui, |ui| core.metrics.video_plots(ui, &p, cur, 46.0));
         }
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        // As tall as the play button, so the readouts and the right-hand
+        // controls center on the icons.
+        let row = Vec2::new(ui.available_width(), 34.0);
+        ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let fit = self.transport_fit(ui);
             let b = |ui: &mut Ui, icon: &str, tip: &str| widgets::icon_button(ui, icon, tip, false).clicked();
@@ -1530,10 +1752,11 @@ impl VideoMode {
             let a = &self.sources[0];
             let (time, frame) = self.position_text(fit.duration, fit.frame_word);
             if fit.time {
-                ui.label(RichText::new(time).monospace().color(p.text)).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
-                ui.add_space(6.0);
+                ui.add_space(4.0);
+                readout(ui, time, p.text, Sense::hover()).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
+                ui.add_space(2.0);
             }
-            let fr = ui.add(egui::Button::new(RichText::new(frame).monospace().size(12.0)).frame(false)).on_hover_text("Go to frame or time (G)");
+            let fr = readout(ui, frame, p.muted, Sense::click()).on_hover_text("Go to frame or time (G)");
             if fr.clicked() {
                 self.goto = Some(String::new());
             }
@@ -1542,7 +1765,7 @@ impl VideoMode {
                 widgets::separator_v(ui);
                 let lab = self.loop_label();
                 let text = if fit.loop_label { format!("{} {lab}", I::REPEAT) } else { I::REPEAT.to_string() };
-                if ui.add(egui::Button::new(RichText::new(text).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
+                if ui.add(egui::Button::new(RichText::new(text).size(12.5)).selected(self.loop_ab.1.is_some()).min_size(Vec2::new(0.0, 26.0))).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
                     self.toggle_loop();
                 }
             }
@@ -1552,10 +1775,18 @@ impl VideoMode {
                 self.timeline_legend(ui, &p);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Volume
+                // Volume: a slim slider (a smaller knob than the default).
                 ui.spacing_mut().slider_width = 90.0;
                 if self.audio.is_some() && self.sources[0].info.has_audio {
-                    if fit.volume && ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).show_value(false)).changed() {
+                    let slim = |ui: &mut Ui, v: &mut f32| {
+                        ui.scope(|ui| {
+                            ui.spacing_mut().interact_size.y = 16.0;
+                            ui.spacing_mut().slider_rail_height = 4.0;
+                            ui.add(egui::Slider::new(v, 0.0..=1.5).show_value(false))
+                        })
+                        .inner
+                    };
+                    if fit.volume && slim(ui, &mut self.volume).on_hover_text("Volume").changed() {
                         if let Some(a) = self.audio_shared() {
                             a.set_volume(self.volume);
                         }
@@ -1570,15 +1801,18 @@ impl VideoMode {
                     ui.label(RichText::new(I::SPEAKER_SLASH).size(11.5).color(p.faint)).on_hover_text("No audio");
                 }
                 widgets::separator_v(ui);
-                egui::ComboBox::from_id_salt("speed").width(70.0).selected_text(format!("{}×", self.speed)).show_ui(ui, |ui| {
-                    for s in [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0] {
-                        if ui.selectable_label(self.speed == s, format!("{s}×")).clicked() {
+                let speed = ui.menu_button(RichText::new(format!("{}×  {}", self.speed, I::CARET_DOWN)).size(12.5), |ui| {
+                    ui.set_min_width(80.0);
+                    for s in SPEEDS {
+                        if ui.add(egui::Button::new(format!("{s}×")).selected(self.speed == s)).clicked() {
                             self.set_speed(s);
+                            ui.close();
                         }
                     }
                 });
+                speed.response.on_hover_text("Playback speed ([ and ]; Backspace: 1×)");
                 if fit.speed_label {
-                    ui.label(RichText::new("Speed").size(12.0).color(p.muted));
+                    ui.label(RichText::new("Speed").size(12.5).color(p.muted));
                 }
             });
         });
@@ -1610,8 +1844,8 @@ impl VideoMode {
         let s = ui.spacing().item_spacing.x;
         let pad = ui.spacing().button_padding.x * 2.0;
         let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_string(), f, Color32::WHITE).size().x;
-        let mono = egui::TextStyle::Monospace.resolve(ui.style());
-        let small = FontId::proportional(12.0);
+        let mono = FontId::monospace(12.5);
+        let small = FontId::proportional(12.5);
         let icon = 30.0 + s;
         let sep = 9.0 + s;
         let audio = self.audio.is_some() && self.sources[0].info.has_audio;
@@ -1619,7 +1853,7 @@ impl VideoMode {
             let (time, frame) = self.position_text(f.duration, f.frame_word);
             let mut w = 2.0 * icon + 34.0 + s + sep;
             w += if f.first_last { 2.0 * icon } else { 0.0 } + if f.skip_secs { 2.0 * icon } else { 0.0 };
-            w += if f.time { text_w(&time, mono.clone()) + s + 6.0 } else { 0.0 } + text_w(&frame, FontId::monospace(12.0)) + pad + s;
+            w += if f.time { text_w(&time, mono.clone()) + 2.0 * s + 6.0 } else { 0.0 } + text_w(&frame, mono.clone()) + 8.0 + s;
             if f.loop_button {
                 w += sep + if f.loop_label { text_w(&format!("{} {}", I::REPEAT, self.loop_label()), small.clone()) } else { text_w(I::REPEAT, small.clone()) } + pad + s;
             }
@@ -1634,7 +1868,7 @@ impl VideoMode {
                 (false, true) => text_w(&format!("{} no audio", I::SPEAKER_SLASH), FontId::proportional(11.5)) + s,
                 (false, false) => 16.0 + s,
             };
-            w += sep + 70.0 + pad + s + if f.speed_label { text_w("Speed", small.clone()) + s } else { 0.0 };
+            w += sep + text_w(&format!("0.25×  {}", I::CARET_DOWN), small.clone()) + pad + s + if f.speed_label { text_w("Speed", small.clone()) + s } else { 0.0 };
             // Room between the left and right groups.
             w + 12.0
         };

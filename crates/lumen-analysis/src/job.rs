@@ -210,10 +210,16 @@ pub struct VideoSpec {
     pub roi: Option<Roi>,
     /// `want_map` defaults to false here: maps are not kept per frame.
     pub options: MetricOptions,
-    /// Bytes for frames in flight plus their derived images (default 1 GB).
+    /// Bytes for frames in flight plus their derived images, and for the
+    /// frames queued on the producer's side (`queued_frames`) (default 1 GB).
     pub memory_budget: u64,
     /// Upper bound on frames in flight (default: the pool size plus 2).
     pub max_in_flight: Option<usize>,
+    /// Decoded frames (A and B counted apart) the producer holds outside
+    /// the job: its channels and the frames its decoders hand over. They
+    /// count against `memory_budget` at the first frame's size (default 12:
+    /// a channel of 4 pairs and 4 B frames waiting to be paired).
+    pub queued_frames: usize,
     /// Expected frame count, for progress and ETA.
     pub total_frames: Option<u64>,
     pub scope: Scope,
@@ -227,6 +233,7 @@ impl Default for VideoSpec {
             options: MetricOptions { want_map: false, ..MetricOptions::default() },
             memory_budget: 1 << 30,
             max_in_flight: None,
+            queued_frames: 12,
             total_frames: None,
             scope: Scope { kind: ScopeKind::VideoRange, ..Scope::default() },
         }
@@ -479,7 +486,9 @@ where
     let per_frame = va.byte_size() + FrameCtx::derived_bytes(rw, rh, &inputs) + ms.len() * px * 4 + if spec.options.want_map { px * 4 * ms.len() } else { 0 } + px;
     let per_pair = per_frame * if has_b { 2 } else { 1 };
     let cap = spec.max_in_flight.unwrap_or(pool.threads() + 2).max(1);
-    let window = ((spec.memory_budget as usize / per_pair.max(1)).max(1)).min(cap);
+    // Frames waiting on the producer's side take their share first.
+    let budget = (spec.memory_budget as usize).saturating_sub(spec.queued_frames * va.byte_size());
+    let window = ((budget / per_pair.max(1)).max(1)).min(cap);
     let mut builder = ReportBuilder::new(scope);
     let mut ta = TemporalStream { metrics: tm.iter().map(|t| (t.make)(&spec.options)).collect(), prev: None, suffix: "" };
     let mut tb = TemporalStream { metrics: tm.iter().map(|t| (t.make)(&spec.options)).collect(), prev: None, suffix: "_b" };

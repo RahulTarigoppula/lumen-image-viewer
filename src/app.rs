@@ -2109,11 +2109,11 @@ impl App {
                         if self.do_save(&path, &img, &opts) {
                             self.save_dialog = None;
                             self.core.settings.jpeg_quality = opts.jpeg_quality;
-                            // Saving to a new file: show it.
-                            if self.viewer.current() != Some(&path) && path.parent() == Some(self.browser.folder.as_path()) {
-                                if let Some(e) = &mut self.viewer.edit {
-                                    e.saved_version = e.version;
-                                }
+                            // Saved to a new file: the viewer goes on with the
+                            // saved copy (as saved, no edits); the original stays
+                            // as it is on disk.
+                            if self.mode == Mode::Viewer && self.viewer.current() != Some(&path) {
+                                self.viewer.show_saved_copy(&path);
                             }
                         } else if let Some(d) = &mut self.save_dialog {
                             d.error = Some("Could not save - see the message below.".into());

@@ -542,6 +542,24 @@ impl Viewer {
         }
     }
 
+    /// After Save as to `path`: show that file (added after the current
+    /// image unless the list has it) with no edit session, as if just
+    /// opened. The view stays: the saved copy has the edited image's size.
+    pub fn show_saved_copy(&mut self, path: &Path) {
+        self.index = match self.list.iter().position(|p| p == path) {
+            Some(i) => i,
+            None => {
+                let at = (self.index + 1).min(self.list.len());
+                self.list.insert(at, path.to_path_buf());
+                at
+            }
+        };
+        self.refit_on_size = None;
+        self.edit = None;
+        self.tool = None;
+        self.crop = None;
+    }
+
     pub fn replace_path(&mut self, from: &Path, to: &Path) {
         for p in self.list.iter_mut() {
             if p == from {
