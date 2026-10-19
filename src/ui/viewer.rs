@@ -71,6 +71,9 @@ struct ActiveTool {
     final_rx: Option<Receiver<RgbaImage>>,
     show_original: bool,
     error: Option<String>,
+    /// The user changed something (parameters, strokes, shapes) since the tool
+    /// opened or was reset: closing it without Apply asks first.
+    touched: bool,
 }
 
 impl ActiveTool {
@@ -249,6 +252,27 @@ pub struct CropState {
     /// Image size `r` refers to. The overlay works in the displayed image's
     /// size, which can differ (e.g. right after a rotate): `r` is rescaled.
     size: (f32, f32),
+    /// The area the crop started with (in `size`): anything else is the user's work.
+    initial: [f32; 4],
+}
+
+impl CropState {
+    fn touched(&self) -> bool {
+        self.r != self.initial || self.aspect.is_some()
+    }
+}
+
+/// What runs once the user answers the discard prompt with Discard.
+enum Pending {
+    /// Move by this many images.
+    Step(isize),
+    /// Leave the viewer.
+    Close,
+    /// Close the open tool or crop (Esc).
+    CancelTool,
+    /// Open another tool, or crop, in place of the current one.
+    OpenTool(Box<dyn EditTool>),
+    StartCrop,
 }
 
 pub struct Viewer {
@@ -283,7 +307,8 @@ pub struct Viewer {
     magnifier_active: bool,
     last_activity: Instant,
     last_view_rect: Rect,
-    pub pending_nav: Option<isize>,
+    /// The action waiting for the discard prompt (`confirm_discard`).
+    pending: Option<Pending>,
     pub confirm_discard: bool,
     hist_cache: crate::bg::BgSlot<(PathBuf, u64, usize), Histogram>,
     exif_cache: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
@@ -328,7 +353,7 @@ impl Viewer {
             magnifier_active: false,
             last_activity: Instant::now(),
             last_view_rect: Rect::NOTHING,
-            pending_nav: None,
+            pending: None,
             confirm_discard: false,
             hist_cache: Default::default(),
             exif_cache: Default::default(),
@@ -410,12 +435,39 @@ impl Viewer {
         self.tool.is_some() || self.crop.is_some()
     }
 
+    /// An open tool or crop holds changes that are not applied yet.
+    pub fn tool_has_work(&self) -> bool {
+        self.tool.as_ref().is_some_and(|t| t.touched) || self.crop.as_ref().is_some_and(|c| c.touched())
+    }
+
+    /// Anything leaving this image would lose: unsaved edits or unapplied tool work.
+    pub fn has_unsaved_work(&self) -> bool {
+        self.is_dirty() || self.tool_has_work()
+    }
+
+    /// Close the open tool or crop without applying it.
+    pub fn close_tool(&mut self) {
+        self.tool = None;
+        self.crop = None;
+    }
+
+    /// Ask before leaving the viewer (unsaved edits or unapplied tool work).
+    pub fn confirm_close(&mut self) {
+        self.ask(Pending::Close);
+    }
+
+    fn ask(&mut self, what: Pending) {
+        self.pending = Some(what);
+        self.confirm_discard = true;
+    }
+
     /// Undo inside the open edit tool (strokes, points). False when nothing changed.
     pub fn tool_undo(&mut self) -> bool {
         let Some(t) = &mut self.tool else { return false };
         let changed = t.tool.undo();
         if changed {
             t.version += 1;
+            t.touched = true;
         }
         changed
     }
@@ -425,18 +477,19 @@ impl Viewer {
         let changed = t.tool.redo();
         if changed {
             t.version += 1;
+            t.touched = true;
         }
         changed
     }
 
-    /// Navigate by `delta` images. Returns false if blocked by unsaved edits.
+    /// Navigate by `delta` images. Returns false if blocked by unsaved edits
+    /// or unapplied tool work (the discard prompt asks first).
     pub fn step(&mut self, delta: isize, wrap: bool, fit: FitMode) -> bool {
         if self.list.is_empty() {
             return true;
         }
-        if self.is_dirty() {
-            self.pending_nav = Some(delta);
-            self.confirm_discard = true;
+        if self.has_unsaved_work() {
+            self.ask(Pending::Step(delta));
             return false;
         }
         let n = self.list.len() as isize;
@@ -457,14 +510,20 @@ impl Viewer {
         true
     }
 
+    /// Show image `index` (filmstrip, end of a slideshow); asks first like `step`.
     pub fn go_to(&mut self, index: usize, fit: FitMode) {
-        if index < self.list.len() && index != self.index && !self.is_dirty() {
-            self.index = index;
-            self.edit = None;
-            self.tool = None;
-            self.crop = None;
-            self.after_index_change(fit);
+        if index >= self.list.len() || index == self.index {
+            return;
         }
+        if self.has_unsaved_work() {
+            self.ask(Pending::Step(index as isize - self.index as isize));
+            return;
+        }
+        self.index = index;
+        self.edit = None;
+        self.tool = None;
+        self.crop = None;
+        self.after_index_change(fit);
     }
 
     pub fn discard_edits(&mut self) {
@@ -538,6 +597,10 @@ impl Viewer {
 
     pub fn open_tool(&mut self, tool: Box<dyn EditTool>, core: &Core) {
         let Some(img) = self.current_image(core) else { return };
+        if self.tool_has_work() {
+            self.ask(Pending::OpenTool(tool));
+            return;
+        }
         self.crop = None;
         // Preview runs on a copy sized to the screen for interactivity. Resizing a
         // big photo takes a while, so it is prepared off the UI thread.
@@ -557,14 +620,19 @@ impl Viewer {
             }
             ctx.request_repaint();
         });
-        self.tool = Some(ActiveTool { tool, base: None, base_rx: Some(rx), version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, show_original: false, error: None });
+        self.tool = Some(ActiveTool { tool, base: None, base_rx: Some(rx), version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, show_original: false, error: None, touched: false });
     }
 
     pub fn start_crop(&mut self, core: &Core) {
         let Some(img) = self.current_image(core) else { return };
+        if self.tool_has_work() {
+            self.ask(Pending::StartCrop);
+            return;
+        }
         self.tool = None;
         let (w, h) = (img.width() as f32, img.height() as f32);
-        self.crop = Some(CropState { r: [w * 0.1, h * 0.1, w * 0.9, h * 0.9], aspect: None, drag: None, size: (w, h) });
+        let r = [w * 0.1, h * 0.1, w * 0.9, h * 0.9];
+        self.crop = Some(CropState { r, aspect: None, drag: None, size: (w, h), initial: r });
     }
 
     fn fit_zoom(&self, mode: FitMode, img: (u32, u32), view: Vec2, ppp: f32) -> f32 {
@@ -867,6 +935,7 @@ impl Viewer {
                     };
                     if t.tool.canvas(&cx, &painter, &resp) {
                         t.version += 1;
+                        t.touched = true;
                         ui.ctx().request_repaint();
                     }
                 }
@@ -943,7 +1012,7 @@ impl Viewer {
         let idle = self.last_activity.elapsed() > Duration::from_millis(2200);
         let near_bottom = ui.input(|i| i.pointer.hover_pos()).map(|pos| pos.y > view.max.y - 90.0 && view.contains(pos)).unwrap_or(false);
         if !idle || near_bottom || !fullscreen {
-            self.bottom_bar(ui, core, view, &mut ev);
+            self.bottom_bar(ui, core, view, size.is_some(), &mut ev);
         } else if fullscreen && self.crop.is_none() && self.tool.is_none() && !edge_open {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
@@ -1031,7 +1100,10 @@ impl Viewer {
         let (si, ctrl, now) = ui.input(|i| (scroll_input(i), i.modifiers.ctrl, i.time));
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let ppp = ui.ctx().pixels_per_point();
+        // While a tool or crop is open the wheel always zooms (the panels say
+        // so): stepping to another image would throw the tool's work away.
         let zoom_mode = core.settings.wheel_action == WheelAction::Zoom;
+        let tool_open = self.has_tool();
         // Pinch: touch screens and gesture events. Ctrl+wheel (which is also how
         // Windows delivers touchpad pinches) is handled below, never both.
         if (si.pinch - 1.0).abs() > 1e-4 && si.pinch.is_finite() && si.pinch > 0.0 {
@@ -1046,7 +1118,7 @@ impl Viewer {
                 // Two-finger touchpad scroll pans an image larger than the window.
                 self.center -= si.precise * ppp / self.zoom;
                 self.auto_fit = None;
-            } else if ctrl != zoom_mode {
+            } else if tool_open || ctrl != zoom_mode {
                 if si.wheel != 0.0 {
                     // Proportional zoom so precision touchpads feel smooth too.
                     let f = (1.0 + si.wheel.clamp(-200.0, 200.0) * 0.0045).max(0.2);
@@ -1060,7 +1132,7 @@ impl Viewer {
                 }
             }
         }
-        if resp.double_clicked() && self.crop.is_none() && !self.tool_grabs_pointer(ui) {
+        if resp.double_clicked() && !tool_open {
             ev.push(ViewerEvent::Close);
         }
         if resp.middle_clicked() {
@@ -1087,9 +1159,14 @@ impl Viewer {
             for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::Crop, Command::Resize] {
                 menu_item(ui, c, ev);
             }
-            ui.menu_button(format!("{}   Adjust", I::SLIDERS_HORIZONTAL), |ui| {
-                for c in [Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::CanvasSize, Command::AddBorder, Command::AddText, Command::Watermark, Command::DrawBoard, Command::CloneStamp, Command::HealingBrush, Command::RedEye, Command::BlurRegion, Command::Selection] {
-                    menu_item(ui, c, ev);
+            ui.menu_button(format!("{}   Edit", I::SLIDERS_HORIZONTAL), |ui| {
+                for (gi, g) in Command::EDIT_GROUPS.iter().enumerate() {
+                    if gi > 0 {
+                        ui.separator();
+                    }
+                    for c in g.iter() {
+                        menu_item(ui, *c, ev);
+                    }
                 }
             });
             ui.separator();
@@ -1294,8 +1371,9 @@ impl Viewer {
                 Rect::from_min_size(Pos2::new(view.max.x - w - 6.0 + slide, view.min.y + 8.0), Vec2::new(w, (view.height() - 16.0 - bottom_reserve).max(120.0)))
             }
             Edge::Left => {
-                // Size to the menu's content (about 22 rows) instead of the full height.
-                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 640.0);
+                // Size to the menu's content (about 29 rows) instead of the full
+                // height; it scrolls when the window is shorter.
+                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 790.0);
                 Rect::from_min_size(Pos2::new(view.min.x + 6.0 - slide, view.center().y - h / 2.0 - bottom_reserve / 2.0), Vec2::new(262.0, h))
             }
             Edge::Bottom => return false,
@@ -1333,18 +1411,12 @@ impl Viewer {
 
     /// Compact vertical list of edit commands for the left pop-out panel.
     fn edge_tool_menu(&mut self, ui: &mut Ui, ev: &mut Vec<ViewerEvent>) {
-        let groups: [&[Command]; 4] = [
-            &[Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::FreeRotate],
-            &[Command::Crop, Command::Resize, Command::CanvasSize],
-            &[Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects],
-            &[Command::AddText, Command::AddBorder, Command::Watermark],
-        ];
         let dirty = self.is_dirty();
         egui::ScrollArea::vertical().id_salt("edge-tools").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(RichText::new("Edit").font(super::theme::semibold(13.0)));
             ui.add_space(4.0);
-            for (gi, g) in groups.iter().enumerate() {
+            for (gi, g) in Command::EDIT_GROUPS.iter().enumerate() {
                 if gi > 0 {
                     ui.add_space(3.0);
                     ui.separator();
@@ -1367,10 +1439,11 @@ impl Viewer {
     fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path) {
         let p = core.pal;
         let mut parts = vec![format!("{} / {}", self.index + 1, self.list.len()), file_name(path)];
+        // No zoom while nothing is shown (still loading, or not decodable).
         if let Some((w, h)) = size {
             parts.push(format!("{w} × {h}"));
+            parts.push(format!("{:.0}%{}", self.zoom * 100.0, if self.lock_zoom { " (locked)" } else { "" }));
         }
-        parts.push(format!("{:.0}%{}", self.zoom * 100.0, if self.lock_zoom { " (locked)" } else { "" }));
         if self.is_dirty() {
             parts.push("● edited".into());
         }
@@ -1378,13 +1451,18 @@ impl Viewer {
             parts.push(format!("frame {}/{}{}", f + 1, n, if playing { "" } else { " (paused)" }));
         }
         let text = parts.join("   ·   ");
-        let galley = ui.painter().layout_no_wrap(text, FontId::proportional(12.5), Color32::from_white_alpha(230));
+        // Wrap inside the image area: a long name at a large UI scale must not
+        // run under the tool / info panel beside it.
+        let wrap = (view.width() - 44.0).max(40.0);
+        let galley = ui.painter().layout(text, FontId::proportional(12.5), Color32::from_white_alpha(230), wrap);
         let r = Rect::from_min_size(view.min + Vec2::new(12.0, 12.0), galley.size() + Vec2::new(20.0, 10.0));
-        ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(150));
-        ui.painter().galley(r.min + Vec2::new(10.0, 5.0), galley, p.text);
+        let painter = ui.painter().with_clip_rect(view);
+        painter.rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(150));
+        painter.galley(r.min + Vec2::new(10.0, 5.0), galley, p.text);
     }
 
-    fn bottom_bar(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, ev: &mut Vec<ViewerEvent>) {
+    /// `shown`: an image is on screen (no zoom figure otherwise).
+    fn bottom_bar(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, shown: bool, ev: &mut Vec<ViewerEvent>) {
         use BarItem as B;
         let p = core.pal;
         // Fit the bar to the view: drop separators first, then move the least
@@ -1406,7 +1484,8 @@ impl Viewer {
             match item {
                 B::Sep => widgets::separator_v(&mut child),
                 B::ZoomPct => {
-                    let zl = child.add_sized([54.0, 26.0], egui::Button::new(RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(12.0)).frame(false));
+                    let pct = if shown { format!("{:.0}%", self.zoom * 100.0) } else { "-".into() };
+                    let zl = child.add_enabled_ui(shown, |ui| ui.add_sized([54.0, 26.0], egui::Button::new(RichText::new(pct).size(12.0)).frame(false))).inner;
                     if zl.clicked() {
                         ev.push(ViewerEvent::Command(Command::ZoomActual));
                     }
@@ -1656,6 +1735,10 @@ impl Viewer {
 
     fn tool_panel(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
+        // Esc / Enter belong to the panel only if no text field had them as
+        // the frame began (Esc in a text box just leaves the box), and not
+        // while the discard prompt shows.
+        let keys = keyboard_free(ui) && !self.confirm_discard;
         let Some(t) = &mut self.tool else { return };
         // The preview base is prepared in the background (resize + histogram).
         if let Some(rx) = &t.base_rx {
@@ -1733,6 +1816,7 @@ impl Viewer {
         }
         if changed {
             t.version += 1;
+            t.touched = true;
         }
         // Launch a preview render when parameters changed and no render is in flight.
         if let Some(base) = &t.base {
@@ -1760,14 +1844,15 @@ impl Viewer {
         ui.add_space(6.0);
         let mut close = false;
         let mut apply = false;
+        let can_apply = t.final_rx.is_none() && t.base.is_some() && t.tool.can_apply();
         ui.horizontal(|ui| {
             if ui.button("Reset").clicked() {
                 t.tool.reset();
                 t.version += 1;
+                t.touched = false;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = t.final_rx.is_none() && t.base.is_some();
-                if ui.add_enabled(enabled, egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(80.0, 28.0))).clicked() {
+                if ui.add_enabled(can_apply, egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(80.0, 28.0))).clicked() {
                     apply = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -1775,13 +1860,18 @@ impl Viewer {
                 }
             });
         });
-        if keyboard_free(ui) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+        // Esc with unapplied work asks first (Cancel is the explicit way out).
+        if keys && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            if t.touched {
+                self.ask(Pending::CancelTool);
+                return;
+            }
             close = true;
         }
-        if keyboard_free(ui) && ui.input(|i| i.key_pressed(Key::Enter)) {
+        if keys && ui.input(|i| i.key_pressed(Key::Enter)) {
             apply = true;
         }
-        if apply && t.final_rx.is_none() && t.base.is_some() {
+        if apply && can_apply {
             let full = self.edit.as_ref().filter(|e| e.path == self.list[self.index]).map(|e| e.current.clone()).or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.clone()));
             if let Some(full) = full {
                 let tool = t.tool.clone_box();
@@ -1827,6 +1917,9 @@ impl Viewer {
         let p = core.pal;
         let Some(img) = self.current_image(core) else { return };
         let (iw, ih) = (img.width() as f32, img.height() as f32);
+        // Esc / Enter belong to the panel only if no number field had them as
+        // the frame began, and not while the discard prompt shows.
+        let keys = keyboard_free(ui) && !self.confirm_discard;
         let Some(c) = &mut self.crop else { return };
         ui.label(RichText::new("Crop").font(super::theme::semibold(16.0)));
         ui.add_space(8.0);
@@ -1905,8 +1998,16 @@ impl Viewer {
         ui.add_space(12.0);
         ui.label(RichText::new("Drag inside to move, drag edges or corners to resize, drag outside to draw a new area. Enter applies, Esc cancels.").size(11.5).color(p.faint));
         ui.add_space(12.0);
-        let mut apply = keyboard_free(ui) && ui.input(|i| i.key_pressed(Key::Enter));
-        let mut cancel = keyboard_free(ui) && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        // Esc after changing the area asks first, like the tools.
+        let mut apply = keys && ui.input(|i| i.key_pressed(Key::Enter));
+        let mut cancel = false;
+        if keys && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            if c.touched() {
+                self.ask(Pending::CancelTool);
+                return;
+            }
+            cancel = true;
+        }
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 cancel = true;
@@ -1934,6 +2035,7 @@ impl Viewer {
         if c.size != (iw, ih) {
             let (kx, ky) = (iw / c.size.0.max(1.0), ih / c.size.1.max(1.0));
             c.r = [c.r[0] * kx, c.r[1] * ky, c.r[2] * kx, c.r[3] * ky];
+            c.initial = [c.initial[0] * kx, c.initial[1] * ky, c.initial[2] * kx, c.initial[3] * ky];
             c.size = (iw, ih);
             c.drag = None;
             clamp_crop(&mut c.r, iw, ih);
@@ -2058,40 +2160,102 @@ impl Viewer {
         }
     }
 
+    /// The prompt behind `confirm_discard`: unapplied tool work first (Discard /
+    /// Keep editing), then unsaved edits (Save / Discard / Cancel). Discard
+    /// carries on with the pending action, which may ask again for the next level.
     fn discard_dialog(&mut self, ctx: &egui::Context, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
+        let tool_title = match (&self.tool, &self.crop) {
+            (Some(t), _) if t.touched => Some(t.tool.title()),
+            (_, Some(c)) if c.touched() => Some("Crop".to_string()),
+            _ => None,
+        };
+        if tool_title.is_none() && !self.is_dirty() {
+            // Nothing to lose any more (the tool was applied meanwhile).
+            self.confirm_discard = false;
+            self.continue_pending(core, ev);
+            return;
+        }
+        // 0 keep / cancel, 1 discard, 2 save
+        let mut choice: Option<u8> = None;
         egui::Modal::new(egui::Id::new("discard-edits")).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.heading("Save changes?");
-            ui.add_space(6.0);
-            ui.label("This image has unsaved edits.");
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.confirm_discard = false;
-                    self.pending_nav = None;
+            match &tool_title {
+                Some(title) => {
+                    ui.heading("Discard changes?");
+                    ui.add_space(6.0);
+                    ui.label(format!("Your {} changes are not applied yet.", title.to_lowercase()));
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("Discard").color(Color32::WHITE)).fill(p.accent)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                            choice = Some(1);
+                        }
+                        if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            choice = Some(0);
+                        }
+                    });
                 }
-                if ui.button("Discard").clicked() {
-                    self.confirm_discard = false;
+                None => {
+                    ui.heading("Save changes?");
+                    ui.add_space(6.0);
+                    ui.label("This image has unsaved edits.");
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            choice = Some(0);
+                        }
+                        if ui.button("Discard").clicked() {
+                            choice = Some(1);
+                        }
+                        if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(p.accent)).clicked() {
+                            choice = Some(2);
+                        }
+                    });
+                }
+            }
+        });
+        match choice {
+            Some(0) => {
+                self.confirm_discard = false;
+                self.pending = None;
+            }
+            Some(1) => {
+                self.confirm_discard = false;
+                if tool_title.is_some() {
+                    self.close_tool();
+                } else {
                     self.edit = None;
                     self.gpu = None;
-                    if let Some(d) = self.pending_nav.take() {
-                        self.step(d, core.settings.loop_navigation, core.settings.fit_mode);
-                    }
                 }
-                if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(p.accent)).clicked() {
-                    self.confirm_discard = false;
-                    ev.push(ViewerEvent::Command(Command::Save));
-                }
-            });
-        });
+                self.continue_pending(core, ev);
+            }
+            Some(_) => {
+                self.confirm_discard = false;
+                self.pending = None;
+                ev.push(ViewerEvent::Command(Command::Save));
+            }
+            None => {}
+        }
+    }
+
+    /// Run the action that waited for the discard prompt.
+    fn continue_pending(&mut self, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
+        match self.pending.take() {
+            Some(Pending::Step(d)) => {
+                self.step(d, core.settings.loop_navigation, core.settings.fit_mode);
+            }
+            Some(Pending::Close) => ev.push(ViewerEvent::Close),
+            Some(Pending::OpenTool(t)) => self.open_tool(t, core),
+            Some(Pending::StartCrop) => self.start_crop(core),
+            Some(Pending::CancelTool) | None => {}
+        }
     }
 }
 
-/// True when no text field has keyboard focus and no popup/menu is open, so
-/// Esc / Enter belong to the viewer's tool panels.
+/// True when no text field has keyboard focus and no popup, menu or modal
+/// dialog is open, so Esc / Enter belong to the viewer's tool panels.
 fn keyboard_free(ui: &Ui) -> bool {
-    !ui.ctx().egui_wants_keyboard_input() && !egui::Popup::is_any_open(ui.ctx())
+    !ui.ctx().egui_wants_keyboard_input() && !egui::Popup::is_any_open(ui.ctx()) && ui.ctx().memory(|m| m.top_modal_layer().is_none())
 }
 
 fn frame_delay(frames: &[crate::decode::AnimFrame], i: usize) -> Duration {

@@ -350,6 +350,17 @@ impl Command {
         }
     }
 
+    /// Image editing commands in menu order, in groups (the viewer's Edit
+    /// pop-out panel and context menu). The palette lists them from here too,
+    /// so a new tool shows up everywhere at once.
+    pub const EDIT_GROUPS: [&'static [Command]; 5] = [
+        &[RotateLeft, RotateRight, FlipHorizontal, FlipVertical, FreeRotate],
+        &[Crop, Resize, CanvasSize],
+        &[AutoEnhance, AdjustColors, Levels, Curves, Sharpen, Blur, Effects],
+        &[AddText, AddBorder, Watermark],
+        &[DrawBoard, CloneStamp, HealingBrush, RedEye, BlurRegion, Selection],
+    ];
+
     /// Commands listed in the palette.
     pub fn palette() -> Vec<Command> {
         let mut v = vec![
@@ -358,14 +369,15 @@ impl Command {
             ShowInExplorer, CopyPath, ThumbBigger, ThumbSmaller, ToggleDetails, TogglePreviewPane, FocusFilter,
             BatchConvert, BatchRename, ContactSheet, FindDuplicates, Slideshow, Compare, ToggleFlag, ShowFlaggedOnly,
             OpenVideoMode, OpenViewer, CloseViewer, NextImage, PrevImage, FirstImage, LastImage, ZoomIn, ZoomOut,
-            ZoomActual, ZoomFit, CycleFit, RotateLeft, RotateRight, FlipHorizontal, FlipVertical, Crop, Resize,
-            CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance, AddText, AddBorder,
-            Watermark, FreeRotate, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
+            ZoomActual, ZoomFit, CycleFit,
+        ];
+        v.extend(Self::EDIT_GROUPS.iter().flat_map(|g| g.iter().copied()));
+        v.extend([
+            Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, DrawBoard, CloneStamp, HealingBrush, RedEye, BlurRegion, Selection,
-            Exit,
-        ];
+            CreateMultiPage, ImageStrip, CreateZip, Exit,
+        ]);
         for n in 0..=5 {
             v.push(Rate(n));
         }
