@@ -76,7 +76,23 @@ fn load_system_font(names: &[&str]) -> Option<Vec<u8>> {
     None
 }
 
+/// Install the UI fonts. The first frame only needs Segoe UI and the icon
+/// fonts; the symbol, CJK and emoji fallbacks (about 35 MB of font files,
+/// slow to read on a cold start) are loaded on a worker and swapped in when
+/// ready, so file names in other scripts render a moment later.
 pub fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(fonts(false));
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new().name("lumen-fonts".into()).spawn(move || {
+        ctx.set_fonts(fonts(true));
+        ctx.request_repaint();
+    });
+    if let Err(e) = spawned {
+        log::warn!("could not load fallback fonts in the background: {e}");
+    }
+}
+
+fn fonts(fallbacks: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let mut prop: Vec<String> = Vec::new();
     if let Some(b) = load_system_font(&["segoeui.ttf"]) {
@@ -97,7 +113,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         ("cjk", &["msyh.ttc", "YuGothR.ttc", "malgun.ttf"][..]),
         ("emoji", &["seguiemj.ttf"][..]),
     ] {
-        if let Some(b) = load_system_font(files) {
+        if let Some(b) = fallbacks.then(|| load_system_font(files)).flatten() {
             fonts.font_data.insert(key.into(), Arc::new(FontData::from_owned(b)));
         }
     }
@@ -131,7 +147,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         m.push("phosphor".into());
         fonts.families.insert(FontFamily::Monospace, m);
     }
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 pub fn semibold(size: f32) -> FontId {

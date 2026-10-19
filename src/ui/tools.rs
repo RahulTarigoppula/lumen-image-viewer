@@ -569,6 +569,10 @@ pub struct Duplicates {
     want_changed: Option<((bool, u32), std::time::Instant)>,
     /// Let "Mark all but the best" also mark similar (not identical) groups.
     bulk_similar: bool,
+    /// "Mark all but the best" asks before marking this many similar groups.
+    confirm_bulk_similar: Option<usize>,
+    /// What the last "Mark all but the best" left for the user to review.
+    bulk_note: Option<String>,
     marked: HashSet<PathBuf>,
     keep_rule: KeepRule,
     confirm_delete: bool,
@@ -592,7 +596,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             .par_iter()
             .filter_map(|p| {
                 let m = std::fs::metadata(p).ok()?;
-                Some(ScanItem { path: p.clone(), size: m.len(), modified: m.modified().ok(), dims: None, content: None, dhash: None, detail: 0.0 })
+                Some(ScanItem::new(p.clone(), m.len(), m.modified().ok()))
             })
             .filter(|it| it.size > 0)
             .collect();
@@ -621,7 +625,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
         if prog.cancelled() {
             return Err("Cancelled".to_string());
         }
-        // Visual fingerprints (and dimensions for picking the best copy).
+        // Visual fingerprints (and dimensions and capture dates for picking the best copy).
         let need: Vec<usize> = if similar {
             (0..items.len()).collect()
         } else {
@@ -634,27 +638,30 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             (0..items.len()).filter(|&i| items[i].content.is_some_and(|c| seen[&(items[i].size, c)] > 1)).collect()
         };
         prog.set_phase(if similar { "Analyzing images" } else { "Reading image sizes" }, need.len());
-        let info: Vec<(usize, Option<(u32, u32)>, Option<(u64, f32)>)> = need
+        type Info = (usize, Option<(u32, u32)>, Option<i64>, Option<(u64, f32)>);
+        let info: Vec<Info> = need
             .par_iter()
             .map(|&i| {
                 if prog.cancelled() {
-                    return (i, None, None);
+                    return (i, None, None, None);
                 }
                 let p = &items[i].path;
                 // A decoder panic on one broken file must not take the whole scan down.
                 let r = std::panic::catch_unwind(|| {
                     let dims = crate::decode::probe_dimensions(p);
+                    let taken = crate::meta::read_taken(p);
                     let h = if similar { crate::decode::decode_thumbnail(p, 256).ok().map(|t| dupes::dhash_detail(&t)) } else { None };
-                    (dims, h)
+                    (dims, taken, h)
                 });
-                let (dims, h) = r.unwrap_or((None, None));
+                let (dims, taken, h) = r.unwrap_or((None, None, None));
                 prog.done.fetch_add(1, Ordering::Relaxed);
                 ctx.request_repaint();
-                (i, dims, h)
+                (i, dims, taken, h)
             })
             .collect();
-        for (i, d, h) in info {
+        for (i, d, taken, h) in info {
             items[i].dims = d;
+            items[i].taken = taken;
             if let Some((h, detail)) = h {
                 items[i].dhash = Some(h);
                 items[i].detail = detail;
@@ -662,6 +669,43 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
         }
         if prog.cancelled() {
             return Err("Cancelled".to_string());
+        }
+        if similar {
+            // Identical pixels: only files with the same size and the same
+            // dHash can match, and only when their bytes differ.
+            let mut by_look: HashMap<((u32, u32), u64), Vec<usize>> = HashMap::new();
+            for (i, it) in items.iter().enumerate() {
+                if let (Some(d), Some(h)) = (it.dims, it.dhash) {
+                    by_look.entry((d, h)).or_default().push(i);
+                }
+            }
+            let mut check: Vec<usize> = Vec::new();
+            for v in by_look.into_values().filter(|v| v.len() > 1) {
+                let distinct: HashSet<(u64, Option<u64>)> = v.iter().map(|&i| (items[i].size, items[i].content)).collect();
+                if distinct.len() > 1 || v.iter().any(|&i| items[i].content.is_none()) {
+                    check.extend(v);
+                }
+            }
+            prog.set_phase("Comparing pixels", check.len());
+            let pixels: Vec<(usize, Option<u64>)> = check
+                .par_iter()
+                .map(|&i| {
+                    if prog.cancelled() {
+                        return (i, None);
+                    }
+                    let opts = crate::decode::DecodeOptions { color_manage: true, animations: false };
+                    let h = std::panic::catch_unwind(|| crate::decode::decode_file(&items[i].path, opts).ok().map(|d| dupes::pixel_hash(&d.image))).ok().flatten();
+                    prog.done.fetch_add(1, Ordering::Relaxed);
+                    ctx.request_repaint();
+                    (i, h)
+                })
+                .collect();
+            for (i, h) in pixels {
+                items[i].pixels = h;
+            }
+            if prog.cancelled() {
+                return Err("Cancelled".to_string());
+            }
         }
         Ok(items)
     })
@@ -692,6 +736,8 @@ impl Duplicates {
             items_gen: 0,
             want_changed: None,
             bulk_similar: false,
+            confirm_bulk_similar: None,
+            bulk_note: None,
             marked: HashSet::new(),
             keep_rule: KeepRule::Resolution,
             confirm_delete: false,
@@ -709,6 +755,7 @@ impl Duplicates {
         self.groups.clear();
         self.groups_gen = self.items_gen;
         self.marked.clear();
+        self.bulk_note = None;
         self.grouped_for = None;
         // A grouping still running for the old list is stale; let a new one start.
         self.group_rx = None;
@@ -722,8 +769,10 @@ impl Duplicates {
         }
         let n = self.items.len();
         groups.retain(|g| g.members.len() > 1 && g.members.iter().all(|&i| i < n));
+        dupes::refresh_representatives(&mut groups, &self.items, self.keep_rule);
         self.groups = groups;
         self.groups_gen = generation;
+        self.bulk_note = None;
         self.grouped_for = Some(want);
         let present: HashSet<&PathBuf> = self.groups.iter().flat_map(|g| g.members.iter().map(|&i| &self.items[i].path)).collect();
         self.marked.retain(|m| present.contains(m));
@@ -860,6 +909,31 @@ impl Duplicates {
         }
     }
 
+    /// Similar groups whose best file is clear enough for bulk marking.
+    fn decisive_similar(&self) -> Vec<usize> {
+        (0..self.groups.len()).filter(|&gi| self.groups[gi].kind == GroupKind::Similar && dupes::pick(&self.items, &self.groups[gi].members, self.keep_rule).decisive).collect()
+    }
+
+    /// "Mark all but the best": every identical group, plus (when the user
+    /// confirmed it) the similar groups with a clear best. Similar groups
+    /// without one are left for review and counted in `bulk_note`.
+    fn mark_all_but_best(&mut self, include_similar: bool) {
+        self.ensure_groups_current();
+        let decisive: HashSet<usize> = if include_similar { self.decisive_similar().into_iter().collect() } else { HashSet::new() };
+        let mut left = 0;
+        for gi in 0..self.groups.len() {
+            if self.groups[gi].kind == GroupKind::Identical || decisive.contains(&gi) {
+                self.mark_best(gi);
+            } else {
+                left += 1;
+            }
+        }
+        self.bulk_note = (left > 0).then(|| {
+            let why = if include_similar { "no clear best" } else { "not exact copies" };
+            format!("{left} similar group{} left unmarked ({why}): review {} one by one.", if left == 1 { "" } else { "s" }, if left == 1 { "it" } else { "them" })
+        });
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, core: &mut Core) -> (bool, Vec<DupEvent>) {
         let p = core.pal;
         let mut events = Vec::new();
@@ -877,6 +951,21 @@ impl Duplicates {
             .show(ctx, |ui| {
                 close = self.ui(ui, &p, core, &mut events);
             });
+        if let Some(n) = self.confirm_bulk_similar {
+            let body = format!(
+                "{n} similar group{s} {have} a clear best by {rule}. Similar pictures are not exact copies: they can be edits, crops or re-encodes.\n\nMark every other picture in {them}, together with the copies in identical groups? Similar groups without a clear best stay unmarked.",
+                s = if n == 1 { "" } else { "s" },
+                have = if n == 1 { "has" } else { "have" },
+                rule = self.keep_rule.label().to_lowercase(),
+                them = if n == 1 { "it" } else { "them" },
+            );
+            if let Some(yes) = crate::ui::widgets::show_confirm(ctx, "Mark similar pictures too?", &body, "Mark them", true, &p) {
+                self.confirm_bulk_similar = None;
+                if yes {
+                    self.mark_all_but_best(true);
+                }
+            }
+        }
         if self.confirm_delete && (self.marked.is_empty() || self.deleting.is_some()) {
             self.confirm_delete = false;
         }
@@ -1005,7 +1094,7 @@ impl Duplicates {
                 return;
             }
             // Summary + auto-mark
-            let files_in_groups: usize = self.groups.iter().map(|g| g.members.len()).sum();
+            let files_in_groups = self.groups.iter().flat_map(|g| g.members.iter()).collect::<HashSet<_>>().len();
             let reclaim: u64 = self
                 .groups
                 .iter()
@@ -1023,25 +1112,37 @@ impl Duplicates {
                     if ui.add_enabled(!self.marked.is_empty(), egui::Button::new("Clear marks")).clicked() {
                         self.marked.clear();
                     }
-                    if ui.button(format!("{}  Mark all but the best", I::LIST_CHECKS)).on_hover_text("In every identical group (and, if allowed, every similar group), mark all copies except the one to keep").clicked() {
+                    if ui
+                        .button(format!("{}  Mark all but the best", I::LIST_CHECKS))
+                        .on_hover_text("In every identical group, mark all copies except the one to keep. Similar groups are marked only when allowed, confirmed and the best is clear")
+                        .clicked()
+                    {
                         mark_all = true;
                     }
                     ui.checkbox(&mut self.bulk_similar, "Include similar groups")
-                        .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure");
+                        .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure. Only groups where the keep rule finds a clearly sharper picture are marked");
+                    let before = self.keep_rule;
                     egui::ComboBox::from_id_salt("dup-keep").selected_text(self.keep_rule.label()).show_ui(ui, |ui| {
                         for r in KeepRule::ALL {
                             ui.selectable_value(&mut self.keep_rule, r, r.label());
                         }
                     });
+                    if self.keep_rule != before {
+                        dupes::refresh_representatives(&mut self.groups, &self.items, self.keep_rule);
+                    }
                     ui.label(RichText::new("Keep").color(p.muted));
                 });
             });
+            if let Some(note) = &self.bulk_note {
+                ui.label(RichText::new(format!("{}  {note}", I::INFO)).color(p.muted));
+            }
             if mark_all {
-                for gi in 0..self.groups.len() {
-                    // Similar groups are only bulk-marked on explicit opt-in.
-                    if self.groups[gi].kind == GroupKind::Identical || self.bulk_similar {
-                        self.mark_best(gi);
-                    }
+                // Similar groups are only bulk-marked on explicit opt-in and confirmation.
+                let n = if self.bulk_similar { self.decisive_similar().len() } else { 0 };
+                if n > 0 {
+                    self.confirm_bulk_similar = Some(n);
+                } else {
+                    self.mark_all_but_best(self.bulk_similar);
                 }
             }
             ui.add_space(4.0);
@@ -1049,7 +1150,8 @@ impl Duplicates {
             let mut unmark_group = None;
             egui::ScrollArea::vertical().id_salt("dup-groups").auto_shrink([false, false]).show(ui, |ui| {
                 for (gi, g) in self.groups.iter().enumerate() {
-                    let best = dupes::best_in_group(&self.items, &g.members, self.keep_rule);
+                    let choice = dupes::pick(&self.items, &g.members, self.keep_rule);
+                    let best = choice.index;
                     egui::Frame::new()
                         .fill(if p.dark { p.panel } else { p.bg })
                         .stroke(egui::Stroke::new(1.0, p.border))
@@ -1058,20 +1160,29 @@ impl Duplicates {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                let (badge, color) = match g.kind {
-                                    GroupKind::Identical => ("Identical".to_string(), p.accent),
-                                    GroupKind::Similar => (format!("Similar · {}%", g.min_similarity), p.warn),
+                                let (badge, color, tip) = match g.kind {
+                                    GroupKind::Identical if g.same_bytes => ("Identical".to_string(), p.accent, "Byte-for-byte copies of the same file"),
+                                    GroupKind::Identical => ("Identical pixels".to_string(), p.accent, "Every pixel is the same; the files differ only in metadata or compression"),
+                                    GroupKind::Similar => (format!("Similar · {}%", g.min_similarity), p.warn, "Pictures that look alike but are not exact copies"),
                                 };
+                                ui.label(RichText::new(format!("Group {}", gi + 1)).strong());
                                 egui::Frame::new().fill(color.gamma_multiply(0.18)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
                                     ui.label(RichText::new(badge).size(11.5).color(color).strong());
-                                });
+                                })
+                                .response
+                                .on_hover_text(tip);
                                 let total: u64 = g.members.iter().map(|&i| self.items[i].size).sum();
                                 ui.label(RichText::new(format!("{} files · {}", g.members.len(), human_size(total))).color(p.muted));
+                                let chain = self.keep_rule.chain().iter().map(|c| c.reason().trim_start_matches("Kept: ")).collect::<Vec<_>>().join(", then ");
+                                ui.label(RichText::new(choice.reason.reason()).color(p.ok)).on_hover_text(format!("The crowned file is kept. Order of preference: {chain}."));
+                                if g.kind == GroupKind::Similar && !choice.decisive {
+                                    ui.label(RichText::new(format!("{}  No clear best: review", I::WARNING)).color(p.warn)).on_hover_text("These pictures differ, and the keep rule does not find one clearly sharper picture. Mark all but the best skips this group; choose yourself or use Keep best.");
+                                }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button("Unmark").clicked() {
                                         unmark_group = Some(gi);
                                     }
-                                    if ui.small_button(format!("{}  Keep best", I::CROWN)).on_hover_text(format!("Mark all except the {} copy", self.keep_rule.label().to_lowercase())).clicked() {
+                                    if ui.small_button(format!("{}  Keep best", I::CROWN)).on_hover_text("Mark all except the crowned file").clicked() {
                                         mark_group = Some(gi);
                                     }
                                 });
@@ -1082,7 +1193,10 @@ impl Duplicates {
                                 for (k, &i) in g.members.iter().enumerate() {
                                     let it = &self.items[i];
                                     let mut marked = self.marked.contains(&it.path);
-                                    if dup_tile(ui, p, core, it, &mut marked, k == best, events) {
+                                    // A similar group shows one file per set of exact copies.
+                                    let copies = g.linked.get(k).copied().flatten().and_then(|l| self.groups.get(l)).map(|lg| lg.members.len().saturating_sub(1)).unwrap_or(0);
+                                    let note = (copies > 0).then(|| format!("+{copies} identical cop{} in group {}", if copies == 1 { "y" } else { "ies" }, g.linked[k].unwrap_or(0) + 1));
+                                    if dup_tile(ui, p, core, it, &mut marked, k == best, note.as_deref(), events) {
                                         if marked {
                                             self.marked.insert(it.path.clone());
                                         } else {
@@ -1136,11 +1250,11 @@ mod tests {
     }
 
     fn item(name: &str) -> super::ScanItem {
-        super::ScanItem { path: std::path::PathBuf::from(name), size: 10, modified: None, dims: None, content: Some(1), dhash: None, detail: 0.0 }
+        super::ScanItem { content: Some(1), ..super::ScanItem::new(std::path::PathBuf::from(name), 10, None) }
     }
 
     fn group(members: Vec<usize>) -> super::Group {
-        super::Group { kind: super::GroupKind::Identical, members, min_similarity: 100 }
+        super::Group { kind: super::GroupKind::Identical, members, linked: Vec::new(), min_similarity: 100, same_bytes: true }
     }
 
     #[test]
@@ -1170,13 +1284,34 @@ mod tests {
         d.ensure_groups_current();
         assert!(d.groups.is_empty());
     }
+
+    #[test]
+    fn mark_all_keeps_the_original_over_an_edit() {
+        // clone.jpg and dup_of_05.jpg are byte-identical; draw.jpg is a bigger,
+        // annotated edit of the same size.
+        let at = |s: u64| Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        let img = |name: &str, size: u64, content: u64, dhash: u64, t: u64| super::ScanItem { content: Some(content), dhash: Some(dhash), detail: 20.0, dims: Some((1200, 800)), ..super::ScanItem::new(name.into(), size, at(t)) };
+        let items = vec![img("clone.jpg", 195_656, 7, 0xF0F0_F0F0, 1_000), img("draw.jpg", 328_713, 8, 0xF0F0_F0F7, 1_060), img("dup_of_05.jpg", 195_656, 7, 0xF0F0_F0F0, 2_000)];
+        let mut d = super::Duplicates::blank(std::path::PathBuf::from("C:\\x"), Vec::new());
+        d.replace_items(items);
+        let groups = super::dupes::group(&d.items, true, 6);
+        assert!(d.accept_groups((true, 6), d.items_gen, groups));
+        for allow_similar in [false, true] {
+            d.marked.clear();
+            d.mark_all_but_best(allow_similar);
+            let marked: Vec<&str> = d.marked.iter().map(|p| p.to_str().unwrap()).collect();
+            assert_eq!(marked, vec!["dup_of_05.jpg"]);
+            assert!(d.bulk_note.as_deref().is_some_and(|n| n.starts_with("1 similar group left unmarked")));
+        }
+        assert!(d.decisive_similar().is_empty());
+    }
 }
 
 /// One file inside a duplicate group. Returns true when the mark changed.
-fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &mut bool, best: bool, events: &mut Vec<DupEvent>) -> bool {
+fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &mut bool, best: bool, note: Option<&str>, events: &mut Vec<DupEvent>) -> bool {
     let w = 168.0;
     let mut changed = false;
-    ui.allocate_ui_with_layout(Vec2::new(w, 190.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+    ui.allocate_ui_with_layout(Vec2::new(w, if note.is_some() { 206.0 } else { 190.0 }), egui::Layout::top_down(egui::Align::Min), |ui| {
         ui.set_width(w);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 2.0);
@@ -1229,6 +1364,9 @@ fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &m
         ui.add(egui::Label::new(RichText::new(format!("{dims}{}", human_size(it.size))).size(11.5).color(p.muted)).truncate());
         let folder = it.path.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         ui.add(egui::Label::new(RichText::new(format!("{} · {folder}", crate::catalog::format_time(it.modified))).size(11.0).color(p.faint)).truncate());
+        if let Some(note) = note {
+            ui.add(egui::Label::new(RichText::new(format!("{}  {note}", I::LINK_SIMPLE)).size(11.0).color(p.accent)).truncate());
+        }
     });
     changed
 }

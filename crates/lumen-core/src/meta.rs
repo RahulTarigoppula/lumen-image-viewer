@@ -75,24 +75,9 @@ fn summarize(exif: &exif::Exif) -> ExifSummary {
     s.copyright = get(Tag::Copyright);
     s.description = get(Tag::ImageDescription);
     s.orientation = exif.get_field(Tag::Orientation, In::PRIMARY).and_then(|f| f.value.get_uint(0));
-    let dt_field = exif
-        .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-        .or_else(|| exif.get_field(Tag::DateTimeDigitized, In::PRIMARY))
-        .or_else(|| exif.get_field(Tag::DateTime, In::PRIMARY));
-    if let Some(f) = dt_field {
-        if let exif::Value::Ascii(ref v) = f.value {
-            if let Some(bytes) = v.first() {
-                if let Ok(dt) = exif::DateTime::from_ascii(bytes) {
-                    s.taken = Some(format!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
-                    ));
-                    s.taken_ts = chrono::NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)
-                        .and_then(|d| d.and_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32))
-                        .map(|n| n.and_utc().timestamp());
-                }
-            }
-        }
+    if let Some((text, ts)) = taken(exif) {
+        s.taken = Some(text);
+        s.taken_ts = ts;
     }
     s.gps = gps(exif);
     for f in exif.fields() {
@@ -116,6 +101,30 @@ fn summarize(exif: &exif::Exif) -> ExifSummary {
         s.all.push((group.to_string(), f.tag.to_string(), val));
     }
     s
+}
+
+/// Capture date as display text and Unix seconds (DateTimeOriginal, then
+/// DateTimeDigitized, then DateTime).
+fn taken(exif: &exif::Exif) -> Option<(String, Option<i64>)> {
+    use exif::{In, Tag};
+    let f = exif
+        .get_field(Tag::DateTimeOriginal, In::PRIMARY)
+        .or_else(|| exif.get_field(Tag::DateTimeDigitized, In::PRIMARY))
+        .or_else(|| exif.get_field(Tag::DateTime, In::PRIMARY))?;
+    let exif::Value::Ascii(ref v) = f.value else { return None };
+    let dt = exif::DateTime::from_ascii(v.first()?).ok()?;
+    let text = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+    let ts = chrono::NaiveDate::from_ymd_opt(dt.year as i32, dt.month as u32, dt.day as u32)
+        .and_then(|d| d.and_hms_opt(dt.hour as u32, dt.minute as u32, dt.second as u32))
+        .map(|n| n.and_utc().timestamp());
+    Some((text, ts))
+}
+
+/// Just the capture date of a file (Unix seconds), without summarizing every tag.
+pub fn read_taken(path: &Path) -> Option<i64> {
+    let file = std::fs::File::open(path).ok()?;
+    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()?;
+    taken(&exif)?.1
 }
 
 fn gps(exif: &exif::Exif) -> Option<(f64, f64)> {
