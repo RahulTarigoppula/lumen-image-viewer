@@ -15,7 +15,7 @@ fn font_names() -> Vec<String> {
 fn opacity_color_row(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4], opacity: &mut f32) -> bool {
     let mut c = false;
     ui.horizontal(|ui| {
-        ui.add_sized([super::LABEL_W, 18.0], egui::Label::new(label));
+        super::row_label(ui, label);
         c |= color_button(ui, color, false);
         ui.spacing_mut().slider_width = (ui.available_width() - 74.0).max(50.0);
         c |= ui.add(egui::Slider::new(opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0)).on_hover_text("Opacity").changed();

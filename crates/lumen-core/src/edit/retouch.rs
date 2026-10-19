@@ -108,6 +108,10 @@ fn for_mask_rows(img: &mut RgbaImage, m: &Mask, f: impl Fn(u32, u32, f32, &mut [
 /// that matches the destination around the stroke's border (a fast membrane /
 /// normalised-convolution approximation of Poisson blending). The result
 /// keeps the source's detail on the destination's low frequencies.
+///
+/// The border samples are filtered for outliers first: a thin bright line or
+/// a speck that crosses the border is usually what the user is removing, and
+/// letting it into the match would tint the whole patch.
 fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
     let (iw, ih) = img.dimensions();
     let m = mask::stroke_mask(&s.pts, s.radius, s.hardness, iw, ih);
@@ -138,71 +142,166 @@ fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
     let f = heal_grid_factor(sigma, ww, wh);
     let (cw, ch) = (ww.div_ceil(f), wh.div_ceil(f));
     let sample_src = |x: u32, y: u32| sample_patch(&src, sb.0 as f32, sb.1 as f32, x as f32 + 0.5 + dx, y as f32 + 0.5 + dy);
-    // Boundary samples: destination minus source just outside the stroke,
-    // summed per coarse cell (one band of coarse rows per task).
+    // Boundary samples (destination minus source just outside the stroke) of
+    // one band of coarse rows, as `visit(cell x, x, y, diff)`.
     let raw = img.as_raw();
-    let band_rows: Vec<(Vec<f32>, [Vec<f32>; 3], [f64; 3], f64)> = (0..ch)
-        .into_par_iter()
-        .map(|cy| {
-            let mut wgt = vec![0f32; cw];
-            let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; cw]);
-            let (mut acc, mut cnt) = ([0f64; 3], 0f64);
-            for ry in cy * f..((cy + 1) * f).min(wh) {
-                for rx in 0..ww {
-                    let (x, y) = (wb.0 + rx as u32, wb.1 + ry as u32);
-                    if m.at(x, y) > 0.0 || ring.at(x, y) <= 0.0 {
-                        continue;
-                    }
-                    if let Some(sv) = sample_src(x, y) {
-                        let di = (y as usize * iw as usize + x as usize) * 4;
-                        let cx = rx / f;
-                        wgt[cx] += 1.0;
-                        for c in 0..3 {
-                            let d = raw[di + c] as f32 - sv[c];
-                            diff[c][cx] += d;
-                            acc[c] += d as f64;
-                        }
-                        cnt += 1.0;
-                    }
+    let ring_row = |cy: usize, visit: &mut dyn FnMut(usize, u32, u32, [f32; 3])| {
+        for ry in cy * f..((cy + 1) * f).min(wh) {
+            for rx in 0..ww {
+                let (x, y) = (wb.0 + rx as u32, wb.1 + ry as u32);
+                if m.at(x, y) > 0.0 || ring.at(x, y) <= 0.0 {
+                    continue;
+                }
+                if let Some(sv) = sample_src(x, y) {
+                    let di = (y as usize * iw as usize + x as usize) * 4;
+                    visit(rx / f, x, y, std::array::from_fn(|c| raw[di + c] as f32 - sv[c]));
                 }
             }
-            (wgt, diff, acc, cnt)
-        })
-        .collect();
-    let n = cw * ch;
-    let mut wsum = Vec::with_capacity(n);
-    let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(n));
-    let (mut acc, mut cnt) = ([0f64; 3], 0f64);
-    for (w, d, a, c) in band_rows {
-        wsum.extend_from_slice(&w);
-        for k in 0..3 {
-            diff[k].extend_from_slice(&d[k]);
-            acc[k] += a[k];
         }
-        cnt += c;
+    };
+    let grid = HealGrid { cw, ch, f, x0: wb.0, y0: wb.1, sigma: sigma / f as f32 };
+    // Robust fit: fit the field to every sample, drop the samples far from it
+    // (relative to the typical residual), refit. The first fit is pulled
+    // towards a bright line, so a second round, against a nearly clean fit,
+    // separates the line's samples fully.
+    let mut field = grid.fit(&ring_row, |_, _, _| true);
+    for _ in 0..2 {
+        let limit = field.outlier_limit(&grid, &ring_row);
+        field = grid.fit(&ring_row, |x, y, d| residual(d, field.at(&grid, x, y)) <= limit);
     }
-    let mean = if cnt > 0.0 { acc.map(|a| (a / cnt) as f32) } else { [0.0; 3] };
-    let cs = sigma / f as f32;
-    mask::blur_plane(&mut wsum, cw, ch, cs);
-    for d in diff.iter_mut() {
-        mask::blur_plane(d, cw, ch, cs);
-    }
-    // Cell sums hold up to f^2 samples: scale the "no boundary nearby" threshold.
-    let ws_min = 1e-3 * (f * f) as f32;
     let op = s.opacity.clamp(0.0, 1.0);
     for_mask_rows(img, &m, |x, y, c, d| {
         let Some(sv) = sample_src(x, y) else { return };
-        let (rx, ry) = ((x - wb.0) as f32, (y - wb.1) as f32);
-        let (gx, gy) = ((rx + 0.5) / f as f32 - 0.5, (ry + 0.5) / f as f32 - 0.5);
-        let ws = sample_plane(&wsum, cw, ch, gx, gy);
+        let off = field.at(&grid, x, y);
         let t = c * op;
         for k in 0..3 {
-            let off = if ws > ws_min { sample_plane(&diff[k], cw, ch, gx, gy) / ws } else { mean[k] };
-            let v = sv[k] + off;
+            let v = sv[k] + off[k];
             d[k] = (d[k] as f32 + (v - d[k] as f32) * t).round().clamp(0.0, 255.0) as u8;
         }
         d[3] = (d[3] as f32 + (sv[3] - d[3] as f32) * t).round().clamp(0.0, 255.0) as u8;
     });
+}
+
+/// Largest per-channel distance between a border sample and the field.
+#[inline]
+fn residual(d: [f32; 3], e: [f32; 3]) -> f32 {
+    (0..3).map(|k| (d[k] - e[k]).abs()).fold(0.0, f32::max)
+}
+
+/// Visitor over the border samples of one band of coarse rows.
+type RingRow<'a> = dyn Fn(usize, &mut dyn FnMut(usize, u32, u32, [f32; 3])) + Sync + 'a;
+
+/// Layout of the coarse healing grid inside the work box.
+struct HealGrid {
+    cw: usize,
+    ch: usize,
+    f: usize,
+    x0: u32,
+    y0: u32,
+    /// Blur radius in coarse cells.
+    sigma: f32,
+}
+
+impl HealGrid {
+    /// Normalised convolution of the border samples that `keep` accepts.
+    fn fit(&self, ring_row: &RingRow, keep: impl Fn(u32, u32, [f32; 3]) -> bool + Sync) -> HealField {
+        let cw = self.cw;
+        let band_rows: Vec<(Vec<f32>, [Vec<f32>; 3], [f64; 3], f64)> = (0..self.ch)
+            .into_par_iter()
+            .map(|cy| {
+                let mut wgt = vec![0f32; cw];
+                let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; cw]);
+                let (mut acc, mut cnt) = ([0f64; 3], 0f64);
+                ring_row(cy, &mut |cx, x, y, d| {
+                    if !keep(x, y, d) {
+                        return;
+                    }
+                    wgt[cx] += 1.0;
+                    for c in 0..3 {
+                        diff[c][cx] += d[c];
+                        acc[c] += d[c] as f64;
+                    }
+                    cnt += 1.0;
+                });
+                (wgt, diff, acc, cnt)
+            })
+            .collect();
+        let n = cw * self.ch;
+        let mut wsum = Vec::with_capacity(n);
+        let mut diff: [Vec<f32>; 3] = std::array::from_fn(|_| Vec::with_capacity(n));
+        let (mut acc, mut cnt) = ([0f64; 3], 0f64);
+        for (w, d, a, c) in band_rows {
+            wsum.extend_from_slice(&w);
+            for k in 0..3 {
+                diff[k].extend_from_slice(&d[k]);
+                acc[k] += a[k];
+            }
+            cnt += c;
+        }
+        let mean = if cnt > 0.0 { acc.map(|a| (a / cnt) as f32) } else { [0.0; 3] };
+        mask::blur_plane(&mut wsum, cw, self.ch, self.sigma);
+        for d in diff.iter_mut() {
+            mask::blur_plane(d, cw, self.ch, self.sigma);
+        }
+        HealField { wsum, diff, mean }
+    }
+}
+
+/// Smooth destination-minus-source colour offset on the coarse grid.
+struct HealField {
+    wsum: Vec<f32>,
+    diff: [Vec<f32>; 3],
+    /// Used where no border sample is near (the field is undefined there).
+    mean: [f32; 3],
+}
+
+impl HealField {
+    fn at(&self, g: &HealGrid, x: u32, y: u32) -> [f32; 3] {
+        let (rx, ry) = ((x - g.x0) as f32, (y - g.y0) as f32);
+        let (gx, gy) = ((rx + 0.5) / g.f as f32 - 0.5, (ry + 0.5) / g.f as f32 - 0.5);
+        let ws = sample_plane(&self.wsum, g.cw, g.ch, gx, gy);
+        // Cell sums hold up to f^2 samples: scale the "no boundary nearby" threshold.
+        if ws > 1e-3 * (g.f * g.f) as f32 {
+            std::array::from_fn(|k| sample_plane(&self.diff[k], g.cw, g.ch, gx, gy) / ws)
+        } else {
+            self.mean
+        }
+    }
+
+    /// Residual above which a border sample counts as an outlier: three robust
+    /// standard deviations (1.4826 x the median absolute residual), never
+    /// below a few levels so smooth or noise-free borders keep every sample.
+    fn outlier_limit(&self, g: &HealGrid, ring_row: &RingRow) -> f32 {
+        const PER_LEVEL: f32 = 4.0;
+        const BINS: usize = 512 * PER_LEVEL as usize;
+        let hist = (0..g.ch)
+            .into_par_iter()
+            .map(|cy| {
+                let mut h = vec![0u32; BINS];
+                ring_row(cy, &mut |_, x, y, d| {
+                    let r = residual(d, self.at(g, x, y));
+                    h[((r * PER_LEVEL) as usize).min(BINS - 1)] += 1;
+                });
+                h
+            })
+            .reduce(
+                || vec![0u32; BINS],
+                |mut a, b| {
+                    a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
+                    a
+                },
+            );
+        let total: u64 = hist.iter().map(|&v| v as u64).sum();
+        let mut seen = 0u64;
+        let med = hist
+            .iter()
+            .position(|&v| {
+                seen += v as u64;
+                seen * 2 >= total
+            })
+            .map_or(0.0, |i| (i as f32 + 0.5) / PER_LEVEL);
+        (3.0 * 1.4826 * med).max(8.0)
+    }
 }
 
 /// Coarsening factor for the healing offset field: exact (1) for small
@@ -629,6 +728,50 @@ mod tests {
         apply_strokes(&mut small, &[s], 0.5);
         let c = small.get_pixel(100, 75);
         assert_eq!(c, before.get_pixel(100, 75));
+    }
+
+    #[test]
+    fn heal_over_thin_line_matches_surroundings() {
+        // A flat patch with a thin white vertical line. A dab on the line (its
+        // ring crosses the line twice) with a flat source must come out at
+        // the flat colour, not tinted by the line's border samples.
+        let flat = [60u8, 150, 130, 255];
+        let line = |x: u32| (98..101).contains(&x);
+        let base = RgbaImage::from_fn(200, 120, |x, _| image::Rgba(if line(x) { [255, 255, 255, 255] } else { flat }));
+        for (pts, radius) in [(vec![[99.5, 60.0]], 10.0), (vec![[88.0, 60.0], [111.0, 60.0]], 7.0), (vec![[99.5, 60.0]], 30.0)] {
+            let mut img = base.clone();
+            let s = BrushStroke { pts, radius, hardness: 0.8, opacity: 1.0, offset: [-60.0, 0.0], heal: true };
+            apply_strokes(&mut img, &[s], 1.0);
+            let p = img.get_pixel(99, 60);
+            for k in 0..3 {
+                assert!((p[k] as i32 - flat[k] as i32).abs() <= 3, "radius {radius}: centre {p:?}, flat {flat:?}");
+            }
+        }
+        // Same on a vertical gradient (the field must still follow it).
+        let grad = |y: u32| [40 + y as u8 / 2, 150, 130 - y as u8 / 3, 255];
+        let base = RgbaImage::from_fn(200, 120, |x, y| image::Rgba(if line(x) { [255, 255, 255, 255] } else { grad(y) }));
+        let mut img = base.clone();
+        apply_strokes(&mut img, &[BrushStroke { pts: vec![[88.0, 60.0], [111.0, 60.0]], radius: 8.0, hardness: 0.8, opacity: 1.0, offset: [-60.0, 0.0], heal: true }], 1.0);
+        for y in [56, 60, 64] {
+            let (p, want) = (img.get_pixel(99, y), grad(y));
+            for k in 0..3 {
+                assert!((p[k] as i32 - want[k] as i32).abs() <= 3, "row {y}: {p:?}, want {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn heal_across_edge_keeps_both_sides() {
+        // A dab straddling a dark / bright edge is not an outlier case: half
+        // of the ring on each side must still pull its own side's tone.
+        let mut img = RgbaImage::from_fn(200, 100, |x, _| if x < 150 { image::Rgba([60, 60, 60, 255]) } else { image::Rgba([200, 200, 200, 255]) });
+        for x in 146..154 {
+            img.put_pixel(x, 50, image::Rgba([0, 0, 255, 255]));
+        }
+        let s = BrushStroke { pts: vec![[150.0, 50.0]], radius: 12.0, hardness: 0.8, opacity: 1.0, offset: [-100.0, 0.0], heal: true };
+        apply_strokes(&mut img, &[s], 1.0);
+        let (l, r) = (img.get_pixel(141, 50)[0] as i32, img.get_pixel(159, 50)[0] as i32);
+        assert!(l < 110 && r > 150, "left {l}, right {r}");
     }
 
     #[test]
