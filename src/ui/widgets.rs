@@ -159,7 +159,9 @@ pub fn section_title(ui: &mut Ui, p: &Palette, text: &str) {
 }
 
 /// One key / value row (info panels): 96 pt muted key, 12.5 pt value that wraps,
-/// at least 20 pt tall with 2 pt between rows.
+/// at least 20 pt tall with 2 pt between rows. (The viewer's info panel uses a
+/// grid of these rows instead; kept for one-off key / value lines.)
+#[allow(dead_code)]
 pub fn kv_row(ui: &mut Ui, p: &Palette, key: &str, value: &str) {
     ui.scope(|ui| {
         ui.spacing_mut().interact_size.y = 20.0;
@@ -668,12 +670,16 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) -> bool {
             let hr = Rect::from_min_size(egui::pos2(rect.left() + inset + h as f32 * seg_w, rect.top() + inset), sel_rect.size());
             painter.rect_filled(hr, CornerRadius::same(radius::SMALL), if p.dark { Color32::from_white_alpha(8) } else { Color32::from_black_alpha(8) });
         }
-        let raised = if p.dark { Color32::from_rgb(62, 66, 75) } else { Color32::WHITE };
-        let sh = egui::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Color32::from_black_alpha(if p.dark { 90 } else { 30 }) };
-        painter.add(sh.as_shape(sel_rect, CornerRadius::same(radius::SMALL)));
-        painter.rect_filled(sel_rect, CornerRadius::same(radius::SMALL), raised);
-        if !p.dark {
-            painter.rect_stroke(sel_rect, CornerRadius::same(radius::SMALL), Stroke::new(1.0, p.border), StrokeKind::Inside);
+        // An index past the end selects nothing (the value is set elsewhere, e.g. a
+        // combo next to the control).
+        if *selected < n {
+            let raised = if p.dark { Color32::from_rgb(62, 66, 75) } else { Color32::WHITE };
+            let sh = egui::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Color32::from_black_alpha(if p.dark { 90 } else { 30 }) };
+            painter.add(sh.as_shape(sel_rect, CornerRadius::same(radius::SMALL)));
+            painter.rect_filled(sel_rect, CornerRadius::same(radius::SMALL), raised);
+            if !p.dark {
+                painter.rect_stroke(sel_rect, CornerRadius::same(radius::SMALL), Stroke::new(1.0, p.border), StrokeKind::Inside);
+            }
         }
         for (i, g) in galleys.into_iter().enumerate() {
             let r = Rect::from_min_size(egui::pos2(rect.left() + inset + i as f32 * seg_w, rect.top() + inset), sel_rect.size());

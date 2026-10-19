@@ -1560,31 +1560,27 @@ impl App {
         let can_save = !tool_work && lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
         let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
         // Same wording and buttons as the viewer's own prompt.
-        egui::Modal::new(egui::Id::unique("unsaved-guard")).show(ctx, |ui| {
-            ui.set_width(380.0);
+        crate::ui::widgets::modal(ctx, egui::Id::unique("unsaved-guard"), 400.0, |ui| {
+            use crate::ui::widgets;
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                choice = Some(0);
+            }
             let note = |ui: &mut egui::Ui, text: &str| {
-                ui.add_space(2.0);
-                ui.add(egui::Label::new(RichText::new(text).color(p.muted).size(12.0)).wrap());
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(text).color(p.muted).size(crate::ui::theme::text::SMALL)).wrap());
             };
             if !dirty {
-                // Only an open tool's unapplied work would be lost.
-                ui.heading("Discard changes?");
-                ui.add_space(6.0);
-                ui.label(format!("The changes in the open tool are not applied to \"{name}\" yet."));
-                ui.add_space(12.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(RichText::new("Discard").color(egui::Color32::WHITE)).fill(p.accent)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                        choice = Some(2);
-                    }
-                    if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        choice = Some(0);
-                    }
-                });
+                // Only an open tool's unapplied work would be lost. Destructive:
+                // red, and Enter does not discard.
+                widgets::modal_title(ui, "Discard changes?");
+                widgets::modal_body(ui, &format!("The changes in the open tool are not applied to \"{name}\" yet."));
+                if let Some(r) = widgets::dialog_buttons(ui, &p, "Keep editing", "Discard", widgets::ButtonKind::Danger, true) {
+                    choice = Some(if r { 2 } else { 0 });
+                }
                 return;
             }
-            ui.heading("Save changes?");
-            ui.add_space(6.0);
-            ui.label(format!("\"{name}\" has unsaved edits."));
+            widgets::modal_title(ui, "Save changes?");
+            widgets::modal_body(ui, &format!("\"{name}\" has unsaved edits."));
             if tool_work {
                 note(ui, "The open tool also has changes that are not applied. Keep editing to apply them before saving.");
             } else if let Some(why) = &lossy {
@@ -1592,16 +1588,17 @@ impl App {
             } else if !can_save {
                 note(ui, "This format cannot be saved in place. Use Save as from the viewer.");
             }
-            ui.add_space(12.0);
+            ui.add_space(crate::ui::theme::space::BUTTONS_GAP);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(if tool_work { "Keep editing" } else { "Cancel" }).clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                // [Discard] [Cancel] [Save]: the primary last, Discard away from it.
+                if widgets::primary_button_enabled(ui, &p, can_save, "Save").clicked() {
+                    choice = Some(1);
+                }
+                if widgets::secondary_button(ui, if tool_work { "Keep editing" } else { "Cancel" }).clicked() {
                     choice = Some(0);
                 }
-                if ui.button("Discard").clicked() {
+                if widgets::secondary_button(ui, "Discard").clicked() {
                     choice = Some(2);
-                }
-                if ui.add_enabled(can_save, egui::Button::new(RichText::new("Save").color(egui::Color32::WHITE)).fill(p.accent)).clicked() {
-                    choice = Some(1);
                 }
             });
         });
@@ -2360,8 +2357,17 @@ impl App {
                     item(ui, c, &mut fire);
                 }
             });
+            let (details, preview, flagged, full) = (self.core.settings.browser_view == crate::settings::BrowserView::Details, self.core.settings.show_preview_pane, self.browser.flagged_only, self.fullscreen);
             submenu(ui, I::EYE, "View", |ui| {
-                for c in [Command::ToggleDetails, Command::TogglePreviewPane, Command::ThumbBigger, Command::ThumbSmaller, Command::ShowFlaggedOnly, Command::ToggleFullscreen, Command::ToggleTheme] {
+                // On / off settings show a check mark instead of "Toggle ...".
+                for (c, label, on) in [(Command::ToggleDetails, "Details view", details), (Command::TogglePreviewPane, "Preview pane", preview), (Command::ShowFlaggedOnly, "Flagged only", flagged), (Command::ToggleFullscreen, "Full screen", full)] {
+                    if menu_toggle(ui, on, label, &c.shortcut()).clicked() {
+                        fire = Some(c);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                for c in [Command::ThumbBigger, Command::ThumbSmaller, Command::ToggleTheme] {
                     item(ui, c, &mut fire);
                 }
                 ui.separator();
@@ -2377,11 +2383,17 @@ impl App {
                 });
             });
             submenu(ui, I::IMAGE, "Image", |ui| {
-                for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::Crop, Command::Resize, Command::CanvasSize, Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::AddText, Command::AddBorder, Command::Watermark, Command::SetWallpaper, Command::Print] {
-                    item(ui, c, &mut fire);
+                // The edit tools by group (as in the viewer's Edit menu): one short
+                // list instead of 25 rows that would not fit the window.
+                for (g, name) in Command::EDIT_GROUPS.iter().zip(crate::ui::viewer::EDIT_GROUP_NAMES) {
+                    submenu(ui, g[0].icon(), name, |ui| {
+                        for c in g.iter() {
+                            item(ui, *c, &mut fire);
+                        }
+                    });
                 }
                 ui.separator();
-                for c in [Command::DrawBoard, Command::CloneStamp, Command::HealingBrush, Command::RedEye, Command::BlurRegion, Command::Selection] {
+                for c in [Command::SetWallpaper, Command::Print] {
                     item(ui, c, &mut fire);
                 }
             });

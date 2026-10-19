@@ -116,30 +116,25 @@ pub trait HistogramPaint {
 }
 
 impl HistogramPaint for Histogram {
+    /// Red, green and blue as smoothed, filled areas (45% alpha, so overlaps mix)
+    /// with a 1 pt line on top, on the input-well background with radius 6.
     fn paint(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool) {
-        use egui::{Color32, Pos2};
-        painter.rect_filled(rect, 4.0, if dark { Color32::from_black_alpha(90) } else { Color32::from_black_alpha(14) });
+        use egui::Color32;
+        let p = crate::ui::theme::palette(painter.ctx());
+        painter.rect_filled(rect, 6.0, p.input_bg);
         if self.l.is_empty() {
             return;
         }
-        let series: [(&Vec<u32>, Color32); 4] = [
-            (&self.r, Color32::from_rgba_unmultiplied(255, 80, 80, 110)),
-            (&self.g, Color32::from_rgba_unmultiplied(80, 220, 110, 110)),
-            (&self.b, Color32::from_rgba_unmultiplied(90, 140, 255, 110)),
-            (&self.l, Color32::from_rgba_unmultiplied(230, 230, 230, if dark { 120 } else { 90 })),
-        ];
-        for (data, color) in series {
-            let mut mesh = egui::Mesh::default();
-            let w = rect.width() / 256.0;
-            for (i, &v) in data.iter().enumerate() {
-                let hgt = ((v as f32 / self.max as f32).sqrt().min(1.0)) * rect.height();
-                let x = rect.min.x + i as f32 * w;
-                mesh.add_colored_rect(
-                    egui::Rect::from_min_max(Pos2::new(x, rect.max.y - hgt), Pos2::new(x + w + 0.3, rect.max.y)),
-                    color,
-                );
-            }
-            painter.add(egui::Shape::mesh(mesh));
+        // The extreme bins (pure black / white) can dwarf everything else: scale
+        // to the tallest bin inside them.
+        let max = [&self.r, &self.g, &self.b].iter().flat_map(|d| d.iter().skip(1).take(254)).copied().max().unwrap_or(1).max(1);
+        let area = rect.shrink2(egui::vec2(4.0, 4.0));
+        let line_a = if dark { 230 } else { 255 };
+        for (data, rgb) in [(&self.r, [235, 80, 80]), (&self.g, [80, 200, 120]), (&self.b, [80, 150, 255])] {
+            let bins = tools::smooth_bins(data, max);
+            let fill = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 115);
+            let line = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], line_a);
+            tools::paint_area(painter, area, &bins, fill, line);
         }
     }
 }

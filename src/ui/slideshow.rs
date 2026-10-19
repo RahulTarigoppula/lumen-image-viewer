@@ -1082,7 +1082,7 @@ impl Slideshow {
 
         // ---- Overlays
         let idle = self.last_activity.elapsed() > Duration::from_secs(2);
-        let bar_rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 40.0), Vec2::new(820.0_f32.min(view.width() - 24.0), 56.0));
+        let bar_rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 40.0), Vec2::new(744.0_f32.min(view.width() - 24.0), 56.0));
         let hover_bar = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| bar_rect.expand(12.0).contains(pos));
         let show_bar = !idle || hover_bar || self.popup_was_open || self.help;
         if cfg.show_caption {
@@ -1161,8 +1161,8 @@ impl Slideshow {
         // Swallow clicks on the bar background so they don't toggle pause.
         let _ = child.interact(rect, child.scope_id().with("bar-blocker"), Sense::click());
         let bg = Color32::from_rgba_unmultiplied(18, 19, 22, 225);
-        ui.painter().rect_filled(rect, CornerRadius::same(14), bg);
-        ui.painter().rect_stroke(rect, CornerRadius::same(14), Stroke::new(1.0, Color32::from_white_alpha(22)), egui::StrokeKind::Inside);
+        ui.painter().rect_filled(rect, CornerRadius::same(12), bg);
+        ui.painter().rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, Color32::from_white_alpha(22)), egui::StrokeKind::Inside);
         // Progress of the current slide.
         let frac = if self.current.is_some() { progress(self.display, interval) } else { 0.0 };
         let track = Rect::from_min_size(rect.min + Vec2::new(14.0, 5.0), Vec2::new(rect.width() - 28.0, 3.0));
@@ -1178,7 +1178,9 @@ impl Slideshow {
         vis.widgets.inactive.bg_fill = Color32::from_white_alpha(14);
         vis.widgets.hovered.weak_bg_fill = Color32::from_white_alpha(30);
         vis.widgets.inactive.bg_stroke = Stroke::NONE;
-        vis.selection.bg_fill = p.accent.gamma_multiply(0.8);
+        // The one selected style (soft accent fill, accent icon), as in dark mode.
+        vis.selection.bg_fill = Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 56);
+        vis.selection.stroke = Stroke::new(1.0, p.accent);
         child.spacing_mut().item_spacing.x = 2.0;
         child.add_space(2.0);
 
@@ -1193,13 +1195,12 @@ impl Slideshow {
         if widgets::icon_button(&mut child, I::SKIP_FORWARD, "Next  (→ / PgDn)", false).clicked() {
             self.go_rel(1, true);
         }
-        let counter = format!("{} / {}", (self.pending.map(|(p, _)| p).unwrap_or(self.pos) + 1).min(self.order.len()), self.order.len());
-        child.add_sized([64.0, 26.0], egui::Label::new(RichText::new(counter).size(12.0).color(Color32::from_gray(200))));
+        // The position is in the caption (and the progress line), not repeated here.
         widgets::separator_v(&mut child);
 
         let cfg = &mut core.settings.slideshow;
         child.label(RichText::new(I::TIMER).size(15.0).color(Color32::from_gray(190))).on_hover_text("Time per slide  (+ / -)");
-        egui::ComboBox::from_id_salt("ss-interval").width(62.0).selected_text(fmt_secs(cfg.interval_secs)).show_ui(&mut child, |ui| {
+        widgets::combo("ss-interval").width(62.0).selected_text(fmt_secs(cfg.interval_secs)).show_ui(&mut child, |ui| {
             for v in INTERVALS {
                 ui.selectable_value(&mut cfg.interval_secs, v, fmt_secs(v));
             }
@@ -1207,14 +1208,14 @@ impl Slideshow {
         child.add_space(4.0);
         child.label(RichText::new(I::SPARKLE).size(15.0).color(Color32::from_gray(190))).on_hover_text("Transition");
         let cur = Transition::from_name(&cfg.transition);
-        egui::ComboBox::from_id_salt("ss-transition").width(150.0).selected_text(cur.label()).height(420.0).show_ui(&mut child, |ui| {
+        widgets::combo("ss-transition").width(150.0).selected_text(cur.label()).height(420.0).show_ui(&mut child, |ui| {
             for t in Transition::ALL {
                 if ui.selectable_label(cur == t, t.label()).clicked() {
                     cfg.transition = t.name().to_string();
                 }
             }
         });
-        egui::ComboBox::from_id_salt("ss-duration").width(56.0).selected_text(fmt_secs(cfg.transition_secs)).show_ui(&mut child, |ui| {
+        widgets::combo("ss-duration").width(56.0).selected_text(fmt_secs(cfg.transition_secs)).show_ui(&mut child, |ui| {
             for v in DURATIONS {
                 ui.selectable_value(&mut cfg.transition_secs, v, fmt_secs(v));
             }

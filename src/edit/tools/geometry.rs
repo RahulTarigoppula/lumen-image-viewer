@@ -1,6 +1,7 @@
 //! Size-changing tools: Resize, Canvas size, Straighten / free rotate, Border.
 
-use super::{anchor_grid, color_button, color_row, combo, drag_px, info, mp, row, section, segmented, slider, slider_ex};
+use super::{anchor_grid, color_button, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented, slider, slider_ex};
+use crate::ui::widgets;
 use crate::edit::geom::{self, clamp_dim, BorderSpec, MAX_DIM};
 use crate::edit::{EditTool, ToolUiCtx};
 use crate::imaging::Filter;
@@ -63,11 +64,12 @@ impl EditTool for Resize {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
+        // Taking the image's size is set-up, not a change by the user (closing the
+        // tool must not ask to discard it); the first preview renders anyway.
         if self.src != cx.image_size {
             self.src = cx.image_size;
             self.w = self.src.0 as i64;
             self.h = self.src.1 as i64;
-            c = true;
         }
         let (sw, sh) = (self.src.0.max(1) as f64, self.src.1.max(1) as f64);
         if segmented(ui, &mut self.mode, &["Pixels", "Percent"]) {
@@ -94,9 +96,8 @@ impl EditTool for Resize {
                 }
                 c = true;
             }
-            row(ui, "", |ui| {
-                let icon = if self.lock { I::LINK } else { I::LINK_BREAK };
-                if ui.checkbox(&mut self.lock, format!("{icon} Keep aspect ratio")).changed() && self.lock {
+            indented(ui, |ui| {
+                if widgets::checkbox(ui, &mut self.lock, "Keep aspect ratio").changed() && self.lock {
                     self.h = clamp_dim(self.w as f64 * sh / sw) as i64;
                     c = true;
                 }
@@ -104,7 +105,7 @@ impl EditTool for Resize {
         } else {
             c |= slider_ex(ui, "Scale", &mut self.pct, 1.0..=400.0, 100.0, " %", 0.0, 1, true);
         }
-        section(ui, cx, "Presets (long edge)");
+        section(ui, cx, "Presets");
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             for le in [3840u32, 2560, 1920, 1280, 1024, 800] {
@@ -126,9 +127,11 @@ impl EditTool for Resize {
         c |= combo(ui, "Filter", "resize-filter", &mut self.filter, &names);
         ui.add_space(8.0);
         let (tw, th) = self.target();
+        section(ui, cx, "Size");
         info(ui, cx, format!("Original   {} × {}  ·  {}", self.src.0, self.src.1, mp(self.src.0, self.src.1)));
         let what = if (tw as u64 * th as u64) > (self.src.0 as u64 * self.src.1 as u64) { "  ·  upscaling" } else { "" };
         ui.label(egui::RichText::new(format!("New   {tw} × {th}  ·  {}{what}", mp(tw, th))).strong());
+        hint(ui, "Presets set the long edge in pixels (or a percentage). Lanczos is the sharpest filter for downsizing.");
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {
@@ -192,11 +195,11 @@ impl EditTool for CanvasSize {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
+        // Set-up, not a change by the user (see Resize).
         if self.src != cx.image_size {
             self.src = cx.image_size;
             self.w = self.src.0 as i64;
             self.h = self.src.1 as i64;
-            c = true;
         }
         let (sw, sh) = (self.src.0 as i64, self.src.1 as i64);
         c |= segmented(ui, &mut self.mode, &["New size", "Add margins"]);
@@ -248,13 +251,13 @@ impl EditTool for CanvasSize {
             c |= color_button(ui, &mut self.fill, true);
             ui.add_space(4.0);
             for (tip, col) in [("White", [255, 255, 255, 255]), ("Black", [0, 0, 0, 255]), ("None", [0, 0, 0, 0])] {
-                if ui.small_button(tip).clicked() {
+                if ui.button(tip).clicked() {
                     self.fill = col;
                     c = true;
                 }
             }
         });
-        ui.add_space(8.0);
+        section(ui, cx, "Size");
         let (tw, th) = self.target(sw as f64, sh as f64);
         let (tw, th) = (clamp_dim(tw), clamp_dim(th));
         info(ui, cx, format!("Original   {sw} × {sh}"));
@@ -329,10 +332,10 @@ impl EditTool for FreeRotate {
         let mut c = false;
         self.src = cx.image_size;
         c |= slider_ex(ui, "Angle", &mut self.angle, -45.0..=45.0, 0.0, "°", 0.1, 1, false);
-        row(ui, "", |ui| {
+        indented(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (label, d) in [("-1°", -1.0f32), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
-                if ui.small_button(label).clicked() {
+                if ui.button(label).clicked() {
                     self.angle = ((self.angle + d) * 10.0).round() / 10.0;
                     self.angle = self.angle.clamp(-45.0, 45.0);
                     c = true;
@@ -350,24 +353,25 @@ impl EditTool for FreeRotate {
                 c = true;
             }
         });
-        section(ui, cx, "Borders");
-        if ui.radio_value(&mut self.mode, 0, "Auto-crop to remove borders").changed() {
+        section(ui, cx, "Corners");
+        if widgets::radio_value(ui, &mut self.mode, 0, "Crop to remove the empty corners").changed() {
             c = true;
         }
-        if ui.radio_value(&mut self.mode, 1, "Expand canvas").changed() {
+        if widgets::radio_value(ui, &mut self.mode, 1, "Expand the canvas").changed() {
             c = true;
         }
         if self.mode == 1 {
             c |= color_row(ui, "Background", &mut self.bg, true);
         }
-        ui.add_space(8.0);
+        section(ui, cx, "Result");
         let (mut w, mut h) = self.src;
         if self.quarter.rem_euclid(2) == 1 {
             std::mem::swap(&mut w, &mut h);
         }
         let (ow, oh) = if self.angle.abs() < 1e-4 { (w, h) } else { geom::rotated_size(w.max(1), h.max(1), self.angle, self.mode == 0) };
         let total = self.quarter.rem_euclid(4) as f32 * 90.0 + self.angle;
-        info(ui, cx, format!("Rotation {total:.1}°  ·  result {ow} × {oh}"));
+        info(ui, cx, format!("Rotation {total:.1}°  ·  {ow} × {oh}"));
+        hint(ui, "Line up a horizon or a wall with the image edge. Hold to compare shows the original.");
         c
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {
@@ -478,33 +482,32 @@ impl EditTool for AddBorder {
             }
         });
         section(ui, cx, "Border");
-        c |= row(ui, "Units", |ui| segmented(ui, &mut self.unit, &["px", "% of short side"]));
+        c |= row(ui, "Units", |ui| segmented(ui, &mut self.unit, &["Pixels", "Percent"]));
         if self.unit == 0 {
             c |= slider_ex(ui, "Width", &mut self.width_px, 0.0..=1000.0, 40.0, " px", 1.0, 0, true);
         } else {
             c |= slider_ex(ui, "Width", &mut self.width_pct, 0.0..=25.0, 3.0, " %", 0.1, 1, false);
         }
         c |= color_row(ui, "Color", &mut self.color, true);
-        c |= row(ui, "", |ui| ui.checkbox(&mut self.polaroid, "Polaroid style (thick bottom)").changed());
+        c |= indented(ui, |ui| widgets::checkbox(ui, &mut self.polaroid, "Polaroid (thick bottom)").changed());
         c |= slider_ex(ui, "Corner radius", &mut self.radius, 0.0..=1000.0, 0.0, " px", 1.0, 0, true);
-        section(ui, cx, "Inner line");
-        c |= row(ui, "", |ui| ui.checkbox(&mut self.line, "Line around the photo").changed());
+        c |= section_toggle(ui, &mut self.line, "Line around the photo");
         if self.line {
             c |= slider_ex(ui, "Line width", &mut self.line_w, 0.5..=50.0, 2.0, " px", 0.5, 1, false);
             c |= color_row(ui, "Line color", &mut self.line_color, true);
         }
-        section(ui, cx, "Drop shadow");
-        c |= row(ui, "", |ui| ui.checkbox(&mut self.shadow, "Drop shadow").changed());
+        c |= section_toggle(ui, &mut self.shadow, "Drop shadow");
         if self.shadow {
             c |= slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=300.0, 24.0, " px", 1.0, 0, false);
             c |= slider_ex(ui, "Offset", &mut self.shadow_offset, 0.0..=300.0, 12.0, " px", 1.0, 0, false);
             c |= slider(ui, "Opacity", &mut self.shadow_opacity, 0.0..=100.0, 45.0, " %");
             c |= color_row(ui, "Background", &mut self.shadow_bg, true);
         }
-        ui.add_space(8.0);
+        section(ui, cx, "Result");
         let (w, h) = self.src;
         let (ow, oh, _) = geom::border_size(w, h, &self.spec(w.min(h) as f32, 1.0));
-        info(ui, cx, format!("Result   {ow} × {oh}  ·  {}", mp(ow, oh)));
+        info(ui, cx, format!("{ow} × {oh}  ·  {}", mp(ow, oh)));
+        hint(ui, "Percent widths are relative to the short side of the image, so the frame looks the same at any size.");
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {
