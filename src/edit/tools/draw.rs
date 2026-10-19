@@ -251,9 +251,13 @@ impl DrawBoard {
                         st.callout = c as u8;
                     }
                 });
-                let te = ui.add(egui::TextEdit::multiline(&mut st.text).desired_rows(2).desired_width(f32::INFINITY).hint_text("Type the callout text"));
+                let mut te = egui::TextEdit::multiline(&mut st.text).desired_rows(2).desired_width(f32::INFINITY).hint_text("Type the callout text").show(ui);
                 if self.focus_text {
-                    te.request_focus();
+                    // A new box shows its placeholder text selected, so typing replaces it.
+                    te.response.request_focus();
+                    let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(st.text.chars().count()));
+                    te.state.cursor.set_char_range(Some(all));
+                    te.state.store(ui.ctx(), te.response.id);
                     self.focus_text = false;
                 }
                 slider_ex(ui, "Text size", &mut st.font_px, 6.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
