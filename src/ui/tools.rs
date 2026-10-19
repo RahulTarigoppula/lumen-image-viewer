@@ -1401,11 +1401,3 @@ fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &m
     });
     changed
 }
-
-// ================================================================== print
-
-/// Print an image (shows the Windows print dialog). Returns Ok(()) when the
-/// user cancels.
-pub fn print_image(img: &RgbaImage, title: &str) -> anyhow::Result<()> {
-    print::print_image(img, title)
-}

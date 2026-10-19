@@ -144,14 +144,6 @@ impl GpuImage {
         GpuImage { width, height, pyramid, levels, top, nearest0, frame_counter: 0, name: name.to_string() }
     }
 
-    pub fn level_count(&self) -> usize {
-        self.pyramid.len()
-    }
-
-    pub fn full(&self) -> &Arc<RgbaImage> {
-        &self.pyramid[0]
-    }
-
     /// Choose the pyramid level for a zoom factor (physical px per image px).
     fn level_for_zoom(&self, zoom: f32) -> usize {
         if zoom >= 1.0 {
@@ -280,19 +272,6 @@ impl GpuImage {
                 }
             }
         }
-    }
-
-    /// Paint a small preview using only the always-resident top level.
-    pub fn paint_top(&self, painter: &egui::Painter, dest: Rect, tint: Color32) {
-        if let Some(top) = &self.top {
-            let mut mesh = egui::Mesh::with_texture(top.id());
-            mesh.add_rect_with_uv(dest, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
-            painter.add(egui::Shape::mesh(mesh));
-        }
-    }
-
-    pub fn top_texture(&self) -> Option<&TextureHandle> {
-        self.top.as_ref()
     }
 }
 

@@ -186,11 +186,6 @@ impl ThumbService {
         Thumb::Pending
     }
 
-    /// Peek without requesting.
-    pub fn peek(&mut self, key: &ThumbKey) -> Option<&ThumbInfo> {
-        self.textures.get(key)
-    }
-
     /// Mark currently queued jobs as low-priority leftovers (call when changing folder).
     pub fn cancel_all(&mut self) {
         let mut jobs = self.shared.jobs.lock();

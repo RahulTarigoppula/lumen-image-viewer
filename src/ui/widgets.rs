@@ -35,13 +35,6 @@ pub fn icon_button_sized(ui: &mut Ui, icon: &str, tip: &str, selected: bool, siz
     }
 }
 
-/// Icon + text button that looks like a toolbar pill.
-pub fn pill_button(ui: &mut Ui, icon: &str, text: &str, selected: bool) -> Response {
-    let label = if icon.is_empty() { text.to_string() } else { format!("{icon}  {text}") };
-    let btn = egui::Button::new(label).selected(selected).corner_radius(CornerRadius::same(6));
-    ui.add(btn)
-}
-
 pub fn separator_v(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, 22.0), Sense::hover());
     let c = ui.visuals().widgets.noninteractive.bg_stroke.color;
@@ -133,7 +126,7 @@ impl Toasts {
                 ToastKind::Success => (super::icons::CHECK_CIRCLE, p.ok),
                 ToastKind::Error => (super::icons::WARNING_CIRCLE, p.danger),
             };
-            let resp = egui::Area::new(egui::Id::new(("toast", i)))
+            let resp = egui::Area::new(egui::Id::unique(("toast", i)))
                 .order(egui::Order::Tooltip)
                 .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, y - screen.max.y))
                 .interactable(true)
@@ -175,7 +168,7 @@ impl Prompt {
 /// Returns Some(true)=OK, Some(false)=Cancel, None=still open.
 pub fn show_prompt(ctx: &egui::Context, prompt: &mut Prompt) -> Option<bool> {
     let mut result = None;
-    egui::Modal::new(egui::Id::new("prompt")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("prompt")).show(ctx, |ui| {
         ui.set_width(380.0);
         ui.heading(&prompt.title);
         ui.add_space(6.0);
@@ -224,7 +217,7 @@ pub fn show_prompt(ctx: &egui::Context, prompt: &mut Prompt) -> Option<bool> {
 /// Confirmation dialog. Returns Some(true) confirm / Some(false) cancel.
 pub fn show_confirm(ctx: &egui::Context, title: &str, body: &str, confirm: &str, danger: bool, p: &Palette) -> Option<bool> {
     let mut result = None;
-    egui::Modal::new(egui::Id::new(("confirm", title))).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique(("confirm", title))).show(ctx, |ui| {
         ui.set_width(400.0);
         ui.heading(title);
         ui.add_space(6.0);
