@@ -8,14 +8,14 @@
 //! | Modal dialog | [`modal`], [`modal_title`], [`modal_body`], [`dialog_buttons`], [`show_confirm`], [`show_prompt`] |
 //! | Label / control form rows | [`form_row`] |
 //! | Scroll bars that show when content is cut | [`visible_scrollbars`] (already on in windows and modals) |
-//! | Buttons | [`primary_button`], [`danger_button`], [`success_button`], [`secondary_button`], [`icon_button`] |
+//! | Buttons | [`primary_button`], [`danger_button`], [`success_button`], [`secondary_button`], [`icon_button`], [`labeled_icon_button`] |
 //! | Slider (+ value box, double-click reset, centre fill) | [`Slider`] (drop-in for `egui::Slider`) |
 //! | Number field | [`value_box`] around an `egui::DragValue` |
 //! | Checkbox / radio | [`checkbox`], [`radio`], [`radio_value`] |
 //! | Color well with picker | [`color_button`], [`color_button_rgba`] |
 //! | Segmented control | [`segmented`], [`segmented_value`], [`segmented_with_tips`] |
 //! | Combo / collapsing carets | [`combo`], [`combo_caret`], [`collapse_caret`] |
-//! | Menu rows | [`menu_item`], [`menu_toggle`], [`submenu`] |
+//! | Menu rows | [`menu_item`], [`menu_toggle`], [`menu_check`], [`submenu`] |
 //! | Shortcuts | [`keycap`], [`shortcut_keys`], [`paint_shortcut_keys`] |
 //! | Section label | [`section_title`] |
 //! | Notifications | [`Toasts`] |
@@ -71,6 +71,56 @@ pub fn icon_button_sized(ui: &mut Ui, icon: &str, tip: &str, selected: bool, siz
     } else {
         resp
     }
+}
+
+/// Flat toolbar button with an icon and a short label ("Histogram", "Swap"),
+/// in the [`icon_button`] style: 30 pt tall, transparent until hovered,
+/// `selected` in the one selected style. For toolbars that show labels when
+/// there is room and fall back to [`icon_button`] when narrow; see
+/// [`labeled_icon_button_width`].
+pub fn labeled_icon_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, selected: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(labeled_icon_button_width(ui, label), 30.0), Sense::click());
+    let vis = ui.visuals();
+    let hovered = resp.hovered();
+    let bg = if selected {
+        vis.selection.bg_fill
+    } else if resp.is_pointer_button_down_on() {
+        vis.widgets.active.weak_bg_fill
+    } else if hovered {
+        vis.widgets.hovered.weak_bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    let fg = if selected {
+        vis.selection.stroke.color
+    } else if hovered {
+        vis.strong_text_color()
+    } else {
+        vis.text_color()
+    };
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(radius::CONTROL), bg);
+        let x = rect.left() + 8.0;
+        painter.text(egui::pos2(x + size::ICON_TOOLBAR / 2.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(size::ICON_TOOLBAR), fg);
+        let g = painter.layout_no_wrap(label.to_string(), text::body(), fg);
+        painter.galley(egui::pos2(x + size::ICON_TOOLBAR + 6.0, rect.center().y - g.size().y / 2.0), g, fg);
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(radius::CONTROL), Stroke::new(1.0, vis.text_color()), StrokeKind::Inside);
+        }
+    }
+    if !tip.is_empty() {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    }
+}
+
+/// Width of a [`labeled_icon_button`] with `label`: 8 pt padding, the 16 pt
+/// icon, a 6 pt gap, the label and 10 pt padding.
+pub fn labeled_icon_button_width(ui: &Ui, label: &str) -> f32 {
+    let w = ui.painter().layout_no_wrap(label.to_string(), text::body(), Color32::WHITE).size().x;
+    (8.0 + size::ICON_TOOLBAR + 6.0 + w + 10.0).round()
 }
 
 /// Run `add` with button visuals filled with `fill` and `fg` text in every state
@@ -903,6 +953,18 @@ pub fn menu_item(ui: &mut Ui, icon: &str, label: &str, shortcut: &str) -> Respon
 pub fn menu_toggle(ui: &mut Ui, on: bool, label: &str, shortcut: &str) -> Response {
     let p = theme::palette(ui.ctx());
     menu_row(ui, if on { I::CHECK } else { "" }, Some(p.accent_text), label, shortcut)
+}
+
+/// [`menu_toggle`] for a command that has an icon: the icon column shows the
+/// command's icon while off and the accent check mark while on, so a menu
+/// mixing commands and settings has no empty icon slots.
+pub fn menu_check(ui: &mut Ui, on: bool, icon: &str, label: &str, shortcut: &str) -> Response {
+    let p = theme::palette(ui.ctx());
+    if on {
+        menu_row(ui, I::CHECK, Some(p.accent_text), label, shortcut)
+    } else {
+        menu_row(ui, icon, None, label, shortcut)
+    }
 }
 
 /// A menu row that opens a submenu (caret on the right), aligned with [`menu_item`].

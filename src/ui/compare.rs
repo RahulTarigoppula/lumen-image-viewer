@@ -273,6 +273,21 @@ fn mode_label(m: CmpMode, with_name: bool) -> String {
     if with_name { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() }
 }
 
+/// Names shown next to the toolbar icons when the bar has room.
+const SYNC_LABEL: &str = "Sync";
+const HIST_LABEL: &str = "Histogram";
+const EXIF_LABEL: &str = "Camera";
+const SWAP_LABEL: &str = "Swap";
+
+/// A toolbar toggle or action: icon and name when `labels`, else the icon.
+fn bar_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, selected: bool, labels: bool) -> egui::Response {
+    if labels {
+        widgets::labeled_icon_button(ui, icon, label, tip, selected)
+    } else {
+        widgets::icon_button(ui, icon, tip, selected)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpMode {
     SideBySide,
@@ -334,6 +349,8 @@ struct BarPlan {
     title: bool,
     /// Mode buttons with their names (else icons, names in the tooltips).
     labels: bool,
+    /// Sync, the view toggles and Swap with their names next to the icons.
+    icon_labels: bool,
     /// The last resort: the mode buttons become one menu.
     modes_menu: bool,
     hidden: Vec<BarPart>,
@@ -1040,8 +1057,8 @@ impl Compare {
             }
             r
         };
-        let toggle = |ui: &mut Ui, on: bool, label: &str, key: &str| {
-            let r = widgets::menu_toggle(ui, on, label, key).clicked();
+        let toggle = |ui: &mut Ui, on: bool, icon: &str, label: &str, key: &str| {
+            let r = widgets::menu_check(ui, on, icon, label, key).clicked();
             if r {
                 ui.close();
             }
@@ -1058,13 +1075,13 @@ impl Compare {
         if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
             self.swap_ab();
         }
-        if toggle(ui, self.sync, "Link zoom & pan", "L") {
+        if toggle(ui, self.sync, I::LINK, "Link zoom & pan", "L") {
             self.toggle_sync();
         }
-        if toggle(ui, self.show_hist, "Histograms", "G") {
+        if toggle(ui, self.show_hist, I::CHART_BAR, "Histograms", "G") {
             self.show_hist = !self.show_hist;
         }
-        if toggle(ui, self.show_exif, "Camera info strip", "H") {
+        if toggle(ui, self.show_exif, I::CAMERA, "Camera info strip", "H") {
             self.show_exif = !self.show_exif;
         }
         // Culling on the pane that was right-clicked.
@@ -1076,7 +1093,7 @@ impl Compare {
                 self.keep_only(core, pane);
             }
             let flagged = core.tags.get(&self.panes[pane].path).flagged;
-            if toggle(ui, flagged, &format!("Flag {letter}"), "Q") {
+            if toggle(ui, flagged, I::FLAG, &format!("Flag {letter}"), "Q") {
                 self.toggle_flag(core, pane);
             }
             if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del") {
@@ -1455,9 +1472,11 @@ impl Compare {
         }
     }
 
-    /// What fits in a toolbar of `avail` points: labels go first, then
-    /// parts move into the "..." menu in [`BarPart`] order (back, the mode
-    /// buttons, zoom and the Analysis button always stay).
+    /// What fits in a toolbar of `avail` points: the image count goes first,
+    /// then the button names (Sync, Histogram, Camera, Swap), the mode names
+    /// and the title, then parts move into the "..." menu in [`BarPart`]
+    /// order (back, the mode buttons, zoom and the Analysis button always
+    /// stay).
     fn bar_plan(&self, ui: &Ui, avail: f32) -> BarPlan {
         let s = ui.spacing().item_spacing.x;
         let pad = ui.spacing().button_padding.x * 2.0;
@@ -1466,25 +1485,27 @@ impl Compare {
         let icon = 30.0 + s;
         let sep = 9.0 + s;
         let pair = self.panes.len() == 2;
+        // An icon button, or with `labels` the icon and its name.
+        let button = |label: &str, labels: bool| if labels { widgets::labeled_icon_button_width(ui, label) + s } else { icon };
         // One segmented control: equal segments as wide as the widest label.
         let widest = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference].iter().map(|m| text_w(&mode_label(*m, true), body.clone())).fold(0.0, f32::max);
         let modes_full = if pair { 4.0 * (widest + 24.0) + 4.0 + s } else { 0.0 };
         let modes_compact = if pair { 4.0 * (text_w(I::COLUMNS, body.clone()) + 24.0) + 4.0 + s } else { 0.0 };
         let title = text_w("Compare", text::title()) + s;
         let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(text::SMALL)) + s;
-        let part = |b: BarPart| -> f32 {
+        let part = |b: BarPart, labels: bool| -> f32 {
             match b {
                 BarPart::Help => icon,
-                BarPart::Views => sep + 2.0 * icon,
+                BarPart::Views => sep + button(HIST_LABEL, labels) + button(EXIF_LABEL, labels),
                 BarPart::Basis => 126.0 + s,
-                BarPart::Sync => sep + icon,
+                BarPart::Sync => sep + button(SYNC_LABEL, labels),
                 BarPart::Cull => {
                     let keep = if self.panes.len() >= 2 { text_w(&format!("{}  Keep A", I::CHECK_CIRCLE), body.clone()) + pad + s } else { 0.0 };
                     sep + keep + if self.panes.is_empty() { 0.0 } else { 2.0 * icon }
                 }
                 BarPart::Swap => {
                     if pair {
-                        icon
+                        button(SWAP_LABEL, labels)
                     } else {
                         0.0
                     }
@@ -1501,23 +1522,37 @@ impl Compare {
         // Back, Fit, Analysis and "..." always stay.
         let fixed = icon + 4.0 + sep + sep + icon + sep + icon + icon;
         let modes_menu = text_w(&format!("{}  {}", I::COLUMNS, I::CARET_DOWN), body.clone()) + pad + s;
-        let mut plan = BarPlan { count: true, title: true, labels: true, modes_menu: false, hidden: Vec::new() };
+        let mut plan = BarPlan { count: true, title: true, labels: true, icon_labels: true, modes_menu: false, hidden: Vec::new() };
         let width = |p: &BarPlan| -> f32 {
             let mut w = fixed + if p.modes_menu { modes_menu } else if p.labels { modes_full } else { modes_compact };
             w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
-            w + BarPart::ALL.iter().filter(|b| !p.hidden.contains(b)).map(|b| part(*b)).sum::<f32>()
+            w + BarPart::ALL.iter().filter(|b| !p.hidden.contains(b)).map(|b| part(*b, p.icon_labels)).sum::<f32>()
         };
-        for step in 0..4 + BarPart::ALL.len() {
+        for step in 0..5 + BarPart::ALL.len() {
             if width(&plan) <= avail {
                 break;
             }
             match step {
                 0 => plan.count = false,
-                1 => plan.labels = false,
-                2 => plan.title = false,
-                n if n - 3 < BarPart::ALL.len() => plan.hidden.push(BarPart::ALL[n - 3]),
+                1 => plan.icon_labels = false,
+                2 => plan.labels = false,
+                3 => plan.title = false,
+                n if n - 4 < BarPart::ALL.len() => plan.hidden.push(BarPart::ALL[n - 4]),
                 _ => plan.modes_menu = true,
             }
+        }
+        // What went first may fit again once the mode names are icons.
+        if !plan.title {
+            plan.title = true;
+            plan.title = width(&plan) <= avail;
+        }
+        if plan.title && !plan.icon_labels {
+            plan.icon_labels = true;
+            plan.icon_labels = width(&plan) <= avail;
+        }
+        if plan.icon_labels && !plan.count {
+            plan.count = true;
+            plan.count = width(&plan) <= avail;
         }
         plan
     }
@@ -1579,7 +1614,7 @@ impl Compare {
             if shown(BarPart::Sync) {
                 widgets::separator_v(ui);
                 let (icon, tip) = if self.sync { (I::LINK, "Zoom & pan synchronized  (L)") } else { (I::LINK_BREAK, "Zoom & pan independent  (L)") };
-                if widgets::icon_button(ui, icon, tip, self.sync).clicked() {
+                if bar_button(ui, icon, SYNC_LABEL, tip, self.sync, plan.icon_labels).clicked() {
                     self.toggle_sync();
                 }
             }
@@ -1617,10 +1652,10 @@ impl Compare {
             }
             if shown(BarPart::Views) {
                 widgets::separator_v(ui);
-                if widgets::icon_button(ui, I::CHART_BAR, "Histograms  (G)", self.show_hist).clicked() {
+                if bar_button(ui, I::CHART_BAR, HIST_LABEL, "Histograms  (G)", self.show_hist, plan.icon_labels).clicked() {
                     self.show_hist = !self.show_hist;
                 }
-                if widgets::icon_button(ui, I::CAMERA, "Camera info strip  (H)", self.show_exif).clicked() {
+                if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
                     self.show_exif = !self.show_exif;
                 }
             }
@@ -1649,7 +1684,7 @@ impl Compare {
                     }
                 }
             }
-            if shown(BarPart::Swap) && pair && widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B  (X)", false).clicked() {
+            if shown(BarPart::Swap) && pair && bar_button(ui, I::ARROWS_LEFT_RIGHT, SWAP_LABEL, "Swap A and B  (X)", false, plan.icon_labels).clicked() {
                 self.swap_ab();
             }
             // Mode-specific controls.
@@ -1701,9 +1736,9 @@ impl Compare {
         let p = core.pal;
         let pair = self.panes.len() == 2;
         let letter = LETTERS[sel.min(3)];
-        // `on`: an on / off setting (check mark); `None`: a plain command.
+        // `on`: an on / off setting (check mark while on); `None`: a plain command.
         let item = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: Option<bool>| match on {
-            Some(on) => widgets::menu_toggle(ui, on, label, key).clicked(),
+            Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
         for (n, part) in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)).enumerate() {

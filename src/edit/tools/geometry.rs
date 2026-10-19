@@ -1,6 +1,6 @@
 //! Size-changing tools: Resize, Canvas size, Straighten / free rotate, Border.
 
-use super::{anchor_grid, color_button, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented, slider, slider_ex};
+use super::{anchor_grid, color_button, color_presets, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented, slider, slider_ex};
 use crate::ui::widgets;
 use crate::edit::geom::{self, clamp_dim, BorderSpec, MAX_DIM};
 use crate::edit::{EditTool, ToolUiCtx};
@@ -152,6 +152,9 @@ impl EditTool for Resize {
     fn reset(&mut self) {
         *self = Resize { src: (0, 0), ..Default::default() };
     }
+    fn can_apply(&self) -> bool {
+        self.src.0 > 0 && self.w > 0 && self.target() != self.src
+    }
 }
 
 // ---------------------------------------------------------------- Canvas size
@@ -227,7 +230,7 @@ impl EditTool for CanvasSize {
                 }
             });
             ui.add_space(4.0);
-            row(ui, &format!("{} Anchor", I::ANCHOR), |ui| c |= anchor_grid(ui, cx, &mut self.anchor));
+            row(ui, "Anchor", |ui| c |= anchor_grid(ui, cx, &mut self.anchor));
         } else {
             let names = ["Top", "Right", "Bottom", "Left"];
             for (i, n) in names.iter().enumerate() {
@@ -247,15 +250,10 @@ impl EditTool for CanvasSize {
         }
         section(ui, cx, "Fill");
         row(ui, "Color", |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
             c |= color_button(ui, &mut self.fill, true);
             ui.add_space(4.0);
-            for (tip, col) in [("White", [255, 255, 255, 255]), ("Black", [0, 0, 0, 255]), ("None", [0, 0, 0, 0])] {
-                if ui.button(tip).clicked() {
-                    self.fill = col;
-                    c = true;
-                }
-            }
+            c |= color_presets(ui, &mut self.fill, &[("White", [255, 255, 255, 255]), ("Black", [0, 0, 0, 255]), ("None (transparent)", [0, 0, 0, 0])]);
         });
         section(ui, cx, "Size");
         let (tw, th) = self.target(sw as f64, sh as f64);
@@ -289,6 +287,13 @@ impl EditTool for CanvasSize {
     }
     fn reset(&mut self) {
         *self = CanvasSize::default();
+    }
+    fn can_apply(&self) -> bool {
+        if self.mode == 1 {
+            self.margins != [0; 4]
+        } else {
+            self.src.0 > 0 && (self.w, self.h) != (self.src.0 as i64, self.src.1 as i64)
+        }
     }
 }
 
@@ -387,6 +392,9 @@ impl EditTool for FreeRotate {
     }
     fn reset(&mut self) {
         *self = FreeRotate::default();
+    }
+    fn can_apply(&self) -> bool {
+        self.angle.abs() >= 1e-4 || self.quarter.rem_euclid(4) != 0
     }
 }
 
@@ -519,6 +527,10 @@ impl EditTool for AddBorder {
     }
     fn reset(&mut self) {
         *self = AddBorder::default();
+    }
+    fn can_apply(&self) -> bool {
+        let width = if self.unit == 1 { self.width_pct } else { self.width_px };
+        width > 0.0 || self.radius > 0.0 || self.line || self.shadow
     }
 }
 

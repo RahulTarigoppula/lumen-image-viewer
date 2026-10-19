@@ -972,6 +972,8 @@ impl Browser {
         }
         let img_area = Rect::from_min_size(Pos2::new(rect.center().x - ts / 2.0, rect.min.y + pad), Vec2::splat(ts));
         let mut dims = None;
+        // Where the picture is drawn: the badges sit on its corners.
+        let mut pic = img_area;
         match entry.kind {
             EntryKind::Folder => {
                 painter.text(img_area.center(), Align2::CENTER_CENTER, I::FOLDER, super::theme::icon_fill(ts * 0.55), p.accent.gamma_multiply(0.85));
@@ -984,6 +986,7 @@ impl Browser {
                         let tsz = t.tex.size_vec2();
                         let s = cap_upscale((ts / tsz.x).min(ts / tsz.y), tsz, t.source_dims);
                         let r = Rect::from_center_size(img_area.center(), tsz * s);
+                        pic = r;
                         // Subtle drop shadow makes thumbnails pop off the background.
                         painter.rect_filled(r.translate(Vec2::new(0.0, 2.0)).expand(1.0), CornerRadius::same(3), Color32::from_black_alpha(if p.dark { 90 } else { 30 }));
                         let mut mesh = egui::Mesh::with_texture(t.tex.id());
@@ -1005,27 +1008,42 @@ impl Browser {
                 }
             }
         }
-        // Badges: flag, label, rating
+        // Badges on the picture's top corners, each a dark 18 pt pill: flag and
+        // color label on the left, the stars on the right. A picture too small
+        // to hold them (a tiny icon, a thin panorama) uses the square thumbnail
+        // area instead.
         if entry.is_media() {
             let tag = core.tags.get(&entry.path);
-            let mut x = rect.min.x + 10.0;
-            let y = rect.min.y + 12.0;
+            let box_ = if pic.width() >= 96.0 && pic.height() >= 40.0 { pic } else { img_area };
+            let (inset, h) = (5.0, 18.0);
+            let top = box_.min.y + inset;
+            let pill_bg = Color32::from_black_alpha(150);
+            let mut w = 0.0;
             if tag.flagged {
-                painter.circle_filled(Pos2::new(x + 6.0, y + 2.0), 10.0, Color32::from_black_alpha(130));
-                painter.text(Pos2::new(x + 6.0, y + 2.0), Align2::CENTER_CENTER, I::FLAG, super::theme::icon_fill(12.0), p.accent);
-                x += 22.0;
+                w += 16.0;
             }
             if tag.label > 0 {
-                let c = crate::tags::LABEL_COLORS[tag.label as usize];
-                painter.circle_filled(Pos2::new(x + 6.0, y + 2.0), 6.0, Color32::from_rgb(c[0], c[1], c[2]));
+                w += 14.0;
+            }
+            if w > 0.0 {
+                let pill = Rect::from_min_size(Pos2::new(box_.min.x + inset, top), Vec2::new(w + 6.0, h));
+                painter.rect_filled(pill, CornerRadius::same(radius::SMALL), pill_bg);
+                let mut x = pill.min.x + 3.0;
+                if tag.flagged {
+                    painter.text(Pos2::new(x + 8.0, pill.center().y), Align2::CENTER_CENTER, I::FLAG, super::theme::icon_fill(11.5), p.accent);
+                    x += 16.0;
+                }
+                if tag.label > 0 {
+                    let c = crate::tags::LABEL_COLORS[tag.label as usize];
+                    painter.circle_filled(Pos2::new(x + 7.0, pill.center().y), 5.0, Color32::from_rgb(c[0], c[1], c[2]));
+                }
             }
             if tag.rating > 0 {
                 let stars: String = I::STAR.repeat(tag.rating as usize);
-                let pos = Pos2::new(rect.max.x - 10.0, rect.min.y + 13.0);
                 let galley = painter.layout_no_wrap(stars, super::theme::icon_fill(10.5), Color32::from_rgb(250, 196, 60));
-                let bg_r = Rect::from_min_size(Pos2::new(pos.x - galley.size().x - 4.0, pos.y - galley.size().y / 2.0 - 2.0), galley.size() + Vec2::new(8.0, 4.0));
-                painter.rect_filled(bg_r, CornerRadius::same(4), Color32::from_black_alpha(140));
-                painter.galley(Pos2::new(bg_r.min.x + 4.0, bg_r.min.y + 2.0), galley, Color32::WHITE);
+                let pill = Rect::from_min_size(Pos2::new(box_.max.x - inset - galley.size().x - 10.0, top), Vec2::new(galley.size().x + 10.0, h));
+                painter.rect_filled(pill, CornerRadius::same(radius::SMALL), pill_bg);
+                painter.galley(Pos2::new(pill.min.x + 5.0, pill.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
             }
         }
         if captions != ThumbCaption::None {
