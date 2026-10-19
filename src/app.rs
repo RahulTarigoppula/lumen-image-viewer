@@ -35,6 +35,11 @@ pub struct Core {
     pub thumbs: ThumbService,
     pub meta: MetaService,
     pub toasts: Toasts,
+    /// Remote AI analysis: settings, connection, runs and results.
+    #[cfg(feature = "ai")]
+    pub ai: crate::analysis_ui::ai::AiState,
+    /// The Analysis panel's Metrics tab (video mode draws its graphs).
+    pub metrics: crate::analysis_ui::metrics_view::MetricsTab,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +127,8 @@ pub struct App {
     slideshow: Option<crate::ui::slideshow::Slideshow>,
     compare: Option<crate::ui::compare::Compare>,
     video: Option<crate::video::VideoMode>,
+    /// The Analysis panel of the viewer, compare and video modes.
+    analysis: crate::analysis_ui::AnalysisPanel,
     batch_convert: Option<crate::ui::batch::BatchConvert>,
     batch_rename: Option<crate::ui::batch::BatchRename>,
     contact_sheet: Option<crate::ui::tools::ContactSheet>,
@@ -234,14 +241,29 @@ impl App {
         crate::devhook::mark("tags");
         let browser = Browser::new(start_folder.clone());
         crate::devhook::mark("browser");
+        #[cfg(feature = "ai")]
+        let ai = crate::analysis_ui::ai::AiState::new(&ctx, &settings);
         let mut app = App {
-            core: Core { ctx: ctx.clone(), settings, pal, tags, loader, thumbs, meta, toasts: Toasts::default() },
+            core: Core {
+                ctx: ctx.clone(),
+                settings,
+                pal,
+                tags,
+                loader,
+                thumbs,
+                meta,
+                toasts: Toasts::default(),
+                #[cfg(feature = "ai")]
+                ai,
+                metrics: Default::default(),
+            },
             mode: Mode::Browser,
             browser,
             viewer: Viewer::new(),
             slideshow: None,
             compare: None,
             video: None,
+            analysis: Default::default(),
             batch_convert: None,
             batch_rename: None,
             contact_sheet: None,
@@ -993,6 +1015,67 @@ impl App {
                     fileops::properties_dialog(p);
                 }
             }
+            ToggleAnalysis | RunMetrics | RunAi => {
+                if !matches!(self.mode, Mode::Viewer | Mode::Compare | Mode::Video) {
+                    self.core.toasts.info("The analysis panel works on an open image, a comparison or a video");
+                    return;
+                }
+                match cmd {
+                    ToggleAnalysis => self.analysis.toggle(),
+                    RunMetrics => self.analysis.request_metrics_run(),
+                    _ => self.analysis.request_ai_run(),
+                }
+            }
+        }
+    }
+
+    /// What the Analysis panel works on in the current mode.
+    fn analysis_subject(&self) -> Option<crate::analysis_ui::Subject> {
+        match self.mode {
+            Mode::Viewer => Some(crate::analysis_ui::Subject::image(self.viewer.current().map(|p| p.as_path()), self.viewer.current_image(&self.core))),
+            Mode::Compare => self.compare.as_ref().map(|c| c.analysis_subject()),
+            Mode::Video => self.video.as_ref().map(|v| v.analysis_subject()),
+            _ => None,
+        }
+    }
+
+    /// Requests from the Analysis panel.
+    fn analysis_actions(&mut self, ctx: &egui::Context, actions: Vec<crate::analysis_ui::PanelAction>) {
+        use crate::analysis_ui::{canvas, PanelAction};
+        for a in actions {
+            match a {
+                PanelAction::ZoomTo { slot, rect } => {
+                    let ppp = ctx.pixels_per_point();
+                    let pane = canvas::panes(ctx).into_iter().find(|p| p.slot == slot).map(|p| p.clip.size());
+                    match self.mode {
+                        Mode::Viewer => self.viewer.zoom_to_region(rect, ppp),
+                        Mode::Compare => {
+                            if let Some(c) = &mut self.compare {
+                                c.zoom_to_region(if slot == canvas::Slot::B { 1 } else { 0 }, rect, ppp);
+                            }
+                        }
+                        Mode::Video => {
+                            if let (Some(v), Some(pane)) = (&mut self.video, pane) {
+                                v.zoom_to_region(rect, pane, ppp);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                PanelAction::OpenSettings(page) => {
+                    crate::ui::settings_window::open_page(ctx, page);
+                    self.show_settings = true;
+                }
+                PanelAction::Toast(t) => self.core.toasts.success(t),
+                PanelAction::ExportJson(text) => {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("lumen_ai_result.json").save_file() {
+                        match std::fs::write(&p, text) {
+                            Ok(()) => self.core.toasts.success(format!("Exported {}", p.display())),
+                            Err(e) => self.core.toasts.error(e.to_string()),
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1595,6 +1678,7 @@ impl App {
             || self.viewer.confirm_discard
             || self.pending_guard.is_some()
             || self.gps_confirm.is_some()
+            || self.analysis.modal_open(&self.core)
     }
 
     fn tool_window_open(&self) -> bool {
@@ -1730,6 +1814,10 @@ impl App {
                     self.window_stack.pop();
                 }
             }
+        }
+        // The Analysis panel's R (draw a region) and Esc (clear it) win over the mode's keys.
+        if !typing && !self.tool_window_active && matches!(self.mode, Mode::Viewer | Mode::Compare | Mode::Video) {
+            self.analysis.pre_shortcuts(ctx);
         }
         let km = keymap::active();
         // Edit tools own Enter / Escape and most keys; only undo / redo (of the tool) pass.
@@ -2367,6 +2455,7 @@ impl eframe::App for App {
         if self.fullscreen && self.fullscreen_from_viewer && self.mode == Mode::Browser {
             self.set_fullscreen(false);
         }
+        crate::analysis_ui::tick(&mut self.core);
         while let Ok(res) = self.file_jobs.rx.try_recv() {
             self.file_jobs.queued = self.file_jobs.queued.saturating_sub(1);
             self.finish_file_job(res);
@@ -2410,6 +2499,20 @@ impl eframe::App for App {
         self.viewer.edge_panels = self.core.settings.edge_panels;
         let p = self.core.pal;
 
+        // The Analysis panel sits right of the mode's whole view, so it is shown
+        // before the mode's central panel; its overlays are drawn after it.
+        #[cfg(feature = "video")]
+        if self.mode != Mode::Video {
+            // Video mode publishes its state every frame; drop it (and the
+            // frames it holds) elsewhere.
+            self.core.metrics.set_video(None);
+        }
+        let subject = self.analysis_subject();
+        let mut analysis_actions = match (&subject, self.analysis.open) {
+            (Some(s), true) => self.analysis.side_panel(ui, &mut self.core, s),
+            _ => Vec::new(),
+        };
+
         match self.mode {
             Mode::Browser => {
                 let mut ev = Vec::new();
@@ -2428,8 +2531,10 @@ impl eframe::App for App {
                         ui.horizontal_centered(|ui| {
                             ui.label(RichText::new(self.browser.status_text(&self.core)).size(12.0).color(p.muted));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{} Offline & private", I::SHIELD_CHECK)).size(11.5).color(p.faint))
-                                    .on_hover_text("Lumen itself never connects to the internet; map links open in your browser only when you ask. Ratings and tags are stored locally.");
+                                if !crate::analysis_ui::network_badge(ui, &self.core) {
+                                    ui.label(RichText::new(format!("{} Offline & private", I::SHIELD_CHECK)).size(11.5).color(p.faint))
+                                        .on_hover_text(crate::analysis_ui::privacy_note(&self.core));
+                                }
                                 if self.browser.loading {
                                     ui.spinner();
                                 }
@@ -2571,6 +2676,8 @@ impl eframe::App for App {
             }
         }
 
+        analysis_actions.extend(self.analysis.overlay(ui, &mut self.core, subject.as_ref()));
+        self.analysis_actions(&ctx, analysis_actions);
         self.dialogs(&ctx);
         self.guard_dialog(&ctx);
         // Leaving video mode by any route stops playback.
@@ -2618,6 +2725,12 @@ impl App {
                         Some(c) => self.run(c),
                         None => self.dev.write_state(&format!("unknown command {name}")),
                     }
+                }
+                crate::devhook::DevAction::Analysis(args) => {
+                    let subject = self.analysis_subject();
+                    let (reply, actions) = crate::analysis_ui::dev(&mut self.analysis, &mut self.core, subject.as_ref(), &args);
+                    self.analysis_actions(ctx, actions);
+                    self.dev.write_state(&reply);
                 }
                 crate::devhook::DevAction::Open(p) => {
                     if p.is_dir() {

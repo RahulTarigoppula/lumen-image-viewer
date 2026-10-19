@@ -414,6 +414,8 @@ pub struct VideoMode {
     offset_cancel: u8,
     /// Dev hook only: start time and press count of the current step burst.
     dev_burst: Option<(Instant, u32)>,
+    /// A alone decodes native planes for the Analysis panel's Metrics tab.
+    metrics_native: bool,
 }
 
 impl VideoMode {
@@ -467,6 +469,7 @@ impl VideoMode {
             offset_editing: false,
             offset_cancel: 0,
             dev_burst: None,
+            metrics_native: false,
         };
         for p in paths.into_iter().take(2) {
             vm.add_source(&p, &core.ctx, &mut None);
@@ -749,6 +752,7 @@ impl VideoMode {
             }
         }
         self.advance_playback(&ctx);
+        self.metrics_hooks(core);
         self.dev_report_step();
         if self.flicker_auto && self.flicker_at.elapsed() > Duration::from_millis(500) {
             self.flicker_b = !self.flicker_b;
@@ -1056,8 +1060,12 @@ impl VideoMode {
                 p2.add(egui::Shape::mesh(mesh));
             }
         };
+        // Where A and B are drawn, for the Analysis panel's overlays.
+        let publish = |slot, dest: Rect, clip: Rect| crate::analysis_ui::canvas::publish(ui.ctx(), slot, dest, (dw, dh), clip);
+        use crate::analysis_ui::canvas::Slot;
         if !compare {
             let dest = dest_in(view, self.center, self.zoom);
+            publish(Slot::A, dest, view);
             draw_tex(&painter, &self.sources[0], dest, view, Color32::WHITE);
             self.pixel_probe(ui, dest, (dw, dh));
         } else {
@@ -1068,6 +1076,7 @@ impl VideoMode {
                     for (i, s) in [a, b].iter().enumerate() {
                         let r = pane(i);
                         let dest = dest_in(r, self.center, self.zoom);
+                        publish(if i == 0 { Slot::A } else { Slot::B }, dest, r);
                         draw_tex(&painter, s, dest, r, Color32::WHITE);
                     }
                     painter.line_segment([Pos2::new(view.center().x, view.min.y), Pos2::new(view.center().x, view.max.y)], Stroke::new(1.0, Color32::from_gray(60)));
@@ -1082,6 +1091,8 @@ impl VideoMode {
                         }
                     }
                     let x = view.min.x + view.width() * self.wipe_pos;
+                    publish(Slot::A, dest, Rect::from_min_max(view.min, Pos2::new(x, view.max.y)));
+                    publish(Slot::B, dest, Rect::from_min_max(Pos2::new(x, view.min.y), view.max));
                     draw_tex(&painter, a, dest, Rect::from_min_max(view.min, Pos2::new(x, view.max.y)), Color32::WHITE);
                     draw_tex(&painter, b, dest, Rect::from_min_max(Pos2::new(x, view.min.y), view.max), Color32::WHITE);
                     painter.line_segment([Pos2::new(x, view.min.y), Pos2::new(x, view.max.y)], Stroke::new(1.5, Color32::from_white_alpha(200)));
@@ -1093,6 +1104,7 @@ impl VideoMode {
                     let dest = dest_in(view, self.center, self.zoom);
                     let held = ui.input(|i| i.key_down(Key::Tab));
                     let show_b = self.flicker_b ^ held;
+                    publish(if show_b { Slot::B } else { Slot::A }, dest, view);
                     draw_tex(&painter, if show_b { b } else { a }, dest, view, Color32::WHITE);
                     let label = if show_b { "B" } else { "A" };
                     let col = if show_b { Color32::from_rgb(90, 190, 255) } else { Color32::from_rgb(255, 170, 60) };
@@ -1103,12 +1115,14 @@ impl VideoMode {
                 }
                 CompareMode::Overlay => {
                     let dest = dest_in(view, self.center, self.zoom);
+                    publish(Slot::A, dest, view);
                     draw_tex(&painter, a, dest, view, Color32::WHITE);
                     draw_tex(&painter, b, dest, view, Color32::from_white_alpha(128));
                     self.pixel_probe(ui, dest, (dw, dh));
                 }
                 CompareMode::Checker => {
                     let dest = dest_in(view, self.center, self.zoom);
+                    publish(Slot::A, dest, view);
                     draw_tex(&painter, a, dest, view, Color32::WHITE);
                     let cell = 64.0;
                     let mut y = dest.min.y.max(view.min.y - cell) - ((dest.min.y.max(view.min.y - cell) - dest.min.y) % cell);
@@ -1133,6 +1147,7 @@ impl VideoMode {
                 }
                 CompareMode::Difference => {
                     let dest = dest_in(view, self.center, self.zoom);
+                    publish(Slot::A, dest, view);
                     self.update_diff(ui.ctx());
                     if let Some((_, t)) = &self.diff_tex {
                         let mut mesh = egui::Mesh::with_texture(t.id());
@@ -1205,6 +1220,35 @@ impl VideoMode {
         }
     }
 
+    /// What the Analysis panel works on: the displayed frame of A (and of
+    /// B), decoded at native resolution through `engine::frame_at` on Run.
+    pub fn analysis_subject(&self) -> crate::analysis_ui::Subject {
+        use crate::analysis_ui::{FrameInfo, Pixels, Subject, SubjectImage, SubjectKind};
+        let img = |s: &Source| {
+            let pts = s.pts();
+            SubjectImage {
+                path: s.path.clone(),
+                pixels: Pixels::VideoFrame { path: s.path.clone(), pts },
+                size: Some(s.display_size()),
+                frame: Some(FrameInfo { timestamp_s: pts, index: s.frame_of(pts) as u64 }),
+            }
+        };
+        let b = self.sources.get(1).map(img);
+        let kind = if b.is_some() { SubjectKind::VideoPair } else { SubjectKind::Video };
+        Subject { kind, a: self.sources.first().map(img), b }
+    }
+
+    /// Shows `r` (fractions 0..1 of the frame) in a pane of `pane` points.
+    pub fn zoom_to_region(&mut self, r: [f32; 4], pane: Vec2, ppp: f32) {
+        let Some(s) = self.sources.first() else { return };
+        let (w, h) = s.display_size();
+        let (w, h) = (w as f32, h as f32);
+        let (rw, rh) = (((r[2] - r[0]) * w).max(16.0), ((r[3] - r[1]) * h).max(16.0));
+        self.zoom = ((pane.x * ppp / rw).min(pane.y * ppp / rh) * 0.6).clamp(0.02, 8.0);
+        self.center = Vec2::new((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+        self.auto_fit = false;
+    }
+
     fn pixel_probe(&mut self, ui: &Ui, dest: Rect, (dw, dh): (u32, u32)) {
         self.pixel = None;
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -1270,6 +1314,40 @@ impl VideoMode {
 
     // ---------------------------------------------------------------- transport
 
+    /// The Analysis panel's Metrics tab: what it measures, the frame it
+    /// asks to show, and native planes of the paused frame while it is open.
+    fn metrics_hooks(&mut self, core: &mut Core) {
+        use crate::analysis_ui::metrics_view::{VideoSideCtx, VideoSubject};
+        let Some(a) = self.sources.first() else {
+            core.metrics.set_video(None);
+            return;
+        };
+        let side = |s: &Source| VideoSideCtx::new(&s.path, &s.info, &s.index, s.current.as_ref().and_then(|f| f.native.clone()));
+        let loop_ab = match self.loop_ab {
+            (Some(x), Some(y)) => Some((a.frame_of(x), a.frame_of(y))),
+            _ => None,
+        };
+        let current = a.current.as_ref().map(|f| a.frame_of(f.pts));
+        core.metrics.set_video(Some(VideoSubject { a: side(a), b: self.sources.get(1).map(side), offset: self.offset_frames, current, loop_ab }));
+        if let Some(f) = core.metrics.take_seek() {
+            let t = a.pts_of(f as usize);
+            self.pause();
+            self.seek_all(t, true);
+        }
+        // With B loaded both players already copy native planes.
+        if self.sources.len() != 1 {
+            self.metrics_native = false;
+        } else if core.metrics.visible() != self.metrics_native {
+            self.metrics_native = !self.metrics_native;
+            self.sources[0].player.send(Cmd::Native(self.metrics_native));
+            if self.metrics_native && !self.playing {
+                // Decode the paused frame again, now with its planes.
+                let t = self.sources[0].pts();
+                self.seek_all(t, true);
+            }
+        }
+    }
+
     fn transport(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
         if self.sources.is_empty() {
@@ -1277,6 +1355,13 @@ impl VideoMode {
             return;
         }
         self.timeline(ui, &p);
+        if core.metrics.has_plots() {
+            // Graphs of the Metrics tab's frame range, on the timeline's frame axis.
+            let a = &self.sources[0];
+            let cur = a.current.as_ref().map(|f| a.frame_of(f.pts) as u64);
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().id_salt("video-metric-plots").max_height(170.0).show(ui, |ui| core.metrics.video_plots(ui, &p, cur, 46.0));
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;

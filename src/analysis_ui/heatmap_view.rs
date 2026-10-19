@@ -115,12 +115,6 @@ impl HeatmapView {
         ColorizeOptions { colormap: self.colormap, range, invert, threshold: self.threshold_on.then_some(self.threshold), alpha: 255 }
     }
 
-    /// Value range the current options color.
-    pub fn value_range(&self) -> Option<(f32, f32)> {
-        let m = self.disp.as_ref()?;
-        Some(m.range(self.options().range))
-    }
-
     /// Colorized PNG of the full map with the current settings.
     pub fn export_png(&self, path: &std::path::Path) -> std::io::Result<()> {
         let m = self.full.as_ref().ok_or_else(|| std::io::Error::other("no heatmap"))?;
@@ -196,7 +190,7 @@ impl HeatmapView {
             _ => {}
         }
         lines.push(format!("x {}  y {}", ip.x.floor() as i64, ip.y.floor() as i64));
-        readout(ui, &painter, pos, &lines.join("\n"));
+        readout(ui, pos, &lines.join("\n"));
     }
 
     /// Colormap, range, opacity and threshold controls and the legend.
@@ -280,8 +274,10 @@ pub fn legend(ui: &mut Ui, p: &Palette, cm: Colormap, invert: bool, (lo, hi): (f
     });
 }
 
-/// A small text box next to the pointer.
-pub fn readout(ui: &Ui, painter: &Painter, pos: Pos2, text: &str) {
+/// A small text box beside the pointer, above everything (not clipped to
+/// the pane or plot it describes).
+pub fn readout(ui: &Ui, pos: Pos2, text: &str) {
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("analysis-readout")));
     let galley = painter.layout_no_wrap(text.to_string(), FontId::monospace(12.0), Color32::WHITE);
     let pad = Vec2::new(6.0, 4.0);
     let size = galley.size() + pad * 2.0;
@@ -294,7 +290,7 @@ pub fn readout(ui: &Ui, painter: &Painter, pos: Pos2, text: &str) {
         at.y = pos.y - 16.0 - size.y;
     }
     let r = Rect::from_min_size(at, size);
-    let painter = painter.with_clip_rect(screen);
+
     painter.rect_filled(r, 4.0, Color32::from_black_alpha(210));
     painter.galley(r.min + pad, galley, Color32::WHITE);
 }
@@ -335,7 +331,7 @@ mod tests {
         v.set_map("diff.abs", map(10, 10));
         v.range = RangeKind::Custom;
         v.user = (5.0, 50.0);
-        assert_eq!(v.value_range(), Some((5.0, 50.0)));
+        assert_eq!(v.options().range, RangeMode::User { lo: 5.0, hi: 50.0 });
         assert_eq!(fmt_value(1.23456, Some(lumen_analysis::Unit::DeltaE)), "1.2346 dE");
         assert_eq!(fmt_value(0.5, None), "0.5000");
     }
