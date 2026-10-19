@@ -541,10 +541,10 @@ mod tests {
     /// picked.
     #[test]
     fn apply_needs_a_change() {
-        for cmd in [Command::AdjustColors, Command::Resize, Command::CanvasSize, Command::FreeRotate, Command::Levels, Command::Curves, Command::Effects] {
+        for cmd in [Command::AdjustColors, Command::Resize, Command::CanvasSize, Command::FreeRotate, Command::Levels, Command::Curves, Command::Effects, Command::AddText] {
             assert!(!make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
         }
-        for cmd in [Command::Sharpen, Command::Blur, Command::AddBorder, Command::AddText, Command::Watermark] {
+        for cmd in [Command::Sharpen, Command::Blur, Command::AddBorder, Command::Watermark] {
             assert!(make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
         }
         let changed = AdjustColors { gamma: 1.2, ..Default::default() };

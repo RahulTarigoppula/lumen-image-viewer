@@ -365,7 +365,7 @@ fn stream_with_reasoning_usage_and_structured_report() {
     let src = report.findings[0].source.unwrap();
     assert_eq!(src.label, ImageLabel::A);
     assert!((src.x1 - 320.0).abs() < 1.0 && (src.y1 - 240.0).abs() < 1.0, "{src:?}");
-    assert!(report.to_markdown("Quality critique").contains("chroma noise top left"));
+    assert!(report.to_markdown("Quality critique", false).contains("chroma noise top left"));
     assert_eq!(r.sent.images.len(), 1);
 
     // The body vLLM received.

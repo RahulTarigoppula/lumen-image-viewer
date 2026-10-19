@@ -2004,6 +2004,8 @@ impl VideoMode {
     }
 
     fn timeline(&mut self, ui: &mut Ui, p: &Palette) {
+        // Tick to label: half the playhead's head (5 pt) plus a 4 pt gap.
+        const LABEL_GAP: f32 = 9.0;
         let h = 60.0;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
         let painter = ui.painter().with_clip_rect(rect);
@@ -2037,11 +2039,12 @@ impl VideoMode {
             let x = x_of(t).round() + 0.5;
             painter.line_segment([Pos2::new(x, rect.min.y + ruler_h - 5.0), Pos2::new(x, rect.min.y + ruler_h)], Stroke::new(1.0, p.faint));
             let g = painter.layout_no_wrap(fmt_tick(t, step, dur), label_font.clone(), p.faint);
-            // Labels start clear of the playhead's head resting on the tick
-            // (at 0:00 before playing); one that would run off the right
-            // edge is skipped.
-            if x + 7.0 + g.size().x <= rect.max.x - 2.0 {
-                painter.galley(Pos2::new(x + 7.0, rect.min.y + ruler_h / 2.0 - g.size().y / 2.0), g, p.faint);
+            // Labels start 4 pt clear of the playhead's 10 pt head resting on
+            // the tick (at 0:00 before playing); one that would run off the
+            // right edge is skipped.
+            let lx = x + LABEL_GAP;
+            if lx + g.size().x <= rect.max.x - 2.0 {
+                painter.galley(Pos2::new(lx, rect.min.y + ruler_h / 2.0 - g.size().y / 2.0), g, p.faint);
             }
         }
         painter.line_segment([Pos2::new(rect.min.x, base + 0.5), Pos2::new(rect.max.x, base + 0.5)], Stroke::new(1.0, p.border));

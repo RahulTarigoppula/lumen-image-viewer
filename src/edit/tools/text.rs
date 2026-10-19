@@ -84,7 +84,9 @@ pub struct AddText {
 impl Default for AddText {
     fn default() -> Self {
         AddText {
-            text: "Your text here".into(),
+            // Empty: the field shows "Your text here" as a placeholder and
+            // Apply stays off until something is typed.
+            text: String::new(),
             family: 0,
             bold: true,
             italic: false,
@@ -144,7 +146,7 @@ impl EditTool for AddText {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
-        c |= ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(3).desired_width(ui.available_width()).hint_text("Type your text...")).changed();
+        c |= ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(3).desired_width(ui.available_width()).hint_text("Your text here")).changed();
         ui.add_space(4.0);
         c |= combo(ui, "Font", "text-font", &mut self.family, &font_names());
         row(ui, "Style", |ui| {
@@ -404,7 +406,7 @@ pub mod tests {
     #[test]
     fn text_tool_draws_and_scales() {
         let full = RgbaImage::from_pixel(400, 300, image::Rgba([0, 0, 0, 255]));
-        let t = AddText { family: usize::MAX, size: 15.0, ..Default::default() };
+        let t = AddText { text: "Your text here".into(), family: usize::MAX, size: 15.0, ..Default::default() };
         let out = t.apply(&full, 1.0);
         let lit = out.pixels().filter(|p| p[0] > 128).count();
         assert!(lit > 100, "{lit}");
@@ -415,7 +417,10 @@ pub mod tests {
         assert!((0.15..0.35).contains(&ratio), "{ratio}");
         let empty = AddText { text: "  ".into(), ..Default::default() };
         assert_eq!(empty.apply(&full, 1.0), full);
-        let rot = AddText { angle: 30.0, bg: true, outline: true, ..Default::default() };
+        // The default text is empty: nothing to draw, so Apply stays off.
+        assert_eq!(AddText::default().apply(&full, 1.0), full);
+        assert!(!AddText::default().can_apply());
+        let rot = AddText { text: "Your text here".into(), angle: 30.0, bg: true, outline: true, ..Default::default() };
         assert_eq!(rot.apply(&full, 1.0).dimensions(), (400, 300));
     }
 

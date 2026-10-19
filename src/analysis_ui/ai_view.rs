@@ -478,7 +478,7 @@ impl AiView {
         let bytes: usize = res.sent.images.iter().map(|i| i.bytes).sum();
         foot.push(format!("{} image(s), {}", res.sent.images.len(), fmt_bytes(bytes)));
         let foot_l = ui.add(egui::Label::new(RichText::new(foot.join("  |  ")).size(10.5).color(p.faint)).wrap());
-        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({} × {}, {} {})", i.description, i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
+        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({} × {}, {} {})", shown_text(&i.description, rec.dims[1].is_some()), i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
         foot_l.on_hover_text(format!("Sent to {}:\n{}", res.sent.destination, sent.join("\n")));
         for c in &res.sent.changes {
             ui.label(RichText::new(c).size(10.5).color(p.faint));
@@ -760,10 +760,34 @@ pub fn fmt_bytes(b: usize) -> String {
     }
 }
 
+/// Text written for the model, as the UI shows it: sizes with the
+/// multiplication sign ("1536x864" becomes "1536 × 864") and, for a single
+/// image (`pair` false), no "A" label ("A full view" becomes "Full view").
+pub fn shown_text(s: &str, pair: bool) -> String {
+    let s = match s.strip_prefix("A ") {
+        Some(rest) if !pair => {
+            let mut c = rest.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        }
+        _ => s.to_string(),
+    };
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 8);
+    for (i, ch) in s.char_indices() {
+        if ch == 'x' && i > 0 && b[i - 1].is_ascii_digit() && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            // No-break spaces: a size never wraps inside.
+            out.push_str("\u{a0}×\u{a0}");
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// "Copy as Markdown": the report (or free-form answer) and where it came from.
 pub fn markdown(rec: &RunRecord, res: &RunResult) -> String {
     let mut md = match &res.report {
-        Some(Ok(r)) => r.to_markdown(&res.preset_name),
+        Some(Ok(r)) => r.to_markdown(&res.preset_name, rec.dims[1].is_some()),
         _ => match &res.quick_score {
             Some(Ok(q)) => format!("## {}: MOS {:.2} (score {:.3})\n", res.preset_name, q.mos(), q.score),
             _ => format!("## {}\n\n{}\n", res.preset_name, res.text.trim()),
@@ -778,6 +802,17 @@ pub fn markdown(rec: &RunRecord, res: &RunResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_text_uses_the_times_sign_and_drops_a_for_one_image() {
+        let t = |s: &str, pair: bool| shown_text(s, pair).replace('\u{a0}', " ");
+        assert_eq!(t("A full view, 1536x864, downscaled 1.25x from 1920x1080", false), "Full view, 1536 × 864, downscaled 1.25x from 1920 × 1080");
+        assert_eq!(t("A full view, 1536x1152, native resolution", true), "A full view, 1536 × 1152, native resolution");
+        assert_eq!(t("B ROI tile 1/4: source pixels x=10..20, y=0..5 of 800x600", true), "B ROI tile 1/4: source pixels x=10..20, y=0..5 of 800 × 600");
+        assert_eq!(t("A is 1920x1080 and B is 1280x720: resampled", true), "A is 1920 × 1080 and B is 1280 × 720: resampled");
+        // A size never wraps inside.
+        assert_eq!(shown_text("800x600", false), "800\u{a0}×\u{a0}600");
+    }
 
     #[test]
     fn preset_lists_fit_the_view() {

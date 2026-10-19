@@ -368,6 +368,9 @@ struct Pane {
 
 // ---------------------------------------------------------------- culling
 
+/// The per-pane culling button (shown on hover, in the caption row).
+const KEEP_TEXT: &str = "Keep, reject others";
+
 /// Between the parts of a pane caption (name, size, file size, zoom).
 const CAPTION_SEP: &str = "  ·  ";
 
@@ -1211,14 +1214,17 @@ impl Compare {
                 self.placeholder(ui, core, i, rect);
             }
             self.view_input(ui, core, &resp, i, rects, ppp);
-            // Caption pill.
+            // Caption pill; while the pointer is on the pane it makes room in
+            // its row for "Keep, reject others" (and the remove button).
             let text = self.caption_text(i, zoom);
-            Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))), rect.width() - 20.0);
+            let reserve = if self.panes.len() > 2 { 34.0 } else { 0.0 };
+            let keep = if self.shows_keep(i, rect) { Self::keep_size(ui).x + 8.0 } else { 0.0 };
+            let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))), rect.width() - 20.0 - reserve - keep);
             if self.show_hist {
                 let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
                 self.paint_hist(ui, core, i, hr);
             }
-            self.pane_overlays(ui, core, i, rect);
+            self.pane_overlays(ui, core, i, rect, caption, reserve);
             if self.panes.len() > 2 {
                 let br = Rect::from_min_size(Pos2::new(rect.max.x - 34.0, rect.min.y + 8.0), Vec2::splat(26.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
@@ -1251,9 +1257,22 @@ impl Compare {
         }
     }
 
+    /// "Keep, reject others" shows on the pane under the pointer only.
+    fn shows_keep(&self, i: usize, rect: Rect) -> bool {
+        self.hover_pane == Some(i) && self.panes.len() >= 2 && rect.width() > 260.0 && !self.popup_open
+    }
+
+    /// Size of the "Keep, reject others" button.
+    fn keep_size(ui: &Ui) -> Vec2 {
+        let g = ui.painter().layout_no_wrap(KEEP_TEXT.into(), FontId::proportional(12.5), Color32::WHITE);
+        Vec2::new(12.0 + size::ICON + 6.0 + g.size().x + 12.0, size::CONTROL)
+    }
+
     /// Culling overlays for pane `i` drawn inside `rect`: reject frame, rating /
-    /// flag / reject status, the optional EXIF strip and the "Keep" button.
-    fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect) {
+    /// flag / reject status, the optional EXIF strip and the "Keep" button in
+    /// the caption row (`caption` is the caption pill, `reserve` the points
+    /// kept free at the row's right end for the remove button).
+    fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect, caption: Rect, reserve: f32) {
         if i >= self.panes.len() || !rect.is_positive() {
             return;
         }
@@ -1310,25 +1329,29 @@ impl Compare {
                 x += gw + 14.0;
             }
         }
-        // "Keep, reject others" only on the pane under the pointer: a neutral pill,
-        // so it never competes with the image (the toolbar's Keep is the filled one).
-        if self.hover_pane == Some(i) && self.panes.len() >= 2 && rect.width() > 260.0 && !self.popup_open {
+        // "Keep, reject others" only on the pane under the pointer: a neutral
+        // pill in the caption row, so it never covers the image or competes
+        // with it (the toolbar's Keep is the filled one). It goes at the row's
+        // right end, or left of a caption that is there (Split's B).
+        if self.shows_keep(i, rect) {
             let p = core.pal;
-            let font = FontId::proportional(12.5);
-            let g = ui.painter().layout_no_wrap("Keep, reject others".into(), font, p.text);
-            let size = Vec2::new(12.0 + size::ICON + 6.0 + g.size().x + 12.0, size::CONTROL);
-            let top = rect.min.y + 42.0; // below the caption pill and the remove button
-            let br = Rect::from_min_size(Pos2::new(rect.max.x - size.x - 10.0, top), size);
-            let resp = ui.interact(br, ui.scope_id().with(("cmp-keep", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            let painter = ui.painter().with_clip_rect(rect);
-            let r = CornerRadius::same((size::CONTROL / 2.0) as u8);
-            painter.add(theme::popover_shadow(&p).as_shape(br, r));
-            painter.rect(br, r, if resp.hovered() { theme::mix(p.raised, p.text, 0.08) } else { p.overlay }, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-            painter.text(Pos2::new(br.min.x + 12.0 + size::ICON / 2.0, br.center().y), Align2::CENTER_CENTER, I::CHECK_CIRCLE, FontId::proportional(size::ICON), p.ok);
-            painter.galley(Pos2::new(br.min.x + 12.0 + size::ICON + 6.0, br.center().y - g.size().y / 2.0), g, p.text);
-            if resp.on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
-                self.selected = i;
-                self.keep_only(core, i);
+            let size = Self::keep_size(ui);
+            let gap = 8.0;
+            let clear = |x: f32| x >= rect.min.x + 10.0 && (x + size.x + gap <= caption.min.x || x >= caption.max.x + gap);
+            let x = [rect.max.x - 10.0 - reserve - size.x, caption.min.x - gap - size.x].into_iter().find(|&x| clear(x));
+            if let Some(x) = x {
+                let br = Rect::from_min_size(Pos2::new(x, caption.center().y - size.y / 2.0), size);
+                let resp = ui.interact(br, ui.scope_id().with(("cmp-keep", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                let painter = ui.painter().with_clip_rect(rect);
+                let r = CornerRadius::same((size::CONTROL / 2.0) as u8);
+                painter.rect(br, r, if resp.hovered() { theme::mix(p.raised, p.text, 0.08) } else { p.overlay }, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+                painter.text(Pos2::new(br.min.x + 12.0 + size::ICON / 2.0, br.center().y), Align2::CENTER_CENTER, I::CHECK_CIRCLE, FontId::proportional(size::ICON), p.ok);
+                let g = painter.layout_no_wrap(KEEP_TEXT.into(), FontId::proportional(12.5), p.text);
+                painter.galley(Pos2::new(br.min.x + 12.0 + size::ICON + 6.0, br.center().y - g.size().y / 2.0), g, p.text);
+                if resp.on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
+                    self.selected = i;
+                    self.keep_only(core, i);
+                }
             }
         }
     }
@@ -1388,16 +1411,16 @@ impl Compare {
                 let tb = self.caption_text(1, zb);
                 // Each caption keeps to its half, wherever the divider is.
                 let half = (area.width() - 30.0) / 2.0;
-                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))), half);
-                Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))), half);
+                let cap_a = Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))), half);
+                let cap_b = Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))), half);
                 if self.show_hist {
                     let ha = if self.show_exif { Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 30.0)) } else { area };
                     self.paint_hist(ui, core, 1, ha);
                     let left_hist = Rect::from_min_max(ha.min, Pos2::new(ha.min.x + 240.0, ha.max.y));
                     self.paint_hist(ui, core, 0, left_hist);
                 }
-                self.pane_overlays(ui, core, 0, left);
-                self.pane_overlays(ui, core, 1, right);
+                self.pane_overlays(ui, core, 0, left, cap_a, 0.0);
+                self.pane_overlays(ui, core, 1, right, cap_b, 0.0);
                 if !hresp.dragged() {
                     self.view_input(ui, core, &resp, 0, rects, ppp);
                 }
@@ -1418,13 +1441,14 @@ impl Compare {
                     self.placeholder(ui, core, i, area);
                 }
                 let t = self.caption_text(i, z);
-                Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))), area.width() - 20.0);
+                let keep = if self.shows_keep(i, area) { Self::keep_size(ui).x + 8.0 } else { 0.0 };
+                let caption = Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))), area.width() - 20.0 - keep);
                 let hint = if self.flicker_auto { format!("Auto flicker every {:.1} s", self.flicker_secs) } else { "Tab / Space to switch".to_string() };
                 Self::pill(ui, Pos2::new(area.center().x, area.max.y - if self.show_exif { 40.0 } else { 14.0 }), Align2::CENTER_BOTTOM, &hint, None, area.width() - 20.0);
                 if self.show_hist {
                     self.paint_hist(ui, core, i, area);
                 }
-                self.pane_overlays(ui, core, i, area);
+                self.pane_overlays(ui, core, i, area, caption, 0.0);
                 self.view_input(ui, core, &resp, i, rects, ppp);
             }
             CmpMode::Difference => {

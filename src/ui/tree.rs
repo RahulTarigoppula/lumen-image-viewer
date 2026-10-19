@@ -50,6 +50,8 @@ pub struct FolderTree {
     indent: f32,
     /// Path tooltips this frame: off while a window is open (they would draw on top of it).
     tips: bool,
+    /// Settings > Show hidden files: list hidden folders, dot-folders and AppData.
+    show_hidden: bool,
 }
 
 const ROW_H: f32 = 26.0;
@@ -72,7 +74,18 @@ enum Row {
     Item { path: PathBuf, name: String, icon: &'static str, depth: usize, expandable: bool, favorite: bool },
 }
 
-fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
+/// Hidden (0x2) and system (0x4) attributes: Show hidden files lists hidden
+/// folders, never protected ones that are both, as Explorer does.
+#[cfg(windows)]
+fn skip_attrs(attrs: u32, show_hidden: bool) -> bool {
+    if show_hidden {
+        attrs & 0x6 == 0x6
+    } else {
+        attrs & 0x6 != 0
+    }
+}
+
+fn list_subdirs(dir: &Path, show_hidden: bool) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
@@ -83,7 +96,7 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
                     use std::os::windows::fs::MetadataExt;
                     // Check the link itself first: legacy junctions such as
                     // "Application Data" or "My Documents" are hidden+system.
-                    if m.file_attributes() & 0x6 != 0 {
+                    if skip_attrs(m.file_attributes(), show_hidden) {
                         return false;
                     }
                 }
@@ -101,11 +114,13 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
                 {
                     use std::os::windows::fs::MetadataExt;
                     // Skip hidden + system folders ($Recycle.Bin, System Volume Information, ...)
-                    if m.file_attributes() & 0x6 != 0 {
+                    if skip_attrs(m.file_attributes(), show_hidden) {
                         return false;
                     }
                 }
-                !e.file_name().to_string_lossy().starts_with('.')
+                // Dot-folders (.cargo, .vscode) and the profile's AppData are
+                // hidden too, as in Explorer, unless Show hidden files is on.
+                show_hidden || !(e.file_name().to_string_lossy().starts_with('.') || crate::catalog::is_profile_noise(&e.path()))
             })
             .map(|e| e.path())
             .collect(),
@@ -161,8 +176,9 @@ impl FolderTree {
         let tx = self.chan.get_or_insert_with(crossbeam_channel::unbounded).0.clone();
         let d = dir.to_path_buf();
         let c = ctx.clone();
+        let show_hidden = self.show_hidden;
         std::thread::spawn(move || {
-            let kids = list_subdirs(&d);
+            let kids = list_subdirs(&d, show_hidden);
             let _ = tx.send((d, kids));
             c.request_repaint();
         });
@@ -213,6 +229,14 @@ impl FolderTree {
         if self.children.contains_key(dir) {
             self.stale.insert(dir.to_path_buf());
             self.rows_dirty = true;
+        }
+    }
+
+    /// Follow Settings > Show hidden files: a change lists the folders again.
+    pub fn set_show_hidden(&mut self, on: bool) {
+        if self.show_hidden != on {
+            self.show_hidden = on;
+            self.refresh();
         }
     }
 
