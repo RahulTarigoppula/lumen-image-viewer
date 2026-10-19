@@ -47,6 +47,9 @@ enum Drag {
     Create([f32; 2]),
     Move([f32; 2], DrawObj),
     Handle(usize, DrawObj),
+    /// Dragging out a new bubble: the tail points at the press, the bubble
+    /// follows the pointer.
+    Callout([f32; 2], DrawObj),
 }
 
 #[derive(Clone)]
@@ -202,7 +205,7 @@ impl DrawBoard {
             _ => "Color",
         };
         ui.horizontal(|ui| {
-            ui.add_sized([super::LABEL_W, 18.0], egui::Label::new(color_label));
+            super::row_label(ui, color_label);
             color_button(ui, &mut st.color, false);
             ui.spacing_mut().item_spacing.x = 3.0;
             for s in SWATCHES {
@@ -227,7 +230,7 @@ impl DrawBoard {
         }
         if kind.has_fill() {
             ui.horizontal(|ui| {
-                ui.add_sized([super::LABEL_W, 18.0], egui::Label::new("Fill"));
+                super::row_label(ui, "Fill");
                 let mut on = st.fill.is_some();
                 if ui.checkbox(&mut on, "").changed() {
                     st.fill = if on { Some(if kind == Kind::Text { [255, 255, 255, 255] } else { [st.color[0], st.color[1], st.color[2], 90] }) } else { None };
@@ -262,7 +265,7 @@ impl DrawBoard {
                 }
                 slider_ex(ui, "Text size", &mut st.font_px, 6.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
                 ui.horizontal(|ui| {
-                    ui.add_sized([super::LABEL_W, 18.0], egui::Label::new("Text color"));
+                    super::row_label(ui, "Text color");
                     color_button(ui, &mut st.text_color, false);
                     if ui.selectable_label(st.bold, egui::RichText::new(I::TEXT_B).size(15.0)).on_hover_text("Bold").clicked() {
                         st.bold = !st.bold;
@@ -272,7 +275,7 @@ impl DrawBoard {
             Kind::Number => {
                 slider_ex(ui, "Size", &mut st.font_px, 8.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
                 ui.horizontal(|ui| {
-                    ui.add_sized([super::LABEL_W, 18.0], egui::Label::new("Number"));
+                    super::row_label(ui, "Number");
                     color_button(ui, &mut st.text_color, false);
                     if let Some(i) = sel {
                         let _ = i;
@@ -321,6 +324,21 @@ impl DrawBoard {
         let hidden = if self.drag.is_some() { self.selected } else { None };
         self.objs.iter().enumerate().filter(|(i, _)| Some(*i) != hidden).map(|(_, o)| o).collect()
     }
+}
+
+/// Put a bubble's tail tip at `tip` and centre the bubble on `at`.
+fn place_callout(o: &mut DrawObj, tip: [f32; 2], at: [f32; 2]) {
+    if o.pts.len() < 3 {
+        return;
+    }
+    let (a, b) = (o.pts[0], o.pts[1]);
+    let c = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let (dx, dy) = (at[0] - c[0], at[1] - c[1]);
+    for p in &mut o.pts[..2] {
+        p[0] += dx;
+        p[1] += dy;
+    }
+    o.pts[2] = tip;
 }
 
 fn snap_angle(a: [f32; 2], p: [f32; 2]) -> [f32; 2] {
@@ -478,7 +496,7 @@ impl EditTool for DrawBoard {
         ui.add_space(4.0);
         let hint = match self.tool {
             None => "Click an object to select it; drag to move, drag handles to reshape. Del deletes.",
-            Some(Kind::Text) => "Click where the text goes, then type in the box above. Drag the tail handle to point the bubble.",
+            Some(Kind::Text) => "Click where the text goes, or drag from the spot a bubble should point at. Type in the box above; drag the tail handle to re-aim it.",
             Some(Kind::Number) => "Click to drop numbered markers; the number counts up.",
             Some(Kind::Pen) | Some(Kind::Highlighter) => "Drag to draw freehand.",
             Some(_) => "Drag on the image to draw. Shift snaps angles / keeps squares and circles.",
@@ -562,9 +580,11 @@ impl EditTool for DrawBoard {
                         }
                         self.objs.push(o);
                         self.selected = Some(self.objs.len() - 1);
-                        if pt.drag_started && matches!(kind, Kind::Text | Kind::Number) {
+                        let i = self.objs.len() - 1;
+                        if pt.drag_started && kind == Kind::Text && self.objs[i].callout == CALLOUT_BUBBLE {
+                            self.drag = Some(Drag::Callout(p, self.objs[i].clone()));
+                        } else if pt.drag_started && matches!(kind, Kind::Text | Kind::Number) {
                             // Dragging right after dropping one moves it.
-                            let i = self.objs.len() - 1;
                             self.drag = Some(Drag::Move(start, self.objs[i].clone()));
                         } else if pt.drag_started {
                             self.drag = Some(Drag::Create(p));
@@ -599,6 +619,13 @@ impl EditTool for DrawBoard {
                         }
                         Drag::Handle(k, orig) => {
                             Self::set_handle(o, &orig, k, p, pt.shift);
+                        }
+                        Drag::Callout(start, orig) => {
+                            *o = orig.clone();
+                            // A short drag is a click: keep the default tail.
+                            if canvas::dist(start, p) >= cx.screen_to_px(8.0) {
+                                place_callout(o, start, cx.clamp_to_image(p));
+                            }
                         }
                     }
                 }
@@ -717,5 +744,18 @@ mod tests {
         DrawBoard::set_handle(&mut l, &line, 1, [10.0, 9.0], true);
         assert!((l.pts[1][0] - l.pts[1][1]).abs() < 1e-3, "snapped to 45 degrees");
         assert_eq!(snap_angle([0.0, 0.0], [10.0, 1.0])[1].round(), 0.0);
+    }
+
+    #[test]
+    fn dragged_callout_points_at_the_press() {
+        let mut o = DrawObj { kind: Kind::Text, callout: CALLOUT_BUBBLE, pts: vec![[100.0, 100.0]], text: "Hi".into(), font_px: 20.0, ..Default::default() };
+        o.fit_text_box();
+        let size = [o.pts[1][0] - o.pts[0][0], o.pts[1][1] - o.pts[0][1]];
+        place_callout(&mut o, [100.0, 100.0], [300.0, 50.0]);
+        assert_eq!(o.pts[2], [100.0, 100.0], "tail tip at the drag start");
+        let c = [(o.pts[0][0] + o.pts[1][0]) / 2.0, (o.pts[0][1] + o.pts[1][1]) / 2.0];
+        assert!(canvas::dist(c, [300.0, 50.0]) < 1e-3, "bubble centred on the drag end: {c:?}");
+        let now = [o.pts[1][0] - o.pts[0][0], o.pts[1][1] - o.pts[0][1]];
+        assert!(canvas::dist(now, size) < 1e-3, "bubble keeps its size: {now:?} vs {size:?}");
     }
 }

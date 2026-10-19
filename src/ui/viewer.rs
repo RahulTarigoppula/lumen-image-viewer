@@ -307,6 +307,10 @@ pub struct Viewer {
     /// The action waiting for the discard prompt (`confirm_discard`).
     pending: Option<Pending>,
     pub confirm_discard: bool,
+    /// A text field had keyboard focus when the tool panels were last drawn.
+    /// egui drops focus on Esc before this frame's widgets run, so the Esc
+    /// that only leaves a field must not also cancel the tool.
+    text_was_focused: bool,
     hist_cache: crate::bg::BgSlot<(PathBuf, u64, usize), Histogram>,
     exif_cache: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
     /// (size, mtime) per file so thumbnail lookups never stat() every frame.
@@ -352,6 +356,7 @@ impl Viewer {
             last_view_rect: Rect::NOTHING,
             pending: None,
             confirm_discard: false,
+            text_was_focused: false,
             hist_cache: Default::default(),
             exif_cache: Default::default(),
             stat_cache: Default::default(),
@@ -582,8 +587,12 @@ impl Viewer {
     pub fn apply_simple(&mut self, core: &Core, what: &str, f: impl FnOnce(&RgbaImage) -> RgbaImage) -> bool {
         let Some(sess) = self.ensure_edit(core) else { return false };
         let out = f(&sess.current);
+        let resized = out.dimensions() != sess.current.dimensions();
         sess.push(out, what);
-        self.auto_fit = self.auto_fit.or(Some(FitMode::FitLarge));
+        // Same size (flip, auto enhance): keep the zoom and position.
+        if resized {
+            self.refit_on_size = Some((self.view_img, self.auto_fit.unwrap_or(FitMode::FitLarge)));
+        }
         true
     }
 
@@ -772,6 +781,7 @@ impl Viewer {
                 .frame(egui::Frame::NONE.fill(p.panel.gamma_multiply(0.96)).inner_margin(egui::Margin::symmetric(6, 6)))
                 .show(ui, |ui| self.filmstrip(ui, core));
         }
+        self.text_was_focused = ui.ctx().text_edit_focused();
 
         let view = ui.available_rect_before_wrap();
         self.last_view_rect = view;
@@ -1402,6 +1412,9 @@ impl Viewer {
     /// Compact vertical list of edit commands for the left pop-out panel.
     fn edge_tool_menu(&mut self, ui: &mut Ui, ev: &mut Vec<ViewerEvent>) {
         let dirty = self.is_dirty();
+        // A solid bar takes its own column when the window is too short for
+        // the whole menu; a floating one would cover the shortcut column.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical().id_salt("edge-tools").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.label(RichText::new("Edit").font(super::theme::semibold(13.0)));
@@ -1725,9 +1738,9 @@ impl Viewer {
     fn tool_panel(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
         // Esc / Enter belong to the panel only if no text field had them as
-        // the frame began (Esc in a text box just leaves the box), and not
-        // while the discard prompt shows.
-        let keys = keyboard_free(ui) && !self.confirm_discard;
+        // the frame began (Esc in a text box just leaves the box, keeping the
+        // text), and not while the discard prompt shows.
+        let keys = keyboard_free(ui) && !self.text_was_focused && !self.confirm_discard;
         let Some(t) = &mut self.tool else { return };
         // The preview base is prepared in the background (resize + histogram).
         if let Some(rx) = &t.base_rx {
@@ -1880,11 +1893,16 @@ impl Viewer {
                 Ok(img) => {
                     let title = t.tool.title();
                     self.tool = None;
+                    let mut resized = false;
                     if let Some(sess) = self.ensure_edit(core) {
+                        resized = img.dimensions() != sess.current.dimensions();
                         sess.push(img, &title);
                     }
-                    self.auto_fit = Some(core.settings.fit_mode);
-                    self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
+                    // Keep the zoom and position unless the size changed; then
+                    // fit the new size once it shows.
+                    if resized {
+                        self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
+                    }
                     core.toasts.success(format!("{title} applied - Ctrl+Z to undo, Ctrl+S to save"));
                     return;
                 }
@@ -1908,7 +1926,7 @@ impl Viewer {
         let (iw, ih) = (img.width() as f32, img.height() as f32);
         // Esc / Enter belong to the panel only if no number field had them as
         // the frame began, and not while the discard prompt shows.
-        let keys = keyboard_free(ui) && !self.confirm_discard;
+        let keys = keyboard_free(ui) && !self.text_was_focused && !self.confirm_discard;
         let Some(c) = &mut self.crop else { return };
         ui.label(RichText::new("Crop").font(super::theme::semibold(16.0)));
         ui.add_space(8.0);
@@ -2173,7 +2191,7 @@ impl Viewer {
                 Some(title) => {
                     ui.heading("Discard changes?");
                     ui.add_space(6.0);
-                    ui.label(format!("Your {} changes are not applied yet.", title.to_lowercase()));
+                    ui.label(format!("{title}: changes not applied yet."));
                     ui.add_space(12.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new("Discard").color(Color32::WHITE)).fill(p.accent)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
