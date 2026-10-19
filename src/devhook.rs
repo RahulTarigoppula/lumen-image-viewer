@@ -5,6 +5,7 @@
 //!   run <Command>        run a command by its debug name, e.g. `run NextImage`
 //!   open <path>          open a file or folder
 //!   state                append the app state to state.txt
+//!   ai <args>            drive the Analysis panel's AI tab (see `analysis_ui::dev`)
 //! and writes `done.txt` when the batch has been processed.
 
 use std::path::PathBuf;
@@ -64,6 +65,8 @@ pub struct DevHook {
 
 pub enum DevAction {
     Run(String),
+    /// `ai ...` lines for the Analysis panel.
+    Analysis(String),
     Open(PathBuf),
     State,
 }
@@ -145,6 +148,7 @@ impl DevHook {
                 "run" => out.push(DevAction::Run(arg.to_string())),
                 "open" => out.push(DevAction::Open(PathBuf::from(arg))),
                 "state" => out.push(DevAction::State),
+                "ai" => out.push(DevAction::Analysis(arg.to_string())),
                 "bench" => {
                     self.bench_left = arg.parse().unwrap_or(60);
                     if let Ok(mut v) = PROF.lock() {

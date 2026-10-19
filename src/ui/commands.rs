@@ -115,6 +115,14 @@ pub enum Command {
     RedEye,
     BlurRegion,
     Selection,
+    // Analysis (viewer, compare and video modes)
+    /// Show or hide the Analysis panel.
+    ToggleAnalysis,
+    /// Run the selected local metrics.
+    RunMetrics,
+    /// Start a remote AI analysis (feature `ai`).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    RunAi,
 }
 
 use Command::*;
@@ -230,6 +238,9 @@ impl Command {
             RedEye => "Red-eye removal...".into(),
             BlurRegion => "Blur / pixelate region...".into(),
             Selection => "Selection...".into(),
+            ToggleAnalysis => "Toggle analysis panel".into(),
+            RunMetrics => "Run analysis metrics".into(),
+            RunAi => "Run AI analysis".into(),
         }
     }
 
@@ -347,6 +358,9 @@ impl Command {
             RedEye => I::EYE,
             BlurRegion => I::DOTS_NINE,
             Selection => I::SELECTION,
+            ToggleAnalysis => I::CHART_LINE,
+            RunMetrics => I::GAUGE,
+            RunAi => I::SPARKLE,
         }
     }
 
@@ -376,8 +390,11 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, Exit,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics,
         ]);
+        #[cfg(feature = "ai")]
+        v.push(RunAi);
+        v.push(Exit);
         for n in 0..=5 {
             v.push(Rate(n));
         }
@@ -408,6 +425,9 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
+        v.extend([ToggleAnalysis, RunMetrics]);
+        #[cfg(feature = "ai")]
+        v.push(RunAi);
         v
     }
 

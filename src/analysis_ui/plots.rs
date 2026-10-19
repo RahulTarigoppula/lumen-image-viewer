@@ -96,13 +96,6 @@ impl Series {
         s
     }
 
-    /// First and last frame with a value.
-    pub fn frame_span(&self) -> Option<(u64, u64)> {
-        let lo = self.data.iter().filter_map(|d| d.first()).map(|p| p.0).min()?;
-        let hi = self.data.iter().filter_map(|d| d.last()).map(|p| p.0).max()?;
-        Some((lo, hi))
-    }
-
     /// Metric families in column order. A family plots the columns that share
     /// its headline (first) column's unit, so PSNR shows Y, U, V and the
     /// average but not the MSE columns.
@@ -311,13 +304,15 @@ impl Plots {
         };
         let inner = rect.shrink2(Vec2::new(4.0, 6.0));
         let to_y = |v: f64| inner.max.y - ((v - lo) / (hi - lo).max(1e-12)) as f32 * inner.height();
-        // Grid: min, middle, max.
-        for (k, v) in [hi, (lo + hi) / 2.0, lo].into_iter().enumerate() {
-            let y = to_y(v);
-            if k == 1 {
-                painter.line_segment([Pos2::new(inner.min.x, y), Pos2::new(inner.max.x, y)], Stroke::new(1.0, p.border));
-            }
-            painter.text(Pos2::new(inner.min.x + 2.0, y), if k == 0 { egui::Align2::LEFT_TOP } else if k == 2 { egui::Align2::LEFT_BOTTOM } else { egui::Align2::LEFT_CENTER }, fmt_axis(v, fam.unit), FontId::proportional(10.0), p.faint);
+        // Grid: a middle line; max and min labels in the corners (the middle
+        // value too when the plot is tall enough).
+        let mid = (lo + hi) / 2.0;
+        painter.line_segment([Pos2::new(inner.min.x, to_y(mid)), Pos2::new(inner.max.x, to_y(mid))], Stroke::new(1.0, p.border));
+        let font = FontId::proportional(10.0);
+        painter.text(Pos2::new(inner.min.x + 2.0, rect.min.y + 1.0), egui::Align2::LEFT_TOP, fmt_axis(hi, fam.unit), font.clone(), p.faint);
+        painter.text(Pos2::new(inner.min.x + 2.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, fmt_axis(lo, fam.unit), font.clone(), p.faint);
+        if inner.height() >= 60.0 {
+            painter.text(Pos2::new(inner.min.x + 2.0, to_y(mid)), egui::Align2::LEFT_CENTER, fmt_axis(mid, fam.unit), font, p.faint);
         }
         // Selection being dragged.
         if let Some((f, start)) = &self.drag {
@@ -375,7 +370,7 @@ impl Plots {
                     lines.push(format!("{} {}{at}", s.cols[i].key, fmt_axis(v, s.cols[i].unit)));
                 }
             }
-            super::heatmap_view::readout(ui, ui.painter(), pos, &lines.join("\n"));
+            super::heatmap_view::readout(ui, pos, &lines.join("\n"));
         }
         // Click seeks; a drag selects a new range.
         if resp.drag_started() {
@@ -457,7 +452,7 @@ impl Plots {
     /// Frames listed by [`Plots::worst_ui`].
     pub fn worst_frames(&self, s: &Series) -> Vec<u64> {
         let key = self.rank_key.clone().or_else(|| s.default_rank_key()).unwrap_or_default();
-        s.worst(&key, self.worst_n.max(1)).into_iter().map(|w| w.0).collect()
+        s.worst(&key, if self.worst_n == 0 { 8 } else { self.worst_n }).into_iter().map(|w| w.0).collect()
     }
 }
 
@@ -495,7 +490,6 @@ mod tests {
         // MSE is a different unit and is left out of the PSNR plot.
         assert_eq!(f[0].cols.iter().map(|&i| s.cols[i].key.as_str()).collect::<Vec<_>>(), vec!["psnr.y", "psnr.avg"]);
         assert_eq!(metric_of("temporal.freeze.duplicate_b"), "temporal.freeze");
-        assert_eq!(s.frame_span(), Some((0, 6)));
     }
 
     #[test]

@@ -18,6 +18,8 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 - **Live, full-size editing.** Adjustments preview on the real image, hold to compare with the original, unlimited undo. Nothing is modal.
 - **Safe by default.** Lossless JPEG rotation, atomic saves that never corrupt originals, unsaved-edit guards, Recycle Bin deletes, undo for move and rename.
 - **Video mode.** Frame-accurate stepping, A/B comparison (side by side, wipe, flicker, difference, overlay, checkerboard), PSNR/SSIM per frame and whole-file analysis with CSV export, an I/P/B frame-size timeline, scopes (waveform, RGB parade, vectorscope, histogram) and full media info.
+- **Quality analysis.** Objective metrics for images, compare pairs and video ranges: PSNR, SSIM and MS-SSIM, CIEDE2000, SSIMULACRA2, butteraugli and FLIP with heatmaps, plus no-reference sharpness, noise, exposure, color cast, blockiness and banding. Works on a whole image, a region or a frame range, and exports CSV and JSON.
+- **Optional AI critique on your own server.** Point Lumen at your vLLM (or any OpenAI-compatible) server by IP, pick the model (Qwen and other vision models), pick a mode and run. Off by default, local network only by default, and you see exactly what is sent.
 - **Private.** Ratings, flags and labels live in a local file, never written into your photos and never uploaded.
 
 ## Features
@@ -31,6 +33,8 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 **Tools**: batch convert and resize with an ordered pipeline and presets, batch rename with tokens, preview and undo, contact sheets, duplicate and similar-image finder, compare 2-4 images with synced zoom (split, flicker, difference), slideshow with GPU transitions and Ken Burns, multi-page PDF/TIFF/GIF creation, image strips, ZIP archives, metadata tools (JPEG comments, strip metadata, change dates, XMP sidecars), set as wallpaper, print with layouts, command palette (Ctrl+K) for every command.
 
 **Video**: play with audio (A/V synced), `,` and `.` frame stepping in both directions, go to frame or time (G), A-B loop, speed control, compare two encodes with a frame offset, PSNR-Y/U/V and SSIM, whole-file analysis with worst-frame list, scopes, native-resolution snapshots.
+
+**Analysis** (Ctrl+Q): metric presets (Quick, Encode QA, Photo technical), region of interest (R), heatmap overlays with colormaps and thresholds, per-frame graphs and worst frames for video, history per file, CSV, JSON, PNG and TIFF export. AI tab: quality critique, A vs B comparison, encode review, photo technical review, video frame review, free-form questions and a quick score, with findings drawn on the image.
 
 **Keyboard**: every shortcut is remappable (Settings, Keyboard), with a FastStone-compatible preset.
 
@@ -46,6 +50,7 @@ Press **F1** in the app for the full list, or **Ctrl+K** to search every command
 | Rate / flag | 0-5 / Space or Q | 0-5 / Q or `` ` `` | - |
 | Edit | - | X crop, Ctrl+E colors, Ctrl+R resize, L/R rotate, T draw board | - |
 | Compare | P | P | S W D O C Tab, X swap, +/- offset |
+| Analysis | - | Ctrl+Q panel, Shift+Q metrics, Ctrl+Shift+Q AI, R region | same |
 
 ## Install
 
@@ -64,16 +69,25 @@ git clone https://github.com/microsoft/vcpkg C:\vcpkg; C:\vcpkg\bootstrap-vcpkg.
 C:\vcpkg\vcpkg install "ffmpeg[core,avcodec,avformat,swscale,swresample,dav1d]:x64-windows-static-md-rel" --overlay-ports=vcpkg/overlay-ports --overlay-triplets=vcpkg/triplets
 $env:VCPKG_ROOT="C:\vcpkg"; $env:VCPKGRS_TRIPLET="x64-windows-static-md-rel"; $env:LIBCLANG_PATH="C:\Program Files\LLVM\bin"
 cargo build --release                          # target\release\lumen.exe
-cargo build --release --no-default-features    # image-only build without FFmpeg
+cargo build --release --no-default-features    # image-only build without FFmpeg or AI
+cargo build --release --no-default-features --features video   # video, no network code at all
 ```
 
-The repository is a Cargo workspace: the `lumen` app at the root and the UI-free `lumen-core` library in `crates/lumen-core`. Run all unit tests with `cargo test --workspace --no-default-features` (no FFmpeg needed).
+The repository is a Cargo workspace: the `lumen` app at the root, the UI-free `lumen-core` library in `crates/lumen-core`, the metrics engine `lumen-analysis` and the AI client `lumen-ai` (the only network code). Run all unit tests with `cargo test --workspace --no-default-features` (no FFmpeg needed).
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md), and the proposed analysis feature in [docs/ANALYSIS-PLAN.md](docs/ANALYSIS-PLAN.md).
+Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md), the analysis design in [docs/ANALYSIS-PLAN.md](docs/ANALYSIS-PLAN.md), and the crate guides [lumen-analysis](crates/lumen-analysis/API.md) and [lumen-ai](crates/lumen-ai/API.md).
 
 ## Privacy
 
-Lumen itself never connects to the internet. Map links for photos with GPS data open in your web browser only when you ask, after a confirmation.
+Lumen never connects to the internet on its own. Map links for photos with GPS data open in your web browser only when you ask, after a confirmation.
+
+The optional AI analysis is the only network feature. It is off until you enable it in Settings, AI, and then talks only to the server you enter (local network addresses only, unless you allow others). Images are re-encoded from pixels with no EXIF, GPS or file names, every request shows a preview of exactly what will be sent (unless you turn that off for a server), redirects and system proxies are ignored, and API keys are kept in Windows Credential Manager. Builds without the `ai` feature contain no network code at all.
+
+### Using your own vLLM server
+
+1. On the server: `vllm serve <your Qwen vision model> --limit-mm-per-prompt '{"image": 8}' --max-model-len 32768` (add `--api-key <key>` if you want one).
+2. In Lumen: Settings, AI, enable, type the server's IP (port 8000 is assumed, `host:port` or a full `http://host:port/v1` URL also work), press Test connection. The model list is fetched and a vision model is picked; change it or type a model id.
+3. Open an image, compare pair or video, press Ctrl+Q, choose the AI tab, pick a mode and Run.
 
 ## License
 

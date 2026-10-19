@@ -25,12 +25,14 @@ enum Page {
     Performance,
     Editors,
     Integration,
+    #[cfg(feature = "ai")]
+    Ai,
     Privacy,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 10] = [
+    const ALL: &[Page] = &[
         Page::Appearance,
         Page::Viewer,
         Page::Browser,
@@ -39,6 +41,8 @@ impl Page {
         Page::Performance,
         Page::Editors,
         Page::Integration,
+        #[cfg(feature = "ai")]
+        Page::Ai,
         Page::Privacy,
         Page::About,
     ];
@@ -52,6 +56,8 @@ impl Page {
             Page::Performance => "Performance & cache",
             Page::Editors => "External editors",
             Page::Integration => "Windows integration",
+            #[cfg(feature = "ai")]
+            Page::Ai => "AI analysis",
             Page::Privacy => "Privacy & data",
             Page::About => "About",
         }
@@ -66,6 +72,8 @@ impl Page {
             Page::Performance => I::GAUGE,
             Page::Editors => I::ARROW_SQUARE_OUT,
             Page::Integration => I::WINDOWS_LOGO,
+            #[cfg(feature = "ai")]
+            Page::Ai => I::SPARKLE,
             Page::Privacy => I::SHIELD_CHECK,
             Page::About => I::INFO,
         }
@@ -80,6 +88,8 @@ impl Page {
             Page::Performance => "Memory and disk caches",
             Page::Editors => "Programs offered for 'Open in external editor' (E)",
             Page::Integration => "File associations, Explorer menu and single window",
+            #[cfg(feature = "ai")]
+            Page::Ai => "Your own vision model server (vLLM) for image critique",
             Page::Privacy => "What Lumen stores, and where",
             Page::About => "Version, license and open-source credits",
         }
@@ -193,6 +203,8 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
                         Page::Performance => performance(ui, &p, core, &mut st),
                         Page::Editors => editors(ui, &p, core),
                         Page::Integration => integration(ui, &p, core, &mut st),
+                        #[cfg(feature = "ai")]
+                        Page::Ai => ai_page(ui, &p, core),
                         Page::Privacy => privacy(ui, &p, &mut st),
                         Page::About => about(ui, &p),
                     };
@@ -266,7 +278,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
 pub fn open_page(ctx: &egui::Context, page: &str) {
     let state_id = egui::Id::unique("settings-window-state");
     let mut st: State = ctx.data_mut(|d| d.get_temp(state_id)).unwrap_or_else(initial_state);
-    if let Some(pg) = Page::ALL.into_iter().find(|p| format!("{p:?}").eq_ignore_ascii_case(page.trim())) {
+    if let Some(pg) = Page::ALL.iter().copied().find(|p| format!("{p:?}").eq_ignore_ascii_case(page.trim())) {
         st.page = pg;
     }
     ctx.data_mut(|d| d.insert_temp(state_id, st));
@@ -278,7 +290,7 @@ fn initial_state() -> State {
     let mut st = State::default();
     if std::env::var_os("LUMEN_DEV_DIR").is_some() {
         if let Ok(name) = std::env::var("LUMEN_SETTINGS_PAGE") {
-            if let Some(page) = Page::ALL.into_iter().find(|p| format!("{p:?}").eq_ignore_ascii_case(name.trim())) {
+            if let Some(page) = Page::ALL.iter().copied().find(|p| format!("{p:?}").eq_ignore_ascii_case(name.trim())) {
                 st.page = page;
             }
         }
@@ -303,7 +315,7 @@ fn navigation(ui: &mut Ui, p: &Palette, st: &mut State, compact: bool) {
     egui::ScrollArea::vertical().id_salt("settings-nav").auto_shrink([false, false]).show(&mut list_ui, |ui| {
         egui::Frame::new().inner_margin(Margin::symmetric(if compact { 6 } else { 8 }, 12)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = GAP;
-            for page in Page::ALL {
+            for &page in Page::ALL {
                 if page == Page::Privacy {
                     ui.add_space(6.0);
                 }
@@ -952,6 +964,8 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Lumen never connects to the internet").font(semibold(14.0)).color(p.text));
                 hint(ui, p, "No telemetry, no analytics, no accounts, no update checks and no cloud. Your pictures, tags and ratings never leave this PC.");
+                #[cfg(feature = "ai")]
+                hint(ui, p, "The optional AI analysis (off by default) talks only to the server you set in Settings > AI, and only when you press Run.");
             });
         });
         ui.add_space(10.0);
@@ -991,6 +1005,236 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
     });
     false
 }
+
+// ====================================================================== AI
+
+/// Settings > AI: the master switch, the server (IP, port, HTTPS, LAN-only,
+/// API key), Test connection, the model, and advanced options. The flow is:
+/// type the IP, press Test connection (a model is picked), done.
+#[cfg(feature = "ai")]
+fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
+    use lumen_ai::{CoordConvention, ImageEncoding, StepStatus, TestStep};
+    let ai = &mut core.ai;
+    section_title(ui, p, "Remote AI analysis");
+    card(ui, p, |ui| {
+        if toggle_row(
+            ui,
+            p,
+            "Enable remote AI analysis",
+            "Lets the Analysis panel (Ctrl+Q) ask your own vision model server for a critique of the image you are viewing.",
+            &mut ai.settings.enabled,
+        ) {
+            ai.dirty = true;
+        }
+        hint(
+            ui,
+            p,
+            "What is sent, and only when you press Run: the pixels you choose (the image, or the region you draw), downscaled and re-encoded by Lumen without EXIF, GPS or color profile, and the prompt text. File names and capture settings only if you turn them on below. Every request goes to the server below and nowhere else, and is shown to you before it is sent.",
+        );
+        ui.add_space(8.0);
+    });
+
+    let enabled = ai.settings.enabled;
+    section_title(ui, p, "Server");
+    card(ui, p, |ui| {
+        ui.add_enabled_ui(enabled, |ui| {
+            row(ui, p, "Server address", "IP address, host:port or URL of your vLLM server, for example 192.168.1.20", |ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(230.0));
+                if resp.lost_focus() {
+                    ai.apply_host();
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    ai.test_connection();
+                }
+                false
+            });
+            if let Some(e) = &ai.host_error {
+                ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
+                ui.add_space(4.0);
+            }
+            row(ui, p, "Port", "Used when the address has no port (vLLM's default is 8000)", |ui| {
+                let r = ui.add(egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
+                if r.changed() {
+                    ai.dirty = true;
+                }
+                false
+            });
+            if toggle_row(ui, p, "Use HTTPS", "For a server behind TLS (a reverse proxy, or vLLM with --ssl-certfile)", &mut ai.settings.https) {
+                ai.dirty = true;
+            }
+            if toggle_row(
+                ui,
+                p,
+                "Only allow local network servers",
+                "Loopback, 10.x, 172.16-31.x, 192.168.x, link-local and IPv6 ULA addresses. Public servers also need HTTPS.",
+                &mut ai.settings.lan_only,
+            ) {
+                ai.dirty = true;
+            }
+            if ai.settings.lan_only && toggle_row(ui, p, "Also allow Tailscale addresses", "100.64.0.0/10 (CGNAT)", &mut ai.settings.allow_cgnat) {
+                ai.dirty = true;
+            }
+            let has_key = ai.has_key();
+            let key_desc = if has_key {
+                "Saved in Windows Credential Manager (or an encrypted file in the data folder), never in settings.json."
+            } else {
+                "Optional: only when vllm serve runs with --api-key."
+            };
+            row(ui, p, "API key", key_desc, |ui| {
+                if has_key {
+                    if ui.button(format!("{}  Forget key", I::TRASH)).clicked() {
+                        ai.forget_key();
+                    }
+                    status_chip(ui, p, true, "Key saved", "");
+                } else {
+                    let save = ui.add_enabled(!ai.key_edit.trim().is_empty(), egui::Button::new("Save"));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut ai.key_edit).password(true).hint_text("none").desired_width(170.0));
+                    if save.clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        ai.save_key();
+                    }
+                }
+                false
+            });
+            for w in ai.settings.warnings(has_key) {
+                ui.add(egui::Label::new(RichText::new(format!("{}  {w}", I::WARNING)).size(11.5).color(p.warn)).wrap());
+            }
+            row(ui, p, "Test connection", "Connects, checks the server, lists its models and picks one that takes images", |ui| {
+                let testing = ai.testing();
+                if ui.add_enabled(!testing, egui::Button::new(RichText::new(format!("{}  Test connection", I::PLUGS_CONNECTED)).color(Color32::WHITE)).fill(p.accent)).clicked() {
+                    ai.test_connection();
+                }
+                if testing {
+                    ui.spinner();
+                }
+                false
+            });
+            if !ai.steps.is_empty() || ai.testing() {
+                ui.add_space(2.0);
+                for step in TestStep::ALL {
+                    let done = ai.steps.iter().find(|s| s.step == step);
+                    ui.horizontal(|ui| {
+                        match done.map(|s| s.status) {
+                            Some(StepStatus::Ok) => ui.label(RichText::new(I::CHECK_CIRCLE).color(p.ok)),
+                            Some(StepStatus::Warning) => ui.label(RichText::new(I::WARNING).color(p.warn)),
+                            Some(StepStatus::Failed) => ui.label(RichText::new(I::X_CIRCLE).color(p.danger)),
+                            Some(StepStatus::Skipped) => ui.label(RichText::new(I::MINUS_CIRCLE).color(p.faint)),
+                            None if ai.testing() => ui.spinner(),
+                            None => ui.label(RichText::new(I::MINUS_CIRCLE).color(p.faint)),
+                        };
+                        ui.allocate_ui_with_layout(Vec2::new(62.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
+                            ui.set_width(62.0);
+                            ui.label(RichText::new(step.label()).size(12.0).color(p.text));
+                        });
+                        if let Some(s) = done {
+                            let ms = if s.elapsed_ms > 0 { format!("  ({} ms)", s.elapsed_ms) } else { String::new() };
+                            ui.add(egui::Label::new(RichText::new(format!("{}{ms}", s.message)).size(11.5).color(p.muted)).wrap());
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+            }
+        });
+    });
+
+    section_title(ui, p, "Model");
+    card(ui, p, |ui| {
+        ui.add_enabled_ui(enabled, |ui| {
+            let current = ai.settings.model.clone().unwrap_or_default();
+            let desc = if current.is_empty() { "Test connection lists the server's models and picks one".to_string() } else { ai.vision_label(&current) };
+            row(ui, p, "Model", &desc, |ui| {
+                if ui.add_enabled(ai.probing().is_none() && !current.is_empty(), egui::Button::new("Test vision")).on_hover_text("Sends a tiny gray test image to check that the model accepts images").clicked() {
+                    ai.probe_vision(&current);
+                }
+                if ui.button(I::ARROW_CLOCKWISE).on_hover_text("Refresh the model list").clicked() {
+                    ai.refresh_models();
+                }
+                let mut pick = None;
+                egui::ComboBox::from_id_salt("settings-ai-model")
+                    .selected_text(if current.is_empty() { "None".to_string() } else { current.clone() })
+                    .width(230.0)
+                    .show_ui(ui, |ui| {
+                        if ai.models.is_empty() {
+                            ui.label(RichText::new("Press Test connection to list the models").size(12.0).color(p.muted));
+                        }
+                        for m in &ai.models {
+                            let mut text = format!("{}  ({})", m.id, ai.vision_label(&m.id));
+                            if let Some(n) = m.max_model_len {
+                                text.push_str(&format!(", {n} context"));
+                            }
+                            if ui.selectable_label(m.id == current, text).clicked() {
+                                pick = Some(m.id.clone());
+                            }
+                        }
+                    });
+                if let Some(m) = pick {
+                    ai.set_model(&m);
+                }
+                false
+            });
+            row(ui, p, "Model id", "Or type the id exactly as the server serves it", |ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut ai.model_edit).hint_text("Qwen/Qwen3.5-9B").desired_width(230.0));
+                if resp.lost_focus() {
+                    let m = ai.model_edit.clone();
+                    ai.set_model(&m);
+                }
+                false
+            });
+        });
+    });
+
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::CollapsingHeader::new(RichText::new("Advanced options").size(12.5).color(p.muted)).id_salt("settings-ai-advanced").default_open(false).show(ui, |ui| {
+            let s = &mut ai.settings;
+            let mut changed = false;
+            card(ui, p, |ui| {
+                let num = |ui: &mut Ui, title: &str, desc: &str, v: &mut u32, range: std::ops::RangeInclusive<u32>, suffix: &str| {
+                    row(ui, p, title, desc, |ui| ui.add(egui::DragValue::new(v).range(range).suffix(suffix)).changed())
+                };
+                changed |= num(ui, "Connect timeout", "TCP and TLS connection", &mut s.timeout_connect_s, 1..=60, " s");
+                changed |= num(ui, "First token timeout", "Covers model warm-up and reading large images", &mut s.timeout_first_token_s, 5..=1800, " s");
+                changed |= num(ui, "Total timeout", "The whole request", &mut s.timeout_total_s, 10..=3600, " s");
+                changed |= num(ui, "Max output tokens", "Longer answers need more; reports need about 1500", &mut s.max_completion_tokens, 64..=16384, "");
+                changed |= row(ui, p, "Temperature", "Low values give repeatable scores", |ui| slider_box_resp(ui, egui::Slider::new(&mut s.temperature, 0.0..=1.5).fixed_decimals(2)).changed());
+                changed |= num(ui, "Overview size", "Long side of the downscaled full view", &mut s.max_side_overview, 512..=4096, " px");
+                changed |= num(ui, "Tile size", "Side of native-resolution ROI tiles (multiple of 32)", &mut s.tile_side, 256..=2048, " px");
+                changed |= num(ui, "Images per request", "Must not exceed the server's --limit-mm-per-prompt", &mut s.max_images, 1..=16, "");
+                changed |= row(ui, p, "Image encoding", "PNG is lossless; JPEG (q95) is smaller for slow links", |ui| segmented(ui, &mut s.encoding, &[(ImageEncoding::Png, "PNG"), (ImageEncoding::Jpeg, "JPEG")]));
+                changed |= row(ui, p, "Box coordinates", "How the model reports boxes: 0..1000 (Qwen3, Gemma) or pixels (Qwen2.5-VL)", |ui| {
+                    segmented(ui, &mut s.coord_convention, &[(CoordConvention::Relative1000, "0..1000"), (CoordConvention::AbsolutePixels, "Pixels")])
+                });
+                let mut thinking = !s.disable_thinking;
+                if toggle_row(ui, p, "Let the model think first", "Slower; sometimes better at subtle artifacts (Qwen3.x thinking mode)", &mut thinking) {
+                    s.disable_thinking = !thinking;
+                    changed = true;
+                }
+                changed |= toggle_row(ui, p, "Swap-check comparisons", "Runs A vs B twice with A and B exchanged and reports whether the preference holds", &mut s.swap_check);
+                changed |= toggle_row(ui, p, "Blind (no metrics)", "Leave Lumen's measured metrics out of the prompt", &mut s.blind);
+            });
+            section_title(ui, p, "Privacy");
+            card(ui, p, |ui| {
+                changed |= toggle_row(ui, p, "Always confirm before sending", "Show the send preview for every request (otherwise only the first time for each server)", &mut s.always_confirm);
+                changed |= toggle_row(ui, p, "Include file name", "Send the file name with the image", &mut s.include_filename);
+                changed |= toggle_row(ui, p, "Include capture settings", "Send camera, lens and exposure from EXIF (never GPS)", &mut s.include_exif);
+                if !s.trusted_servers.is_empty() {
+                    let n = s.trusted_servers.len();
+                    let desc = format!("{n} server(s) skip the send preview: {}", s.trusted_servers.join(", "));
+                    changed |= row(ui, p, "Trusted servers", &desc, |ui| {
+                        let c = ui.button("Clear").clicked();
+                        if c {
+                            s.trusted_servers.clear();
+                        }
+                        c
+                    });
+                }
+            });
+            if changed {
+                ai.dirty = true;
+            }
+        });
+    });
+    false
+}
+
 
 fn path_row(ui: &mut Ui, p: &Palette, title: &str, path: &Path) {
     row(ui, p, title, &path.display().to_string(), |ui| {
@@ -1060,6 +1304,10 @@ const CREDITS: &[(&str, &str, &str)] = &[
     ("serde, serde_json", "Settings storage", "MIT / Apache-2.0"),
     ("rfd, trash, arboard", "Dialogs, Recycle Bin, clipboard", "MIT / Apache-2.0"),
     ("lru, parking_lot, chrono", "Utilities", "MIT / Apache-2.0"),
+    #[cfg(feature = "ai")]
+    ("ureq, rustls, ring", "AI server connection (optional)", "MIT / Apache-2.0 / ISC"),
+    #[cfg(feature = "ai")]
+    ("egui_commonmark, pulldown-cmark", "Markdown answers (optional)", "MIT / Apache-2.0"),
 ];
 
 // ====================================================================== helpers

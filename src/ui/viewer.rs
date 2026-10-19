@@ -658,6 +658,19 @@ impl Viewer {
         self.zoom_target = Some((new, a));
     }
 
+    /// Shows `r` (fractions 0..1 of the image: x0, y0, x1, y1) with some
+    /// context around it (Analysis panel: a finding clicked in the list).
+    pub fn zoom_to_region(&mut self, r: [f32; 4], ppp: f32) {
+        let (w, h) = (self.view_img.0.max(1) as f32, self.view_img.1.max(1) as f32);
+        let view = self.last_view_rect;
+        let (rw, rh) = (((r[2] - r[0]) * w).max(16.0), ((r[3] - r[1]) * h).max(16.0));
+        let z = (view.width() * ppp / rw).min(view.height() * ppp / rh) * 0.6;
+        self.auto_fit = None;
+        self.zoom_target = None;
+        self.zoom = sane_zoom(z.min(8.0));
+        self.center = Vec2::new((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+    }
+
     pub fn set_zoom(&mut self, z: f32, anchor: Option<Pos2>) {
         self.auto_fit = None;
         self.zoom_target = Some((z.clamp(0.01, 64.0), anchor.unwrap_or(self.last_view_rect.center())));
@@ -895,6 +908,7 @@ impl Viewer {
             min.x = (min.x * ppp).round() / ppp;
             min.y = (min.y * ppp).round() / ppp;
             let dest = Rect::from_min_size(min, Vec2::new(draw_w, draw_h));
+            crate::analysis_ui::canvas::publish(ui.ctx(), crate::analysis_ui::canvas::Slot::A, dest, disp, view);
             let painter = ui.painter().with_clip_rect(view);
             if has_alpha && core.settings.checkerboard_alpha {
                 render::paint_checkerboard(&painter, dest.intersect(view), 10.0, p.dark);

@@ -188,6 +188,9 @@ pub struct VideoSideCtx {
     pub size: (u32, u32),
     pub fps: f64,
     pub color: adapters::VideoColor,
+    /// Display rotation in degrees (phone footage); the panel's ROI is in
+    /// displayed pixels.
+    pub rotation: i32,
     pub index: SharedIndex,
     /// Native planes of the frame on screen (when paused and enabled).
     pub native: Option<Arc<YuvFrame>>,
@@ -197,7 +200,7 @@ pub struct VideoSideCtx {
 impl VideoSideCtx {
     pub fn new(path: &Path, info: &MediaInfo, index: &SharedIndex, native: Option<Arc<YuvFrame>>) -> VideoSideCtx {
         let fps = [info.avg_fps, info.fps].into_iter().find(|f| *f > 0.0).unwrap_or(25.0);
-        VideoSideCtx { path: path.to_path_buf(), size: (info.width, info.height), fps, color: adapters::VideoColor::of_info(info), index: index.clone(), native }
+        VideoSideCtx { path: path.to_path_buf(), size: (info.width, info.height), fps, color: adapters::VideoColor::of_info(info), rotation: info.rotation, index: index.clone(), native }
     }
 
     fn side(&self) -> adapters::VideoSide {
@@ -298,10 +301,6 @@ impl Subject {
         matches!(self.kind(), Kind::Video | Kind::VideoPair)
     }
 
-    fn has_b(&self) -> bool {
-        matches!(self.kind(), Kind::Compare | Kind::VideoPair)
-    }
-
     fn fps(&self) -> f64 {
         match self {
             #[cfg(feature = "video")]
@@ -317,6 +316,23 @@ impl Subject {
             _ => None,
         }
     }
+}
+
+/// A region drawn on a video displayed rotated by `rotation` degrees, in the
+/// stream's native pixels (`size`, unrotated).
+pub fn native_roi(r: Roi, rotation: i32, size: (u32, u32)) -> Roi {
+    let (w, h) = (size.0 as i64, size.1 as i64);
+    let (x0, y0, x1, y1) = (r.x as i64, r.y as i64, (r.x + r.w) as i64, (r.y + r.h) as i64);
+    let (a, b, c, d) = match rotation.rem_euclid(360) {
+        // Displayed (x, y) shows native (y, h - x) when turned 90 degrees.
+        90 => (y0, h - x1, y1, h - x0),
+        180 => (w - x1, h - y1, w - x0, h - y0),
+        270 => (w - y1, x0, w - y0, x1),
+        _ => (x0, y0, x1, y1),
+    };
+    let clamp = |v: i64, m: i64| v.clamp(0, m) as u32;
+    let (a, b, c, d) = (clamp(a, w), clamp(b, h), clamp(c, w), clamp(d, h));
+    Roi::new(a, b, c.saturating_sub(a).max(1), d.saturating_sub(b).max(1))
 }
 
 // ------------------------------------------------------------------ prefs and history
@@ -618,6 +634,8 @@ pub struct MetricsTab {
     shown: Option<Instant>,
     /// Run once the tab next has its context (Shift+Q).
     run_requested: bool,
+    /// Dev hook: scroll the panel by this many points on the next frame.
+    dev_scroll: f32,
 }
 
 impl Default for MetricsTab {
@@ -661,6 +679,7 @@ impl MetricsTab {
             video: None,
             shown: None,
             run_requested: false,
+            dev_scroll: 0.0,
         }
     }
 
@@ -681,11 +700,6 @@ impl MetricsTab {
         self.video = v;
     }
 
-    #[cfg(feature = "video")]
-    pub fn video(&self) -> Option<&VideoSubject> {
-        self.video.as_ref()
-    }
-
     /// The tab was on screen in the last moment: hosts keep what it needs
     /// ready (video mode copies native planes of the paused frame).
     pub fn visible(&self) -> bool {
@@ -695,6 +709,110 @@ impl MetricsTab {
     /// Run the selected metrics the next time the tab is drawn (Shift+Q).
     pub fn request_run(&mut self) {
         self.run_requested = true;
+    }
+
+    /// The tab's subject from the panel's: display pixels of the viewer or
+    /// of compare A and B (`source_bits` of A's file), or video mode's state
+    /// (see [`MetricsTab::set_video`]) at the frame on screen.
+    pub fn subject_of(&self, s: &super::Subject, source_bits: u8) -> Subject {
+        use super::{Pixels, SubjectKind};
+        let ready = |i: &Option<super::SubjectImage>| match i.as_ref().map(|i| (&i.pixels, &i.path)) {
+            Some((Pixels::Ready(img), path)) => Some((path.clone(), img.clone())),
+            _ => None,
+        };
+        match s.kind {
+            SubjectKind::Image => match ready(&s.a) {
+                Some((path, image)) => Subject::Image { path, image, source_bits },
+                None => Subject::None,
+            },
+            SubjectKind::Pair => match (ready(&s.a), ready(&s.b)) {
+                (Some((a, image_a)), Some((b, image_b))) => Subject::Compare { a, image_a, b, image_b, source_bits },
+                _ => Subject::None,
+            },
+            #[cfg(feature = "video")]
+            SubjectKind::Video | SubjectKind::VideoPair => {
+                let a = s.a.as_ref();
+                match &self.video {
+                    Some(v) if a.is_some_and(|a| a.path == v.a.path) => {
+                        let mut v = v.clone();
+                        v.current = a.and_then(|a| a.frame).map(|f| f.index as usize).or(v.current);
+                        Subject::Video(v)
+                    }
+                    _ => Subject::None,
+                }
+            }
+            #[cfg(not(feature = "video"))]
+            SubjectKind::Video | SubjectKind::VideoPair => Subject::None,
+        }
+    }
+
+    /// Dev hook (`ai metrics <verb> [args]`): drive the tab in automated UI
+    /// tests. Returns a state line.
+    pub fn dev(&mut self, args: &str) -> String {
+        let (verb, rest) = args.trim().split_once(' ').map(|(v, r)| (v, r.trim())).unwrap_or((args.trim(), ""));
+        match verb {
+            "preset" => self.selected = metrics::preset(rest).iter().map(|s| s.to_string()).collect(),
+            "select" => self.selected = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            "frames" => self.temporal = if rest == "range" { Temporal::Range } else { Temporal::Frame },
+            "range" => {
+                let v: Vec<&str> = rest.split_whitespace().collect();
+                for (i, t) in v.iter().take(3).enumerate() {
+                    self.range_text[i] = if *t == "end" { String::new() } else { t.to_string() };
+                }
+                self.temporal = Temporal::Range;
+            }
+            "run" => self.request_run(),
+            "cancel" => self.cancel(),
+            "scroll" => self.dev_scroll = rest.parse().unwrap_or(0.0),
+            "map" => match self.report.as_ref().and_then(|r| r.map(rest).cloned()) {
+                Some(m) => {
+                    self.heat.set_map(rest, m);
+                    self.heat.visible = true;
+                }
+                None => self.heat.visible = false,
+            },
+            "opacity" => self.heat.opacity = rest.parse().unwrap_or(self.heat.opacity),
+            "expand" => {
+                self.expanded.insert(rest.to_string());
+            }
+            "seek" => {
+                let worst = self.plots.worst_frames(&self.series);
+                self.seek = if rest == "worst" { worst.first().copied() } else { rest.parse().ok() };
+            }
+            "export" => {
+                let (what, path) = rest.split_once(' ').map(|(w, p)| (w, Some(PathBuf::from(p.trim())))).unwrap_or((rest, None));
+                if path.is_some() {
+                    match what {
+                        "csv" => self.export_report(true, path),
+                        "json" => self.export_report(false, path),
+                        "png" => self.export_heatmap(true, path),
+                        "tiff" => self.export_heatmap(false, path),
+                        "bundle" => self.export_bundle(path),
+                        "pairs" => self.export_worst(path),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        let values: Vec<String> = self
+            .report
+            .as_ref()
+            .map(|r| rows_of_report(r).iter().filter_map(|row| row.cells.first().map(|c| format!("{}={}", c.key, c.value.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into())))).collect())
+            .unwrap_or_default();
+        format!(
+            "metrics: kind={:?} running={} status={:?} frames={} selected=[{}] values=[{}] map={:?} notes={} history={} worst={:?}",
+            self.kind,
+            self.run.is_some(),
+            self.status.as_ref().map(|s| s.0.clone()),
+            self.report.as_ref().map(|r| r.frames.len()).unwrap_or(0),
+            self.selected.iter().cloned().collect::<Vec<_>>().join(","),
+            values.join(" "),
+            self.heat.id(),
+            self.report.as_ref().map(|r| r.notes.len()).unwrap_or(0),
+            self.history.len(),
+            self.plots.worst_frames(&self.series),
+        )
     }
 
     /// Headline results of the shown report as (name, value, unit), for
@@ -709,10 +827,6 @@ impl MetricsTab {
                 Some((name, c.value?, c.unit.label().to_string()))
             })
             .collect()
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.run.is_some()
     }
 
     /// A frame (of A) the user asked to see, once.
@@ -851,6 +965,7 @@ impl MetricsTab {
     #[cfg(feature = "video")]
     #[allow(clippy::too_many_arguments)]
     fn run_video(&mut self, v: &VideoSubject, ids: Vec<String>, roi: Option<Roi>, fa: PathBuf, fb: Option<PathBuf>, hist: Option<CacheKey>, egui_ctx: &egui::Context) {
+        let roi = roi.map(|r| native_roi(r, v.a.rotation, v.a.size));
         if self.temporal == Temporal::Frame {
             let Some(cur) = v.current else {
                 self.set_status("No frame on screen yet", true);
@@ -956,8 +1071,8 @@ impl MetricsTab {
                 if let Some(d) = &run.decode {
                     d.fix_scope(&mut report);
                 }
-                let secs = run.started.elapsed().as_secs_f64();
-                self.set_status(format!("Done in {secs:.1} s"), false);
+                let ms = run.started.elapsed().as_secs_f32() * 1000.0;
+                self.set_status(format!("Done in {}", fmt_cost(ms.max(1.0))), false);
                 self.finish(report, Some((run.key, run.history)));
             }
             Err(e) if e.is_empty() => self.set_status("Cancelled", false),
@@ -974,13 +1089,10 @@ impl MetricsTab {
                 self.plot_span = (f.start, f.end.saturating_sub(1).max(f.start));
             }
         }
-        // Keep the overlay of the same metric, else show the first map.
+        // Keep the overlay of the same metric, else show a difference map;
+        // no-reference tile maps only when asked (they cover the photo).
         let pick = self.heat.id().map(str::to_string).filter(|id| report.map(id).is_some_and(|m| !m.data.is_empty())).or_else(|| {
-            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"]
-                .iter()
-                .map(|s| s.to_string())
-                .chain(report.metrics.iter().map(|m| m.id.clone()))
-                .find(|id| report.map(id).is_some_and(|m| !m.data.is_empty()))
+            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().map(|s| s.to_string()).find(|id| report.map(id).is_some_and(|m| !m.data.is_empty()))
         });
         match pick {
             Some(id) => self.heat.set_map(&id, report.map(&id).cloned().expect("picked")),
@@ -1095,6 +1207,9 @@ impl MetricsTab {
         }
         ui.add_space(6.0);
         self.history_section(ui, &p);
+        if self.dev_scroll != 0.0 {
+            ui.scroll_with_delta(Vec2::new(0.0, -std::mem::take(&mut self.dev_scroll)));
+        }
     }
 
     fn scope_bar(&mut self, ui: &mut Ui, p: &Palette, s: &Subject) {
@@ -1195,7 +1310,7 @@ impl MetricsTab {
                 metrics::all().iter().filter(|m| m.info().kind == kind && self.selected.contains(m.id())).count()
             };
             let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).color(if blocked.is_some() { p.faint } else { p.text });
-            egui::CollapsingHeader::new(head).id_salt(("metrics-group", title)).default_open(blocked.is_none() && kind != MetricKind::Temporal).show(ui, |ui| {
+            egui::CollapsingHeader::new(head).id_salt(("metrics-group", title)).default_open(false).show(ui, |ui| {
                 if let Some(why) = blocked {
                     ui.label(RichText::new(why).size(11.0).color(p.faint));
                 }
@@ -1226,7 +1341,7 @@ impl MetricsTab {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (text, color) = match cost {
                                 None => ("too small".to_string(), p.warn),
-                                Some(ms) => (format!("~{}", fmt_cost(ms * scale)), if heavy { p.warn } else { p.faint }),
+                                Some(ms) => (if ms * scale < 1.0 { fmt_cost(0.0) } else { format!("~{}", fmt_cost(ms * scale)) }, if heavy { p.warn } else { p.faint }),
                             };
                             ui.label(RichText::new(text).size(11.0).color(color)).on_hover_text(if heavy { "Heavy: runs on a quarter-size preview first" } else { "Estimated time" });
                         });
@@ -1468,19 +1583,19 @@ impl MetricsTab {
             ui.menu_button(format!("{}  Export", I::EXPORT), |ui| {
                 if ui.button("CSV").clicked() {
                     ui.close();
-                    self.export_report(true);
+                    self.export_report(true, None);
                 }
                 if ui.button("JSON").clicked() {
                     ui.close();
-                    self.export_report(false);
+                    self.export_report(false, None);
                 }
                 if ui.add_enabled(has_map, egui::Button::new("Heatmap PNG")).clicked() {
                     ui.close();
-                    self.export_heatmap(true);
+                    self.export_heatmap(true, None);
                 }
                 if ui.add_enabled(has_map, egui::Button::new("Heatmap TIFF (values)")).clicked() {
                     ui.close();
-                    self.export_heatmap(false);
+                    self.export_heatmap(false, None);
                 }
                 if has_frames && ui.button("Worst frames as PNG pairs").clicked() {
                     ui.close();
@@ -1489,7 +1604,7 @@ impl MetricsTab {
                 ui.separator();
                 if ui.button("Report bundle folder").clicked() {
                     ui.close();
-                    self.export_bundle();
+                    self.export_bundle(None);
                 }
             });
         });
@@ -1505,10 +1620,14 @@ impl MetricsTab {
         self.set_status("Exporting", false);
     }
 
-    fn export_report(&mut self, csv: bool) {
-        let Some(r) = &self.report else { return };
+    /// The report as CSV or JSON to `path` (asked when `None`).
+    fn export_report(&mut self, csv: bool, path: Option<PathBuf>) {
+        if self.report.is_none() {
+            return;
+        }
         let (ext, name) = if csv { ("csv", "CSV") } else { ("json", "JSON") };
-        let Some(path) = self.dialog().add_filter(name, &[ext]).set_file_name(format!("{}_metrics.{ext}", self.stem())).save_file() else { return };
+        let Some(path) = path.or_else(|| self.dialog().add_filter(name, &[ext]).set_file_name(format!("{}_metrics.{ext}", self.stem())).save_file()) else { return };
+        let Some(r) = &self.report else { return };
         let res = if csv { r.write_csv(&path) } else { r.write_json(&path) };
         match res {
             Ok(()) => self.set_status(format!("Saved {}", path.display()), false),
@@ -1516,11 +1635,12 @@ impl MetricsTab {
         }
     }
 
-    fn export_heatmap(&mut self, png: bool) {
+    /// The heatmap shown, colorized (PNG) or as values (TIFF), to `path` (asked when `None`).
+    fn export_heatmap(&mut self, png: bool, path: Option<PathBuf>) {
         let Some(id) = self.heat.id().map(str::to_string) else { return };
         let (ext, name) = if png { ("png", "PNG") } else { ("tif", "TIFF") };
         let file = format!("{}_{}.{ext}", self.stem(), id.replace('.', "_"));
-        let Some(path) = self.dialog().add_filter(name, &[ext]).set_file_name(file).save_file() else { return };
+        let Some(path) = path.or_else(|| self.dialog().add_filter(name, &[ext]).set_file_name(file).save_file()) else { return };
         let res = if png { self.heat.export_png(&path) } else { self.heat.map().map(|m| m.write_tiff(&path)).unwrap_or(Ok(())) };
         match res {
             Ok(()) => self.set_status(format!("Saved {}", path.display()), false),
@@ -1545,9 +1665,9 @@ impl MetricsTab {
 
     /// A folder with the report as JSON and CSV, every heatmap as PNG and
     /// TIFF, and the worst frames of a video range as PNG pairs.
-    fn export_bundle(&mut self) {
+    fn export_bundle(&mut self, parent: Option<PathBuf>) {
         let Some(report) = self.report.clone() else { return };
-        let Some(parent) = self.dialog().pick_folder() else { return };
+        let Some(parent) = parent.or_else(|| self.dialog().pick_folder()) else { return };
         let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let dir = parent.join(format!("{}_analysis_{stamp}", self.stem()));
         let opts = self.heat.options();

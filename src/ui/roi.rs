@@ -517,10 +517,13 @@ mod tests {
         let xf = ImageTransform::new(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0)), (200, 100));
         let frame = |e: &mut RoiEditor, events: Vec<egui::Event>| -> RoiResponse {
             let mut out = RoiResponse::default();
-            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let mut full = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
                 let resp = ui.allocate_rect(xf.dest, egui::Sense::click_and_drag());
                 out = e.show(ui, ui.painter(), &xf, &resp);
             });
+            // No renderer here: drop the font atlas upload (debug builds assert
+            // that texture deltas are applied).
+            full.textures_delta.clear();
             out
         };
         let esc = || vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }];

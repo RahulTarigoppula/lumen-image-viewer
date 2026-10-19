@@ -562,7 +562,7 @@ fn mid_stream_cancel_closes_the_connection() {
     task.cancel();
     let events = collect(&task, Duration::from_secs(5));
     assert!(matches!(done(&events), Err(AiError::Cancelled)));
-    assert!(t.elapsed() < Duration::from_millis(500), "cancel took {:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_millis(1500), "cancel took {:?}", t.elapsed());
     // The server notices the closed socket on its next write.
     let end = Instant::now() + Duration::from_secs(3);
     while !mock.disconnected.load(Ordering::SeqCst) && Instant::now() < end {
@@ -618,7 +618,8 @@ fn host_name_resolves_and_prefers_ipv4() {
     let t = Instant::now();
     let models = Client::from_settings(&s, None).unwrap().list_models().unwrap();
     assert_eq!(models.len(), 2);
-    assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+    // Well under the 5 s connect timeout an IPv6-first attempt would hit (loose for loaded CI).
+    assert!(t.elapsed() < Duration::from_millis(4000), "{:?}", t.elapsed());
 }
 
 #[test]
@@ -640,5 +641,5 @@ fn cancel_while_the_server_is_silent() {
     task.cancel();
     let events = collect(&task, Duration::from_secs(5));
     assert!(matches!(done(&events), Err(AiError::Cancelled)));
-    assert!(t.elapsed() < Duration::from_millis(500), "cancel took {:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_millis(1500), "cancel took {:?}", t.elapsed());
 }

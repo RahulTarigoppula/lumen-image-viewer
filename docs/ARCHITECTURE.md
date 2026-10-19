@@ -7,12 +7,15 @@ tens of thousands of files and on images of hundreds of megapixels.
 
 ## Crates
 
-The repository is a Cargo workspace with two crates:
+The repository is a Cargo workspace:
 
 | Crate | Path | Contents | Depends on |
 |---|---|---|---|
 | `lumen` (binary) | `src/` | UI (egui/eframe), viewer, browser, batch tools, GPU renderer, loader and thumbnail pools, shell integration, FFmpeg video engine (`video` feature), `build.rs` (resources, FFmpeg link libraries) | `lumen-core`, egui, eframe, FFmpeg |
+| `lumen-analysis` | `crates/lumen-analysis/` | Objective image and video metrics, heatmaps, jobs, reports, cache (see its API.md) | rayon, blake3, fast-ssim2, butteraugli, flip-rs |
+| `lumen-ai` | `crates/lumen-ai/` | The only network code: OpenAI-compatible (vLLM) client, prompts, image preparation, secrets (see its API.md); behind the `ai` feature | ureq + rustls, windows |
 | `lumen-core` (library `lumen_core`) | `crates/lumen-core/` | Everything with no UI and no FFmpeg: formats, decoders, color, resizing, encoders, metadata, catalog, tags, settings data, edit pixel operations, video metrics and scopes | image, WIC (`windows`), small pure-Rust codecs |
+| `lumen-ai` (library `lumen_ai`, feature `ai`) | `crates/lumen-ai/` | The only network code: OpenAI-compatible (vLLM) client, Test connection, prompts, image preparation, reports, API key storage. See its `API.md` | ureq (rustls), image |
 
 `lumen-core` must never depend on egui, eframe or FFmpeg. The app imports
 the core modules at its crate root (`use lumen_core::{decode, settings, ...}`
@@ -49,6 +52,7 @@ dependency versions are in `[workspace.dependencies]`.
 | Modes | `lumen` | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and A/B analysis |
 | Video (pure) | `lumen-core` | `video/mod.rs`, `video/metrics.rs`, `video/scopes.rs` | Video extensions, PSNR/SSIM, scopes, thumbnailer hook |
 | Video (FFmpeg) | `lumen` | `video/engine.rs`, `video/audio.rs`, `video/analyze.rs`, `video/mode.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, whole-file analysis, UI |
+| Analysis panel | `lumen` | `analysis_ui/*` | Right-side panel of the viewer, compare and video modes (Ctrl+Q): Metrics tab (`metrics_view.rs`, state in `Core::metrics`, Shift+Q runs it; `heatmap_view.rs` overlays, `plots.rs` graphs under the video timeline, `adapters.rs` from decoded pixels and `SeqDecoder` ranges to `lumen_analysis` jobs), AI tab, send preview, ROI (R) and finding overlays. Modes only publish where they draw images (`analysis_ui::canvas::publish`); video mode also hands the Metrics tab its streams each frame |
 
 Paths in the `lumen-core` rows are relative to `crates/lumen-core/src/`, the
 others to `src/`.
@@ -79,7 +83,7 @@ Video frames are converted by swscale with the correct BT.601/709/2020 matrix an
 
 ## Privacy
 
-There is no network code in the image or video paths. The optional AI critique feature (see `docs/ANALYSIS-PLAN.md`) is off by default, LAN-oriented, and sends only pixels the user explicitly chooses.
+There is no network code in the image or video paths. The optional AI critique (crate `lumen-ai`, feature `ai`) is off by default, LAN-only by default, previews every request, and sends only re-encoded pixels the user chooses. `--no-default-features --features video` builds an exe with no network code.
 
 ## Performance budgets (release build)
 

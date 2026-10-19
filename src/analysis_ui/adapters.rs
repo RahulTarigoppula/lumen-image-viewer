@@ -48,7 +48,6 @@ impl FrameSource for ScaledFrame {
 pub struct FramePair {
     pub a: SharedFrame,
     pub b: Option<SharedFrame>,
-    pub size: (u32, u32),
     /// B had a different size and is resampled to A's.
     pub rescaled: bool,
 }
@@ -68,7 +67,7 @@ pub fn image_pair(a: &Arc<RgbaImage>, b: Option<&Arc<RgbaImage>>) -> Option<Fram
             Arc::new(ScaledFrame::new(b.clone(), size))
         }
     });
-    Some(FramePair { a: Arc::new(RgbaFrame(a.clone())), b, size, rescaled })
+    Some(FramePair { a: Arc::new(RgbaFrame(a.clone())), b, rescaled })
 }
 
 /// Image job spec for display pixels. `source_bits` is the bit depth of the
