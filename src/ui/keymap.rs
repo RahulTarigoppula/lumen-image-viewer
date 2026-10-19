@@ -99,6 +99,12 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+Shift+T", ToggleTheme),
             ("Ctrl+Shift+V", OpenVideoMode),
             ("Alt+F4", Exit),
+            // Analysis panel (viewer, compare and video). Plain Q is the
+            // FastStone flag key, so the panel uses the Q family with modifiers.
+            ("Ctrl+Q", ToggleAnalysis),
+            ("Shift+Q", RunMetrics),
+            #[cfg(feature = "ai")]
+            ("Ctrl+Shift+Q", RunAi),
         ],
         KeyMode::Browser => vec![
             ("Enter", OpenViewer),
