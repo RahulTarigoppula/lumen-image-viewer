@@ -120,7 +120,8 @@ pub struct App {
     file_undo: Vec<FileUndo>,
     /// The running slideshow was started from the viewer (return there when it ends).
     slideshow_from_viewer: bool,
-    first_frame_marked: bool,
+    /// Frames started so far, up to 2 (startup milestones).
+    startup_frames: u8,
     /// Copy / move / paste / rotate jobs running off the UI thread.
     file_jobs: FileJobs,
     /// Ctrl+Alt+M asked to open this map link: waiting for the privacy
@@ -187,10 +188,14 @@ impl App {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("C:\\"));
 
+        let tags = TagStore::load();
+        crate::devhook::mark("tags");
+        let browser = Browser::new(start_folder.clone());
+        crate::devhook::mark("browser");
         let mut app = App {
-            core: Core { ctx: ctx.clone(), settings, pal, tags: TagStore::load(), loader, thumbs, meta, toasts: Toasts::default() },
+            core: Core { ctx: ctx.clone(), settings, pal, tags, loader, thumbs, meta, toasts: Toasts::default() },
             mode: Mode::Browser,
-            browser: Browser::new(start_folder.clone()),
+            browser,
             viewer: Viewer::new(),
             slideshow: None,
             compare: None,
@@ -224,24 +229,28 @@ impl App {
             tool_window_active: false,
             file_undo: Vec::new(),
             slideshow_from_viewer: false,
-            first_frame_marked: false,
+            startup_frames: 0,
             file_jobs: FileJobs::new(ctx.clone()),
             gps_confirm: None,
             window_stack: Vec::new(),
             fullscreen_from_viewer: false,
             maximized_before_fullscreen: false,
         };
+        crate::devhook::mark("app_struct");
         crate::ui::keymap::install(&app.core.settings);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        crate::devhook::mark("keymap");
         for msg in crate::ui::batch::recover_pending_renames() {
             app.core.toasts.info(msg);
         }
+        crate::devhook::mark("renames");
         app.viewer.show_info = app.core.settings.show_info_overlay;
         match initial {
             Some(p) if p.is_file() => app.open_file(&p),
             Some(p) if p.is_dir() => app.navigate(p),
             _ => app.navigate(start_folder),
         }
+        crate::devhook::mark("navigate");
         app
     }
 
@@ -2215,9 +2224,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let frame_start = std::time::Instant::now();
-        if !self.first_frame_marked {
-            self.first_frame_marked = true;
-            crate::devhook::mark("first_frame");
+        if self.startup_frames < 2 {
+            self.startup_frames += 1;
+            // The second frame starts once the first one has been painted and presented.
+            crate::devhook::mark(if self.startup_frames == 1 { "first_frame" } else { "first_frame_shown" });
         }
         // Window close (X, Alt+F4, taskbar) with unsaved edits: ask first.
         if ctx.input(|i| i.viewport().close_requested()) && self.viewer.is_dirty() && !self.allow_close {

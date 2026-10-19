@@ -91,9 +91,14 @@ impl ThumbService {
         });
         let _ = std::fs::create_dir_all(&cache_dir);
         {
-            // Keep the persistent cache bounded: prune oldest files beyond 1.5 GB, off-thread.
+            // Keep the persistent cache bounded: prune oldest files beyond 1.5 GB,
+            // off-thread and after startup, so listing a big cache folder does not
+            // compete with the first folder and its thumbnails for the disk.
             let dir = cache_dir.clone();
-            std::thread::spawn(move || prune_disk_cache(&dir, 1536 << 20));
+            let _ = std::thread::Builder::new().name("lumen-thumb-prune".into()).spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                prune_disk_cache(&dir, 1536 << 20);
+            });
         }
         let (tx, rx) = unbounded();
         for i in 0..threads.max(1) {

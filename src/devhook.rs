@@ -28,10 +28,30 @@ static MARKS: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new
 
 /// Record a startup milestone (ms since process start). Cheap; always on.
 pub fn mark(label: &'static str) {
-    let t0 = *PROCESS_START.get_or_init(Instant::now);
+    let t0 = *PROCESS_START.get_or_init(|| {
+        // The first mark also records how long Windows took to get to it
+        // (loading the image and its DLLs) as "launch".
+        if let (Ok(mut m), Some(ms)) = (MARKS.lock(), since_process_created()) {
+            m.push(("launch", -ms));
+        }
+        Instant::now()
+    });
     if let Ok(mut m) = MARKS.lock() {
         m.push((label, t0.elapsed().as_secs_f64() * 1000.0));
     }
+}
+
+/// Milliseconds since the OS created this process.
+fn since_process_created() -> Option<f64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let ticks = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+    let (mut created, mut exit, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: plain out-parameters on the current process pseudo-handle.
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exit, &mut kernel, &mut user) }.ok()?;
+    let now = unsafe { GetSystemTimePreciseAsFileTime() };
+    Some(ticks(now).saturating_sub(ticks(created)) as f64 / 10_000.0)
 }
 
 pub struct DevHook {

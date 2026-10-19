@@ -77,31 +77,59 @@ pub fn file_hash(path: &Path) -> std::io::Result<u64> {
     Ok(h.finish())
 }
 
+/// 64-bit hash of decoded pixels plus dimensions, for finding files that
+/// differ in bytes (metadata, compression) but not in a single pixel.
+pub fn pixel_hash(img: &RgbaImage) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_u32(img.width());
+    h.write_u32(img.height());
+    h.write(img.as_raw());
+    h.finish()
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanItem {
     pub path: PathBuf,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// EXIF capture date (Unix seconds).
+    pub taken: Option<i64>,
     pub dims: Option<(u32, u32)>,
     pub content: Option<u64>,
+    /// Hash of the decoded pixels, computed only for likely matches (see `pixel_hash`).
+    pub pixels: Option<u64>,
     pub dhash: Option<u64>,
     /// Detail behind the dHash (see `MIN_DETAIL`).
     pub detail: f32,
 }
 
+impl ScanItem {
+    pub fn new(path: PathBuf, size: u64, modified: Option<SystemTime>) -> Self {
+        ScanItem { path, size, modified, taken: None, dims: None, content: None, pixels: None, dhash: None, detail: 0.0 }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupKind {
+    /// Exact copies: byte-identical files, or files with identical pixels.
     Identical,
+    /// Pictures that look alike but are not exact copies.
     Similar,
 }
 
 #[derive(Clone, Debug)]
 pub struct Group {
     pub kind: GroupKind,
-    /// Indices into the scanned items.
+    /// Indices into the scanned items. In a similar group each set of exact
+    /// copies is represented by one file (see `linked`).
     pub members: Vec<usize>,
+    /// Similar only, parallel to `members`: the identical group a member
+    /// stands for. Its copies are listed (and marked) in that group.
+    pub linked: Vec<Option<usize>>,
     /// Lowest similarity between any two members (Similar only).
     pub min_similarity: u32,
+    /// Identical only: every member has the same bytes, not just the same pixels.
+    pub same_bytes: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,34 +150,135 @@ impl KeepRule {
             KeepRule::Oldest => "Oldest",
         }
     }
+
+    /// Criteria in the order they decide, the rule's own first. After it come
+    /// resolution, a name that does not look like a copy, the date (the oldest
+    /// file is the likely original) and file size last: an edited or annotated
+    /// copy is often bigger, so size must never outrank the others.
+    pub fn chain(self) -> &'static [Criterion] {
+        use Criterion as C;
+        match self {
+            KeepRule::Resolution => &[C::Resolution, C::NotACopy, C::Older, C::Larger, C::ShorterName, C::NameOrder],
+            KeepRule::Largest => &[C::Larger, C::Resolution, C::NotACopy, C::Older, C::ShorterName, C::NameOrder],
+            KeepRule::Newest => &[C::Newer, C::Resolution, C::NotACopy, C::Larger, C::ShorterName, C::NameOrder],
+            KeepRule::Oldest => &[C::Older, C::Resolution, C::NotACopy, C::Larger, C::ShorterName, C::NameOrder],
+        }
+    }
+}
+
+/// One step of the keep tie-break chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Criterion {
+    Resolution,
+    Larger,
+    Newer,
+    Older,
+    NotACopy,
+    ShorterName,
+    NameOrder,
+}
+
+impl Criterion {
+    /// Why the kept file won, for the group header.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Criterion::Resolution => "Kept: highest resolution",
+            Criterion::Larger => "Kept: largest file",
+            Criterion::Newer => "Kept: newest",
+            Criterion::Older => "Kept: oldest original",
+            Criterion::NotACopy => "Kept: not named as a copy",
+            Criterion::ShorterName => "Kept: shortest name",
+            Criterion::NameOrder => "Kept: first by name",
+        }
+    }
+
+    /// Greater when `a` is the better file to keep.
+    fn compare(self, items: &[ScanItem], a: usize, b: usize) -> std::cmp::Ordering {
+        let (ia, ib) = (&items[a], &items[b]);
+        let px = |it: &ScanItem| it.dims.map(|(w, h)| w as u64 * h as u64).unwrap_or(0);
+        match self {
+            Criterion::Resolution => px(ia).cmp(&px(ib)),
+            Criterion::Larger => ia.size.cmp(&ib.size),
+            Criterion::Newer => date_cmp(ia, ib),
+            Criterion::Older => date_cmp(ib, ia),
+            Criterion::NotACopy => copy_penalty(&ib.path).cmp(&copy_penalty(&ia.path)),
+            Criterion::ShorterName => name_len(&ib.path).cmp(&name_len(&ia.path)),
+            Criterion::NameOrder => crate::catalog::natural_cmp(&ib.path.to_string_lossy(), &ia.path.to_string_lossy()),
+        }
+    }
+}
+
+/// Compare dates: the capture date when the two files have different ones,
+/// otherwise the modified time (an unknown time compares equal).
+fn date_cmp(a: &ScanItem, b: &ScanItem) -> std::cmp::Ordering {
+    match (a.taken, b.taken) {
+        (Some(x), Some(y)) if x != y => x.cmp(&y),
+        _ => match (a.modified, b.modified) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        },
+    }
+}
+
+/// The file to keep in a group and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pick {
+    /// Index into the group's `members`.
+    pub index: usize,
+    /// The criterion that settled the closest contest.
+    pub reason: Criterion,
+    /// The keep rule alone beat every other file and the winner has more
+    /// pixels than each of them (pictures of the same size that only look
+    /// alike are edits, crops or re-encodes: a person has to choose). Only a
+    /// decisive pick may be applied to a similar group in bulk.
+    pub decisive: bool,
+}
+
+/// Choose the file to keep among `members` with `rule` and its tie-break chain.
+pub fn pick(items: &[ScanItem], members: &[usize], rule: KeepRule) -> Pick {
+    use std::cmp::Ordering;
+    let chain = rule.chain();
+    // The first step of the chain that separates two files.
+    let decide = |a: usize, b: usize| -> (Ordering, usize) {
+        for (step, c) in chain.iter().enumerate() {
+            let o = c.compare(items, a, b);
+            if o != Ordering::Equal {
+                return (o, step);
+            }
+        }
+        (Ordering::Equal, chain.len() - 1)
+    };
+    let mut best = 0;
+    for k in 1..members.len() {
+        if decide(members[k], members[best]).0 == Ordering::Greater {
+            best = k;
+        }
+    }
+    let Some(&b) = members.get(best) else {
+        return Pick { index: 0, reason: chain[0], decisive: true };
+    };
+    // The deepest step needed to beat any other file is the reason.
+    let deepest = members.iter().enumerate().filter(|&(k, _)| k != best).map(|(_, &m)| decide(b, m).1).max().unwrap_or(0);
+    let sharpest = members.iter().enumerate().all(|(k, &m)| k == best || Criterion::Resolution.compare(items, b, m) == Ordering::Greater);
+    Pick { index: best, reason: chain[deepest], decisive: deepest == 0 && sharpest }
 }
 
 /// Index (into `members`) of the file to keep in a group.
 pub fn best_in_group(items: &[ScanItem], members: &[usize], rule: KeepRule) -> usize {
-    let px = |i: usize| items[i].dims.map(|(w, h)| w as u64 * h as u64).unwrap_or(0);
-    let t = |i: usize| items[i].modified.unwrap_or(SystemTime::UNIX_EPOCH);
-    use std::cmp::Ordering;
-    let mut best = 0;
-    for (k, &i) in members.iter().enumerate().skip(1) {
-        let b = members[best];
-        let primary = match rule {
-            KeepRule::Resolution => (px(i), items[i].size).cmp(&(px(b), items[b].size)),
-            KeepRule::Largest => (items[i].size, px(i)).cmp(&(items[b].size, px(b))),
-            KeepRule::Newest => t(i).cmp(&t(b)),
-            KeepRule::Oldest => t(b).cmp(&t(i)),
-        };
-        // On a tie prefer the "original" name over "x - Copy", "Copy of x" or "x (2)",
-        // then the shorter name.
-        let better = match primary {
-            Ordering::Greater => true,
-            Ordering::Less => false,
-            Ordering::Equal => (copy_penalty(&items[i].path), name_len(&items[i].path)) < (copy_penalty(&items[b].path), name_len(&items[b].path)),
-        };
-        if better {
-            best = k;
+    pick(items, members, rule).index
+}
+
+/// In similar groups, show for each linked set of exact copies the file that
+/// its identical group keeps under `rule`, so both groups agree on the survivor.
+pub fn refresh_representatives(groups: &mut [Group], items: &[ScanItem], rule: KeepRule) {
+    let keepers: Vec<Option<usize>> = groups.iter().map(|g| (g.kind == GroupKind::Identical && !g.members.is_empty()).then(|| g.members[best_in_group(items, &g.members, rule)])).collect();
+    for g in groups.iter_mut() {
+        for (k, l) in g.linked.iter().enumerate() {
+            if let (Some(Some(keep)), Some(m)) = (l.map(|gi| keepers.get(gi).copied().flatten()), g.members.get_mut(k)) {
+                *m = keep;
+            }
         }
     }
-    best
 }
 
 fn name_len(p: &std::path::Path) -> usize {
@@ -239,39 +368,59 @@ pub fn similar_aspect(a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> bool {
     }
 }
 
-/// Group scanned items. Byte-identical files always form groups. With
+/// Group scanned items. Exact copies (byte-identical files, or files whose
+/// decoded pixels are identical) always form their own Identical groups. With
 /// `similar` on, visually similar images are clustered with complete linkage:
 /// every member of a similar group is within `threshold` Hamming distance (and
 /// a similar aspect ratio) of every other member, so near-duplicates never
-/// chain into one big group. Flat, low-detail images never match by look.
+/// chain into one big group. A set of exact copies takes part in a similar
+/// group through one representative linked to its Identical group, so an
+/// edited relative never decides which of the exact copies survives. Flat,
+/// low-detail images never match by look.
 pub fn group(items: &[ScanItem], similar: bool, threshold: u32) -> Vec<Group> {
-    // 1. Identical content: units of one or more byte-identical files.
-    let mut units: Vec<Vec<usize>> = Vec::new();
+    // 1. Exact copies: units of files that share bytes or decoded pixels.
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
     let mut by_content: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut by_pixels: HashMap<u64, usize> = HashMap::new();
     for (i, it) in items.iter().enumerate() {
-        match it.content {
-            Some(c) => match by_content.get(&(it.size, c)) {
-                Some(&u) => units[u].push(i),
-                None => {
-                    by_content.insert((it.size, c), units.len());
-                    units.push(vec![i]);
-                }
-            },
-            None => units.push(vec![i]),
+        let firsts = [it.content.map(|c| *by_content.entry((it.size, c)).or_insert(i)), it.pixels.map(|p| *by_pixels.entry(p).or_insert(i))];
+        for j in firsts.into_iter().flatten() {
+            let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+            parent[a.max(b)] = a.min(b);
         }
     }
-    let rep = |u: &Vec<usize>| u[0];
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut unit_of: HashMap<usize, usize> = HashMap::new();
+    for i in 0..items.len() {
+        let r = root(&mut parent, i);
+        match unit_of.get(&r) {
+            Some(&u) => units[u].push(i),
+            None => {
+                unit_of.insert(r, units.len());
+                units.push(vec![i]);
+            }
+        }
+    }
+    // Every member of a unit looks the same; hash by one that has a dHash.
+    let reps: Vec<usize> = units.iter().map(|u| u.iter().copied().find(|&i| items[i].dhash.is_some()).unwrap_or(u[0])).collect();
     // 2. Similar: cluster units by their representative's hash.
     let mut clusters: Vec<Vec<usize>> = Vec::new(); // unit indices
     if similar {
-        let usable: Vec<usize> = (0..units.len()).filter(|&u| items[rep(&units[u])].dhash.is_some() && items[rep(&units[u])].detail >= MIN_DETAIL).collect();
+        let usable: Vec<usize> = (0..units.len()).filter(|&u| items[reps[u]].dhash.is_some() && items[reps[u]].detail >= MIN_DETAIL).collect();
         let mut tree = BkTree::new();
         for &u in &usable {
-            tree.insert(items[rep(&units[u])].dhash.unwrap_or(0), u);
+            tree.insert(items[reps[u]].dhash.unwrap_or(0), u);
         }
         // Deterministic order: by path.
         let mut order = usable.clone();
-        order.sort_by(|&a, &b| crate::catalog::natural_cmp(&items[rep(&units[a])].path.to_string_lossy(), &items[rep(&units[b])].path.to_string_lossy()));
+        order.sort_by(|&a, &b| crate::catalog::natural_cmp(&items[reps[a]].path.to_string_lossy(), &items[reps[b]].path.to_string_lossy()));
         let mut assigned = vec![false; units.len()];
         let mut cands = Vec::new();
         for &u in &order {
@@ -279,20 +428,20 @@ pub fn group(items: &[ScanItem], similar: bool, threshold: u32) -> Vec<Group> {
                 continue;
             }
             assigned[u] = true;
-            let hu = items[rep(&units[u])].dhash.unwrap_or(0);
+            let hu = items[reps[u]].dhash.unwrap_or(0);
             cands.clear();
             tree.query(hu, threshold, &mut cands);
             cands.retain(|&c| !assigned[c]);
             // Closest first, ties by path, for stable groups.
             cands.sort_by(|&a, &b| {
-                let (ia, ib) = (&items[rep(&units[a])], &items[rep(&units[b])]);
+                let (ia, ib) = (&items[reps[a]], &items[reps[b]]);
                 hamming(hu, ia.dhash.unwrap_or(0)).cmp(&hamming(hu, ib.dhash.unwrap_or(0))).then_with(|| crate::catalog::natural_cmp(&ia.path.to_string_lossy(), &ib.path.to_string_lossy()))
             });
             let mut members = vec![u];
             for &c in &cands {
-                let ic = &items[rep(&units[c])];
+                let ic = &items[reps[c]];
                 let fits = members.iter().all(|&m| {
-                    let im = &items[rep(&units[m])];
+                    let im = &items[reps[m]];
                     hamming(im.dhash.unwrap_or(0), ic.dhash.unwrap_or(0)) <= threshold && similar_aspect(im.dims, ic.dims)
                 });
                 if fits {
@@ -305,40 +454,49 @@ pub fn group(items: &[ScanItem], similar: bool, threshold: u32) -> Vec<Group> {
             }
         }
     }
-    let mut in_cluster = vec![false; units.len()];
-    for c in &clusters {
-        for &u in c {
-            in_cluster[u] = true;
-        }
-    }
-    let sort_members = |members: &mut Vec<usize>| {
-        members.sort_by(|&a, &b| crate::catalog::natural_cmp(&items[a].path.to_string_lossy(), &items[b].path.to_string_lossy()));
+    let path_cmp = |a: &usize, b: &usize| crate::catalog::natural_cmp(&items[*a].path.to_string_lossy(), &items[*b].path.to_string_lossy());
+    let wasted = |members: &[usize]| -> u64 {
+        let total: u64 = members.iter().map(|&i| items[i].size).sum();
+        total - members.iter().map(|&i| items[i].size).max().unwrap_or(0)
     };
-    let mut groups: Vec<Group> = Vec::new();
-    for (u, unit) in units.iter().enumerate() {
-        if !in_cluster[u] && unit.len() >= 2 {
+    // 3. Identical groups first, most reclaimable space first.
+    let mut identical: Vec<(usize, Vec<usize>)> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.len() >= 2)
+        .map(|(u, unit)| {
             let mut members = unit.clone();
-            sort_members(&mut members);
-            groups.push(Group { kind: GroupKind::Identical, members, min_similarity: 100 });
-        }
+            members.sort_by(path_cmp);
+            (u, members)
+        })
+        .collect();
+    identical.sort_by(|a, b| wasted(&b.1).cmp(&wasted(&a.1)));
+    let mut group_of_unit = vec![None; units.len()];
+    let mut groups: Vec<Group> = Vec::new();
+    for (u, members) in identical {
+        group_of_unit[u] = Some(groups.len());
+        let key = |i: usize| (items[i].size, items[i].content);
+        let same_bytes = members.iter().all(|&i| items[i].content.is_some() && key(i) == key(members[0]));
+        groups.push(Group { kind: GroupKind::Identical, members, linked: Vec::new(), min_similarity: 100, same_bytes });
     }
-    for c in clusters {
-        let mut members: Vec<usize> = c.iter().flat_map(|&u| units[u].iter().copied()).collect();
-        sort_members(&mut members);
-        let hashes: Vec<u64> = members.iter().filter_map(|&i| items[i].dhash).collect();
-        let mut min_similarity = 100;
-        for a in 0..hashes.len() {
-            for b in a + 1..hashes.len() {
-                min_similarity = min_similarity.min(similarity_pct(hamming(hashes[a], hashes[b])));
+    // 4. Similar groups: one file per unit, linked to the unit's Identical group.
+    let mut similar_groups: Vec<Group> = clusters
+        .into_iter()
+        .map(|c| {
+            let mut shown: Vec<(usize, Option<usize>)> = c.iter().map(|&u| (units[u].iter().copied().min_by(|a, b| path_cmp(a, b)).unwrap_or(reps[u]), group_of_unit[u])).collect();
+            shown.sort_by(|a, b| path_cmp(&a.0, &b.0));
+            let hashes: Vec<u64> = c.iter().filter_map(|&u| items[reps[u]].dhash).collect();
+            let mut min_similarity = 100;
+            for a in 0..hashes.len() {
+                for b in a + 1..hashes.len() {
+                    min_similarity = min_similarity.min(similarity_pct(hamming(hashes[a], hashes[b])));
+                }
             }
-        }
-        groups.push(Group { kind: GroupKind::Similar, members, min_similarity });
-    }
-    let wasted = |g: &Group| -> u64 {
-        let total: u64 = g.members.iter().map(|&i| items[i].size).sum();
-        total - g.members.iter().map(|&i| items[i].size).max().unwrap_or(0)
-    };
-    groups.sort_by(|a, b| (a.kind != GroupKind::Identical).cmp(&(b.kind != GroupKind::Identical)).then(wasted(b).cmp(&wasted(a))));
+            Group { kind: GroupKind::Similar, members: shown.iter().map(|s| s.0).collect(), linked: shown.iter().map(|s| s.1).collect(), min_similarity, same_bytes: false }
+        })
+        .collect();
+    similar_groups.sort_by(|a, b| wasted(&b.members).cmp(&wasted(&a.members)));
+    groups.extend(similar_groups);
     groups
 }
 
@@ -396,7 +554,11 @@ mod tests {
     }
 
     fn item(name: &str, size: u64, content: Option<u64>, dhash: Option<u64>, dims: (u32, u32)) -> ScanItem {
-        ScanItem { path: PathBuf::from(name), size, modified: None, dims: Some(dims), content, dhash, detail: 20.0 }
+        ScanItem { dims: Some(dims), content, dhash, detail: 20.0, ..ScanItem::new(PathBuf::from(name), size, None) }
+    }
+
+    fn at(secs: u64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
     }
 
     #[test]
@@ -473,12 +635,135 @@ mod tests {
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].kind, GroupKind::Identical);
         assert_eq!(exact[0].members, vec![0, 1]);
+        // The exact pair keeps its own group; the similar group lists it once.
         let sim = group(&items, true, 6);
-        assert_eq!(sim.len(), 1);
-        assert_eq!(sim[0].kind, GroupKind::Similar);
-        assert_eq!(sim[0].members, vec![0, 1, 2]);
-        assert_eq!(best_in_group(&items, &sim[0].members, KeepRule::Resolution), 2);
-        assert_eq!(best_in_group(&items, &sim[0].members, KeepRule::Largest), 2);
+        assert_eq!(sim.len(), 2);
+        assert_eq!(sim[0].kind, GroupKind::Identical);
+        assert_eq!(sim[0].members, vec![0, 1]);
+        assert_eq!(sim[1].kind, GroupKind::Similar);
+        assert_eq!(sim[1].members, vec![0, 2]);
+        assert_eq!(sim[1].linked, vec![Some(0), None]);
+        let p = pick(&items, &sim[1].members, KeepRule::Resolution);
+        assert_eq!((p.index, p.reason, p.decisive), (1, Criterion::Resolution, true));
+        assert_eq!(best_in_group(&items, &sim[1].members, KeepRule::Largest), 1);
+    }
+
+    /// The reported case: two byte-identical originals and an annotated,
+    /// bigger, newer edit of the same size.
+    fn originals_and_edit() -> Vec<ScanItem> {
+        let mut items = vec![
+            item("clone.jpg", 195_656, Some(7), Some(0xF0F0_F0F0), (1200, 800)),
+            item("draw.jpg", 328_713, Some(8), Some(0xF0F0_F0F7), (1200, 800)),
+            item("dup_of_05.jpg", 195_656, Some(7), Some(0xF0F0_F0F0), (1200, 800)),
+        ];
+        items[0].modified = at(1_000);
+        items[1].modified = at(1_060);
+        items[2].modified = at(2_000);
+        items
+    }
+
+    #[test]
+    fn exact_copies_never_lose_to_an_edited_relative() {
+        let mut items = originals_and_edit();
+        let mut groups = group(&items, true, 6);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let (ident, sim) = (&groups[0], &groups[1]);
+        assert_eq!((ident.kind, ident.same_bytes), (GroupKind::Identical, true));
+        assert_eq!(ident.members, vec![0, 2]);
+        // The identical pair keeps the older file.
+        let p = pick(&items, &ident.members, KeepRule::Resolution);
+        assert_eq!((ident.members[p.index], p.reason), (0, Criterion::Older));
+        // The edit is only a similar relative of the pair's keeper.
+        assert_eq!(sim.kind, GroupKind::Similar);
+        assert_eq!(sim.members, vec![0, 1]);
+        assert_eq!(sim.linked, vec![Some(0), None]);
+        // Same resolution: the original still wins over the bigger edit, but
+        // the choice is not clear enough to mark anything automatically.
+        let p = pick(&items, &sim.members, KeepRule::Resolution);
+        assert_eq!((sim.members[p.index], p.reason, p.decisive), (0, Criterion::Older, false));
+        // "Largest file" keeps the bigger edit, but a pick between pictures of
+        // the same resolution is never clear enough for bulk marking.
+        let p = pick(&items, &sim.members, KeepRule::Largest);
+        assert_eq!((sim.members[p.index], p.decisive), (1, false));
+        // With "Newest" the identical group keeps dup_of_05 and the similar
+        // group shows that same copy.
+        refresh_representatives(&mut groups, &items, KeepRule::Newest);
+        assert_eq!(groups[1].members, vec![2, 1]);
+        // A capture date takes precedence over modified times.
+        items[0].taken = Some(500);
+        items[2].taken = Some(400);
+        assert_eq!(groups[0].members[best_in_group(&items, &groups[0].members, KeepRule::Resolution)], 2);
+    }
+
+    #[test]
+    fn identical_pixels_form_identical_groups() {
+        // Same pixels, different bytes (metadata stripped, re-saved PNG).
+        let mut items = vec![item("a.jpg", 100, Some(1), Some(0xAB), (10, 10)), item("a_noexif.jpg", 90, Some(2), Some(0xAB), (10, 10)), item("b.png", 300, Some(3), Some(0xAB), (10, 10))];
+        items[0].pixels = Some(42);
+        items[1].pixels = Some(42);
+        items[2].pixels = Some(43);
+        let groups = group(&items, true, 6);
+        assert_eq!(groups[0].kind, GroupKind::Identical);
+        assert_eq!(groups[0].members, vec![0, 1]);
+        assert!(!groups[0].same_bytes);
+        assert_eq!(groups[1].kind, GroupKind::Similar);
+        assert_eq!(groups[1].members, vec![0, 2]);
+        // Without similarity matching only the exact copies are found.
+        let groups = group(&items, false, 6);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members, vec![0, 1]);
+    }
+
+    #[test]
+    fn tie_break_order() {
+        let base = |name: &str| ScanItem { dims: Some((100, 100)), modified: at(5_000), ..ScanItem::new(PathBuf::from(name), 1_000, None) };
+        let both = |a: ScanItem, b: ScanItem| {
+            let items = vec![a, b];
+            let p = pick(&items, &[0, 1], KeepRule::Resolution);
+            (p.index, p.reason)
+        };
+        // 1. Resolution beats everything after it.
+        let mut hi = base("x - Copy.jpg");
+        hi.dims = Some((200, 200));
+        hi.modified = at(9_000);
+        hi.size = 10;
+        assert_eq!(both(base("x.jpg"), hi), (1, Criterion::Resolution));
+        // 2. A name that is not a copy beats an older date and a bigger file.
+        let mut copy = base("x (2).jpg");
+        copy.modified = at(1);
+        copy.size = 9_000;
+        assert_eq!(both(copy, base("x.jpg")), (1, Criterion::NotACopy));
+        // 3. The older file beats a bigger one.
+        let mut big = base("a.jpg");
+        big.size = 9_000;
+        let mut old = base("b.jpg");
+        old.modified = at(1);
+        assert_eq!(both(big, old), (1, Criterion::Older));
+        // 4. File size decides only when everything else ties.
+        let mut big = base("a.jpg");
+        big.size = 9_000;
+        assert_eq!(both(base("b.jpg"), big), (1, Criterion::Larger));
+        // 5. Then the shorter name, then name order.
+        assert_eq!(both(base("photo1.jpg"), base("p1.jpg")), (1, Criterion::ShorterName));
+        assert_eq!(both(base("b.jpg"), base("a.jpg")), (1, Criterion::NameOrder));
+        // The rule comes first: "Largest file" keeps the bigger copy, but
+        // only a winner with more pixels than every other file is decisive.
+        let mut big = base("x (2).jpg");
+        big.size = 9_000;
+        let items = vec![base("x.jpg"), big.clone()];
+        let p = pick(&items, &[0, 1], KeepRule::Largest);
+        assert_eq!((p.index, p.reason, p.decisive), (1, Criterion::Larger, false));
+        big.dims = Some((120, 120));
+        let items = vec![base("x.jpg"), big];
+        let p = pick(&items, &[0, 1], KeepRule::Largest);
+        assert_eq!((p.index, p.decisive), (1, true));
+        // A rule that keeps a smaller picture is never decisive.
+        let mut small_big = base("s.jpg");
+        small_big.dims = Some((50, 50));
+        small_big.size = 9_000;
+        let items = vec![base("x.jpg"), small_big];
+        let p = pick(&items, &[0, 1], KeepRule::Largest);
+        assert_eq!((p.index, p.decisive), (1, false));
     }
 
     #[test]
