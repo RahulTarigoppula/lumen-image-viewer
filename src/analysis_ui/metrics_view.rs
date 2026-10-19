@@ -1992,7 +1992,6 @@ impl MetricsTab {
 
     /// Analyze (or Cancel with progress), the export menu and the status line.
     fn run_row(&mut self, ui: &mut Ui, p: &Palette, ctx: &MetricsCtx) {
-        let w = ui.available_width();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.spacing_mut().interact_size.y = theme::size::CONTROL;
@@ -2001,11 +2000,15 @@ impl MetricsTab {
                 let frac = prog.fraction().unwrap_or(0.0);
                 let eta = prog.eta().map(fmt_eta).unwrap_or_default();
                 let text = if prog.total() > 1 { format!("{} of {}  {eta}", prog.done(), prog.total()) } else if eta.is_empty() { "Analyzing".to_string() } else { eta };
-                let bar_w = (w - 84.0).max(80.0);
-                ui.add(egui::ProgressBar::new(frac).fill(p.accent).desired_width(bar_w).desired_height(theme::size::CONTROL).corner_radius(6).text(RichText::new(text).size(11.5)));
-                if widgets::secondary_button(ui, "Cancel").clicked() {
-                    run.handle.cancel();
-                }
+                // Right to left: the button takes its own width and the bar the rest, so the
+                // row never asks for more than the panel has (a wider row grows the panel).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        run.handle.cancel();
+                    }
+                    let bar_w = ui.available_width().max(40.0);
+                    ui.add(egui::ProgressBar::new(frac).fill(p.accent).desired_width(bar_w).desired_height(theme::size::CONTROL).corner_radius(6).text(RichText::new(text).size(11.5)));
+                });
             } else {
                 let n = self.runnable().len();
                 let what = match (self.kind, ctx.roi.is_some(), self.scope) {
@@ -2018,11 +2021,14 @@ impl MetricsTab {
                     _ => "the whole image",
                 };
                 let tip = format!("Measure {what} with {n} metric{} (Shift+Q)", if n == 1 { "" } else { "s" });
-                let analyze = ui.allocate_ui_with_layout(Vec2::new((w - 40.0).max(80.0), theme::size::CONTROL), egui::Layout::top_down_justified(egui::Align::Center), |ui| widgets::primary_button_enabled(ui, p, n > 0, "Analyze")).inner;
-                if analyze.on_hover_text(tip).on_disabled_hover_text("No metric applies here: choose some in Details and options").clicked() {
-                    self.run(ctx, ui.ctx());
-                }
-                self.export_menu(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.export_menu(ui);
+                    let bw = ui.available_width().max(80.0);
+                    let analyze = ui.allocate_ui_with_layout(Vec2::new(bw, theme::size::CONTROL), egui::Layout::top_down_justified(egui::Align::Center), |ui| widgets::primary_button_enabled(ui, p, n > 0, "Analyze")).inner;
+                    if analyze.on_hover_text(tip).on_disabled_hover_text("No metric applies here: choose some in Details and options").clicked() {
+                        self.run(ctx, ui.ctx());
+                    }
+                });
             }
         });
         if self.stale() && self.run.is_none() && self.report.is_some() {
@@ -2043,7 +2049,7 @@ impl MetricsTab {
             _ => "Checks sharpness, noise, exposure, color and compression in one click.",
         };
         look::note(ui, p, what);
-        ui.label(RichText::new("Press R and drag on the image to check only a region.").size(11.5).color(p.faint));
+        ui.add(egui::Label::new(RichText::new("Press R and drag on the image to check only a region.").size(11.5).color(p.faint)).wrap());
     }
 
     /// The facts the summary is written from (the shown report).

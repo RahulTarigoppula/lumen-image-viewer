@@ -138,15 +138,19 @@ impl AiView {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.spacing_mut().interact_size.y = theme::size::CONTROL;
-                let field_w = (ui.available_width() - 120.0).max(100.0);
-                let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(field_w).margin(Vec2::new(6.0, 5.0)));
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    connect = true;
-                }
-                let busy = ai.testing();
-                if widgets::primary_button_enabled(ui, &p, !busy, if busy { "Connecting" } else { "Test & connect" }).on_hover_text("Turn on AI review, check the server and pick a vision model").clicked() {
-                    connect = true;
-                }
+                // Right to left: the button keeps its width and the field takes the rest
+                // (minus its own margin), so the row never widens the panel.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = ai.testing();
+                    if widgets::primary_button_enabled(ui, &p, !busy, if busy { "Connecting" } else { "Test & connect" }).on_hover_text("Turn on AI review, check the server and pick a vision model").clicked() {
+                        connect = true;
+                    }
+                    let field_w = (ui.available_width() - 12.0).max(60.0);
+                    let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(field_w).margin(Vec2::new(6.0, 5.0)));
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        connect = true;
+                    }
+                });
             });
             let hint = match ai.endpoint() {
                 Some(e) if !ai.settings.host.is_empty() && ai.host_edit.trim() == ai.settings.host => format!("Connects to {}", e.display()),
