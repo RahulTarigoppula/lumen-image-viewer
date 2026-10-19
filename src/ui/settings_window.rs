@@ -106,6 +106,9 @@ struct State {
     confirm_preset: Option<Preset>,
     /// egui pass in which the window last drew; a gap means it was just opened.
     last_pass: u64,
+    /// A text field had keyboard focus at the end of the last frame (egui drops
+    /// the focus on Esc before the field sees it).
+    editing: bool,
 }
 
 const ACCENTS: [(&str, [u8; 3]); 9] = [
@@ -139,20 +142,23 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     }
     st.last_pass = pass;
 
-    // Esc closes Settings unless a text field is being edited (or a key is being captured).
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.text_edit_focused() && st.capture.is_none() {
+    // Esc closes Settings unless it only leaves a text field (or a key is being captured).
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.text_edit_focused() && !st.editing && st.capture.is_none() {
         *open = false;
     }
     // Size and position come from the app window every frame (nothing remembered),
     // so the window always fits, at any interface size and after maximize / restore,
-    // and keeps the same width on every page.
+    // and keeps the same width on every page. The bottom strip stays free so the
+    // status bar remains readable.
     let screen = ctx.content_rect();
-    let size = Vec2::new((screen.width() - 24.0).min(860.0), (screen.height() - 24.0).min(620.0)).max(Vec2::new(120.0, 120.0)).min(screen.size());
+    let status_h = 26.0;
+    let avail = Vec2::new(screen.width(), (screen.height() - status_h).max(120.0));
+    let size = Vec2::new((avail.x - 24.0).min(860.0), (avail.y - 24.0).min(620.0)).max(Vec2::new(120.0, 120.0)).min(avail);
     egui::Window::new("Settings")
         .id(egui::Id::unique("settings-window"))
         .open(open)
         .fixed_size(size)
-        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, -status_h / 2.0))
         .resizable(false)
         .collapsible(false)
         .scroll(false)
@@ -251,6 +257,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
         st.shell = None;
         st.cache_size = None;
     }
+    st.editing = ctx.text_edit_focused();
     ctx.data_mut(|d| d.insert_temp(state_id, st));
     changed
 }
@@ -1374,7 +1381,13 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     let search = |ui: &mut Ui, text: &mut String| {
         ui.label(RichText::new(I::MAGNIFYING_GLASS).color(p.muted));
         let w = 220.0f32.min(ui.available_width() - 8.0).max(80.0);
-        ui.add(egui::TextEdit::singleline(text).hint_text("Search commands or keys").desired_width(w));
+        let r = ui.add(egui::TextEdit::singleline(text).hint_text("Search commands or keys").desired_width(w));
+        // Esc clears the search first (staying in the field), then leaves the field;
+        // only an Esc outside the field closes Settings.
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && !text.is_empty() {
+            text.clear();
+            r.request_focus();
+        }
     };
     ui.horizontal(|ui| {
         for m in KeyMode::ALL {
@@ -1406,6 +1419,13 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     let base = Keymap::preset(preset);
     let mode = st.kb_mode;
     let q = st.kb_search.trim().to_lowercase();
+    // Every shortcut button of this mode has the same width, so the x and +
+    // buttons line up in columns from row to row.
+    let key_font = egui::FontId::monospace(12.0);
+    let text_w = |t: String| ui.painter().layout_no_wrap(t, key_font.clone(), p.text).size().x;
+    let widest = Command::all().into_iter().flat_map(|c| km.keys_for(mode, c)).map(|k| text_w(keymap::format_shortcut(&k))).fold(text_w("Press a key...".into()), f32::max);
+    let key_w = (widest + 2.0 * ui.spacing().button_padding.x).clamp(64.0, 180.0);
+    let btn_h = 24.0;
     card(ui, p, |ui| {
         let mut first = true;
         for cmd in Command::all() {
@@ -1435,7 +1455,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                 let keys_w = (ui.available_width() - restore_w).max(60.0);
                 ui.allocate_ui_with_layout(Vec2::new(keys_w, 26.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
                     ui.set_width(keys_w);
-                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                     for (k, text) in keys.iter().zip(&key_text) {
                         let capturing_this = st.capture == Some(Capture { mode, cmd, replace: Some(*k) });
                         let conflicts = km.conflicts(mode, *k, cmd);
@@ -1444,7 +1464,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                         if !conflicts.is_empty() {
                             rt = rt.color(p.warn);
                         }
-                        let mut b = ui.add(egui::Button::new(rt).selected(capturing_this));
+                        let mut b = ui.add(egui::Button::new(rt).selected(capturing_this).min_size(Vec2::new(key_w, btn_h)));
                         if !conflicts.is_empty() {
                             let names: Vec<String> = conflicts.iter().map(|(m, c)| format!("{} ({})", c.label(), m.label())).collect();
                             b = b.on_hover_text(format!("Also bound to {}", names.join(", ")));
@@ -1455,22 +1475,24 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                             st.capture = Some(Capture { mode, cmd, replace: Some(*k) });
                             st.conflict = None;
                         }
-                        if ui.small_button(I::X).on_hover_text("Remove this shortcut").clicked() {
+                        if ui.add(egui::Button::new(RichText::new(I::X).size(12.0)).frame(false).min_size(Vec2::new(20.0, btn_h))).on_hover_text("Remove this shortcut").clicked() {
                             let rest: Vec<KeyboardShortcut> = keys.iter().copied().filter(|x| x != k).collect();
                             set_command_keys(core, mode, cmd, rest);
                             changed = true;
                         }
+                        ui.add_space(6.0);
                     }
                     let adding = st.capture == Some(Capture { mode, cmd, replace: None });
                     let add_label = if adding { "Press a key...".to_string() } else { I::PLUS.to_string() };
-                    if ui.add(egui::Button::new(add_label).selected(adding)).on_hover_text("Add a shortcut").clicked() {
+                    let add_w = if adding { key_w } else { btn_h };
+                    if ui.add(egui::Button::new(add_label).selected(adding).min_size(Vec2::new(add_w, btn_h))).on_hover_text("Add a shortcut").clicked() {
                         st.capture = Some(Capture { mode, cmd, replace: None });
                         st.conflict = None;
                     }
                 });
                 if customized {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button(I::ARROW_COUNTER_CLOCKWISE).on_hover_text("Restore the preset shortcuts for this command").clicked() {
+                        if ui.add(egui::Button::new(I::ARROW_COUNTER_CLOCKWISE).min_size(Vec2::splat(btn_h))).on_hover_text("Restore the preset shortcuts for this command").clicked() {
                             set_command_keys(core, mode, cmd, base.keys_for(mode, cmd));
                             changed = true;
                         }

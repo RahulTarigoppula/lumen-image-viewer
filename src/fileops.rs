@@ -78,6 +78,54 @@ pub fn is_within(path: &Path, dir: &Path) -> bool {
     p == d || p.starts_with(&format!("{d}\\"))
 }
 
+/// `path` spelled the way it is stored on disk: drive letter in upper case and
+/// each existing component in its real case ("c:\photos\2024" ->
+/// "C:\Photos\2024"). Windows paths are case-insensitive, but the folder tree,
+/// the back / forward history and the title compare paths exactly, so a typed
+/// path must match the one listed. Components that cannot be found are kept as
+/// given.
+pub fn true_case(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => match p.kind() {
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) => out.push(p.as_os_str().to_string_lossy().to_uppercase()),
+                _ => out.push(p.as_os_str()),
+            },
+            Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                let wild = name.to_string_lossy().contains(['*', '?']);
+                let real = if wild { None } else { disk_name(&out.join(name)) };
+                out.push(real.as_deref().unwrap_or(name));
+            }
+        }
+    }
+    out
+}
+
+/// The name of the existing file or folder `path` as stored on disk.
+#[cfg(windows)]
+fn disk_name(path: &Path) -> Option<std::ffi::OsString> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: `data` is a valid out-parameter; the search handle is closed right away.
+    let h = unsafe { FindFirstFileW(&windows::core::HSTRING::from(path.as_os_str()), &mut data) }.ok()?;
+    let _ = unsafe { FindClose(h) };
+    let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+    (len > 0).then(|| std::ffi::OsString::from_wide(&data.cFileName[..len]))
+}
+
+#[cfg(not(windows))]
+fn disk_name(_path: &Path) -> Option<std::ffi::OsString> {
+    None
+}
+
 fn copy_any(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -376,5 +424,24 @@ pub fn drag_out(files: &[PathBuf]) -> Result<DragOutcome> {
         }
         // DRAGDROP_S_CANCEL / DRAGDROP_S_DROP are success codes; only real failures are Err.
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn true_case_restores_the_spelling_on_disk() {
+        let base = std::env::temp_dir().join(format!("lumen-true-case-{}", std::process::id()));
+        let dir = base.join("MixedCase Folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let typed = PathBuf::from(base.to_string_lossy().to_lowercase()).join("mixedcase folder");
+        let fixed = true_case(&typed);
+        assert_eq!(fixed.file_name().unwrap(), "MixedCase Folder");
+        assert!(fixed.to_string_lossy().starts_with(|c: char| c.is_ascii_uppercase()));
+        // Missing components are kept as typed.
+        assert_eq!(true_case(&typed.join("not there")).file_name().unwrap(), "not there");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -66,10 +66,47 @@ enum PendingAction {
     Delete(Vec<PathBuf>),
 }
 
-/// One undoable file operation batch: each pair is (original path, current path).
+/// One entry of the file undo history (Ctrl+Z when no edit is open): moves,
+/// renames, and rotations / flips written to files.
 struct FileUndo {
     label: String,
-    moves: Vec<(PathBuf, PathBuf)>,
+    change: FileChange,
+}
+
+enum FileChange {
+    /// Moved or renamed: each pair is (original path, current path).
+    Moves(Vec<(PathBuf, PathBuf)>),
+    /// `t` was applied to files on disk. Each file is restored from its
+    /// previous bytes when they were kept; without them (only for JPEGs whose
+    /// EXIF orientation alone changed) the inverse transform turns it back.
+    Transform { t: Transform, files: Vec<(PathBuf, Option<Vec<u8>>)> },
+}
+
+impl FileUndo {
+    /// Memory held by saved file contents.
+    fn bytes(&self) -> usize {
+        match &self.change {
+            FileChange::Transform { files, .. } => files.iter().filter_map(|(_, b)| b.as_ref()).map(Vec::len).sum(),
+            FileChange::Moves(_) => 0,
+        }
+    }
+}
+
+/// At most this much previous file content is kept for undoing rotations;
+/// older history is dropped beyond it.
+const UNDO_BYTES_BUDGET: usize = 512 << 20;
+
+/// Decoded size up to which the last viewed image stays cached after the
+/// viewer closes (a 24 MP photo with its mip levels).
+const KEEP_AFTER_VIEWER: u64 = 128 << 20;
+
+/// The transform that undoes `t`.
+fn inverse(t: Transform) -> Transform {
+    match t {
+        Transform::Rotate90 => Transform::Rotate270,
+        Transform::Rotate270 => Transform::Rotate90,
+        other => other,
+    }
 }
 
 struct TransferDialog {
@@ -122,6 +159,11 @@ pub struct App {
     slideshow_from_viewer: bool,
     /// Frames started so far, up to 2 (startup milestones).
     startup_frames: u8,
+    /// A text field had keyboard focus at the end of the last frame.
+    was_editing: bool,
+    /// The window had the keyboard focus last frame (folders are re-listed
+    /// when it comes back, since Explorer may have changed them).
+    window_focused: bool,
     /// Copy / move / paste / rotate jobs running off the UI thread.
     file_jobs: FileJobs,
     /// Ctrl+Alt+M asked to open this map link: waiting for the privacy
@@ -230,6 +272,8 @@ impl App {
             file_undo: Vec::new(),
             slideshow_from_viewer: false,
             startup_frames: 0,
+            was_editing: false,
+            window_focused: true,
             file_jobs: FileJobs::new(ctx.clone()),
             gps_confirm: None,
             window_stack: Vec::new(),
@@ -257,6 +301,8 @@ impl App {
     // ------------------------------------------------------------ navigation
 
     pub fn navigate(&mut self, folder: PathBuf) {
+        // A typed "c:\photos" must match the tree's "C:\Photos".
+        let folder = fileops::true_case(&folder);
         if folder != self.browser.folder && self.browser.folder.exists() && !self.browser.entries.is_empty() {
             self.browser.back.push(self.browser.folder.clone());
             self.browser.forward.clear();
@@ -354,6 +400,11 @@ impl App {
             self.browser.set_focus_path(&p);
         }
         self.viewer.edit = None;
+        // Decoded images are only needed in the viewer (a 100 MP photo holds about
+        // 500 MB): release them, keeping only a normal-sized last image so going
+        // back to it is instant.
+        let keep: Vec<PathBuf> = self.viewer.current().filter(|p| self.core.loader.bytes_of(p).is_some_and(|b| b <= KEEP_AFTER_VIEWER)).cloned().into_iter().collect();
+        self.core.loader.clear_except(&keep);
         self.mode = Mode::Browser;
         if self.fullscreen && (self.core.settings.open_viewer_fullscreen || self.fullscreen_from_viewer) {
             self.set_fullscreen(false);
@@ -448,7 +499,7 @@ impl App {
                 for e in &self.browser.entries {
                     self.core.meta.forget(&e.path);
                 }
-                self.browser.tree.invalidate(&self.browser.folder.clone());
+                self.browser.tree.refresh();
                 self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
             }
             GoUp => {
@@ -768,7 +819,7 @@ impl App {
             }
             AutoEnhance => {
                 if self.ensure_viewer() && !self.viewer.apply_simple(&self.core, "Auto enhance", crate::edit::ops::auto_levels) {
-                    self.core.toasts.info("Image is still loading");
+                    self.image_unavailable();
                 }
             }
             DrawBoard | CloneStamp | HealingBrush | RedEye | BlurRegion | Selection => {
@@ -802,34 +853,45 @@ impl App {
             Undo | Redo if self.viewer.has_tool() => {
                 let _ = if cmd == Undo { self.viewer.tool_undo() } else { self.viewer.tool_redo() };
             }
+            // One history in the viewer: the image's edits first, then the file
+            // changes (lossless rotate, rename, move) in the order they were made.
             Undo => {
-                if let Some(e) = &mut self.viewer.edit {
-                    if let Some(w) = e.undo() {
-                        self.core.toasts.info(format!("Undo: {w}"));
-                        self.viewer.reset_view(fit);
-                    }
+                if let Some(w) = self.viewer.edit.as_mut().and_then(|e| e.undo()) {
+                    self.core.toasts.success(format!("Undone: {w}"));
+                    self.viewer.reset_view(fit);
+                } else if self.mode == Mode::Viewer {
+                    self.undo_file_op();
                 }
             }
             Redo => {
-                if let Some(e) = &mut self.viewer.edit {
-                    if let Some(w) = e.redo() {
-                        self.core.toasts.info(format!("Redo: {w}"));
-                        self.viewer.reset_view(fit);
-                    }
+                if let Some(w) = self.viewer.edit.as_mut().and_then(|e| e.redo()) {
+                    self.core.toasts.success(format!("Redone: {w}"));
+                    self.viewer.reset_view(fit);
                 }
             }
             Save => self.save(false),
             SaveAs => self.save(true),
             CopyImage => {
-                let img = if self.mode == Mode::Viewer { self.viewer.current_image(&self.core) } else { None };
-                let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
-                let img = img.or_else(|| self.targets().first().and_then(|p| crate::decode::decode_file(p, first_frame).ok()).map(|d| d.image));
-                match img {
-                    Some(img) => match fileops::copy_image_to_clipboard(&img) {
-                        Ok(()) => self.core.toasts.info("Image copied to clipboard"),
-                        Err(e) => self.core.toasts.error(format!("Copy failed: {e}")),
-                    },
-                    None => self.core.toasts.info("Image is still loading"),
+                let img = if self.mode == Mode::Viewer {
+                    let Some(img) = self.viewer.current_image(&self.core) else {
+                        self.image_unavailable();
+                        return;
+                    };
+                    img
+                } else {
+                    let Some(p) = self.targets().first().cloned() else { return };
+                    let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
+                    match crate::decode::decode_file(&p, first_frame) {
+                        Ok(d) => d.image,
+                        Err(e) => {
+                            self.core.toasts.error(format!("Could not open {}: {e}", crate::ui::viewer::file_name(&p)));
+                            return;
+                        }
+                    }
+                };
+                match fileops::copy_image_to_clipboard(&img) {
+                    Ok(()) => self.core.toasts.info("Image copied to clipboard"),
+                    Err(e) => self.core.toasts.error(format!("Copy failed: {e}")),
                 }
             }
             PasteImage => match fileops::paste_image_from_clipboard() {
@@ -849,7 +911,7 @@ impl App {
             Print => {
                 if self.mode == Mode::Viewer {
                     let Some(img) = self.viewer.current_image(&self.core) else {
-                        self.core.toasts.info("Image is still loading");
+                        self.image_unavailable();
                         return;
                     };
                     let title = self.viewer.current().map(|p| crate::ui::viewer::file_name(p)).unwrap_or_else(|| "Lumen".into());
@@ -943,10 +1005,23 @@ impl App {
             self.open_viewer_at(f);
         }
         if self.viewer.current_image(&self.core).is_none() {
-            self.core.toasts.info("Image is still loading...");
+            self.image_unavailable();
             return false;
         }
         true
+    }
+
+    /// Tell the user why the viewer has no image to work on: it is still
+    /// loading, or the file could not be opened (and why).
+    fn image_unavailable(&mut self) {
+        let failed = self.viewer.current().and_then(|p| match self.core.loader.state(p) {
+            Some(crate::loader::LoadState::Failed(e)) => Some(format!("Could not open {}: {e}", crate::ui::viewer::file_name(p))),
+            _ => None,
+        });
+        match failed {
+            Some(msg) => self.core.toasts.error(msg),
+            None => self.core.toasts.info("Image is still loading"),
+        }
     }
 
     fn transform(&mut self, t: Transform) {
@@ -976,7 +1051,7 @@ impl App {
             }
         }
         if !self.viewer.apply_simple(&self.core, t.label(), |img| t.apply(img)) {
-            self.core.toasts.info("Image is still loading");
+            self.image_unavailable();
         }
         self.viewer.reset_view(fit);
     }
@@ -988,14 +1063,16 @@ impl App {
         self.core.meta.forget(p);
     }
 
-    /// Lossless JPEG rotate / flip; returns how many files changed.
+    /// Lossless JPEG rotate / flip (undoable); returns how many files changed.
     fn lossless_transform(&mut self, jpegs: &[PathBuf], t: Transform) -> usize {
-        let mut ok = 0;
+        let mut done = Vec::new();
         let mut errs = Vec::new();
         for p in jpegs {
+            // The file as it was, for an exact undo.
+            let before = std::fs::read(p).ok().filter(|b| b.len() <= UNDO_BYTES_BUDGET);
             match crate::encode::lossless_jpeg_transform(p, t) {
                 Ok(_) => {
-                    ok += 1;
+                    done.push((p.clone(), before));
                     self.forget_file(p);
                 }
                 Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
@@ -1004,8 +1081,10 @@ impl App {
         if !errs.is_empty() {
             self.core.toasts.error(format!("{} file(s) not rotated - {}", errs.len(), errs[0]));
         }
+        let ok = done.len();
         if ok > 0 {
             self.core.toasts.info(format!("{} - lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+            self.push_undo(FileUndo { label: t.label().to_string(), change: FileChange::Transform { t, files: done } });
         }
         ok
     }
@@ -1167,8 +1246,8 @@ impl App {
     fn finish_file_job(&mut self, res: JobResult) {
         match res {
             JobResult::Transfer { done, errs, dest, do_move } => self.finish_transfer(done, errs, dest, do_move),
-            JobResult::Rotate { label, lossless, reencoded, skipped, errs } => {
-                for p in lossless.iter().chain(&reencoded) {
+            JobResult::Rotate { t, lossless, reencoded, skipped, errs } => {
+                for (p, _) in lossless.iter().chain(&reencoded) {
                     self.forget_file(p);
                 }
                 if !skipped.is_empty() {
@@ -1180,7 +1259,18 @@ impl App {
                 let ok = lossless.len() + reencoded.len();
                 if ok > 0 {
                     let how = if reencoded.is_empty() { " - lossless" } else { "" };
-                    self.core.toasts.info(format!("{label}{how}{}", if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                    // A re-encoded file is undone from its previous bytes only: when
+                    // those were too large to keep, the change cannot be undone.
+                    let undoable = reencoded.iter().all(|(_, b)| b.is_some());
+                    let note = if undoable { "" } else { " (too large to undo)" };
+                    self.core.toasts.info(format!("{}{how}{}{note}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                    if undoable {
+                        let files = lossless.into_iter().chain(reencoded).collect();
+                        self.push_undo(FileUndo { label: t.label().to_string(), change: FileChange::Transform { t, files } });
+                    } else {
+                        // Ctrl+Z must not skip this change and undo an older one instead.
+                        self.file_undo.clear();
+                    }
                 }
             }
             JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
@@ -1244,13 +1334,22 @@ impl App {
     }
 
     fn push_file_undo(&mut self, label: String, moves: Vec<(PathBuf, PathBuf)>) {
-        self.file_undo.push(FileUndo { label, moves });
+        self.push_undo(FileUndo { label, change: FileChange::Moves(moves) });
+    }
+
+    fn push_undo(&mut self, op: FileUndo) {
+        self.file_undo.push(op);
         if self.file_undo.len() > 20 {
+            self.file_undo.remove(0);
+        }
+        // Saved file contents are bounded: forget the oldest history first.
+        while self.file_undo.len() > 1 && self.file_undo.iter().map(FileUndo::bytes).sum::<usize>() > UNDO_BYTES_BUDGET {
             self.file_undo.remove(0);
         }
     }
 
-    /// Ctrl+Z in the browser: put the last moved / renamed files back.
+    /// Ctrl+Z with no edit to undo: put the last moved / renamed files back, or
+    /// turn the last rotated / flipped files back.
     fn undo_file_op(&mut self) {
         let Some(op) = self.file_undo.pop() else {
             self.core.toasts.info("Nothing to undo. Deleted files can be restored from the Recycle Bin.");
@@ -1258,30 +1357,54 @@ impl App {
         };
         let mut ok = 0;
         let mut errs = Vec::new();
-        let mut folders: Vec<PathBuf> = Vec::new();
-        for (orig, cur) in op.moves.iter().rev() {
-            match fileops::move_path(cur, orig) {
-                Ok(()) => {
-                    ok += 1;
-                    self.core.tags.moved(cur, orig);
-                    self.core.loader.invalidate(cur);
-                    self.core.thumbs.forget(cur);
-                    self.viewer.replace_path(cur, orig);
-                    for d in [orig.parent(), cur.parent()].into_iter().flatten() {
-                        if !folders.iter().any(|f| f == d) {
-                            folders.push(d.to_path_buf());
+        match &op.change {
+            FileChange::Moves(moves) => {
+                let mut folders: Vec<PathBuf> = Vec::new();
+                for (orig, cur) in moves.iter().rev() {
+                    match fileops::move_path(cur, orig) {
+                        Ok(()) => {
+                            ok += 1;
+                            self.core.tags.moved(cur, orig);
+                            self.core.loader.invalidate(cur);
+                            self.core.thumbs.forget(cur);
+                            self.viewer.replace_path(cur, orig);
+                            for d in [orig.parent(), cur.parent()].into_iter().flatten() {
+                                if !folders.iter().any(|f| f == d) {
+                                    folders.push(d.to_path_buf());
+                                }
+                            }
                         }
+                        Err(e) => errs.push(e.to_string()),
                     }
                 }
-                Err(e) => errs.push(e.to_string()),
+                for f in &folders {
+                    self.browser.tree.invalidate(f);
+                }
+                if let Some((orig, _)) = moves.first() {
+                    if orig.parent() == Some(self.browser.folder.as_path()) {
+                        self.browser.pending_select = Some(orig.clone());
+                    }
+                }
             }
-        }
-        for f in &folders {
-            self.browser.tree.invalidate(f);
-        }
-        if let Some((orig, _)) = op.moves.first() {
-            if orig.parent() == Some(self.browser.folder.as_path()) {
-                self.browser.pending_select = Some(orig.clone());
+            FileChange::Transform { t, files } => {
+                for (p, bytes) in files {
+                    let res = match bytes {
+                        _ if !p.is_file() => Err(anyhow::anyhow!("the file no longer exists")),
+                        Some(b) => crate::encode::write_atomic(p, b),
+                        None => crate::encode::lossless_jpeg_transform(p, inverse(*t)).map(|_| ()),
+                    };
+                    match res {
+                        Ok(()) => ok += 1,
+                        Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
+                    }
+                    self.forget_file(p);
+                }
+                // The viewer shows the restored file (unless it holds edits of its own).
+                let shown = self.viewer.current().is_some_and(|c| files.iter().any(|(p, _)| p == c));
+                if shown && !self.viewer.is_dirty() {
+                    self.viewer.edit = None;
+                    self.viewer.reset_view(self.core.settings.fit_mode);
+                }
             }
         }
         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -1323,30 +1446,52 @@ impl App {
         let lossy = self.viewer.current().and_then(|c| lossy_resave_reason(self.viewer.loaded(&self.core).as_ref().map(|l| &l.decoded), c));
         // Saving would leave out an open tool's unapplied work: apply it first.
         let tool_work = self.viewer.tool_has_work();
+        let dirty = self.viewer.is_dirty();
         let can_save = !tool_work && lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
         let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
+        // Same wording and buttons as the viewer's own prompt.
         egui::Modal::new(egui::Id::unique("unsaved-guard")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.heading("Unsaved changes");
-            ui.add_space(4.0);
-            ui.label(format!("\"{name}\" has edits that are not saved."));
-            if tool_work {
-                ui.label(RichText::new("The open tool has changes that are not applied. Cancel and apply them to keep them.").color(p.muted).size(12.0));
-            } else if let Some(why) = &lossy {
-                ui.label(RichText::new(format!("{why} Use Save as from the viewer.")).color(p.muted).size(12.0));
-            } else if !can_save {
-                ui.label(RichText::new("This format cannot be saved in place - use Save as from the viewer.").color(p.muted).size(12.0));
+            ui.set_width(380.0);
+            let note = |ui: &mut egui::Ui, text: &str| {
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(text).color(p.muted).size(12.0)).wrap());
+            };
+            if !dirty {
+                // Only an open tool's unapplied work would be lost.
+                ui.heading("Discard changes?");
+                ui.add_space(6.0);
+                ui.label(format!("The changes in the open tool are not applied to \"{name}\" yet."));
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Discard").color(egui::Color32::WHITE)).fill(p.accent)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        choice = Some(2);
+                    }
+                    if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        choice = Some(0);
+                    }
+                });
+                return;
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(can_save, egui::Button::new(format!("{}  Save", I::FLOPPY_DISK))).clicked() {
-                    choice = Some(1);
+            ui.heading("Save changes?");
+            ui.add_space(6.0);
+            ui.label(format!("\"{name}\" has unsaved edits."));
+            if tool_work {
+                note(ui, "The open tool also has changes that are not applied. Keep editing to apply them before saving.");
+            } else if let Some(why) = &lossy {
+                note(ui, &format!("{why} Use Save as from the viewer."));
+            } else if !can_save {
+                note(ui, "This format cannot be saved in place. Use Save as from the viewer.");
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(if tool_work { "Keep editing" } else { "Cancel" }).clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(0);
                 }
-                if ui.button("Discard changes").clicked() {
+                if ui.button("Discard").clicked() {
                     choice = Some(2);
                 }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    choice = Some(0);
+                if ui.add_enabled(can_save, egui::Button::new(RichText::new("Save").color(egui::Color32::WHITE)).fill(p.accent)).clicked() {
+                    choice = Some(1);
                 }
             });
         });
@@ -1572,8 +1717,12 @@ impl App {
             return;
         }
         self.update_window_stack();
+        // egui drops the keyboard focus on Esc before this frame's widgets run:
+        // Esc that only leaves a text field does nothing else.
+        let left_field = self.was_editing && ctx.input(|i| i.key_pressed(Key::Escape));
+        let typing = ctx.egui_wants_keyboard_input() || left_field;
         // Esc closes the most recently opened floating window first.
-        if !ctx.egui_wants_keyboard_input() {
+        if !typing {
             if let Some(&w) = self.window_stack.last() {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                     self.close_window(w);
@@ -1582,7 +1731,6 @@ impl App {
             }
         }
         let km = keymap::active();
-        let typing = ctx.egui_wants_keyboard_input();
         // Edit tools own Enter / Escape and most keys; only undo / redo (of the tool) pass.
         let tool_only = self.mode == Mode::Viewer && self.viewer.has_tool();
         let mode_map = match self.mode {
@@ -1602,7 +1750,11 @@ impl App {
                 }
                 if let Some(m) = mode_map {
                     if let Some(c) = km.lookup(m, key, mods) {
-                        if !tool_only || matches!(c, Command::Undo | Command::Redo) {
+                        // Image navigation works like the toolbar arrows: it closes an
+                        // untouched tool, or asks first when the tool has changes.
+                        // Space (pan) and Backspace (delete an object) stay with the tool.
+                        let nav = matches!(c, Command::NextImage | Command::PrevImage | Command::FirstImage | Command::LastImage) && !matches!(key, Key::Space | Key::Backspace);
+                        if !tool_only || nav || matches!(c, Command::Undo | Command::Redo) {
                             return Some(c);
                         }
                     }
@@ -2240,6 +2392,13 @@ impl eframe::App for App {
                 self.pending_guard = Some(PendingAction::Exit);
             }
         }
+        // Back from another program: folders may have been created, renamed or
+        // removed there, so the tree lists its open folders again.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.window_focused {
+            self.browser.tree.refresh();
+        }
+        self.window_focused = focused;
         self.dev_actions(&ctx);
         crate::ui::gate_background_tooltips(&ctx);
         self.handle_dropped(&ctx);
@@ -2423,6 +2582,7 @@ impl eframe::App for App {
         }
         self.file_job_progress(&ctx, &p);
         self.core.toasts.show(&ctx, &p);
+        self.was_editing = ctx.text_edit_focused();
         crate::devhook::prof("ui_total", frame_start);
     }
 
@@ -2476,7 +2636,7 @@ impl App {
                         None => "none".into(),
                     };
                     let s = format!(
-                        "mode={:?} folder={} items={} focus={:?} selected={} viewer={} [{}/{}] zoom={:.3} load={} dirty={}",
+                        "mode={:?} folder={} items={} focus={:?} selected={} viewer={} [{}/{}] zoom={:.3} load={} dirty={} window_focused={} file_undo={}",
                         self.mode,
                         self.browser.folder.display(),
                         self.browser.items.len(),
@@ -2487,7 +2647,9 @@ impl App {
                         self.viewer.list.len(),
                         self.viewer.zoom,
                         st,
-                        self.viewer.is_dirty()
+                        self.viewer.is_dirty(),
+                        self.window_focused,
+                        self.file_undo.len()
                     );
                     self.dev.write_state(&s);
                 }
@@ -2545,7 +2707,9 @@ struct JobStatus {
 /// What a finished background file job hands back to the UI thread.
 enum JobResult {
     Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool },
-    Rotate { label: &'static str, lossless: Vec<PathBuf>, reencoded: Vec<PathBuf>, skipped: Vec<String>, errs: Vec<String> },
+    /// Changed files with their previous bytes for undo (`None` once the
+    /// budget for keeping them is used up).
+    Rotate { t: Transform, lossless: Vec<(PathBuf, Option<Vec<u8>>)>, reencoded: Vec<(PathBuf, Option<Vec<u8>>)>, skipped: Vec<String>, errs: Vec<String> },
     Panicked(String),
 }
 
@@ -2629,10 +2793,18 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
     Box::new(move |pr| {
         let total = jpegs.len() + others.len();
         let (mut lossless, mut reencoded, mut skipped, mut errs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // The files as they were, for undo, within a memory budget.
+        let mut kept = 0usize;
+        let mut keep = |p: &Path| {
+            let b = std::fs::read(p).ok().filter(|b| kept + b.len() <= UNDO_BYTES_BUDGET)?;
+            kept += b.len();
+            Some(b)
+        };
         for (i, p) in jpegs.iter().enumerate() {
             pr.set(i, total);
+            let before = keep(p);
             match crate::encode::lossless_jpeg_transform(p, t) {
-                Ok(_) => lossless.push(p.clone()),
+                Ok(_) => lossless.push((p.clone(), before)),
                 Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
             }
         }
@@ -2664,14 +2836,15 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
                 skipped.push(format!("{name} (more than 8 bits per channel)"));
                 continue;
             }
+            let before = keep(p);
             let out = t.apply(&d.image);
             let opts = SaveOptions { format: fmt, jpeg_quality, exif: d.exif.clone(), ..Default::default() };
             match crate::encode::save_from(&out, p, &opts, Some(p)) {
-                Ok(()) => reencoded.push(p.clone()),
+                Ok(()) => reencoded.push((p.clone(), before)),
                 Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
-        JobResult::Rotate { label: t.label(), lossless, reencoded, skipped, errs }
+        JobResult::Rotate { t, lossless, reencoded, skipped, errs }
     })
 }
 
@@ -2687,5 +2860,15 @@ mod tests {
         assert_eq!(lossy_resave_reason(None, Path::new("x.png")), None);
         assert!(lossy_resave_reason(None, Path::new("x.GIF")).is_some());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inverse_transform_restores_the_orientation() {
+        use crate::encode::compose_orientation;
+        for t in [Transform::Rotate90, Transform::Rotate180, Transform::Rotate270, Transform::FlipH, Transform::FlipV] {
+            for o in 1..=8u8 {
+                assert_eq!(compose_orientation(compose_orientation(o, t), inverse(t)), o, "{t:?} from {o}");
+            }
+        }
     }
 }
