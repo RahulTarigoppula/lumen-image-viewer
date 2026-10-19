@@ -2219,6 +2219,7 @@ dependencies = [
  "libwebp-sys",
  "log",
  "lru",
+ "lumen-analysis",
  "lumen-core",
  "parking_lot",
  "rayon",
