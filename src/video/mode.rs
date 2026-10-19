@@ -7,7 +7,7 @@ use super::metrics::{self, FrameMetrics, YuvFrame};
 use super::scopes::{self, Scope};
 use crate::app::Core;
 use crate::ui::icons as I;
-use crate::ui::theme::Palette;
+use crate::ui::theme::{self, size, Palette};
 use crate::ui::widgets;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use image::RgbaImage;
@@ -38,6 +38,17 @@ impl CompareMode {
             CompareMode::Difference => "Difference",
             CompareMode::Overlay => "Overlay 50%",
             CompareMode::Checker => "Checkerboard",
+        }
+    }
+    /// The name in the top bar's segmented control.
+    fn short_label(self) -> &'static str {
+        match self {
+            CompareMode::SideBySide => "Side by side",
+            CompareMode::Wipe => "Wipe",
+            CompareMode::Flicker => "Flicker",
+            CompareMode::Difference => "Difference",
+            CompareMode::Overlay => "Overlay",
+            CompareMode::Checker => "Checker",
         }
     }
     fn icon(self) -> &'static str {
@@ -357,6 +368,35 @@ struct Analysis {
     done: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     bit_max: f64,
+}
+
+/// Radius of the A / B badges on the picture (20 pt circles).
+const BADGE_R: f32 = 10.0;
+
+/// A and B colors, the same as Compare's badges (so image and video compare match).
+fn ab_color(p: &Palette, i: usize) -> Color32 {
+    if i == 0 { p.accent } else { Color32::from_rgb(232, 120, 60) }
+}
+
+/// A round A / B badge: the letter in white on its color, with a soft dark
+/// ring so it stays visible on bright and dark pictures alike.
+fn paint_badge(painter: &egui::Painter, center: Pos2, label: &str, color: Color32, r: f32) {
+    painter.circle_filled(center, r + 1.0, Color32::from_black_alpha(70));
+    painter.circle_filled(center, r, color);
+    painter.text(center, Align2::CENTER_CENTER, label, theme::semibold(r + 1.5), Color32::WHITE);
+}
+
+/// Horizontal padding of the picture's readout pills.
+const OSD_PAD: f32 = 12.0;
+
+/// A readout pill over the picture (overlay fill, 1 pt border, radius 8),
+/// anchored at `pos` by `align`.
+fn osd_pill(painter: &egui::Painter, p: &Palette, pos: Pos2, align: Align2, g: Arc<egui::Galley>) {
+    let size = Vec2::new(g.size().x + 2.0 * OSD_PAD, (g.size().y + 10.0).max(size::COMPACT + 4.0));
+    let r = align.anchor_size(pos, size);
+    painter.add(theme::popover_shadow(p).as_shape(r, CornerRadius::same(theme::radius::CARD)));
+    painter.rect(r, CornerRadius::same(theme::radius::CARD), p.overlay, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+    painter.galley(Pos2::new(r.min.x + OSD_PAD, r.center().y - g.size().y / 2.0), g, p.text);
 }
 
 /// `name` cut to `max` characters, keeping its start and its extension.
@@ -989,25 +1029,29 @@ impl VideoMode {
                 keep = false;
             }
             // In a narrow window (a large UI scale, the Analysis panel open)
-            // the title shrinks, the compare controls move into a menu and
-            // long file names are shortened, so nothing runs under the
-            // buttons on the right.
+            // the title shrinks, the compare modes lose their labels and then
+            // move into a menu, and long file names are shortened, so nothing
+            // runs under the buttons on the right.
             let avail = ui.available_width();
             let narrow = avail < 900.0;
             let pair = self.sources.len() == 2;
-            // Very narrow: the names become A / B buttons; with two videos
+            // Very narrow: the names become A / B badges; with two videos
             // Remove B, Scopes and Save frame join the compare menu.
             let tiny = avail < 560.0;
             if !tiny {
                 let title = if narrow { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
-                ui.label(RichText::new(title).font(crate::ui::theme::semibold(15.0)));
+                ui.label(RichText::new(title).font(theme::text::title()));
                 widgets::separator_v(ui);
             }
-            // Points: back, title, the four buttons on the right, the A / B labels and name buttons' padding.
-            let fixed = 34.0 + if narrow { 30.0 } else { 80.0 } + 13.0 + 4.0 * 34.0 + 12.0 + 2.0 * 44.0 + if pair { 34.0 } else { 0.0 };
-            let controls = if pair { self.compare_controls_width() } else { 0.0 };
+            // Points: back, title, the four buttons on the right, the badges and name buttons' padding.
+            let fixed = 34.0 + if narrow { 30.0 } else { 80.0 } + 13.0 + 4.0 * 34.0 + 12.0 + 2.0 * 48.0 + if pair { 34.0 } else { 0.0 };
+            // Mode names from 1200 points of room (and while they fit), then icons,
+            // then the compare menu.
             let min_names = 2.0 * 12.0 * 7.5;
-            let compact = pair && avail - fixed - min_names < controls;
+            let room = avail - fixed - min_names;
+            let labels = avail >= 1200.0 && self.compare_controls_width(ui, true) <= room;
+            let controls = if pair { self.compare_controls_width(ui, labels) } else { 0.0 };
+            let compact = pair && room < controls;
             let controls = if compact { 50.0 } else { controls };
             let name_chars = ((avail - fixed - controls) / 2.0 / 7.5).clamp(8.0, 48.0) as usize;
             for (i, label) in ["A", "B"].iter().enumerate() {
@@ -1018,21 +1062,22 @@ impl VideoMode {
                     (_, true) => "Add B...".into(),
                     _ => "Add B to compare...".into(),
                 });
-                let color = if i == 0 { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(90, 190, 255) };
-                // One chip per side: the colored letter, then the file name
-                // (muted while it only invites to open one).
+                // One chip per side: the round A / B badge (Compare's colors),
+                // then the file name (muted while it only invites to open one).
                 let mut job = egui::text::LayoutJob::default();
-                let format = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
-                job.append(label, 0.0, format(crate::ui::theme::semibold(12.5), color));
                 if !tiny {
-                    job.append(&name, 7.0, format(FontId::proportional(12.5), if full.is_empty() { p.muted } else { p.text }));
+                    let format = egui::TextFormat { font_id: theme::text::body(), color: if full.is_empty() { p.muted } else { p.text }, valign: egui::Align::Center, ..Default::default() };
+                    job.append(&name, BADGE_R * 2.0 + 6.0, format);
                 }
                 let tip = match (full.is_empty(), tiny || full != name) {
                     (true, _) => name.clone(),
                     (false, true) => format!("{full}\nChoose a file"),
                     (false, false) => "Choose a file".into(),
                 };
-                let resp = ui.add(egui::Button::new(job).min_size(Vec2::new(if tiny { 30.0 } else { 60.0 }, 26.0))).on_hover_text(tip);
+                let resp = ui.add(egui::Button::new(job).min_size(Vec2::new(if tiny { size::CONTROL } else { 60.0 }, size::CONTROL))).on_hover_text(tip);
+                let pad = ui.spacing().button_padding.x;
+                let c = if tiny { resp.rect.center() } else { Pos2::new(resp.rect.left() + pad + BADGE_R, resp.rect.center().y) };
+                paint_badge(ui.painter(), c, label, ab_color(&p, i), BADGE_R - 1.0);
                 if resp.clicked() {
                     let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                     if let Some(f) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_file() {
@@ -1053,18 +1098,18 @@ impl VideoMode {
                 if compact || tiny {
                     let r = ui.menu_button(RichText::new(format!("{}  {}", self.mode.icon(), I::CARET_DOWN)).size(15.0), |ui| {
                         ui.set_min_width(220.0);
-                        self.compare_controls(ui, &p, true);
+                        self.compare_controls(ui, &p, true, false);
                         if tiny {
                             ui.separator();
-                            if ui.add(egui::Button::new(format!("{}   Scopes", I::WAVEFORM)).selected(self.show_scopes).shortcut_text("F2")).clicked() {
+                            if widgets::menu_toggle(ui, self.show_scopes, "Scopes", "F2").clicked() {
                                 self.show_scopes = !self.show_scopes;
                                 ui.close();
                             }
-                            if ui.add(egui::Button::new(format!("{}   Save frame as PNG", I::CAMERA)).shortcut_text("Ctrl+S")).clicked() {
+                            if widgets::menu_item(ui, I::CAMERA, "Save frame as PNG", "Ctrl+S").clicked() {
                                 ui.close();
                                 self.snapshot(false, core);
                             }
-                            if ui.button(format!("{}   Remove B", I::X)).clicked() {
+                            if widgets::menu_item(ui, I::X, "Remove B", "").clicked() {
                                 ui.close();
                                 self.remove_b();
                             }
@@ -1072,7 +1117,7 @@ impl VideoMode {
                     });
                     r.response.on_hover_text(format!("{}: compare mode, B offset", self.mode.label()));
                 } else {
-                    self.compare_controls(ui, &p, false);
+                    self.compare_controls(ui, &p, false, labels);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1098,51 +1143,50 @@ impl VideoMode {
         }
     }
 
-    /// Points the compare controls take in the top bar.
-    fn compare_controls_width(&self) -> f32 {
-        let modes = CompareMode::ALL.len() as f32 * 31.0 + 3.0;
-        let gain = if self.mode == CompareMode::Difference { 190.0 } else { 0.0 };
-        modes + gain + 13.0 + 64.0 + 70.0 + 34.0
+    /// The compare mode segments' labels: names when there is room, else icons.
+    fn mode_labels(labels: bool) -> Vec<&'static str> {
+        CompareMode::ALL.iter().map(|m| if labels { m.short_label() } else { m.icon() }).collect()
     }
 
-    /// Compare mode buttons, the difference gain and B's offset: in the top
-    /// bar, or listed in its menu (`menu`) when the bar is narrow.
-    fn compare_controls(&mut self, ui: &mut Ui, p: &Palette, menu: bool) {
+    /// Points the compare controls take in the top bar.
+    fn compare_controls_width(&self, ui: &Ui, labels: bool) -> f32 {
+        let widest = Self::mode_labels(labels).iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), theme::text::body(), Color32::WHITE).size().x).fold(0.0, f32::max);
+        let modes = CompareMode::ALL.len() as f32 * (widest + 24.0) + 4.0 + 4.0;
+        let gain = if self.mode == CompareMode::Difference { 50.0 + 90.0 + 4.0 + size::VALUE_W } else { 0.0 };
+        // The separator, "B offset", its box, Swap and the gaps between them.
+        modes + gain + 13.0 + 48.0 + size::VALUE_W + 30.0 + 16.0
+    }
+
+    /// Compare modes, the difference gain and B's offset: in the top bar (as
+    /// one segmented control, with names when `labels`), or listed in its
+    /// menu (`menu`) when the bar is narrow.
+    fn compare_controls(&mut self, ui: &mut Ui, p: &Palette, menu: bool, labels: bool) {
         let p = *p;
-        let mut modes = |ui: &mut Ui| {
-            let gap = ui.spacing().item_spacing.x;
-            if !menu {
-                ui.spacing_mut().item_spacing.x = 1.0;
-            }
+        if menu {
             for m in CompareMode::ALL {
-                let tip = format!("{} ({})", m.label(), m.key());
-                let clicked = if menu {
-                    ui.add(egui::Button::new(format!("{}   {}", m.icon(), m.label())).selected(self.mode == m).shortcut_text(m.key())).clicked()
-                } else {
-                    widgets::icon_button(ui, m.icon(), &tip, self.mode == m).clicked()
-                };
-                if clicked {
+                if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).clicked() {
                     self.mode = m;
                 }
             }
-            ui.spacing_mut().item_spacing.x = gap;
-        };
-        if menu {
-            modes(ui);
             ui.separator();
         } else {
-            modes(ui);
+            let mut idx = CompareMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
+            let tips: Vec<String> = CompareMode::ALL.iter().map(|m| format!("{} ({})", m.label(), m.key())).collect();
+            let tips: Vec<&str> = tips.iter().map(|t| t.as_str()).collect();
+            if widgets::segmented_with_tips(ui, &mut idx, &Self::mode_labels(labels), &tips) {
+                self.mode = CompareMode::ALL[idx];
+            }
         }
         let mut rest = |ui: &mut Ui| {
             if self.mode == CompareMode::Difference {
-                ui.label(RichText::new("Gain").color(p.muted).size(12.0));
-                ui.spacing_mut().slider_width = 90.0;
-                ui.add(egui::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×"));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Gain").color(p.muted).size(theme::text::SMALL));
+                ui.add(widgets::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×").fixed_decimals(1).width(90.0).default_value(4.0));
             }
             if !menu {
                 widgets::separator_v(ui);
             }
-            ui.label(RichText::new("B offset").color(p.muted).size(12.0));
+            ui.label(RichText::new("B offset").color(p.muted).size(theme::text::SMALL));
             let mut off = self.offset_frames;
             // Typed values apply on Enter (or when the field loses focus);
             // Esc goes back to the offset in use. egui reports the lost
@@ -1151,7 +1195,7 @@ impl VideoMode {
             if self.offset_editing && ui.input(|i| i.key_pressed(Key::Escape)) {
                 self.offset_cancel = 2;
             }
-            let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
+            let r = widgets::value_box(ui, egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
             self.offset_field = Some(r.id);
             self.offset_editing = ui.memory(|m| m.has_focus(r.id));
             if self.offset_cancel > 0 {
@@ -1236,7 +1280,8 @@ impl VideoMode {
                 y += size.y + 20.0;
             }
             let br = Rect::from_min_size(Pos2::new(cx - 100.0, y), Vec2::new(200.0, 34.0));
-            if ui.put(br, egui::Button::new(RichText::new(format!("{}  Open video...", I::FOLDER_OPEN)).color(Color32::WHITE)).fill(p.accent)).clicked() {
+            let open = ui.scope_builder(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::top_down_justified(egui::Align::Center)), |ui| widgets::primary_button(ui, &p, &format!("{}  Open video...", I::FOLDER_OPEN))).inner;
+            if open.clicked() {
                 let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                 if let Some(files) = rfd::FileDialog::new().add_filter("Videos", &exts).pick_files() {
                     for f in files.into_iter().take(2) {
@@ -1378,11 +1423,8 @@ impl VideoMode {
                     let show_b = self.flicker_b ^ held;
                     publish(if show_b { Slot::B } else { Slot::A }, dest, view);
                     draw_tex(&painter, if show_b { b } else { a }, dest, view, Color32::WHITE);
-                    let label = if show_b { "B" } else { "A" };
-                    let col = if show_b { Color32::from_rgb(90, 190, 255) } else { Color32::from_rgb(255, 170, 60) };
-                    let r = Rect::from_min_size(view.min + Vec2::new(14.0, 14.0), Vec2::new(36.0, 30.0));
-                    painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(170));
-                    painter.text(r.center(), Align2::CENTER_CENTER, label, crate::ui::theme::semibold(18.0), col);
+                    let (label, i) = if show_b { ("B", 1) } else { ("A", 0) };
+                    paint_badge(&painter, view.min + Vec2::splat(12.0 + BADGE_R), label, ab_color(&p, i), BADGE_R);
                     self.pixel_probe(ui, dest, (dw, dh));
                 }
                 CompareMode::Overlay => {
@@ -1428,25 +1470,23 @@ impl VideoMode {
                         painter.add(egui::Shape::mesh(mesh));
                     }
                     if let Some((mean, max)) = self.diff_stats {
-                        let txt = format!("|A-B| x {:.0}   mean {:.2}   max {:.0}", self.gain, mean, max);
-                        let g = painter.layout_no_wrap(txt, FontId::proportional(12.0), Color32::WHITE);
-                        let r = Rect::from_min_size(view.min + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
-                        painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(170));
-                        painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+                        let txt = format!("|A-B| × {:.0}  ·  mean {:.2}  ·  max {:.0}", self.gain, mean, max);
+                        let g = painter.layout_no_wrap(txt, theme::text::small(), p.text);
+                        osd_pill(&painter, &p, view.min + Vec2::splat(12.0), Align2::LEFT_TOP, g);
                     }
                     self.pixel_probe(ui, dest, (dw, dh));
                 }
             }
-            // Pane labels
-            let labels: Vec<(Pos2, &str, Color32)> = match self.mode {
-                CompareMode::SideBySide => vec![(pane(0).left_top(), "A", Color32::from_rgb(255, 170, 60)), (pane(1).left_top(), "B", Color32::from_rgb(90, 190, 255))],
-                CompareMode::Wipe => vec![(view.left_top(), "A", Color32::from_rgb(255, 170, 60)), (Pos2::new(view.max.x - 50.0, view.min.y), "B", Color32::from_rgb(90, 190, 255))],
+            // Pane badges: A top left, B top left of its pane (side by side)
+            // or top right (wipe).
+            let inset = 12.0 + BADGE_R;
+            let badges: Vec<(Pos2, usize)> = match self.mode {
+                CompareMode::SideBySide => vec![(pane(0).left_top() + Vec2::splat(inset), 0), (pane(1).left_top() + Vec2::splat(inset), 1)],
+                CompareMode::Wipe => vec![(view.left_top() + Vec2::splat(inset), 0), (view.right_top() + Vec2::new(-inset, inset), 1)],
                 _ => vec![],
             };
-            for (pos, l, c) in labels {
-                let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), Vec2::new(30.0, 26.0));
-                painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(170));
-                painter.text(r.center(), Align2::CENTER_CENTER, l, crate::ui::theme::semibold(15.0), c);
+            for (c, i) in badges {
+                paint_badge(&painter, c, ["A", "B"][i], ab_color(&p, i), BADGE_R);
             }
             self.maybe_metrics();
         }
@@ -1460,20 +1500,29 @@ impl VideoMode {
         let a = &self.sources[0];
         let f = a.frame_of(a.pts());
         let kind = a.current.as_ref().map(|c| c.kind as char).unwrap_or('?');
-        let mut hud = format!("{}   frame {}   {}   {:.0}%", fmt_time(a.pts()), f, kind_name(kind), self.zoom * 100.0);
+        // One pill: the timecode (monospace), then frame, type and zoom.
+        let mut rest = format!("Frame {f}  ·  {}  ·  {:.0}%", kind_name(kind), self.zoom * 100.0);
         if let Some(e) = &a.error {
-            hud = format!("{hud}   ⚠ {e}");
+            rest = format!("{rest}  ·  {} {e}", I::WARNING);
         }
+        let job = |time: bool, rest: &str| {
+            let mut job = egui::text::LayoutJob::default();
+            let fmt = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
+            if time {
+                job.append(&fmt_time(a.pts()), 0.0, fmt(theme::text::mono(), p.text));
+                job.append("  ·  ", 0.0, fmt(theme::text::small(), p.muted));
+            }
+            job.append(rest, 0.0, fmt(theme::text::small(), p.text));
+            job
+        };
         // In a narrow view the readout shortens (the transport bar has the
         // same numbers), down to nothing, rather than running off the left.
-        let fits = |t: &str| {
-            let g = painter.layout_no_wrap(t.to_string(), FontId::monospace(12.0), Color32::from_white_alpha(230));
-            (g.size().x + 46.0 <= view.width()).then_some(g)
+        let fits = |job: egui::text::LayoutJob| {
+            let g = painter.layout_job(job);
+            (g.size().x + 2.0 * OSD_PAD + 24.0 <= view.width()).then_some(g)
         };
-        if let Some(g) = fits(&hud).or_else(|| fits(&format!("frame {f}   {}", kind_name(kind)))) {
-            let r = Rect::from_min_size(Pos2::new(view.max.x - g.size().x - 30.0, view.max.y - 36.0), g.size() + Vec2::new(16.0, 8.0));
-            painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(150));
-            painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+        if let Some(g) = fits(job(true, &rest)).or_else(|| fits(job(false, &format!("Frame {f}  ·  {}", kind_name(kind))))) {
+            osd_pill(&painter, &p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
         }
         // A slow seek (long GOP) keeps the last frame on screen with a badge,
         // so stepping never looks frozen.
@@ -1484,10 +1533,8 @@ impl VideoMode {
                     Some(f) => format!("Seeking to frame {f}..."),
                     None => "Seeking...".to_string(),
                 };
-                let g = painter.layout_no_wrap(txt, FontId::proportional(13.0), Color32::WHITE);
-                let r = Rect::from_center_size(Pos2::new(view.center().x, view.min.y + 34.0), g.size() + Vec2::new(24.0, 12.0));
-                painter.rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(190));
-                painter.galley(r.min + Vec2::new(12.0, 6.0), g, Color32::WHITE);
+                let g = painter.layout_no_wrap(txt, theme::text::body(), p.text);
+                osd_pill(&painter, &p, Pos2::new(view.center().x, view.min.y + 20.0), Align2::CENTER_TOP, g);
             } else {
                 ui.ctx().request_repaint_after(delay - t0.elapsed());
             }
@@ -1505,8 +1552,9 @@ impl VideoMode {
     /// Esc closes only the menu (see `keys`).
     fn canvas_menu(&mut self, ui: &mut Ui, core: &mut Core) {
         ui.set_min_width(230.0);
-        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| ui.add(egui::Button::new(format!("{icon}   {label}")).shortcut_text(key)).clicked();
-        let check = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| ui.add(egui::Button::new(format!("{icon}   {label}")).selected(on).shortcut_text(key)).clicked();
+        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| widgets::menu_item(ui, icon, label, key).clicked();
+        // On / off rows show a check mark instead of an icon while on.
+        let check = |ui: &mut Ui, _icon: &str, label: &str, key: &str, on: bool| widgets::menu_toggle(ui, on, label, key).clicked();
         let (icon, label) = if self.playing { (I::PAUSE, "Pause") } else { (I::PLAY, "Play") };
         if item(ui, icon, label, "Space") {
             self.toggle_play();
@@ -1535,7 +1583,7 @@ impl VideoMode {
         }
         if self.sources.len() == 2 {
             ui.separator();
-            ui.menu_button(format!("{}   Compare", self.mode.icon()), |ui| {
+            widgets::submenu(ui, self.mode.icon(), "Compare", |ui| {
                 ui.set_min_width(210.0);
                 for m in CompareMode::ALL {
                     if check(ui, m.icon(), m.label(), m.key(), self.mode == m) {
@@ -1778,15 +1826,8 @@ impl VideoMode {
                 // Volume: a slim slider (a smaller knob than the default).
                 ui.spacing_mut().slider_width = 90.0;
                 if self.audio.is_some() && self.sources[0].info.has_audio {
-                    let slim = |ui: &mut Ui, v: &mut f32| {
-                        ui.scope(|ui| {
-                            ui.spacing_mut().interact_size.y = 16.0;
-                            ui.spacing_mut().slider_rail_height = 4.0;
-                            ui.add(egui::Slider::new(v, 0.0..=1.5).show_value(false))
-                        })
-                        .inner
-                    };
-                    if fit.volume && slim(ui, &mut self.volume).on_hover_text("Volume").changed() {
+                    let slim = |ui: &mut Ui, v: &mut f32| ui.add(widgets::Slider::new(v, 0.0..=1.5).show_value(false).width(90.0).default_value(1.0));
+                    if fit.volume && slim(ui, &mut self.volume).on_hover_text("Volume (double-click: 100%)").changed() {
                         if let Some(a) = self.audio_shared() {
                             a.set_volume(self.volume);
                         }
@@ -1804,7 +1845,7 @@ impl VideoMode {
                 let speed = ui.menu_button(RichText::new(format!("{}×  {}", self.speed, I::CARET_DOWN)).size(12.5), |ui| {
                     ui.set_min_width(80.0);
                     for s in SPEEDS {
-                        if ui.add(egui::Button::new(format!("{s}×")).selected(self.speed == s)).clicked() {
+                        if widgets::menu_toggle(ui, self.speed == s, &format!("{s}×"), "").clicked() {
                             self.set_speed(s);
                             ui.close();
                         }
@@ -1858,8 +1899,9 @@ impl VideoMode {
                 w += sep + if f.loop_label { text_w(&format!("{} {}", I::REPEAT, self.loop_label()), small.clone()) } else { text_w(I::REPEAT, small.clone()) } + pad + s;
             }
             if f.legend {
-                let psnr = if self.analysis.is_some() { 23.0 + text_w("PSNR-Y (20-60 dB)", FontId::proportional(11.0)) } else { 0.0 };
-                w += sep + 6.0 + 3.0 * (19.0 + text_w("B", FontId::proportional(11.0))) + psnr;
+                let cap = FontId::proportional(theme::text::CAPTION);
+                let psnr = if self.analysis.is_some() { 26.0 + text_w("PSNR-Y (20-60 dB)", cap.clone()) } else { 0.0 };
+                w += sep + 6.0 + 22.0 + text_w("Frame size", cap.clone()) + 20.0 + text_w("I-frame", cap) + psnr;
             }
             // Right: volume or "no audio", speed.
             w += match (audio, f.volume) {
@@ -1926,38 +1968,43 @@ impl VideoMode {
     }
 
     fn timeline(&mut self, ui: &mut Ui, p: &Palette) {
-        let h = 58.0;
+        let h = 60.0;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(16, 17, 20));
+        painter.rect_filled(rect, CornerRadius::same(theme::radius::CONTROL), ui.visuals().extreme_bg_color);
         let a = &self.sources[0];
         let dur = a.duration().max(0.001);
         let x_of = |t: f64| rect.min.x + (t / dur) as f32 * rect.width();
-        // A time ruler along the top; the bars and the metric graph stay below it.
-        let ruler_h = 14.0;
-        let bar_h = h - ruler_h - 4.0;
-        let base = rect.max.y - 4.0;
+        // A time ruler along the top, the frame-size bars in the middle and a
+        // strip at the bottom with the frame types (I ticks; P and B dots once
+        // frames are far enough apart to tell them apart).
+        let ruler_h = 16.0;
+        let strip_h = 10.0;
+        let base = rect.max.y - strip_h;
+        let bar_h = base - (rect.min.y + ruler_h) - 2.0;
         // Loop region
         if let (Some(la), lb) = self.loop_ab {
             let lb = lb.unwrap_or(a.pts());
             painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(la), rect.min.y), Pos2::new(x_of(lb), rect.max.y)), 0.0, p.accent.gamma_multiply(0.18));
         }
         let step = tick_step(dur, rect.width(), 84.0);
+        let label_font = FontId::proportional(theme::text::CAPTION);
         for k in 0.. {
             let t = k as f64 * step;
             if t > dur {
                 break;
             }
             let x = x_of(t).round() + 0.5;
-            painter.line_segment([Pos2::new(x, rect.min.y + ruler_h), Pos2::new(x, base)], Stroke::new(1.0, Color32::from_white_alpha(14)));
-            painter.line_segment([Pos2::new(x, rect.min.y + ruler_h - 4.0), Pos2::new(x, rect.min.y + ruler_h)], Stroke::new(1.0, p.faint));
-            let label = fmt_tick(t, step, dur);
+            painter.line_segment([Pos2::new(x, rect.min.y + ruler_h - 5.0), Pos2::new(x, rect.min.y + ruler_h)], Stroke::new(1.0, p.faint));
+            let g = painter.layout_no_wrap(fmt_tick(t, step, dur), label_font.clone(), p.faint);
             // Skip a label that would run off the right edge.
-            if x + 4.0 + label.len() as f32 * 6.0 <= rect.max.x {
-                painter.text(Pos2::new(x + 3.0, rect.min.y + 7.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), p.muted);
+            if x + 4.0 + g.size().x <= rect.max.x - 2.0 {
+                painter.galley(Pos2::new(x + 4.0, rect.min.y + ruler_h / 2.0 - g.size().y / 2.0), g, p.faint);
             }
         }
-        // Frame-size bars colored by type (StreamEye-style), aggregated per pixel column.
+        painter.line_segment([Pos2::new(rect.min.x, base + 0.5), Pos2::new(rect.max.x, base + 0.5)], Stroke::new(1.0, p.border));
+        // Frame-size bars (StreamEye-style), aggregated per pixel column; the
+        // keyframes' share of a column is drawn a little lighter.
         let idx_guard = a.index.lock();
         if let Some(idx) = idx_guard.as_ref() {
             let cols = rect.width().max(1.0) as usize;
@@ -1971,30 +2018,45 @@ impl VideoMode {
                 self.timeline_cache = Some((idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
             }
             let (_, _, columns, _) = self.timeline_cache.as_ref().unwrap();
+            let tints = timeline_tints(p);
             let mut mesh = egui::Mesh::default();
+            let mut last_tick = f32::NEG_INFINITY;
+            let tick = p.muted.gamma_multiply(0.8);
             for (c, col) in columns.iter().enumerate() {
+                let x = rect.min.x + c as f32;
+                // An I tick per column with a keyframe, at least 3 points apart.
+                if col.key && x - last_tick >= 3.0 {
+                    mesh.add_colored_rect(Rect::from_min_size(Pos2::new(x, base + 2.0), Vec2::new(1.0, 6.0)), tick);
+                    last_tick = x;
+                }
                 if col.height <= 0.0 {
                     continue;
                 }
                 // Stack the frame types bottom-up by their share of the column's bytes.
-                let x = rect.min.x + c as f32;
                 let mut y = base;
-                for (share, color) in col.shares.iter().zip(TIMELINE_COLORS) {
+                for (share, color) in col.shares.iter().zip(tints) {
                     if *share <= 0.0 {
                         continue;
                     }
                     let top = y - share * col.height * bar_h;
-                    mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + 1.0, y)), color.gamma_multiply(0.85));
+                    mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + 1.0, y)), color);
                     y = top;
+                }
+            }
+            // P and B frames as dots when there are at least 6 points per frame.
+            if !idx.is_empty() && rect.width() / idx.len() as f32 >= 6.0 {
+                for e in idx.iter().filter(|e| !e.key && e.kind != b'I') {
+                    let c = Pos2::new(x_of(e.pts), base + 5.0);
+                    let r = if e.kind == b'B' { 1.0 } else { 1.5 };
+                    mesh.add_colored_rect(Rect::from_center_size(c, Vec2::splat(2.0 * r)), p.faint);
                 }
             }
             painter.add(egui::Shape::mesh(mesh));
         } else {
             let prog = f32::from_bits(a.index_progress.load(Ordering::Relaxed));
-            if prog >= 1.0 {
-                painter.text(rect.center(), Align2::CENTER_CENTER, "Frame index unavailable for this file", FontId::proportional(11.5), p.faint);
-            } else {
-                painter.text(rect.center(), Align2::CENTER_CENTER, format!("Indexing frames... {:.0}%", prog * 100.0), FontId::proportional(11.5), p.faint);
+            let text = if prog >= 1.0 { "Frame index unavailable for this file".to_string() } else { format!("Indexing frames... {:.0}%", prog * 100.0) };
+            painter.text(Pos2::new(rect.center().x, (rect.min.y + ruler_h + base) / 2.0), Align2::CENTER_CENTER, text, theme::text::small(), p.faint);
+            if prog < 1.0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
         }
@@ -2012,19 +2074,19 @@ impl VideoMode {
                         Pos2::new(x_of(t), base - v * bar_h)
                     })
                     .collect();
-                painter.add(egui::Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(250, 210, 80))));
+                painter.add(egui::Shape::line(pts, Stroke::new(1.5, PSNR_COLOR)));
             }
         }
-        // Playhead (A) and B position.
-        let x = x_of(a.pts());
-        painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(2.0, Color32::WHITE));
-        painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y), Pos2::new(x, rect.min.y + 7.0)], Color32::WHITE, Stroke::NONE));
+        // Playhead (A): a 2 pt accent line with a 10 pt head on the ruler.
+        let x = x_of(a.pts()).round();
+        painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(2.0, p.accent));
+        painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y + 5.0), Pos2::new(x, rect.min.y + 10.0), Pos2::new(x - 5.0, rect.min.y + 5.0)], p.accent, Stroke::NONE));
         // Hover tooltip + scrubbing.
         if let Some(pos) = resp.hover_pos() {
             let t = (((pos.x - rect.min.x) / rect.width()) as f64 * dur).clamp(0.0, dur);
             let f = a.frame_of(t);
             let e = a.entry(f);
-            painter.line_segment([Pos2::new(pos.x, rect.min.y), Pos2::new(pos.x, rect.max.y)], Stroke::new(1.0, Color32::from_white_alpha(90)));
+            painter.line_segment([Pos2::new(pos.x, rect.min.y), Pos2::new(pos.x, rect.max.y)], Stroke::new(1.0, p.muted.gamma_multiply(0.7)));
             let mut tip = format!("{}  ·  frame {f}", fmt_time(t));
             if let Some(e) = e {
                 tip += &format!("  ·  {}  ·  {}", kind_name(e.kind as char), crate::catalog::human_size(e.size as u64));
@@ -2053,27 +2115,26 @@ impl VideoMode {
         }
     }
 
-    /// Key to the timeline's colors, shown in the transport row so it never
-    /// covers the bars.
+    /// Key to the timeline, shown in the transport row so it never covers it.
     fn timeline_legend(&self, ui: &mut Ui, p: &Palette) {
-        let chip = |ui: &mut Ui, color: Color32, size: Vec2, text: &str| {
-            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-            ui.painter().rect_filled(r, CornerRadius::same(2), color);
-            ui.add_space(3.0);
-            ui.label(RichText::new(text).size(11.0).color(p.muted));
-            ui.add_space(8.0);
+        let item = |ui: &mut Ui, size: Vec2, color: Color32, round: bool, text: &str| {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(size.x.max(6.0), 12.0), Sense::hover());
+            let r = Rect::from_center_size(r.center(), size);
+            ui.painter().rect_filled(r, CornerRadius::same(if round { 2 } else { 0 }), color);
+            ui.add_space(4.0);
+            ui.label(RichText::new(text).size(theme::text::CAPTION).color(p.muted));
+            ui.add_space(10.0);
         };
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            for (text, color) in [("I", TIMELINE_COLORS[0]), ("P", TIMELINE_COLORS[1]), ("B", TIMELINE_COLORS[2])] {
-                chip(ui, color, Vec2::splat(8.0), text);
-            }
+            item(ui, Vec2::new(8.0, 10.0), timeline_tints(p)[1], false, "Frame size");
+            item(ui, Vec2::new(1.0, 6.0), p.muted.gamma_multiply(0.8), false, "I-frame");
             if self.analysis.is_some() {
-                chip(ui, Color32::from_rgb(250, 210, 80), Vec2::new(12.0, 2.0), "PSNR-Y (20-60 dB)");
+                item(ui, Vec2::new(12.0, 2.0), PSNR_COLOR, false, "PSNR-Y (20-60 dB)");
             }
         })
         .response
-        .on_hover_text("Timeline bars: frame sizes by type (I, P and B frames)");
+        .on_hover_text("Timeline: frame sizes (keyframes lighter), I-frame ticks below; P and B frames show as dots once frames are far enough apart");
     }
 
     // ---------------------------------------------------------------- panels
@@ -2188,15 +2249,15 @@ impl VideoMode {
     }
 
     fn scopes_panel(&mut self, ui: &mut Ui, p: &Palette) {
-        ui.horizontal_wrapped(|ui| {
-            for s in Scope::ALL {
-                if ui.selectable_label(self.scope == s, s.label()).clicked() {
-                    self.scope = s;
-                    self.scope_tex = None;
-                }
-            }
-        });
-        ui.add_space(6.0);
+        // Short names so the four segments fit the panel; the full ones on hover.
+        let names = ["Waveform", "Parade", "Vector", "Histogram"];
+        let tips: Vec<&str> = Scope::ALL.iter().map(|s| s.label()).collect();
+        let mut idx = Scope::ALL.iter().position(|s| *s == self.scope).unwrap_or(0);
+        if widgets::segmented_with_tips(ui, &mut idx, &names, &tips) {
+            self.scope = Scope::ALL[idx];
+            self.scope_tex = None;
+        }
+        ui.add_space(theme::space::M);
         let Some(cur) = self.sources[0].current.clone() else { return };
         let key = cur.pts.to_bits() ^ (self.scope as u64) << 60;
         // Throttle recomputation during playback.
@@ -2213,22 +2274,51 @@ impl VideoMode {
             }
         }
         if let Some((_, t)) = &self.scope_tex {
-            let ts = t.size_vec2();
+            // The plot fills the panel's width at 16:10 (the vectorscope is square),
+            // with a graticule at 0 / 25 / 50 / 75 / 100%.
             let w = ui.available_width();
-            let hgt = if self.scope == Scope::Vectorscope { w } else { (w * ts.y / ts.x).min(w * 0.8) };
+            let hgt = if self.scope == Scope::Vectorscope { w } else { w * 10.0 / 16.0 };
             let (r, _) = ui.allocate_exact_size(Vec2::new(w, hgt), Sense::hover());
-            let mut mesh = egui::Mesh::with_texture(t.id());
-            mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            ui.painter().add(egui::Shape::mesh(mesh));
-            ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            let cr = CornerRadius::same(theme::radius::CONTROL);
+            let painter = ui.painter();
+            painter.add(egui::epaint::RectShape::filled(r, cr, Color32::WHITE).with_texture(t.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
+            // The plots are always black, so the graticule is a dim white in both themes.
+            let line = Stroke::new(1.0, Color32::from_white_alpha(38));
+            let font = FontId::proportional(10.0);
+            let label = Color32::from_white_alpha(150);
+            match self.scope {
+                Scope::Waveform | Scope::Parade => {
+                    // Level 0..255 maps to the 256 image rows, top = 100%.
+                    for pct in [0u32, 25, 50, 75, 100] {
+                        let y = (r.top() + (1.0 - pct as f32 / 100.0) * (255.0 / 256.0) * r.height() + r.height() / 512.0).round() + 0.5;
+                        painter.hline(r.x_range(), y, line);
+                        let (pos, align) = if pct == 100 { (Pos2::new(r.left() + 4.0, y + 1.0), Align2::LEFT_TOP) } else { (Pos2::new(r.left() + 4.0, y - 1.0), Align2::LEFT_BOTTOM) };
+                        painter.text(pos, align, pct.to_string(), font.clone(), label);
+                    }
+                }
+                Scope::Histogram => {
+                    for pct in [0u32, 25, 50, 75, 100] {
+                        let x = (r.left() + pct as f32 / 100.0 * r.width()).round() + 0.5;
+                        painter.vline(x, r.y_range(), line);
+                        let (pos, align) = match pct {
+                            0 => (Pos2::new(x + 3.0, r.bottom() - 2.0), Align2::LEFT_BOTTOM),
+                            100 => (Pos2::new(x - 3.0, r.bottom() - 2.0), Align2::RIGHT_BOTTOM),
+                            _ => (Pos2::new(x, r.bottom() - 2.0), Align2::CENTER_BOTTOM),
+                        };
+                        painter.text(pos, align, pct.to_string(), font.clone(), label);
+                    }
+                }
+                Scope::Vectorscope => {}
+            }
+            painter.rect_stroke(r, cr, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
         }
-        ui.add_space(4.0);
+        ui.add_space(theme::space::S);
         ui.label(RichText::new(match self.scope {
             Scope::Waveform => "Luma level (bottom 0%, top 100%) per image column.",
             Scope::Parade => "R, G, B waveforms side by side.",
             Scope::Vectorscope => "Chroma (BT.709). Boxes: 75% color targets; line: skin tone.",
             Scope::Histogram => "R, G, B and luma distribution.",
-        }).size(11.0).color(p.faint));
+        }).size(theme::text::SMALL).color(p.muted));
     }
 
     fn goto_dialog(&mut self, ctx: &egui::Context) {
@@ -2573,10 +2663,10 @@ fn media_table(ui: &mut Ui, p: &Palette, compare: bool, rows: Vec<(&'static str,
         row(ui, false, &mut |ui| {
             cell(ui, LABEL_W, &mut |_| {});
             cell(ui, value_w, &mut |ui| {
-                ui.label(RichText::new("A").strong().color(Color32::from_rgb(255, 170, 60)));
+                ui.label(RichText::new("A").strong().color(ab_color(p, 0)));
             });
             cell(ui, value_w, &mut |ui| {
-                ui.label(RichText::new("B").strong().color(Color32::from_rgb(90, 190, 255)));
+                ui.label(RichText::new("B").strong().color(ab_color(p, 1)));
             });
         });
     }
@@ -2599,8 +2689,14 @@ fn media_table(ui: &mut Ui, p: &Palette, compare: bool, rows: Vec<(&'static str,
     }
 }
 
-/// Timeline colors for I, P, B and not yet known frame types.
-const TIMELINE_COLORS: [Color32; 4] = [Color32::from_rgb(235, 90, 80), Color32::from_rgb(80, 150, 255), Color32::from_rgb(80, 200, 120), Color32::from_rgb(110, 116, 128)];
+/// Timeline bar tints for I, P, B and not yet known frame types: one neutral
+/// color, keyframes lighter (the frame types themselves are marked below the bars).
+fn timeline_tints(p: &Palette) -> [Color32; 4] {
+    [p.muted.gamma_multiply(0.6), p.muted.gamma_multiply(0.42), p.muted.gamma_multiply(0.34), p.muted.gamma_multiply(0.42)]
+}
+
+/// The PSNR-Y graph over the timeline.
+const PSNR_COLOR: Color32 = Color32::from_rgb(250, 210, 80);
 
 /// One pixel column of the frame-size timeline.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -2609,6 +2705,8 @@ struct TimelineColumn {
     height: f32,
     /// Share of the column's bytes in I, P, B and unknown frames.
     shares: [f32; 4],
+    /// The column holds a keyframe (an I tick in the type strip).
+    key: bool,
 }
 
 /// Aggregate the frame index into `cols` columns. Heights follow the mean
@@ -2617,6 +2715,7 @@ struct TimelineColumn {
 fn timeline_columns(idx: &[IndexEntry], dur: f64, cols: usize) -> Vec<TimelineColumn> {
     let cols = cols.max(1);
     let mut sums = vec![([0u64; 4], 0u32); cols];
+    let mut keys = vec![false; cols];
     for e in idx {
         let c = (((e.pts / dur.max(1e-9)) * cols as f64).max(0.0) as usize).min(cols - 1);
         let k = match e.kind {
@@ -2628,6 +2727,7 @@ fn timeline_columns(idx: &[IndexEntry], dur: f64, cols: usize) -> Vec<TimelineCo
         };
         sums[c].0[k] += e.size as u64;
         sums[c].1 += 1;
+        keys[c] |= e.key || e.kind == b'I';
     }
     let means: Vec<f64> = sums.iter().map(|(b, n)| if *n == 0 { 0.0 } else { b.iter().sum::<u64>() as f64 / *n as f64 }).collect();
     let mut sorted: Vec<f64> = means.iter().copied().filter(|m| *m > 0.0).collect();
@@ -2639,9 +2739,10 @@ fn timeline_columns(idx: &[IndexEntry], dur: f64, cols: usize) -> Vec<TimelineCo
     };
     sums.iter()
         .zip(&means)
-        .map(|((bytes, _), mean)| {
+        .zip(keys)
+        .map(|(((bytes, _), mean), key)| {
             let total = bytes.iter().sum::<u64>().max(1) as f32;
-            TimelineColumn { height: (mean / p98.max(1.0)).min(1.0) as f32, shares: bytes.map(|b| b as f32 / total) }
+            TimelineColumn { height: (mean / p98.max(1.0)).min(1.0) as f32, shares: bytes.map(|b| b as f32 / total), key }
         })
         .collect()
 }
@@ -2790,6 +2891,8 @@ mod tests {
         assert_eq!(cols[0].shares, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(cols[1].shares, [0.0, 0.0, 1.0, 0.0]);
         assert!(cols[1].height < cols[0].height);
+        // The type strip marks the keyframe's column only.
+        assert!(cols[0].key && !cols[1].key);
     }
 
     #[test]

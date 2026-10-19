@@ -347,7 +347,7 @@ impl Plots {
             // Threshold controls at the right edge.
             let mut v = thr.unwrap_or_else(|| s.data[fam.cols[0]].iter().map(|p| p.1).sum::<f64>() / s.data[fam.cols[0]].len().max(1) as f64);
             ui.add_space((width - (ui.cursor().min.x - left) - need).max(0.0));
-            let mut changed = ui.checkbox(&mut on, RichText::new("Threshold").size(11.0)).changed();
+            let mut changed = crate::ui::widgets::checkbox(ui, &mut on, RichText::new("Threshold").size(crate::ui::theme::text::SMALL)).changed();
             if on {
                 changed |= ui.add(egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
             }
@@ -485,7 +485,7 @@ impl Plots {
             ui.label(RichText::new("Rank by").size(12.0).color(p.muted));
             let label = |k: &str| format!("{}, {}", metric_name(metric_of(k)), key_label(metric_of(k), k.rsplit_once('.').map(|x| x.1).unwrap_or(k)));
             // Fits the panel: long metric names are cut short.
-            egui::ComboBox::from_id_salt("worst-key").selected_text(label(&key)).width(ui.available_width().max(80.0)).truncate().show_ui(ui, |ui| {
+            crate::ui::widgets::combo("worst-key").selected_text(label(&key)).width(ui.available_width().max(80.0)).truncate().show_ui(ui, |ui| {
                 for k in &keys {
                     ui.selectable_value(&mut key, k.clone(), label(k));
                 }

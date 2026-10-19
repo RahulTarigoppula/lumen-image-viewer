@@ -2,7 +2,7 @@
 
 use super::commands::Command;
 use super::icons as I;
-use super::theme::Palette;
+use super::theme::{self, radius, size, space, text, Palette};
 use super::tree::{DragFiles, FolderTree, TreeAction};
 use super::widgets;
 use crate::app::Core;
@@ -14,6 +14,12 @@ use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sen
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
+
+/// Thumbnail caption: the file name (the details line below uses `text::CAPTION`).
+const CAPTION_NAME: f32 = 12.5;
+/// Preview pane: the picture's maximum height and the text block below it.
+const PREVIEW_MAX_H: f32 = 180.0;
+const PREVIEW_TEXT_H: f32 = 92.0;
 
 pub enum BrowserEvent {
     Navigate(PathBuf),
@@ -322,22 +328,25 @@ impl Browser {
             }
             ui.add_space(if narrow { 2.0 } else { 6.0 });
 
-            // Adapt to the room left (points, so UI scale is included): first drop
-            // the size slider, then shrink the filter box, then fold the mode
-            // buttons into a "..." menu and the sort label into its icon.
+            // Adapt to the room left (points, so UI scale is included): first
+            // Slideshow and Compare lose their labels, then the filter box
+            // shrinks, the sort key and the Tools label go, and last Slideshow,
+            // Compare and the view toggle move into the Tools menu.
             let room = ui.available_width();
-            let show_slider = room >= 1050.0;
-            let filter_w = if room >= 860.0 {
-                150.0
+            let filter_w = if room >= 900.0 {
+                160.0
             } else if room >= 700.0 {
-                110.0
+                120.0
             } else if room >= 440.0 {
-                80.0
+                84.0
             } else {
                 56.0
             };
-            let overflow = room < 800.0;
+            let mode_labels = room >= 1080.0;
             let sort_icon_only = room < 640.0;
+            let tools_label = room >= 600.0;
+            let modes_in_menu = room < 520.0;
+            let view_in_menu = room < 440.0;
 
             // Address bar: breadcrumbs, click to edit.
             let addr_w = (ui.available_width() - self.right_w - 14.0).max(if room >= 440.0 { 120.0 } else { 64.0 });
@@ -363,46 +372,25 @@ impl Browser {
                 self.resort_needed = true;
                 filter_resp.surrender_focus();
             }
-
-            // Sort menu
-            let sort_icon = if core.settings.sort_desc { I::SORT_DESCENDING } else { I::SORT_ASCENDING };
-            let sort_label = if sort_icon_only { sort_icon.to_string() } else { format!("{sort_icon} {}", core.settings.sort_key.label()) };
-            ui.menu_button(sort_label, |ui| {
-                for k in SortKey::ALL {
-                    if ui.radio(core.settings.sort_key == k, k.label()).clicked() {
-                        core.settings.sort_key = k;
-                        if matches!(k, SortKey::Dimensions | SortKey::DateTaken) {
-                            for e in self.entries.iter().filter(|e| e.kind == EntryKind::Image) {
-                                core.meta.request(&e.path);
-                            }
-                        }
-                        self.resort_needed = true;
-                    }
-                }
-                ui.separator();
-                if ui.checkbox(&mut core.settings.sort_desc, "Descending").changed() {
-                    self.resort_needed = true;
-                }
-                if ui.checkbox(&mut core.settings.folders_first, "Folders first").changed() {
-                    self.resort_needed = true;
-                }
-                if ui.checkbox(&mut core.settings.show_folders_in_grid, "Show folders").changed() {
-                    self.resort_needed = true;
-                }
-            });
+            ui.add_space(4.0);
+            self.sort_button(ui, core, sort_icon_only);
+            ui.add_space(2.0);
 
             // Media type + flag/rating filters
-            let filt_icon = if self.flagged_only || self.min_rating > 0 || self.media_filter != MediaFilter::All { I::FUNNEL_SIMPLE } else { I::FUNNEL_SIMPLE_X };
-            ui.menu_button(filt_icon, |ui| {
-                ui.label(RichText::new("Show").color(p.muted));
+            let filtered = self.flagged_only || self.min_rating > 0 || self.media_filter != MediaFilter::All;
+            let filt_icon = if filtered { I::FUNNEL_SIMPLE } else { I::FUNNEL_SIMPLE_X };
+            let filt = widgets::icon_button(ui, filt_icon, "Show: media type, flag and rating", filtered);
+            egui::Popup::menu(&filt).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(220.0);
+                ui.label(RichText::new("Show").font(text::caption()).color(p.muted));
                 for (f, label) in [(MediaFilter::All, "Images and videos"), (MediaFilter::Images, "Images only"), (MediaFilter::Videos, "Videos only")] {
-                    if ui.radio(self.media_filter == f, label).clicked() {
+                    if widgets::radio(ui, self.media_filter == f, label).clicked() {
                         self.media_filter = f;
                         self.resort_needed = true;
                     }
                 }
                 ui.separator();
-                if ui.checkbox(&mut self.flagged_only, format!("{} Flagged only", I::FLAG)).changed() {
+                if widgets::checkbox(ui, &mut self.flagged_only, "Flagged only").changed() {
                     self.resort_needed = true;
                 }
                 ui.horizontal(|ui| {
@@ -414,62 +402,148 @@ impl Browser {
                 });
             });
 
-            // Thumbnail size
-            if show_slider {
-                let mut ts = core.settings.thumb_size;
-                ui.add_space(4.0);
-                ui.label(RichText::new(I::IMAGE).color(p.muted).size(12.0));
-                ui.spacing_mut().slider_width = 90.0;
-                if ui.add(egui::Slider::new(&mut ts, 80.0..=384.0).show_value(false)).on_hover_text("Thumbnail size (Ctrl+wheel)").changed() {
-                    core.settings.thumb_size = ts;
-                }
-                ui.label(RichText::new(I::IMAGE).color(p.muted).size(17.0));
-            }
-
             let details = core.settings.browser_view == BrowserView::Details;
             let (view_icon, view_tip) = if details { (I::SQUARES_FOUR, "Thumbnails view") } else { (I::LIST_DASHES, "Details view") };
-            // Narrowest: the view toggle joins the "..." menu as well.
-            let view_in_menu = room < 440.0;
-            if !view_in_menu {
-                if widgets::icon_button(ui, view_icon, view_tip, false).clicked() {
-                    ev.push(BrowserEvent::Command(Command::ToggleDetails));
-                }
-                widgets::separator_v(ui);
+            if !view_in_menu && widgets::icon_button(ui, view_icon, &format!("{view_tip} ({})", Command::ToggleDetails.shortcut()), false).clicked() {
+                ev.push(BrowserEvent::Command(Command::ToggleDetails));
             }
-            let modes = [
-                (I::PLAY_CIRCLE, "Slideshow (S)", Command::Slideshow),
-                (I::COLUMNS, "Compare selected (P)", Command::Compare),
-                (I::FILM_STRIP, "Video mode", Command::OpenVideoMode),
-                (I::STACK, "Batch convert / resize (F3)", Command::BatchConvert),
-            ];
-            if overflow {
-                ui.menu_button(I::DOTS_THREE, |ui| {
-                    if view_in_menu && ui.button(format!("{view_icon}  {view_tip}")).clicked() {
-                        ev.push(BrowserEvent::Command(Command::ToggleDetails));
-                        ui.close();
-                    }
-                    for (icon, tip, cmd) in modes {
-                        if ui.button(format!("{icon}  {tip}")).clicked() {
-                            ev.push(BrowserEvent::Command(cmd));
-                            ui.close();
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("More");
-            } else {
-                for (icon, tip, cmd) in modes {
-                    if widgets::icon_button(ui, icon, tip, false).clicked() {
+            widgets::separator_v(ui);
+            let modes = [(Command::Slideshow, "Slideshow"), (Command::Compare, "Compare")];
+            if !modes_in_menu {
+                for (cmd, label) in modes {
+                    let tip = format!("{} ({})", cmd.label(), cmd.shortcut());
+                    let clicked = if mode_labels { tool_button(ui, cmd.icon(), label, false).on_hover_text(tip).clicked() } else { widgets::icon_button(ui, cmd.icon(), &tip, false).clicked() };
+                    if clicked {
                         ev.push(BrowserEvent::Command(cmd));
                     }
                 }
             }
+            // Tools: batch work on the folder or the selection, and video mode.
+            let tools = tool_button(ui, I::WRENCH, if tools_label { "Tools" } else { "" }, true).on_hover_text("Batch tools and video mode");
+            egui::Popup::menu(&tools).show(|ui| {
+                ui.set_min_width(250.0);
+                let mut item = |ui: &mut Ui, cmd: Command, label: &str| {
+                    if widgets::menu_item(ui, cmd.icon(), label, &cmd.shortcut()).clicked() {
+                        ev.push(BrowserEvent::Command(cmd));
+                        ui.close();
+                    }
+                };
+                if modes_in_menu {
+                    for (cmd, label) in modes {
+                        item(ui, cmd, label);
+                    }
+                    if view_in_menu {
+                        item(ui, Command::ToggleDetails, view_tip);
+                    }
+                    ui.separator();
+                }
+                item(ui, Command::BatchConvert, "Batch convert / resize...");
+                item(ui, Command::BatchRename, "Batch rename...");
+                item(ui, Command::ContactSheet, "Contact sheet...");
+                item(ui, Command::FindDuplicates, "Find duplicates...");
+                ui.separator();
+                item(ui, Command::OpenVideoMode, "Video mode");
+            });
             let used = ui.cursor().min.x - right_start;
             if (used - self.right_w).abs() > 1.0 {
                 self.right_w = used;
                 ui.ctx().request_repaint();
             }
         });
+    }
+
+    /// Sort as one split button: the left part shows the key and direction and
+    /// reverses the direction on click; the caret opens the keys and options.
+    fn sort_button(&mut self, ui: &mut Ui, core: &mut Core, icon_only: bool) {
+        let p = core.pal;
+        let desc = core.settings.sort_desc;
+        let arrow = if desc { I::ARROW_DOWN } else { I::ARROW_UP };
+        let h = size::CONTROL;
+        let key_g = (!icon_only).then(|| ui.painter().layout_no_wrap(core.settings.sort_key.label().to_string(), text::body(), p.text));
+        let arrow_g = ui.painter().layout_no_wrap(arrow.to_string(), FontId::proportional(size::ICON_CARET), p.muted);
+        let main_w = key_g.as_ref().map_or(0.0, |g| g.size().x + 6.0) + arrow_g.size().x + 20.0;
+        let caret_w = 22.0;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(main_w + caret_w, h), Sense::hover());
+        let main_r = Rect::from_min_size(rect.min, Vec2::new(main_w, h));
+        let caret_r = Rect::from_min_max(Pos2::new(main_r.max.x, rect.min.y), rect.max);
+        let main = ui.interact(main_r, ui.scope_id().with("sort-main"), Sense::click());
+        let caret = ui.interact(caret_r, ui.scope_id().with("sort-keys"), Sense::click());
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&caret));
+        if ui.is_rect_visible(rect) {
+            let vis = ui.visuals();
+            let painter = ui.painter();
+            let cr = radius::CONTROL;
+            painter.rect(rect, CornerRadius::same(cr), vis.widgets.inactive.weak_bg_fill, vis.widgets.inactive.bg_stroke, egui::StrokeKind::Inside);
+            for (r, resp, hot, round) in [
+                (main_r, &main, main.hovered(), CornerRadius { nw: cr, sw: cr, ne: 0, se: 0 }),
+                (caret_r, &caret, caret.hovered() || open, CornerRadius { nw: 0, sw: 0, ne: cr, se: cr }),
+            ] {
+                if hot {
+                    let fill = if resp.is_pointer_button_down_on() { vis.widgets.active.weak_bg_fill } else { vis.widgets.hovered.weak_bg_fill };
+                    painter.rect_filled(r, round, fill);
+                }
+            }
+            painter.vline(main_r.max.x, rect.y_range().shrink(6.0), Stroke::new(1.0, p.border));
+            let mut x = main_r.min.x + 10.0;
+            if let Some(g) = key_g {
+                let w = g.size().x;
+                painter.galley(Pos2::new(x, main_r.center().y - g.size().y / 2.0), g, p.text);
+                x += w + 6.0;
+            }
+            painter.galley(Pos2::new(x, main_r.center().y - arrow_g.size().y / 2.0), arrow_g, if main.hovered() { p.text } else { p.muted });
+            let caret_color = if caret.hovered() || open { p.text } else { p.muted };
+            painter.text(caret_r.center() - Vec2::new(1.0, 0.0), Align2::CENTER_CENTER, I::CARET_DOWN, FontId::proportional(size::ICON_CARET), caret_color);
+        }
+        let dir = if desc { "descending" } else { "ascending" };
+        let key = core.settings.sort_key.label().to_lowercase();
+        if main.on_hover_text(format!("Sorted by {key}, {dir}. Click to reverse.")).clicked() {
+            core.settings.sort_desc = !desc;
+            self.resort_needed = true;
+        }
+        let caret = caret.on_hover_text("Sort by");
+        egui::Popup::menu(&caret).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(200.0);
+            for k in SortKey::ALL {
+                if widgets::menu_toggle(ui, core.settings.sort_key == k, k.label(), "").clicked() {
+                    core.settings.sort_key = k;
+                    if matches!(k, SortKey::Dimensions | SortKey::DateTaken) {
+                        for e in self.entries.iter().filter(|e| e.kind == EntryKind::Image) {
+                            core.meta.request(&e.path);
+                        }
+                    }
+                    self.resort_needed = true;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            let mut toggle = |ui: &mut Ui, on: &mut bool, label: &str| {
+                if widgets::menu_toggle(ui, *on, label, "").clicked() {
+                    *on = !*on;
+                    self.resort_needed = true;
+                }
+            };
+            toggle(ui, &mut core.settings.sort_desc, "Descending");
+            toggle(ui, &mut core.settings.folders_first, "Folders first");
+            toggle(ui, &mut core.settings.show_folders_in_grid, "Show folders");
+        });
+    }
+
+    /// The thumbnail size slider at the right of the status bar (thumbnails view only).
+    pub fn status_size_slider(&mut self, ui: &mut Ui, core: &mut Core) {
+        if core.settings.browser_view != BrowserView::Thumbnails {
+            return;
+        }
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 20.0;
+            let mut ts = core.settings.thumb_size;
+            let def = crate::settings::Settings::default().thumb_size;
+            let r = ui.add(widgets::Slider::new(&mut ts, 80.0..=384.0).show_value(false).width(120.0).default_value(def));
+            if r.on_hover_text("Thumbnail size (Ctrl+wheel; double-click to reset)").changed() {
+                core.settings.thumb_size = ts;
+            }
+        });
+        // In the status bar's right-to-left layout this is the gap before the next item.
+        ui.add_space(space::L);
     }
 
     fn address_bar(&mut self, ui: &mut Ui, width: f32, p: &Palette, ev: &mut Vec<BrowserEvent>) {
@@ -542,22 +616,22 @@ impl Browser {
         let mut tree_bottom: Option<f32> = None;
         if show_preview {
             // Never let the preview take more than ~60% of a short sidebar.
-            let max_h = (ui.available_height() * 0.6).clamp(180.0, 640.0);
-            // Tall enough for a small picture above the file details.
-            let min_h = 190.0f32.min(max_h);
+            let max_h = (ui.available_height() * 0.6).clamp(180.0, PREVIEW_TEXT_H + PREVIEW_MAX_H + 24.0);
+            // Tall enough for a picture above the file details.
+            let min_h = (PREVIEW_TEXT_H + 150.0).min(max_h);
             let preview_h = core.settings.preview_height.clamp(min_h, max_h);
             let r = egui::Panel::bottom("preview-pane")
                 .resizable(true)
                 .default_size(preview_h)
                 .size_range(min_h..=max_h)
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)))
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 8)))
                 .show(ui, |ui| {
                     // Content must never ask for more than the panel has, or a
                     // resizable panel grows a little every frame.
                     let h = ui.available_height();
                     ui.set_max_height(h);
                     // Nothing may draw above the panel onto the tree.
-                    ui.set_clip_rect(ui.max_rect().expand2(Vec2::new(10.0, 8.0)).intersect(ui.clip_rect()));
+                    ui.set_clip_rect(ui.max_rect().expand2(Vec2::new(12.0, 8.0)).intersect(ui.clip_rect()));
                     self.preview_pane(ui, core);
                 });
             tree_bottom = Some(r.response.rect.min.y);
@@ -592,15 +666,16 @@ impl Browser {
             return;
         };
         let avail = ui.available_size();
-        // The text block below the picture is about 118 points tall; the picture
-        // gets what is left and is dropped when that is too little.
-        let img_h = avail.y - 118.0;
+        // The text block below the picture is about 90 points tall; the picture
+        // gets what is left (at most 180 points) and is dropped when that is too little.
+        let img_h = (avail.y - PREVIEW_TEXT_H).min(PREVIEW_MAX_H);
         let mut dims = core.meta.get(&entry.path).and_then(|m| m.dims);
         if img_h >= 40.0 {
             self.preview_image(ui, core, &entry, Vec2::new(avail.x, img_h), &mut dims);
-            ui.add_space(6.0);
+            ui.add_space(space::M);
         }
-        ui.add(egui::Label::new(RichText::new(&entry.name).strong()).truncate());
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add(egui::Label::new(RichText::new(&entry.name).font(text::body_strong()).color(p.text)).truncate());
         let mut line = Vec::new();
         if let Some((w, h)) = dims {
             line.push(format!("{w} × {h}"));
@@ -609,9 +684,10 @@ impl Browser {
             line.push(catalog::human_size(entry.size));
         }
         line.push(crate::formats::type_name(&entry.ext));
-        ui.add(egui::Label::new(RichText::new(line.join("  ·  ")).color(p.muted).size(12.0)).truncate());
-        ui.add(egui::Label::new(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(11.5)).truncate());
+        ui.add(egui::Label::new(RichText::new(line.join("  ·  ")).color(p.muted).size(text::SMALL)).truncate());
+        ui.add(egui::Label::new(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(text::SMALL)).truncate());
         if entry.is_media() {
+            ui.add_space(space::XS);
             let tag = core.tags.get(&entry.path);
             ui.horizontal(|ui| {
                 if let Some(r) = widgets::star_rating(ui, tag.rating, 13.0, &p) {
@@ -619,7 +695,7 @@ impl Browser {
                 }
                 ui.add_space(6.0);
                 let flag_color = if tag.flagged { p.accent } else { p.faint };
-                let font = if tag.flagged { super::theme::icon_fill(14.0) } else { FontId::proportional(14.0) };
+                let font = if tag.flagged { theme::icon_fill(14.0) } else { FontId::proportional(14.0) };
                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
                 ui.painter().text(r.center(), Align2::CENTER_CENTER, I::FLAG, font, flag_color);
                 if resp.on_hover_text("Flag (Space)").clicked() {
@@ -629,34 +705,42 @@ impl Browser {
         }
     }
 
+    /// The preview picture, aspect-fit to `size` (the pane's width, at most 180
+    /// points tall) with rounded corners, centered horizontally.
     fn preview_image(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, size: Vec2, dims: &mut Option<(u32, u32)>) {
         let p = core.pal;
-        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        ui.painter().rect_filled(rect, CornerRadius::same(8), ui.visuals().extreme_bg_color);
-        if entry.is_media() {
-            let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
+        let cr = CornerRadius::same(radius::CARD);
+        let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
+        let ready = if entry.is_media() {
             match core.thumbs.get(&key) {
-                Thumb::Ready(t) => {
-                    let ts = t.tex.size_vec2();
-                    let s = cap_upscale(((rect.width() - 12.0) / ts.x).min((rect.height() - 12.0) / ts.y).min(2.0), ts, t.source_dims);
-                    let r = Rect::from_center_size(rect.center(), ts * s);
-                    if dims.is_none() {
-                        *dims = t.source_dims;
-                    }
-                    let mut mesh = egui::Mesh::with_texture(t.tex.id());
-                    mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                    ui.painter().add(egui::Shape::mesh(mesh));
-                }
-                Thumb::Pending => {
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::HOURGLASS, FontId::proportional(22.0), p.faint);
-                }
-                Thumb::Failed => {
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(28.0), p.faint);
-                }
+                Thumb::Ready(t) => Some((t.tex.id(), t.tex.size_vec2(), t.source_dims)),
+                Thumb::Pending => None,
+                Thumb::Failed => None,
             }
         } else {
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::FOLDER, super::theme::icon_fill(54.0), p.accent.gamma_multiply(0.8));
+            None
+        };
+        if let Some((id, ts, source)) = ready {
+            let s = cap_upscale((size.x / ts.x).min(size.y / ts.y), ts, source);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(size.x, ts.y * s), Sense::hover());
+            let r = Rect::from_center_size(rect.center(), ts * s);
+            if dims.is_none() {
+                *dims = source;
+            }
+            ui.painter().add(egui::epaint::RectShape::filled(r, cr, Color32::WHITE).with_texture(id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
+            return;
         }
+        // Placeholder well: a folder, a thumbnail on the way or one that failed.
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(size.x, size.y.min(120.0)), Sense::hover());
+        ui.painter().rect_filled(rect, cr, p.faint_bg);
+        let (icon, font, color) = if !entry.is_media() {
+            (I::FOLDER, theme::icon_fill(54.0), p.accent.gamma_multiply(0.8))
+        } else if matches!(core.thumbs.get(&key), Thumb::Failed) {
+            (I::IMAGE_BROKEN, FontId::proportional(28.0), p.faint)
+        } else {
+            (I::HOURGLASS, FontId::proportional(22.0), p.faint)
+        };
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, font, color);
     }
 
     pub fn central(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
@@ -694,7 +778,7 @@ impl Browser {
         let captions = core.settings.caption();
         let caption_h = match captions {
             ThumbCaption::None => 0.0,
-            ThumbCaption::Name => 22.0,
+            ThumbCaption::Name => 24.0,
             ThumbCaption::NameDetails | ThumbCaption::NameDate => 36.0,
         };
         let pad = 8.0;
@@ -746,6 +830,7 @@ impl Browser {
         let tips = pointer_here && self.tips_after_drag && !super::overlay_open(ui.ctx());
         // Registered before the cells so cells take precedence for clicks.
         let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click());
+        let sole = self.selected.len() <= 1;
         scroll.show_rows(ui, cell.y, rows, |ui, range| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for row in range {
@@ -760,9 +845,9 @@ impl Browser {
                         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
                         let selected = self.selected.contains(&entry.path);
                         let focused = self.focus == Some(i);
-                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, resp.hovered() && pointer_here, &p);
+                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, sole, resp.hovered() && pointer_here, &p);
                         if entry.is_folder() && resp.dnd_hover_payload::<DragFiles>().is_some() {
-                            ui.painter().rect_stroke(rect.shrink(3.0), CornerRadius::same(8), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                            ui.painter().rect_stroke(rect.shrink(4.0), CornerRadius::same(radius::CARD), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
                         }
                         if resp.clicked() {
                             clicked = Some((i, ui.input(|inp| inp.modifiers)));
@@ -786,7 +871,7 @@ impl Browser {
                         // A folder's tooltip would only repeat its caption.
                         let folder_tip_redundant = entry.is_folder()
                             && captions != ThumbCaption::None
-                            && ui.painter().layout_no_wrap(entry.name.clone(), FontId::proportional(12.0), p.text).size().x <= cell.x - 16.0;
+                            && ui.painter().layout_no_wrap(entry.name.clone(), FontId::proportional(CAPTION_NAME), p.text).size().x <= cell.x - 16.0;
                         if !tips || folder_tip_redundant {
                             continue;
                         }
@@ -818,7 +903,7 @@ impl Browser {
                 self.focus = Some(i);
             }
         }
-        self.context_menu(ui, &bg, core, ev, ctx_menu_for.is_some());
+        self.context_menu(ui, &bg, ev, ctx_menu_for.is_some());
     }
 
     /// An in-app file drag (onto tree folders) that leaves the window becomes a
@@ -867,18 +952,23 @@ impl Browser {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: ThumbCaption, selected: bool, focused: bool, hovered: bool, p: &Palette) {
+    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: ThumbCaption, selected: bool, focused: bool, sole_selection: bool, hovered: bool, p: &Palette) {
         if !ui.is_rect_visible(rect) {
             return;
         }
         let painter = ui.painter();
-        let card = rect.shrink(3.0);
-        let bg = if selected { p.accent_soft } else if hovered { p.hover } else { Color32::TRANSPARENT };
-        painter.rect_filled(card, CornerRadius::same(8), bg);
-        if focused {
-            painter.rect_stroke(card, CornerRadius::same(8), Stroke::new(1.5, if selected { p.accent } else { p.faint }), egui::StrokeKind::Inside);
-        } else if selected {
-            painter.rect_stroke(card, CornerRadius::same(8), Stroke::new(1.0, p.accent.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+        // One selected style (soft accent fill + 2 pt accent ring), a lighter hover,
+        // and a thin text-colored ring 2 pt outside the card for the keyboard focus
+        // (left out when the focused cell is the only selected one: its ring says it).
+        let card = rect.shrink(4.0);
+        let cr = CornerRadius::same(radius::CARD);
+        let bg = if selected { p.selected_bg } else if hovered { p.hover.gamma_multiply(0.6) } else { Color32::TRANSPARENT };
+        painter.rect_filled(card, cr, bg);
+        if selected {
+            painter.rect_stroke(card, cr, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+        }
+        if focused && !(selected && sole_selection) {
+            painter.rect_stroke(card.expand(2.0), CornerRadius::same(radius::CARD + 2), Stroke::new(1.0, p.text.gamma_multiply(0.8)), egui::StrokeKind::Inside);
         }
         let img_area = Rect::from_min_size(Pos2::new(rect.center().x - ts / 2.0, rect.min.y + pad), Vec2::splat(ts));
         let mut dims = None;
@@ -940,8 +1030,8 @@ impl Browser {
         }
         if captions != ThumbCaption::None {
             let name_rect = Rect::from_min_max(Pos2::new(rect.min.x + 8.0, img_area.max.y + 4.0), Pos2::new(rect.max.x - 8.0, rect.max.y - 4.0));
-            let galley = ui.painter().layout(entry.name.clone(), FontId::proportional(12.0), if selected { p.text } else { p.text.gamma_multiply(0.9) }, name_rect.width());
-            let painter = ui.painter().with_clip_rect(Rect::from_min_max(name_rect.min, Pos2::new(name_rect.max.x, name_rect.min.y + 16.0)));
+            let galley = ui.painter().layout(entry.name.clone(), FontId::proportional(CAPTION_NAME), p.text, name_rect.width());
+            let painter = ui.painter().with_clip_rect(Rect::from_min_max(name_rect.min, Pos2::new(name_rect.max.x, name_rect.min.y + 17.0)));
             let first_w = galley.rows.first().map(|r| r.rect().width()).unwrap_or(0.0);
             painter.galley(Pos2::new(name_rect.center().x - first_w / 2.0, name_rect.min.y), galley, p.text);
             if captions == ThumbCaption::Name {
@@ -964,7 +1054,7 @@ impl Browser {
                 match d {
                     Some((w, h)) => {
                         // Narrow cells: drop the file size, then the dimensions.
-                        let font = FontId::proportional(10.5);
+                        let font = FontId::proportional(text::CAPTION);
                         let fits = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.faint).size().x <= name_rect.width();
                         let full = format!("{w}×{h}  ·  {size}");
                         let dims_only = format!("{w}×{h}");
@@ -979,12 +1069,12 @@ impl Browser {
                     None => size,
                 }
             };
-            ui.painter().with_clip_rect(name_rect).text(Pos2::new(name_rect.center().x, name_rect.min.y + 24.0), Align2::CENTER_CENTER, sub, FontId::proportional(10.5), p.faint);
+            ui.painter().with_clip_rect(name_rect).text(Pos2::new(name_rect.center().x, name_rect.min.y + 25.0), Align2::CENTER_CENTER, sub, FontId::proportional(text::CAPTION), p.faint);
         }
     }
 
     fn details(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
-        use egui_extras::{Column, TableBuilder};
+        use egui_extras::TableBuilder;
         let p = core.pal;
         let n = self.items.len();
         let mut clicked = None;
@@ -992,113 +1082,140 @@ impl Browser {
         let mut ctx_for = None;
         let mut sort_click: Option<SortKey> = None;
         let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("details-bg"), Sense::click());
-        let mut table = TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(Sense::click_and_drag())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(28.0))
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::initial(90.0))
-            .column(Column::initial(110.0))
-            .column(Column::initial(110.0))
-            .column(Column::initial(140.0))
-            .column(Column::initial(140.0))
-            .column(Column::initial(90.0));
-        if self.scroll_to_focus {
-            if let Some(f) = self.focus {
-                table = table.scroll_to_row(f, None);
-            }
-            self.scroll_to_focus = false;
-        }
-        let sk = core.settings.sort_key;
-        let desc = core.settings.sort_desc;
-        table
-            .header(26.0, |mut h| {
-                let mut head = |h: &mut egui_extras::TableRow, label: &str, key: Option<SortKey>| {
-                    h.col(|ui| {
-                        let arrow = if key == Some(sk) { if desc { " ▾" } else { " ▴" } } else { "" };
-                        let r = ui.add(egui::Button::new(RichText::new(format!("{label}{arrow}")).strong().color(p.muted)).frame(false));
-                        if let (true, Some(k)) = (r.clicked(), key) {
-                            sort_click = Some(k);
-                        }
-                    });
-                };
-                head(&mut h, "", None);
-                head(&mut h, "Name", Some(SortKey::Name));
-                head(&mut h, "Size", Some(SortKey::Size));
-                head(&mut h, "Type", Some(SortKey::Type));
-                head(&mut h, "Dimensions", Some(SortKey::Dimensions));
-                head(&mut h, "Modified", Some(SortKey::Modified));
-                head(&mut h, "Date taken", Some(SortKey::DateTaken));
-                head(&mut h, "Rating", Some(SortKey::Rating));
+        // Columns by priority: a narrow list keeps name, size, date and rating.
+        let avail = ui.available_width();
+        let cols: Vec<DetailCol> = DetailCol::ALL
+            .into_iter()
+            .filter(|c| match c {
+                DetailCol::Dimensions => avail >= 700.0,
+                DetailCol::Type => avail >= 820.0,
+                DetailCol::Taken => avail >= 960.0,
+                _ => true,
             })
-            .body(|body| {
-                body.rows(24.0, n, |mut row| {
-                    let i = row.index();
-                    let entry = self.entries[self.items[i]].clone();
-                    let selected = self.selected.contains(&entry.path);
-                    row.set_selected(selected);
-                    if entry.kind == EntryKind::Image {
-                        core.meta.request(&entry.path);
-                    }
-                    let qm = core.meta.get(&entry.path);
-                    row.col(|ui| {
-                        let icon = match entry.kind {
-                            EntryKind::Folder => I::FOLDER,
-                            EntryKind::Video => I::FILM_STRIP,
-                            EntryKind::Image => I::IMAGE,
-                        };
-                        ui.label(RichText::new(icon).color(if entry.is_folder() { p.accent } else { p.muted }));
-                    });
-                    row.col(|ui| {
-                        ui.add(egui::Label::new(&entry.name).truncate().selectable(false));
-                    });
-                    row.col(|ui| {
-                        if entry.is_media() {
-                            ui.label(RichText::new(catalog::human_size(entry.size)).color(p.muted));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(if entry.is_folder() { "Folder".into() } else { crate::formats::type_name(&entry.ext) }).color(p.muted));
-                    });
-                    row.col(|ui| {
-                        if let Some((w, h)) = qm.and_then(|m| m.dims) {
-                            ui.label(RichText::new(format!("{w} × {h}")).color(p.muted));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(catalog::format_time(entry.modified)).color(p.muted));
-                    });
-                    row.col(|ui| {
-                        if let Some(t) = qm.and_then(|m| m.taken) {
-                            if let Some(dt) = chrono::DateTime::from_timestamp(t, 0) {
-                                ui.label(RichText::new(dt.format("%Y-%m-%d %H:%M").to_string()).color(p.muted));
+            .collect();
+        let full_x = ui.max_rect().x_range();
+        let mut head_bottom = None;
+        ui.scope(|ui| {
+            // Rows sit edge to edge (the zebra marks them), and column lines show only
+            // while a resize handle is hovered or dragged.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.visuals_mut().widgets.noninteractive.bg_stroke = Stroke::NONE;
+            let mut table = TableBuilder::new(ui)
+                .id_salt(("details", cols.len()))
+                .striped(true)
+                .resizable(true)
+                .sense(Sense::click_and_drag())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for c in &cols {
+                table = table.column(c.column());
+            }
+            if self.scroll_to_focus {
+                if let Some(f) = self.focus {
+                    table = table.scroll_to_row(f, None);
+                }
+                self.scroll_to_focus = false;
+            }
+            let sk = core.settings.sort_key;
+            let desc = core.settings.sort_desc;
+            table
+                .header(size::CONTROL, |mut h| {
+                    for c in &cols {
+                        h.col(|ui| {
+                            let Some(key) = c.sort_key() else { return };
+                            let sorted = key == sk;
+                            let color = if sorted { p.text } else { p.muted };
+                            let mut job = egui::text::LayoutJob::default();
+                            let fmt = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
+                            job.append(c.title(), 0.0, fmt(theme::semibold(text::SMALL), color));
+                            if sorted {
+                                job.append(if desc { I::CARET_DOWN } else { I::CARET_UP }, 4.0, fmt(FontId::proportional(size::ICON_CARET - 2.0), p.muted));
                             }
+                            let add = |ui: &mut Ui| ui.add(egui::Label::new(job).sense(Sense::click()).selectable(false)).on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let r = if c.right_aligned() {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(space::L);
+                                    add(ui)
+                                })
+                                .inner
+                            } else {
+                                add(ui)
+                            };
+                            if r.clicked() {
+                                sort_click = Some(key);
+                            }
+                        });
+                    }
+                    head_bottom = Some(h.response().rect.bottom());
+                })
+                .body(|body| {
+                    body.rows(size::LIST_ROW, n, |mut row| {
+                        let i = row.index();
+                        let entry = self.entries[self.items[i]].clone();
+                        let selected = self.selected.contains(&entry.path);
+                        row.set_selected(selected);
+                        if entry.kind == EntryKind::Image {
+                            core.meta.request(&entry.path);
+                        }
+                        let qm = core.meta.get(&entry.path);
+                        for c in &cols {
+                            row.col(|ui| {
+                                let muted = |ui: &mut Ui, t: String| {
+                                    ui.add(egui::Label::new(RichText::new(t).color(p.muted)).truncate().selectable(false));
+                                };
+                                match c {
+                                    DetailCol::Icon => self.row_icon(ui, core, &entry, &p),
+                                    DetailCol::Name => {
+                                        ui.add(egui::Label::new(RichText::new(&entry.name).color(p.text)).truncate().selectable(false));
+                                    }
+                                    DetailCol::Size => {
+                                        if entry.is_media() {
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.add_space(space::L);
+                                                muted(ui, catalog::human_size(entry.size));
+                                            });
+                                        }
+                                    }
+                                    DetailCol::Type => muted(ui, if entry.is_folder() { "Folder".into() } else { crate::formats::type_name(&entry.ext) }),
+                                    DetailCol::Dimensions => {
+                                        if let Some((w, h)) = qm.and_then(|m| m.dims) {
+                                            muted(ui, format!("{w} × {h}"));
+                                        }
+                                    }
+                                    DetailCol::Modified => muted(ui, catalog::format_time(entry.modified)),
+                                    DetailCol::Taken => {
+                                        if let Some(dt) = qm.and_then(|m| m.taken).and_then(|t| chrono::DateTime::from_timestamp(t, 0)) {
+                                            muted(ui, dt.format("%Y-%m-%d %H:%M").to_string());
+                                        }
+                                    }
+                                    DetailCol::Rating => {
+                                        let r = core.tags.get(&entry.path).rating;
+                                        if r > 0 {
+                                            ui.label(RichText::new(I::STAR.repeat(r as usize)).font(theme::icon_fill(11.0)).color(Color32::from_rgb(250, 196, 60)));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        let resp = row.response();
+                        if resp.clicked() {
+                            clicked = Some((i, resp.ctx.input(|inp| inp.modifiers)));
+                        }
+                        if resp.double_clicked() {
+                            double = Some(i);
+                        }
+                        if resp.secondary_clicked() {
+                            ctx_for = Some(i);
+                        }
+                        if resp.drag_started() {
+                            let files = if selected { self.selected_paths() } else { vec![entry.path.clone()] };
+                            resp.dnd_set_drag_payload(DragFiles(files));
                         }
                     });
-                    row.col(|ui| {
-                        let r = core.tags.get(&entry.path).rating;
-                        if r > 0 {
-                            ui.label(RichText::new(I::STAR.repeat(r as usize)).font(super::theme::icon_fill(11.0)).color(Color32::from_rgb(250, 196, 60)));
-                        }
-                    });
-                    let resp = row.response();
-                    if resp.clicked() {
-                        clicked = Some((i, resp.ctx.input(|inp| inp.modifiers)));
-                    }
-                    if resp.double_clicked() {
-                        double = Some(i);
-                    }
-                    if resp.secondary_clicked() {
-                        ctx_for = Some(i);
-                    }
-                    if resp.drag_started() {
-                        let files = if selected { self.selected_paths() } else { vec![entry.path.clone()] };
-                        resp.dnd_set_drag_payload(DragFiles(files));
-                    }
                 });
-            });
+        });
+        if let Some(y) = head_bottom {
+            ui.painter().hline(full_x, y, Stroke::new(1.0, p.border));
+        }
         if let Some(k) = sort_click {
             if core.settings.sort_key == k {
                 core.settings.sort_desc = !core.settings.sort_desc;
@@ -1117,21 +1234,45 @@ impl Browser {
                 self.focus = Some(i);
             }
         }
-        self.context_menu(ui, &bg, core, ev, ctx_for.is_some());
+        self.context_menu(ui, &bg, ev, ctx_for.is_some());
     }
 
-    fn context_menu(&mut self, ui: &mut Ui, bg: &egui::Response, core: &mut Core, ev: &mut Vec<BrowserEvent>, open_now: bool) {
+    /// The details row's first column: a 20 pt thumbnail (folder icon for folders,
+    /// a type icon while the thumbnail loads or when it failed).
+    fn row_icon(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, p: &Palette) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+        let icon = |icon: &str, font: FontId, color: Color32| ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, font, color);
+        match entry.kind {
+            EntryKind::Folder => {
+                icon(I::FOLDER, theme::icon_fill(16.0), p.accent.gamma_multiply(0.85));
+            }
+            kind => {
+                let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
+                match core.thumbs.get(&key) {
+                    Thumb::Ready(t) => {
+                        let ts = t.tex.size_vec2();
+                        let s = (rect.width() / ts.x).min(rect.height() / ts.y);
+                        let r = Rect::from_center_size(rect.center(), ts * s);
+                        let shape = egui::epaint::RectShape::filled(r, CornerRadius::same(2), Color32::WHITE).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+                        ui.painter().add(shape);
+                    }
+                    _ => {
+                        icon(if kind == EntryKind::Video { I::FILM_STRIP } else { I::IMAGE }, FontId::proportional(size::ICON), p.faint);
+                    }
+                }
+            }
+        }
+    }
+
+    fn context_menu(&mut self, ui: &mut Ui, bg: &egui::Response, ev: &mut Vec<BrowserEvent>, open_now: bool) {
         let popup_id = ui.scope_id().with("item-context");
         if open_now {
             egui::Popup::open_id(ui.ctx(), popup_id);
         }
         let has_sel = !self.selected.is_empty() || self.focus.is_some();
-        let p = core.pal;
         let build = |ui: &mut Ui, ev: &mut Vec<BrowserEvent>| {
             let item = |ui: &mut Ui, cmd: Command, ev: &mut Vec<BrowserEvent>| {
-                let text = format!("{}   {}", cmd.icon(), cmd.label());
-                let r = ui.add(egui::Button::new(text).shortcut_text(RichText::new(cmd.shortcut()).color(p.faint)));
-                if r.clicked() {
+                if widgets::menu_item(ui, cmd.icon(), &cmd.label(), &cmd.shortcut()).clicked() {
                     ev.push(BrowserEvent::Command(cmd));
                     ui.close();
                 }
@@ -1147,7 +1288,7 @@ impl Browser {
                 item(ui, Command::Rename, ev);
                 item(ui, Command::Delete, ev);
                 ui.separator();
-                ui.menu_button(format!("{}   Rate & tag", I::STAR), |ui| {
+                widgets::submenu(ui, I::STAR, "Rate & tag", |ui| {
                     for n in 0..=5 {
                         item(ui, Command::Rate(n), ev);
                     }
@@ -1157,7 +1298,7 @@ impl Browser {
                         item(ui, Command::Label(n), ev);
                     }
                 });
-                ui.menu_button(format!("{}   Tools", I::WRENCH), |ui| {
+                widgets::submenu(ui, I::WRENCH, "Tools", |ui| {
                     item(ui, Command::BatchConvert, ev);
                     item(ui, Command::BatchRename, ev);
                     item(ui, Command::ContactSheet, ev);
@@ -1299,6 +1440,86 @@ impl Browser {
             s += &format!("   ·   reading metadata... {}", core.meta.pending());
         }
         s
+    }
+}
+
+/// A flat toolbar button with an icon and a label (and a caret when it opens a
+/// menu): no frame until hovered, like [`widgets::icon_button`]. An empty label
+/// leaves the icon (and caret) only.
+fn tool_button(ui: &mut Ui, icon: &str, label: &str, menu: bool) -> egui::Response {
+    let p = theme::palette(ui.ctx());
+    let mut atoms = egui::Atoms::new(RichText::new(icon).size(size::ICON_TOOLBAR));
+    if !label.is_empty() {
+        atoms.push_right(RichText::new(label).font(text::body()));
+    }
+    if menu {
+        atoms.push_right(RichText::new(I::CARET_DOWN).size(size::ICON_CARET).color(p.muted));
+    }
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.x = 8.0;
+        ui.add(egui::Button::new(atoms).frame_when_inactive(false).min_size(Vec2::new(30.0, 30.0)))
+    })
+    .inner
+}
+
+/// The details view's columns, in display order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailCol {
+    Icon,
+    Name,
+    Size,
+    Type,
+    Dimensions,
+    Modified,
+    Taken,
+    Rating,
+}
+
+impl DetailCol {
+    const ALL: [DetailCol; 8] = [DetailCol::Icon, DetailCol::Name, DetailCol::Size, DetailCol::Type, DetailCol::Dimensions, DetailCol::Modified, DetailCol::Taken, DetailCol::Rating];
+
+    fn title(self) -> &'static str {
+        match self {
+            DetailCol::Icon => "",
+            DetailCol::Name => "Name",
+            DetailCol::Size => "Size",
+            DetailCol::Type => "Type",
+            DetailCol::Dimensions => "Dimensions",
+            DetailCol::Modified => "Modified",
+            DetailCol::Taken => "Date taken",
+            DetailCol::Rating => "Rating",
+        }
+    }
+
+    fn sort_key(self) -> Option<SortKey> {
+        match self {
+            DetailCol::Icon => None,
+            DetailCol::Name => Some(SortKey::Name),
+            DetailCol::Size => Some(SortKey::Size),
+            DetailCol::Type => Some(SortKey::Type),
+            DetailCol::Dimensions => Some(SortKey::Dimensions),
+            DetailCol::Modified => Some(SortKey::Modified),
+            DetailCol::Taken => Some(SortKey::DateTaken),
+            DetailCol::Rating => Some(SortKey::Rating),
+        }
+    }
+
+    fn right_aligned(self) -> bool {
+        self == DetailCol::Size
+    }
+
+    fn column(self) -> egui_extras::Column {
+        use egui_extras::Column;
+        match self {
+            DetailCol::Icon => Column::exact(28.0),
+            DetailCol::Name => Column::remainder().at_least(160.0).clip(true),
+            DetailCol::Size => Column::initial(80.0).at_least(56.0),
+            DetailCol::Type => Column::initial(110.0).at_least(60.0).clip(true),
+            DetailCol::Dimensions => Column::initial(104.0).at_least(60.0).clip(true),
+            DetailCol::Modified => Column::initial(130.0).at_least(80.0).clip(true),
+            DetailCol::Taken => Column::initial(130.0).at_least(80.0).clip(true),
+            DetailCol::Rating => Column::initial(80.0).at_least(72.0),
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 
 use crate::ui::roi::ImageTransform;
 use crate::ui::theme::Palette;
+use crate::ui::widgets;
 use crossbeam_channel::{Receiver, TryRecvError};
 use egui::{Color32, ColorImage, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2};
 use lumen_analysis::{heatmap, Colormap, ColorizeOptions, Heatmap, RangeMode};
@@ -391,8 +392,8 @@ impl HeatmapView {
     pub fn controls(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(m) = self.full.clone() else { return };
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.visible, "Overlay");
-            egui::ComboBox::from_id_salt("heatmap-colormap").width(90.0).selected_text(self.colormap.name()).show_ui(ui, |ui| {
+            widgets::checkbox(ui, &mut self.visible, "Overlay");
+            widgets::combo("heatmap-colormap").width(90.0).selected_text(self.colormap.name()).show_ui(ui, |ui| {
                 for c in Colormap::ALL {
                     ui.selectable_value(&mut self.colormap, c, c.name());
                 }
@@ -422,11 +423,11 @@ impl HeatmapView {
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity").color(p.muted));
-            ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false));
+            ui.add(widgets::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false).width(140.0));
         });
         ui.horizontal(|ui| {
             let tip = if m.invert { "Show only values at or below" } else { "Show only values at or above" };
-            ui.checkbox(&mut self.threshold_on, "Threshold").on_hover_text(tip);
+            widgets::checkbox(ui, &mut self.threshold_on, "Threshold").on_hover_text(tip);
             if self.threshold_on {
                 ui.add(egui::DragValue::new(&mut self.threshold).speed(speed).max_decimals(4));
             }

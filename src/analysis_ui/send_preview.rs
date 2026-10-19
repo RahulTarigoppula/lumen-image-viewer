@@ -3,13 +3,12 @@
 //! size, encoded bytes and what it is) and the exact prompt text. Buttons:
 //! Send, Cancel, and "Do not ask again for this server".
 
-use egui::{Align, Color32, CornerRadius, Layout, RichText, Stroke, Vec2};
+use egui::{Align, CornerRadius, Layout, RichText, Stroke, Vec2};
 
 use super::ai::Phase;
 use super::ai_view::fmt_bytes;
 use crate::app::Core;
 use crate::ui::icons as I;
-use crate::ui::theme::semibold;
 
 enum Choice {
     Send { trust: bool },
@@ -37,7 +36,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
     egui::Modal::new(egui::Id::unique("ai-send-preview")).show(ctx, |ui| {
         ui.set_width((screen.width() - 80.0).clamp(320.0, 640.0));
         ui.spacing_mut().item_spacing.y = 6.0;
-        ui.label(RichText::new(format!("{}  Send to your AI server?", I::PAPER_PLANE_TILT)).font(semibold(super::look::TITLE)).color(p.text));
+        ui.label(RichText::new(format!("{}  Send to your AI server?", I::PAPER_PLANE_TILT)).font(crate::ui::theme::text::title()).color(p.text));
         ui.label(RichText::new("This is exactly what leaves this computer. Nothing has been sent yet.").size(12.0).color(p.muted));
         ui.add_space(4.0);
         let row = |ui: &mut egui::Ui, k: &str, v: RichText| {
@@ -86,10 +85,10 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
                 }
             });
             ui.add_space(4.0);
-            super::look::group(RichText::new("System prompt").size(super::look::BODY), &p).id_salt("ai-preview-system").default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("System prompt").size(crate::ui::theme::text::BODY)).icon(crate::ui::widgets::collapse_caret).id_salt("ai-preview-system").default_open(false).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.system_prompt).monospace().size(10.5).color(p.muted)).wrap());
             });
-            super::look::group(RichText::new("Message").size(super::look::BODY), &p).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Message").size(crate::ui::theme::text::BODY)).icon(crate::ui::widgets::collapse_caret).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.user_prompt).monospace().size(10.5).color(p.text)).wrap());
             });
             if let Some(s) = &req.swapped {
@@ -106,10 +105,10 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
         );
         ui.add_space(4.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(egui::Button::new(RichText::new(format!("{}  Send", I::PAPER_PLANE_TILT)).color(Color32::WHITE)).fill(super::look::accent_fill(&p))).clicked() {
+            if crate::ui::widgets::primary_button(ui, &p, &format!("{}  Send", I::PAPER_PLANE_TILT)).clicked() {
                 choice = Some(Choice::Send { trust: false });
             }
-            if ui.button("Cancel").clicked() {
+            if crate::ui::widgets::secondary_button(ui, "Cancel").clicked() {
                 choice = Some(Choice::Cancel);
             }
             if ui.button("Send, don't ask again").on_hover_text(format!("Send now, and skip this preview for {} from now on (Settings > AI review to undo)", req.server)).clicked() {

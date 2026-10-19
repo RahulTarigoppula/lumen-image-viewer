@@ -1,7 +1,8 @@
 //! Folder navigation sidebar: favorites, quick access and a lazy drive tree.
 
 use super::icons as I;
-use super::theme::Palette;
+use super::theme::{self, Palette};
+use super::widgets;
 use crate::fileops;
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -52,6 +53,8 @@ pub struct FolderTree {
 }
 
 const ROW_H: f32 = 26.0;
+/// Caption of the drive tree (also where `reveal` looks for the current folder).
+const THIS_PC: &str = "This PC";
 /// Indent per tree level when there is room.
 const INDENT: f32 = 14.0;
 
@@ -229,16 +232,16 @@ impl FolderTree {
     fn rebuild_rows(&mut self, favorites: &[PathBuf], ctx: &egui::Context) {
         let mut rows = Vec::new();
         if !favorites.is_empty() {
-            rows.push(Row::Header("FAVORITES"));
+            rows.push(Row::Header("Favorites"));
             for f in favorites {
                 rows.push(Row::Item { path: f.clone(), name: display_name(f), icon: I::STAR, depth: 0, expandable: false, favorite: true });
             }
         }
-        rows.push(Row::Header("QUICK ACCESS"));
+        rows.push(Row::Header("Quick access"));
         for (name, path, icon) in self.quick.clone().unwrap_or_default() {
             rows.push(Row::Item { path, name, icon, depth: 0, expandable: false, favorite: false });
         }
-        rows.push(Row::Header("THIS PC"));
+        rows.push(Row::Header(THIS_PC));
         if self.drives.is_empty() && self.drives_rx.is_some() {
             rows.push(Row::Loading { depth: 0 });
         }
@@ -304,7 +307,7 @@ impl FolderTree {
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("folder-tree");
         if let Some(target) = self.scroll_to.clone() {
             // Look in the drive tree (after the "This PC" header), not in favorites / quick access.
-            let start = self.rows.iter().position(|r| matches!(r, Row::Header("THIS PC"))).unwrap_or(0);
+            let start = self.rows.iter().position(|r| matches!(r, Row::Header(THIS_PC))).unwrap_or(0);
             let find = |t: &Path| self.rows[start..].iter().position(|r| matches!(r, Row::Item { path, .. } if path == t)).map(|i| i + start);
             let settled = self.loading.is_empty() && self.drives_rx.is_none() && !self.rows.iter().any(|r| matches!(r, Row::Loading { .. }));
             // Once loading settles, fall back to the deepest visible ancestor (a hidden
@@ -312,8 +315,11 @@ impl FolderTree {
             let found = find(&target).or_else(|| if settled { target.ancestors().skip(1).find_map(find) } else { None });
             match found {
                 Some(i) => {
+                    // About a third of the way down, on a whole row so the top
+                    // row is never cut in half.
                     let view_h = ui.available_height();
-                    scroll = scroll.vertical_scroll_offset((i as f32 * row_h - view_h / 2.0 + row_h / 2.0).max(0.0));
+                    let rows_above = ((view_h / 3.0) / row_h).floor();
+                    scroll = scroll.vertical_scroll_offset(((i as f32 - rows_above).max(0.0) * row_h).floor());
                     self.scroll_to = None;
                 }
                 // Give up once nothing is loading any more (the target is hidden or gone).
@@ -446,28 +452,29 @@ impl FolderTree {
         }
         let resp = if hovered && self.tips && truncated { resp.on_hover_text(path.display().to_string()) } else { resp };
         resp.context_menu(|ui| {
-            if ui.button(format!("{}  Open", I::FOLDER_OPEN)).clicked() {
+            ui.set_min_width(200.0);
+            if widgets::menu_item(ui, I::FOLDER_OPEN, "Open", "").clicked() {
                 action = Some(TreeAction::Navigate(path.to_path_buf()));
                 ui.close();
             }
-            if ui.button(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).clicked() {
+            if widgets::menu_item(ui, I::ARROW_SQUARE_OUT, "Show in Explorer", "").clicked() {
                 fileops::open_with_default(path);
                 ui.close();
             }
-            if ui.button(format!("{}  New folder here", I::FOLDER_PLUS)).clicked() {
+            if widgets::menu_item(ui, I::FOLDER_PLUS, "New folder here", "").clicked() {
                 action = Some(TreeAction::NewFolderIn(path.to_path_buf()));
                 ui.close();
             }
             if is_favorite {
-                if ui.button(format!("{}  Remove from favorites", I::STAR)).clicked() {
+                if widgets::menu_item(ui, I::STAR, "Remove from favorites", "").clicked() {
                     action = Some(TreeAction::RemoveFavorite(path.to_path_buf()));
                     ui.close();
                 }
-            } else if ui.button(format!("{}  Add to favorites", I::STAR)).clicked() {
+            } else if widgets::menu_item(ui, I::STAR, "Add to favorites", "").clicked() {
                 action = Some(TreeAction::AddFavorite(path.to_path_buf()));
                 ui.close();
             }
-            if ui.button(format!("{}  Copy path", I::LINK)).clicked() {
+            if widgets::menu_item(ui, I::LINK, "Copy path", "").clicked() {
                 fileops::copy_text(&path.display().to_string());
                 ui.close();
             }
@@ -484,7 +491,9 @@ impl FolderTree {
     }
 }
 
+/// A section caption ("Favorites", "This PC"): 11 pt semibold muted, sentence
+/// case, sitting low in its row so it reads with the rows below it.
 fn header(ui: &mut Ui, p: &Palette, text: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
-    ui.painter().text(Pos2::new(rect.min.x + 14.0, rect.max.y - 8.0), Align2::LEFT_CENTER, text, FontId::proportional(10.5), p.faint);
+    ui.painter().text(Pos2::new(rect.min.x + 14.0, rect.max.y - 8.0), Align2::LEFT_CENTER, text, theme::text::caption(), p.muted);
 }
