@@ -382,8 +382,9 @@ impl AiReport {
         }
     }
 
-    /// "Copy as Markdown".
-    pub fn to_markdown(&self, title: &str) -> String {
+    /// "Copy as Markdown". `pair`: A and B were sent, so findings name the
+    /// image; a single image's findings never say "image A".
+    pub fn to_markdown(&self, title: &str, pair: bool) -> String {
         let mut md = String::new();
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
         let score = |s: Option<u8>| s.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
@@ -413,15 +414,22 @@ impl AiReport {
             }
         }
         if !self.findings.is_empty() {
+            // A single image is not "image A": only a pair names the image.
             md.push_str("\n### Findings\n\n");
             for (i, f) in self.findings.iter().enumerate() {
                 let cat = CATEGORIES.iter().find(|c| c.0 == f.category).map(|c| c.1).unwrap_or(&f.category);
-                let place = if f.tile == 0 { format!("image {}", f.image.as_str()) } else { format!("image {}, tile {}", f.image.as_str(), f.tile) };
-                let px = f
-                    .source
-                    .map(|s| format!(", pixels {:.0},{:.0} to {:.0},{:.0}", s.x0, s.y0, s.x1, s.y1))
-                    .unwrap_or_default();
-                md.push_str(&format!("{}. **{}** {} ({place}{px}): {}\n", i + 1, f.severity.as_str(), cat.to_lowercase(), f.description));
+                let mut place = Vec::new();
+                if pair {
+                    place.push(format!("image {}", f.image.as_str()));
+                }
+                if f.tile != 0 {
+                    place.push(format!("tile {}", f.tile));
+                }
+                if let Some(s) = f.source {
+                    place.push(format!("pixels {:.0},{:.0} to {:.0},{:.0}", s.x0, s.y0, s.x1, s.y1));
+                }
+                let place = if place.is_empty() { String::new() } else { format!(" ({})", place.join(", ")) };
+                md.push_str(&format!("{}. **{}** {}{place}: {}\n", i + 1, f.severity.as_str(), cat.to_lowercase(), f.description));
             }
         }
         if !self.summary.is_empty() {
@@ -516,10 +524,13 @@ mod tests {
         assert_eq!(r.findings[1].severity, Severity::Moderate);
         assert!(!r.partial);
         assert!(r.warnings.len() >= 3, "{:?}", r.warnings);
-        let md = r.to_markdown("Quality critique");
+        let md = r.to_markdown("Quality critique", false);
         assert!(md.starts_with("## Quality critique: 7/10"));
         assert!(md.contains("chroma \\| grain"));
-        assert!(md.contains("1. **moderate** noise (image A, tile 1): chroma noise in shadows"));
+        // One image: findings never say "image A".
+        assert!(md.contains("1. **moderate** noise (tile 1): chroma noise in shadows"), "{md}");
+        assert!(md.contains("2. **moderate** blur: x"), "{md}");
+        assert!(!md.contains("image A"), "{md}");
         assert!(md.contains("### Summary\n\nGood overall."));
     }
 
@@ -549,9 +560,11 @@ mod tests {
         let c = r.comparison.clone().unwrap();
         assert_eq!((c.preferred, c.overall_b, c.scores_b[1].score), (Preference::B, Some(8), Some(8)));
         assert_eq!(r.overall, Some(8));
-        let md = r.to_markdown("A vs B");
+        let md = r.to_markdown("A vs B", true);
         assert!(md.starts_with("## A vs B: B preferred, confidence 0.80"));
         assert!(md.contains("| Noise | 5 | 8 | clean |"));
+        // A pair names the image.
+        assert!(md.contains("1. **severe** noise (image A): grain"), "{md}");
         r.unswap();
         let c = r.comparison.unwrap();
         assert_eq!((c.preferred, c.overall_a, c.scores_a[1].score), (Preference::A, Some(8), Some(8)));

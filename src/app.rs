@@ -1579,11 +1579,13 @@ impl App {
         let p = self.core.pal;
         let name = self.viewer.current().map(|c| crate::ui::viewer::file_name(c)).unwrap_or_default();
         let lossy = self.viewer.current().and_then(|c| lossy_resave_reason(self.viewer.loaded(&self.core).as_ref().map(|l| &l.decoded), c));
-        // Saving would leave out an open tool's unapplied work: apply it first.
-        let tool_work = self.viewer.tool_has_work();
+        // Two questions, one at a time: first the open tool's unapplied work
+        // (Discard closes the tool), then, only for real unsaved edits,
+        // Save / Discard / Cancel.
+        let tool_work = self.viewer.tool_work_title();
         let dirty = self.viewer.is_dirty();
-        let can_save = !tool_work && lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
-        let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
+        let can_save = lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
+        let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard, 3 discard the tool's work
         // Same wording and buttons as the viewer's own prompt.
         crate::ui::widgets::modal(ctx, egui::Id::unique("unsaved-guard"), 400.0, |ui| {
             use crate::ui::widgets;
@@ -1594,21 +1596,18 @@ impl App {
                 ui.add_space(6.0);
                 ui.add(egui::Label::new(RichText::new(text).color(p.muted).size(crate::ui::theme::text::SMALL)).wrap());
             };
-            if !dirty {
-                // Only an open tool's unapplied work would be lost. Destructive:
-                // red, and Enter does not discard.
+            if let Some(title) = &tool_work {
+                // Destructive: red, and Enter does not discard.
                 widgets::modal_title(ui, "Discard changes?");
-                widgets::modal_body(ui, &format!("The changes in the open tool are not applied to \"{name}\" yet."));
+                widgets::modal_body(ui, &format!("{title}: the changes are not applied to \"{name}\" yet."));
                 if let Some(r) = widgets::dialog_buttons(ui, &p, "Keep editing", "Discard", widgets::ButtonKind::Danger, true) {
-                    choice = Some(if r { 2 } else { 0 });
+                    choice = Some(if r { 3 } else { 0 });
                 }
                 return;
             }
             widgets::modal_title(ui, "Save changes?");
             widgets::modal_body(ui, &format!("\"{name}\" has unsaved edits."));
-            if tool_work {
-                note(ui, "The open tool also has changes that are not applied. Keep editing to apply them before saving.");
-            } else if let Some(why) = &lossy {
+            if let Some(why) = &lossy {
                 note(ui, &format!("{why} Use Save as from the viewer."));
             } else if !can_save {
                 note(ui, "This format cannot be saved in place. Use Save as from the viewer.");
@@ -1619,7 +1618,7 @@ impl App {
                 if widgets::primary_button_enabled(ui, &p, can_save, "Save").clicked() {
                     choice = Some(1);
                 }
-                if widgets::secondary_button(ui, if tool_work { "Keep editing" } else { "Cancel" }).clicked() {
+                if widgets::secondary_button(ui, "Cancel").clicked() {
                     choice = Some(0);
                 }
                 if widgets::secondary_button(ui, "Discard").clicked() {
@@ -1657,6 +1656,15 @@ impl App {
                     }
                 } else {
                     self.pending_guard = None;
+                }
+            }
+            Some(3) => {
+                // The tool's work is gone; unsaved edits are asked about next.
+                self.viewer.close_tool();
+                if !dirty {
+                    if let Some(a) = self.pending_guard.take() {
+                        self.perform_pending(a);
+                    }
                 }
             }
             Some(_) => {

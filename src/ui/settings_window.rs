@@ -727,7 +727,7 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
             c
         });
         changed |= toggle_row(ui, p, "Show folders in grid", "Sub-folders appear as tiles before the images.", &mut s.show_folders_in_grid);
-        changed |= toggle_row(ui, p, "Show hidden files", "Include files and folders marked hidden. Applies when a folder is next opened.", &mut s.show_hidden_files);
+        changed |= toggle_row(ui, p, "Show hidden files", "Include hidden files and folders, dot-folders and AppData. Applies when a folder is next opened.", &mut s.show_hidden_files);
     });
     section_title(ui, p, "Sorting");
     card(ui, p, |ui| {

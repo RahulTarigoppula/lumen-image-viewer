@@ -644,6 +644,7 @@ impl Browser {
         }
         let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
         tree_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        self.tree.set_show_hidden(core.settings.show_hidden_files);
         let tree_action = self.tree.ui(&mut tree_ui, &self.folder.clone(), &favs, &p);
         ui.advance_cursor_after_rect(rect);
         if let Some(a) = tree_action {
@@ -683,7 +684,7 @@ impl Browser {
         if entry.is_media() {
             line.push(catalog::human_size(entry.size));
         }
-        line.push(crate::formats::type_name(&entry.ext));
+        line.push(if entry.is_folder() { "Folder".to_string() } else { crate::formats::type_name(&entry.ext) });
         ui.add(egui::Label::new(RichText::new(line.join("  ·  ")).color(p.muted).size(text::SMALL)).truncate());
         ui.add(egui::Label::new(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(text::SMALL)).truncate());
         if entry.is_media() {

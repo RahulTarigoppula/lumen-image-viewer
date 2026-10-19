@@ -46,7 +46,7 @@ impl Entry {
         #[cfg(windows)]
         let hidden = {
             use std::os::windows::fs::MetadataExt;
-            meta.file_attributes() & 0x2 != 0 || name.starts_with('.')
+            meta.file_attributes() & 0x2 != 0 || name.starts_with('.') || (meta.is_dir() && is_profile_noise(&path))
         };
         #[cfg(not(windows))]
         let hidden = name.starts_with('.');
@@ -77,6 +77,23 @@ pub enum MediaFilter {
     Videos,
 }
 
+/// Folders of the user profile that Explorer never shows (it hides them
+/// even when their Hidden attribute was cleared): treated as hidden.
+const PROFILE_NOISE: &[&str] = &["AppData"];
+
+/// True for a well-known noise folder directly in the user profile
+/// (`%USERPROFILE%\AppData`). Dot-folders (`.cargo`, `.vscode`) are hidden by
+/// their name already.
+pub fn is_profile_noise(path: &Path) -> bool {
+    std::env::var_os("USERPROFILE").is_some_and(|home| is_noise_in(path, Path::new(&home)))
+}
+
+fn is_noise_in(path: &Path, profile: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    let same = |a: &Path, b: &Path| a.to_string_lossy().trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']));
+    same(parent, profile) && PROFILE_NOISE.iter().any(|n| name.to_string_lossy().eq_ignore_ascii_case(n))
+}
+
 /// List a folder: subfolders plus supported image/video files.
 pub fn list_folder(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
@@ -84,6 +101,13 @@ pub fn list_folder(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>>
         let Ok(item) = item else { continue };
         let path = item.path();
         let Ok(mut meta) = item.metadata() else { continue };
+        // The link's own attributes: legacy junctions such as "Application
+        // Data" or "My Documents" are hidden+system, their targets are not.
+        #[cfg(windows)]
+        let link_attrs = {
+            use std::os::windows::fs::MetadataExt;
+            meta.file_attributes()
+        };
         // DirEntry::metadata does not follow symlinks / junctions on Windows:
         // ask for the target so linked folders and files still show up.
         if meta.file_type().is_symlink() {
@@ -100,7 +124,18 @@ pub fn list_folder(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>>
             }
         }
         // Follow directory symlinks/junctions for the "is dir" test.
-        let e = Entry::from_meta(path, &meta);
+        #[allow(unused_mut)]
+        let mut e = Entry::from_meta(path, &meta);
+        #[cfg(windows)]
+        {
+            // Protected (hidden + system) items stay out even with Show hidden
+            // files, as in Explorer ($Recycle.Bin, "Application Data", ...).
+            use std::os::windows::fs::MetadataExt;
+            if link_attrs & 0x6 == 0x6 || meta.file_attributes() & 0x6 == 0x6 {
+                continue;
+            }
+            e.hidden |= link_attrs & 0x2 != 0;
+        }
         if e.hidden && !show_hidden {
             continue;
         }
@@ -272,6 +307,15 @@ pub fn format_time(t: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_noise_is_appdata_in_the_profile_only() {
+        let home = Path::new(r"C:\Users\pat");
+        assert!(is_noise_in(Path::new(r"C:\Users\pat\AppData"), home));
+        assert!(is_noise_in(Path::new(r"c:\users\PAT\appdata"), Path::new(r"C:\Users\pat\")));
+        assert!(!is_noise_in(Path::new(r"C:\Users\pat\Pictures"), home));
+        assert!(!is_noise_in(Path::new(r"D:\Work\AppData"), home));
+        assert!(!is_noise_in(Path::new(r"C:\Users\pat\Pictures\AppData"), home));
+    }
     #[test]
     fn natural_sort() {
         let mut v = vec!["img10.jpg", "img2.jpg", "IMG1.jpg", "img02.jpg", "a.png"];

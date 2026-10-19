@@ -454,6 +454,15 @@ impl Viewer {
         }
     }
 
+    /// The title of the open tool (or "Crop") when it holds unapplied work.
+    pub fn tool_work_title(&self) -> Option<String> {
+        match (&self.tool, &self.crop) {
+            (Some(t), _) if t.touched => Some(t.tool.title()),
+            (_, Some(c)) if c.touched() => Some("Crop".to_string()),
+            _ => None,
+        }
+    }
+
     pub fn has_unsaved_work(&self) -> bool {
         self.is_dirty() || self.tool_has_work()
     }
@@ -1911,8 +1920,9 @@ impl Viewer {
                 .unwrap_or((base.image.width(), base.image.height()));
             let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &base.histogram, preview: Some(&base.image) };
             widgets::visible_scrollbars(ui);
+            // The content keeps to the scroll area's own width (the panel's
+            // less the scroll bar), so the footer below stays inside the panel.
             let out = egui::ScrollArea::vertical().id_salt("tool-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
-                ui.set_max_width(w);
                 t.tool.ui(ui, &cx)
             });
             scroll_fades(ui, &out, p.panel);
@@ -2030,9 +2040,7 @@ impl Viewer {
             c.roi.set_rect(Some(c.initial));
         }
         let body_h = (ui.available_height() - footer_height(false) - ui.spacing().item_spacing.y * 2.0).max(60.0);
-        let w = ui.available_width();
         egui::ScrollArea::vertical().id_salt("crop-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
-            ui.set_max_width(w);
             widgets::section_title(ui, &p, "Aspect ratio");
             // Free and Original as segments; fixed ratios in a combo beside them.
             let ratios: [(&str, f32); 8] = [("1:1", 1.0), ("4:3", 4.0 / 3.0), ("3:2", 1.5), ("16:9", 16.0 / 9.0), ("5:4", 1.25), ("3:4", 0.75), ("2:3", 2.0 / 3.0), ("9:16", 9.0 / 16.0)];
@@ -2134,12 +2142,11 @@ impl Viewer {
     /// carries on with the pending action, which may ask again for the next level.
     fn discard_dialog(&mut self, ctx: &egui::Context, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
-        let tool_title = match (&self.tool, &self.crop) {
-            (Some(t), _) if t.touched => Some(t.tool.title()),
-            (_, Some(c)) if c.touched() => Some("Crop".to_string()),
-            _ => None,
-        };
-        if tool_title.is_none() && !self.is_dirty() {
+        let tool_title = self.tool_work_title();
+        // Esc in a tool only ever asks about the tool's marks: unsaved edits
+        // are asked about when leaving the image, not here.
+        let cancel_tool = matches!(self.pending, Some(Pending::CancelTool));
+        if tool_title.is_none() && (!self.is_dirty() || cancel_tool) {
             // Nothing to lose any more (the tool was applied meanwhile).
             self.confirm_discard = false;
             self.continue_pending(core, ev);
@@ -2212,7 +2219,9 @@ impl Viewer {
             Some(Pending::Close) => ev.push(ViewerEvent::Close),
             Some(Pending::OpenTool(t)) => self.open_tool(t, core),
             Some(Pending::StartCrop) => self.start_crop(core),
-            Some(Pending::CancelTool) | None => {}
+            // Esc in a tool: it closes once its marks are gone.
+            Some(Pending::CancelTool) => self.close_tool(),
+            None => {}
         }
     }
 }

@@ -6,9 +6,10 @@
 use egui::{Align, CornerRadius, Layout, RichText, Stroke, Vec2};
 
 use super::ai::Phase;
-use super::ai_view::fmt_bytes;
+use super::ai_view::{fmt_bytes, shown_text};
 use crate::app::Core;
 use crate::ui::icons as I;
+use crate::ui::{theme, widgets};
 
 enum Choice {
     Send { trust: bool },
@@ -32,13 +33,15 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
             .collect();
     }
     let screen = ctx.content_rect();
+    // Sizes and descriptions are written for the model ("1536x864", "A full
+    // view"); the sheet shows them as the rest of the app does.
+    let pair = req.layout.iter().flat_map(|l| &l.regions).any(|r| r.label == lumen_ai::ImageLabel::B);
     let mut choice = None;
-    egui::Modal::new(egui::Id::unique("ai-send-preview")).show(ctx, |ui| {
-        ui.set_width((screen.width() - 80.0).clamp(320.0, 640.0));
+    widgets::modal(ctx, egui::Id::unique("ai-send-preview"), 640.0, |ui| {
+        widgets::modal_title(ui, "Send to your AI server?");
+        widgets::modal_body(ui, "This is exactly what leaves this computer. Nothing has been sent yet.");
+        ui.add_space(8.0);
         ui.spacing_mut().item_spacing.y = 6.0;
-        ui.label(RichText::new(format!("{}  Send to your AI server?", I::PAPER_PLANE_TILT)).font(crate::ui::theme::text::title()).color(p.text));
-        ui.label(RichText::new("This is exactly what leaves this computer. Nothing has been sent yet.").size(12.0).color(p.muted));
-        ui.add_space(4.0);
         let row = |ui: &mut egui::Ui, k: &str, v: RichText| {
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(80.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
@@ -65,7 +68,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
             ui.label(RichText::new(format!("{}  {w}", I::WARNING)).size(12.0).color(p.warn));
         }
         for n in &req.notes {
-            ui.add(egui::Label::new(RichText::new(format!("{}  {n}", I::INFO)).size(11.5).color(p.muted)).wrap());
+            ui.add(egui::Label::new(RichText::new(format!("{}  {}", I::INFO, shown_text(n, true))).size(11.5).color(p.muted)).wrap());
         }
         let max_h = (screen.height() * 0.55).max(160.0);
         egui::ScrollArea::vertical().id_salt("ai-send-preview-scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
@@ -79,16 +82,16 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
                             let k = (128.0 / ts.x).min(90.0 / ts.y).min(1.0);
                             ui.add(egui::Image::new((tex.id(), ts * k)));
                             ui.label(RichText::new(format!("{} × {} {}, {}", im.width, im.height, mime_name(im.mime), fmt_bytes(im.bytes))).size(11.0).color(p.text));
-                            ui.add(egui::Label::new(RichText::new(&im.description).size(10.5).color(p.muted)).wrap());
+                            ui.add(egui::Label::new(RichText::new(shown_text(&im.description, pair)).size(10.5).color(p.muted)).wrap());
                         });
                     });
                 }
             });
             ui.add_space(4.0);
-            egui::CollapsingHeader::new(RichText::new("System prompt").size(crate::ui::theme::text::BODY)).icon(crate::ui::widgets::collapse_caret).id_salt("ai-preview-system").default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("System prompt").size(theme::text::BODY)).icon(widgets::collapse_caret).id_salt("ai-preview-system").default_open(false).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.system_prompt).monospace().size(10.5).color(p.muted)).wrap());
             });
-            egui::CollapsingHeader::new(RichText::new("Message").size(crate::ui::theme::text::BODY)).icon(crate::ui::widgets::collapse_caret).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Message").size(theme::text::BODY)).icon(widgets::collapse_caret).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.user_prompt).monospace().size(10.5).color(p.text)).wrap());
             });
             if let Some(s) = &req.swapped {
@@ -103,17 +106,20 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
             .size(11.0)
             .color(p.faint),
         );
-        ui.add_space(4.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if crate::ui::widgets::primary_button(ui, &p, &format!("{}  Send", I::PAPER_PLANE_TILT)).clicked() {
-                choice = Some(Choice::Send { trust: false });
-            }
-            if crate::ui::widgets::secondary_button(ui, "Cancel").clicked() {
-                choice = Some(Choice::Cancel);
-            }
-            if ui.button("Send, don't ask again").on_hover_text(format!("Send now, and skip this preview for {} from now on (Settings > AI review to undo)", req.server)).clicked() {
+        // [Send, don't ask again] on the left, away from [Cancel] [Send].
+        ui.add_space(theme::space::BUTTONS_GAP);
+        ui.horizontal(|ui| {
+            if widgets::secondary_button(ui, "Send, don't ask again").on_hover_text(format!("Send now, and skip this preview for {} from now on (Settings > AI review to undo)", req.server)).clicked() {
                 choice = Some(Choice::Send { trust: true });
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::primary_button(ui, &p, &format!("{}  Send", I::PAPER_PLANE_TILT)).clicked() {
+                    choice = Some(Choice::Send { trust: false });
+                }
+                if widgets::secondary_button(ui, "Cancel").clicked() {
+                    choice = Some(Choice::Cancel);
+                }
+            });
         });
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             choice = Some(Choice::Cancel);

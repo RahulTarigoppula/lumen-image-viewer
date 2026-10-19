@@ -188,7 +188,7 @@ can be stored in the analysis history as is.
 `finding.source: Option<SourceBox { label, x0, y0, x1, y1 }>` is the box in
 source pixels of image `label` (A or B), already mapped through tiles,
 downscaling, padding and composite halves: draw it directly on the viewer,
-compare pane or video frame. Use `report.to_markdown(&run.preset_name)` for
+compare pane or video frame. Use `report.to_markdown(&run.preset_name, pair)` for
 "Copy as Markdown" and `serde_json::to_string_pretty(&run)` for "Export JSON".
 
 ## 8. Batch and blocking use
