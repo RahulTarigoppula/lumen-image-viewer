@@ -12,6 +12,7 @@ publish = false
 name = "lumen_core"
 
 [dependencies]
+lumen-analysis.workspace = true
 image.workspace = true
 rayon.workspace = true
 crossbeam-channel.workspace = true
