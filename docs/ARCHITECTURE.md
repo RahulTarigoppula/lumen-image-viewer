@@ -40,6 +40,7 @@ dependency versions are in `[workspace.dependencies]`.
 | Area | Crate | Modules | Responsibility |
 |---|---|---|---|
 | Shell | `lumen` | `main.rs`, `app.rs`, `shell.rs`, `devhook.rs`, `fileops.rs`, `bg.rs` | Startup, single instance (named pipe), mode switching, command dispatch, dialogs, file operations, dev automation hook |
+| Look and shared widgets | `lumen` | `ui/theme.rs`, `ui/widgets.rs` | Design tokens (palette with the one selected style and primary fill, type scale, spacing, radii, control heights, shadows) and the helpers every surface builds from: `app_window`, `modal`, buttons, `Slider`, `value_box`, `checkbox` / `radio`, `segmented`, carets, menu rows, keycaps, toasts (see the table at the top of `widgets.rs`) |
 | Commands and input | `lumen` | `ui/commands.rs`, `ui/keymap.rs`, `ui/palette.rs` | One `Command` enum drives menus, toolbar, shortcuts and the Ctrl+K palette; remappable keymap with presets |
 | Browser | `lumen` | `ui/browser.rs`, `ui/tree.rs`, `thumbs.rs` | Grid and details views, folder tree, thumbnail pool and GPU texture cache |
 | Catalog and tags | `lumen-core` | `catalog.rs`, `tags.rs`, `settings.rs` | Folder listing, sorting, filtering, ratings/flags/labels, settings data and storage paths |

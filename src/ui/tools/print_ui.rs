@@ -4,7 +4,7 @@
 
 use super::print::{self, Orientation, PageInfo, PrintOptions, PrintProgress, PrintSource, Sizing, Unit, PER_PAGE_CHOICES};
 use crate::app::Core;
-use crate::ui::batch::{card, danger_button, hint, primary_button, window_size};
+use crate::ui::batch::{card, danger_button, hint, primary_button};
 use crate::ui::icons as I;
 use crate::ui::theme::Palette;
 use crossbeam_channel::Receiver;
@@ -154,14 +154,10 @@ impl PrintWindow {
         }
         let mut open = true;
         let mut close = false;
-        egui::Window::new(format!("{}  Print", I::PRINTER))
+        crate::ui::widgets::app_window("print", "Print")
             .open(&mut open)
-            .default_size(window_size(ctx, 820.0, 600.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .min_size(crate::ui::batch::window_size(ctx, 560.0, 420.0))
-            .resizable(true)
-            .collapsible(false)
+            .default_size(820.0, 600.0)
+            .min_size(560.0, 420.0)
             .show(ctx, |ui| {
                 close = crate::ui::batch::window_body(ui, |ui| self.ui(ui, &p, core));
             });
@@ -210,7 +206,7 @@ impl PrintWindow {
                         if primary_button(ui, p, !self.sources.is_empty() && self.infos.is_some(), &format!("{}  Print...", I::PRINTER)).clicked() {
                             start = true;
                         }
-                        if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                        if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
                             close = true;
                         }
                     }
@@ -236,12 +232,12 @@ impl PrintWindow {
             egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("PREVIEW (A4) - PAGE {} OF {pages}", self.page.min(pages - 1) + 1)).size(11.0).color(p.faint).strong());
+                    ui.label(RichText::new(format!("Preview (A4), page {} of {pages}", self.page.min(pages - 1) + 1)).font(crate::ui::theme::text::caption()).color(p.muted));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(self.page + 1 < pages, egui::Button::new(I::CARET_RIGHT).small()).clicked() {
+                        if ui.add_enabled_ui(self.page + 1 < pages, |ui| crate::ui::widgets::icon_button_sized(ui, I::CARET_RIGHT, "Next page", false, 24.0, 14.0)).inner.clicked() {
                             self.page += 1;
                         }
-                        if ui.add_enabled(self.page > 0, egui::Button::new(I::CARET_LEFT).small()).clicked() {
+                        if ui.add_enabled_ui(self.page > 0, |ui| crate::ui::widgets::icon_button_sized(ui, I::CARET_LEFT, "Previous page", false, 24.0, 14.0)).inner.clicked() {
                             self.page -= 1;
                         }
                     });
@@ -260,16 +256,16 @@ impl PrintWindow {
         let o = &mut self.opts;
         card(ui, p, I::ARROWS_OUT_SIMPLE, "Size", |ui| {
             for s in Sizing::ALL {
-                ui.radio_value(&mut o.sizing, s, s.label());
+                crate::ui::widgets::radio_value(ui, &mut o.sizing, s, s.label());
             }
             match o.sizing {
                 Sizing::Custom => {
                     ui.horizontal(|ui| {
                         let speed = if o.unit == Unit::Cm { 0.1 } else { 0.05 };
-                        ui.add(egui::DragValue::new(&mut o.custom_w).range(0.5..=200.0).speed(speed).max_decimals(2));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_w).range(0.5..=200.0).speed(speed).max_decimals(2));
                         ui.label("x");
-                        ui.add(egui::DragValue::new(&mut o.custom_h).range(0.5..=200.0).speed(speed).max_decimals(2));
-                        egui::ComboBox::from_id_salt("pr-unit").width(60.0).selected_text(o.unit.label()).show_ui(ui, |ui| {
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_h).range(0.5..=200.0).speed(speed).max_decimals(2));
+                        crate::ui::widgets::combo("pr-unit").width(60.0).selected_text(o.unit.label()).show_ui(ui, |ui| {
                             for u in [Unit::Cm, Unit::Inch] {
                                 ui.selectable_value(&mut o.unit, u, u.label());
                             }
@@ -280,45 +276,43 @@ impl PrintWindow {
                 Sizing::Actual => {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("When a file has no DPI, use").color(p.muted));
-                        ui.add(egui::DragValue::new(&mut o.assume_dpi).range(10.0..=2400.0).suffix(" dpi"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.assume_dpi).range(10.0..=2400.0).suffix(" dpi"));
                     });
                 }
                 _ => {}
             }
-            ui.checkbox(&mut o.center, "Center on the page");
+            crate::ui::widgets::checkbox(ui, &mut o.center, "Center on the page");
         });
         ui.add_space(8.0);
         card(ui, p, I::GRID_NINE, "Layout", |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Images per page").color(p.muted));
-                for n in PER_PAGE_CHOICES {
-                    ui.selectable_value(&mut o.per_page, n, n.to_string());
-                }
+                let labels: Vec<String> = PER_PAGE_CHOICES.iter().map(|n| n.to_string()).collect();
+                let options: Vec<_> = PER_PAGE_CHOICES.iter().copied().zip(labels.iter().map(String::as_str)).collect();
+                crate::ui::widgets::segmented_value(ui, &mut o.per_page, &options);
             });
             egui::Grid::new("pr-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Orientation");
-                egui::ComboBox::from_id_salt("pr-orient")
+                crate::ui::widgets::combo("pr-orient")
                     .selected_text(match o.orientation {
                         Orientation::Auto => "Automatic",
                         Orientation::Portrait => "Portrait",
                         Orientation::Landscape => "Landscape",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut o.orientation, Orientation::Auto, "Automatic");
-                        ui.selectable_value(&mut o.orientation, Orientation::Portrait, "Portrait");
-                        ui.selectable_value(&mut o.orientation, Orientation::Landscape, "Landscape");
+                        crate::ui::widgets::segmented_value(ui, &mut o.orientation, &[(Orientation::Auto, "Automatic"), (Orientation::Portrait, "Portrait"), (Orientation::Landscape, "Landscape")]);
                     });
                 ui.end_row();
                 ui.label("Margins");
-                ui.add(egui::DragValue::new(&mut o.margin_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.margin_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
                 ui.end_row();
                 if o.per_page > 1 {
                     ui.label("Spacing");
-                    ui.add(egui::DragValue::new(&mut o.gap_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.gap_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
                     ui.end_row();
                 }
                 ui.label("Copies");
-                ui.add(egui::DragValue::new(&mut o.copies).range(1..=999));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.copies).range(1..=999));
                 ui.end_row();
             });
             hint(ui, p, "Printer, paper size and quality are chosen in the next dialog.");
