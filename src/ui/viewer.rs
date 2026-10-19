@@ -1135,6 +1135,7 @@ impl Viewer {
     }
 
     fn nav_input(&mut self, ui: &mut Ui, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>, can_pan: bool) {
+        self.context_menu(resp, core, ev);
         if !resp.hovered() && !resp.contains_pointer() {
             return;
         }
@@ -1190,13 +1191,21 @@ impl Viewer {
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra2)) {
             ev.push(ViewerEvent::Command(Command::NextImage));
         }
+    }
+
+    /// The image's right-click menu. Shown whatever the pointer is over: once
+    /// open, the menu covers the image, and egui closes a popup that is not
+    /// shown every frame.
+    fn context_menu(&mut self, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let dirty = self.is_dirty();
         let (info, film, full) = (self.show_info, self.show_filmstrip, self.is_fullscreen);
         resp.context_menu(|ui| {
             ui.set_min_width(240.0);
-            // About 500 pt tall. On a shorter window (a large UI scale on a small
-            // screen) it scrolls; otherwise it moves to fit, which a scroll area
-            // would prevent (it would shrink to the room below the pointer).
+            // 13 rows in five groups, about 430 pt tall: it fits a 1366 x 768
+            // screen at 150%. The panels and modes share one View submenu. On a
+            // shorter window it scrolls; otherwise it moves to fit, which a
+            // scroll area would prevent (it would shrink to the room below the
+            // pointer).
             let screen_h = ui.ctx().content_rect().height();
             let mut rows = |ui: &mut Ui| {
                 // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
@@ -1208,7 +1217,14 @@ impl Viewer {
                 ui.separator();
                 menu_item(ui, Command::ZoomFit, ev);
                 menu_item(ui, Command::ZoomActual, ev);
-                menu_check(ui, Command::ToggleFullscreen, "Full screen", full, ev);
+                widgets::submenu(ui, I::EYE, "View", |ui| {
+                    ui.set_min_width(220.0);
+                    menu_check(ui, Command::ToggleFullscreen, "Full screen", full, ev);
+                    menu_check(ui, Command::ToggleInfo, "Info panel", info, ev);
+                    menu_check(ui, Command::ToggleFilmstrip, "Filmstrip", film, ev);
+                    ui.separator();
+                    menu_item(ui, Command::Slideshow, ev);
+                });
                 ui.separator();
                 widgets::submenu(ui, Command::RotateRight.icon(), "Rotate & flip", |ui| {
                     for c in Command::EDIT_GROUPS[0] {
@@ -1228,13 +1244,9 @@ impl Viewer {
                     }
                 });
                 ui.separator();
-                menu_check(ui, Command::ToggleInfo, "Info panel", info, ev);
-                menu_check(ui, Command::ToggleFilmstrip, "Filmstrip", film, ev);
-                menu_item(ui, Command::Slideshow, ev);
-                ui.separator();
                 menu_item(ui, Command::Delete, ev);
             };
-            if screen_h < 540.0 {
+            if screen_h < 470.0 {
                 egui::ScrollArea::vertical().max_height((screen_h - 24.0).max(120.0)).show(ui, rows);
             } else {
                 rows(ui);
@@ -2323,9 +2335,10 @@ fn edge_menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
     }
 }
 
-/// A menu row for an on / off command: a check mark instead of "Toggle ...".
+/// A menu row for an on / off command: its icon while off, a check mark
+/// while on (instead of "Toggle ...").
 fn menu_check(ui: &mut Ui, c: Command, label: &str, on: bool, ev: &mut Vec<ViewerEvent>) {
-    if widgets::menu_toggle(ui, on, label, &c.shortcut()).clicked() {
+    if widgets::menu_check(ui, on, c.icon(), label, &c.shortcut()).clicked() {
         ev.push(ViewerEvent::Command(c));
         ui.close();
     }
