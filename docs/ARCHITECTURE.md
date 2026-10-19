@@ -12,6 +12,8 @@ The repository is a Cargo workspace:
 | Crate | Path | Contents | Depends on |
 |---|---|---|---|
 | `lumen` (binary) | `src/` | UI (egui/eframe), viewer, browser, batch tools, GPU renderer, loader and thumbnail pools, shell integration, FFmpeg video engine (`video` feature), `build.rs` (resources, FFmpeg link libraries) | `lumen-core`, egui, eframe, FFmpeg |
+| `lumen-analysis` | `crates/lumen-analysis/` | Objective image and video metrics, heatmaps, jobs, reports, cache (see its API.md) | rayon, blake3, fast-ssim2, butteraugli, flip-rs |
+| `lumen-ai` | `crates/lumen-ai/` | The only network code: OpenAI-compatible (vLLM) client, prompts, image preparation, secrets (see its API.md); behind the `ai` feature | ureq + rustls, windows |
 | `lumen-core` (library `lumen_core`) | `crates/lumen-core/` | Everything with no UI and no FFmpeg: formats, decoders, color, resizing, encoders, metadata, catalog, tags, settings data, edit pixel operations, video metrics and scopes | image, WIC (`windows`), small pure-Rust codecs |
 | `lumen-ai` (library `lumen_ai`, feature `ai`) | `crates/lumen-ai/` | The only network code: OpenAI-compatible (vLLM) client, Test connection, prompts, image preparation, reports, API key storage. See its `API.md` | ureq (rustls), image |
 
@@ -81,7 +83,7 @@ Video frames are converted by swscale with the correct BT.601/709/2020 matrix an
 
 ## Privacy
 
-There is no network code in the image or video paths. The optional AI critique feature (see `docs/ANALYSIS-PLAN.md`) is off by default, LAN-oriented, and sends only pixels the user explicitly chooses.
+There is no network code in the image or video paths. The optional AI critique (crate `lumen-ai`, feature `ai`) is off by default, LAN-only by default, previews every request, and sends only re-encoded pixels the user chooses. `--no-default-features --features video` builds an exe with no network code.
 
 ## Performance budgets (release build)
 
