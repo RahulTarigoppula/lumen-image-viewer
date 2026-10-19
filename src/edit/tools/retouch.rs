@@ -139,6 +139,9 @@ impl EditTool for CloneStamp {
         let heal = self.heal;
         *self = CloneStamp::new(heal);
     }
+    fn can_apply(&self) -> bool {
+        !self.strokes.is_empty()
+    }
     fn wants_canvas(&self) -> bool {
         true
     }

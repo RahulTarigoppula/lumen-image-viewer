@@ -101,6 +101,9 @@ impl EditTool for ObscureRegion {
     fn reset(&mut self) {
         *self = ObscureRegion::default();
     }
+    fn can_apply(&self) -> bool {
+        !self.ed.committed().is_empty()
+    }
     fn wants_canvas(&self) -> bool {
         true
     }
@@ -295,6 +298,9 @@ impl EditTool for RedEye {
     }
     fn reset(&mut self) {
         *self = RedEye::default();
+    }
+    fn can_apply(&self) -> bool {
+        !self.ed.committed().is_empty()
     }
     fn wants_canvas(&self) -> bool {
         true
