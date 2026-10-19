@@ -212,9 +212,11 @@ let mut job = analyzer.submit_video(spec, rx);
 - Frames are processed in parallel (one task per frame) and reordered; you get
   one `JobEvent::Row(FrameResult { idx, values })` per frame in input order,
   then `Done(report)`.
-- In-flight frames are capped at `memory_budget / (bytes of A + B + their
-  derived images)` (and at twice the pool size); the iterator is not pulled
-  faster than that, so a bounded channel back-pressures the decoder.
+- In-flight frames are capped at `(memory_budget - queued_frames x frame
+  bytes) / (bytes of A + B + their derived images)` (and at the pool size
+  plus 2); the iterator is not pulled faster than that, so a bounded channel
+  back-pressures the decoder. `queued_frames` (default 12) is what your side
+  holds: the channel's pairs and frames your decoders have handed over.
 - Temporal metrics compare consecutive frames *as fed*; with stride > 1 they
   measure the sampled sequence.
 - Cancel with `job.cancel()`: in-flight frames finish within one frame of
