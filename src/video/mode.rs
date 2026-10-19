@@ -402,6 +402,10 @@ pub struct VideoMode {
     timeline_cache: Option<(usize, usize, Vec<TimelineColumn>, Instant)>,
     /// Frame number most recently requested by stepping (until it arrives).
     pending_step: Option<usize>,
+    /// A text field had keyboard focus at the end of the last frame. egui drops
+    /// focus on Esc before this frame's widgets run, so Esc that only leaves a
+    /// field must not also leave video mode.
+    was_editing: bool,
     /// Widget id of the B offset field (last frame), so + and - keep
     /// shifting B while that field has keyboard focus.
     offset_field: Option<egui::Id>,
@@ -456,6 +460,7 @@ impl VideoMode {
             snap_rx: None,
             timeline_cache: None,
             pending_step: None,
+            was_editing: false,
             offset_field: None,
             dev_burst: None,
         };
@@ -782,6 +787,7 @@ impl VideoMode {
         if !keep {
             self.pause();
         }
+        self.was_editing = ctx.text_edit_focused();
         keep
     }
 
@@ -1723,6 +1729,7 @@ impl VideoMode {
                 continue;
             }
             match k {
+                Key::Escape if self.was_editing => {}
                 Key::Escape => keep = false,
                 Key::Space | Key::K if !m.ctrl => self.toggle_play(),
                 Key::Period => self.step(1),
