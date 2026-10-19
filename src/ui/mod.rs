@@ -4,6 +4,7 @@ pub mod keymap;
 #[allow(dead_code)]
 pub mod icons;
 pub mod palette;
+pub mod roi;
 pub mod theme;
 pub mod tree;
 pub mod viewer;

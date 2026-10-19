@@ -363,7 +363,7 @@ struct Worker {
     backlog: VecDeque<Cmd>,
     quit: bool,
     scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32, u32, u32))>,
-    native_scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32))>,
+    native: NativeConverter,
     out_size: (u32, u32),
     want_native: bool,
     playing: bool,
@@ -428,7 +428,7 @@ impl Worker {
             backlog: VecDeque::new(),
             quit: false,
             scaler: None,
-            native_scaler: None,
+            native: NativeConverter::default(),
             out_size: (vw, vh),
             want_native: false,
             playing: false,
@@ -860,56 +860,100 @@ impl Worker {
 
     /// Copy the frame's native planes for metrics (normalising unusual layouts).
     fn native_planes(&mut self, f: &ff::frame::Video) -> Result<YuvFrame> {
+        self.native.convert(f, None).map(|(y, _)| y)
+    }
+}
+
+/// Copies decoded frames into [`YuvFrame`]s: planar 8-bit and 10/12/16-bit
+/// layouts are copied as they are, everything else (NV12, P010, RGB, ...) is
+/// first normalised to planar 4:2:0 by swscale (8-bit, or 16-bit for deeper
+/// sources). Playback and [`SeqDecoder`] share it, so both hand out the same
+/// samples for the same frame.
+#[derive(Default)]
+struct NativeConverter {
+    scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32))>,
+}
+
+impl NativeConverter {
+    /// The frame's planes, cropped to `roi` (snapped outward to the chroma
+    /// grid) when one is given, and the layout of what was copied.
+    fn convert(&mut self, f: &ff::frame::Video, roi: Option<Roi>) -> Result<(YuvFrame, NativeFormat)> {
         use ff::format::Pixel as P;
         let fmt = f.format();
         let direct8 = matches!(fmt, P::YUV420P | P::YUVJ420P | P::YUV422P | P::YUVJ422P | P::YUV444P | P::YUVJ444P | P::GRAY8);
         let direct16 = matches!(fmt, P::YUV420P10LE | P::YUV420P12LE | P::YUV422P10LE | P::YUV422P12LE | P::YUV444P10LE | P::YUV444P12LE | P::YUV420P16LE | P::YUV444P16LE);
         if direct8 || direct16 {
-            return Ok(copy_planes(f, direct16));
+            let y = copy_planes(f, direct16, roi);
+            let nf = NativeFormat::of(f, f, &y);
+            return Ok((y, nf));
         }
-        // Normalise everything else (NV12, P010, RGB, ...) to planar YUV.
-        let depth = unsafe {
-            let d = ff::ffi::av_pix_fmt_desc_get(fmt.into());
-            if d.is_null() { 8 } else { (*d).comp[0].depth as u32 }
-        };
+        let depth = pix_depth(fmt);
         let target = if depth > 8 { P::YUV420P16LE } else { P::YUV420P };
         let key = (fmt, f.width(), f.height());
-        if self.native_scaler.as_ref().map(|(_, k)| *k != key).unwrap_or(true) {
+        if self.scaler.as_ref().map(|(_, k)| *k != key).unwrap_or(true) {
             let sc = ff::software::scaling::Context::get(fmt, f.width(), f.height(), target, f.width(), f.height(), ff::software::scaling::Flags::POINT)?;
-            self.native_scaler = Some((sc, key));
+            self.scaler = Some((sc, key));
         }
-        let (sc, _) = self.native_scaler.as_mut().unwrap();
+        let (sc, _) = self.scaler.as_mut().unwrap();
         let mut out = ff::frame::Video::empty();
         sc.run(f, &mut out)?;
-        let mut y = copy_planes(&out, depth > 8);
+        let mut y = copy_planes(&out, depth > 8, roi);
         if depth > 8 {
             y.bit_depth = 16;
         }
-        Ok(y)
+        let nf = NativeFormat::of(f, &out, &y);
+        Ok((y, nf))
     }
 }
 
-fn copy_planes(f: &ff::frame::Video, wide: bool) -> YuvFrame {
-    let depth = unsafe {
-        let d = ff::ffi::av_pix_fmt_desc_get(f.format().into());
+/// Bit depth of the first component of a pixel format.
+fn pix_depth(fmt: ff::format::Pixel) -> u32 {
+    unsafe {
+        let d = ff::ffi::av_pix_fmt_desc_get(fmt.into());
         if d.is_null() { 8 } else { (*d).comp[0].depth as u32 }
-    };
+    }
+}
+
+/// log2 of the horizontal and vertical chroma subsampling of a pixel format.
+fn chroma_shift(fmt: ff::format::Pixel) -> (u32, u32) {
+    unsafe {
+        let d = ff::ffi::av_pix_fmt_desc_get(fmt.into());
+        if d.is_null() { (0, 0) } else { ((*d).log2_chroma_w as u32, (*d).log2_chroma_h as u32) }
+    }
+}
+
+fn copy_planes(f: &ff::frame::Video, wide: bool, roi: Option<Roi>) -> YuvFrame {
+    let depth = pix_depth(f.format());
+    let shift = chroma_shift(f.format());
+    // Luma-space window to copy; the chroma planes take it shifted down.
+    let roi = roi.map(|r| r.snapped(f.width(), f.height(), shift));
     let mut planes = Vec::new();
     for i in 0..f.planes().min(3) {
-        let (w, h) = (f.plane_width(i) as usize, f.plane_height(i) as usize);
+        let (pw, ph) = (f.plane_width(i) as usize, f.plane_height(i) as usize);
+        let (x0, y0, w, h) = match roi {
+            Some(r) => {
+                let (sx, sy) = if i == 0 { (0, 0) } else { shift };
+                let (x0, y0) = ((r.x >> sx) as usize, (r.y >> sy) as usize);
+                // Round the far edge up (odd luma sizes have a partial chroma sample).
+                let x1 = (((r.x + r.w) as usize + (1 << sx) - 1) >> sx).min(pw);
+                let y1 = (((r.y + r.h) as usize + (1 << sy) - 1) >> sy).min(ph);
+                (x0.min(x1), y0.min(y1), x1.saturating_sub(x0), y1.saturating_sub(y0))
+            }
+            None => (0, 0, pw, ph),
+        };
         let stride = f.stride(i);
         let data = f.data(i);
         let pd = if wide {
             let mut v = Vec::with_capacity(w * h);
-            for y in 0..h {
-                let row = &data[y * stride..y * stride + w * 2];
+            for y in y0..y0 + h {
+                let row = &data[y * stride + x0 * 2..y * stride + (x0 + w) * 2];
                 v.extend(row.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])));
             }
             PlaneData::U16(v)
         } else {
             let mut v = Vec::with_capacity(w * h);
-            for y in 0..h {
-                v.extend_from_slice(&data[y * stride..y * stride + w]);
+            for y in y0..y0 + h {
+                v.extend_from_slice(&data[y * stride + x0..y * stride + x0 + w]);
             }
             PlaneData::U8(v)
         };
@@ -1017,31 +1061,565 @@ pub fn ffmpeg_version() -> String {
     }
 }
 
+// ------------------------------------------------------------ native planes
+//
+// Zero-copy access to a `YuvFrame`'s samples for analysis code. A
+// `YuvFrame` stores each plane tightly packed (`stride == width`, in samples)
+// as `u8` (8-bit) or `u16` (10/12/16-bit, little-endian values, not shifted).
+// What a `YuvFrame` does not carry (chroma subsampling, matrix, range,
+// transfer) comes with it as a `NativeFormat`: `SeqDecoder::format()` and
+// `RangeReader::format()` describe the frames they hand out. Build borrowed
+// views with `native_view(&frame, &format)`, then narrow them with
+// `NativeView::crop(roi)` / `PlaneSlice::window(..)` without copying.
 
-/// Sequential decoder producing native planes in presentation order (used by
-/// whole-file analysis; independent from playback).
-pub struct SeqDecoder {
-    input: ff::format::context::Input,
-    vidx: usize,
-    dec: ff::decoder::Video,
-    scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32))>,
-    eof: bool,
-    flushed: bool,
+/// Pixel rectangle in luma (full-resolution) coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Roi {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
+#[allow(dead_code)] // Used by the analysis panel.
+impl Roi {
+    pub fn new(x: u32, y: u32, w: u32, h: u32) -> Roi {
+        Roi { x, y, w, h }
+    }
+
+    /// Clamped to a `width` x `height` frame (never empty) and grown outward
+    /// to whole chroma samples: with `chroma_shift` (1, 1) for 4:2:0 the
+    /// corners land on even coordinates, so the luma and chroma windows
+    /// cover exactly the same picture area.
+    pub fn snapped(self, width: u32, height: u32, chroma_shift: (u32, u32)) -> Roi {
+        let (width, height) = (width.max(1), height.max(1));
+        let (mx, my) = ((1u32 << chroma_shift.0) - 1, (1u32 << chroma_shift.1) - 1);
+        let x0 = self.x.min(width - 1) & !mx;
+        let y0 = self.y.min(height - 1) & !my;
+        let x1 = (self.x.saturating_add(self.w.max(1)).min(width).saturating_add(mx) & !mx).min(width).max(x0 + 1);
+        let y1 = (self.y.saturating_add(self.h.max(1)).min(height).saturating_add(my) & !my).min(height).max(y0 + 1);
+        Roi { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+    }
+}
+
+/// YUV to RGB matrix of a stream (FFmpeg `colorspace`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YuvMatrix {
+    Bt601,
+    Bt709,
+    Bt2020Ncl,
+    Bt2020Cl,
+    Smpte240m,
+    Fcc,
+    YCgCo,
+    /// RGB stored in planes (GBR order, as FFmpeg does).
+    Identity,
+}
+
+/// Sample range: limited ("TV", 16-235 for 8-bit luma) or full ("PC").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YuvRange {
+    Limited,
+    Full,
+}
+
+/// Transfer characteristic of the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transfer {
+    /// BT.709 / BT.601 / unspecified SDR gamma.
+    Sdr,
+    Srgb,
+    Pq,
+    Hlg,
+    Other,
+}
+
+/// Layout and color meaning of the planes of a `YuvFrame`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeFormat {
+    /// Size of the luma plane as copied (the ROI size when cropped).
+    pub width: u32,
+    pub height: u32,
+    /// 1 (gray) or 3 (Y, U, V).
+    pub planes: usize,
+    /// Significant bits per sample: 8 for `u8` planes, 10/12/16 for `u16`
+    /// planes. Deep formats that had to be normalised (P010, ...) report 16
+    /// and use the full 16-bit range.
+    pub bit_depth: u32,
+    /// log2 of the chroma subsampling: (1, 1) 4:2:0, (1, 0) 4:2:2, (0, 0) 4:4:4.
+    pub chroma_shift: (u32, u32),
+    /// The matrix to decode with: as signalled, or the guess playback uses
+    /// for unspecified streams (BT.709 from 720 lines up, else BT.601).
+    pub matrix: YuvMatrix,
+    /// False when `matrix` is a guess.
+    pub matrix_signalled: bool,
+    pub range: YuvRange,
+    pub transfer: Transfer,
+}
+
+impl NativeFormat {
+    /// `src` is the decoded frame, `copied` the frame the planes were copied
+    /// from (the same frame, or its normalised version).
+    fn of(src: &ff::frame::Video, copied: &ff::frame::Video, y: &YuvFrame) -> NativeFormat {
+        use ff::color::Space;
+        use ff::format::Pixel as P;
+        let rgb_src = unsafe {
+            let d = ff::ffi::av_pix_fmt_desc_get(src.format().into());
+            !d.is_null() && (*d).flags & ff::ffi::AV_PIX_FMT_FLAG_RGB as u64 != 0
+        };
+        let (matrix, matrix_signalled) = match src.color_space() {
+            // swscale converted RGB sources with its default BT.601 matrix.
+            _ if rgb_src => (YuvMatrix::Bt601, false),
+            Space::BT709 => (YuvMatrix::Bt709, true),
+            Space::BT470BG | Space::SMPTE170M => (YuvMatrix::Bt601, true),
+            Space::BT2020NCL => (YuvMatrix::Bt2020Ncl, true),
+            Space::BT2020CL => (YuvMatrix::Bt2020Cl, true),
+            Space::SMPTE240M => (YuvMatrix::Smpte240m, true),
+            Space::FCC => (YuvMatrix::Fcc, true),
+            Space::YCGCO => (YuvMatrix::YCgCo, true),
+            Space::RGB => (YuvMatrix::Identity, true),
+            _ if src.height() >= 720 => (YuvMatrix::Bt709, false),
+            _ => (YuvMatrix::Bt601, false),
+        };
+        let full = !rgb_src && (matches!(src.color_range(), ff::color::Range::JPEG) || matches!(src.format(), P::YUVJ420P | P::YUVJ422P | P::YUVJ444P));
+        use ff::color::TransferCharacteristic as T;
+        let transfer = match src.color_transfer_characteristic() {
+            T::SMPTE2084 => Transfer::Pq,
+            T::ARIB_STD_B67 => Transfer::Hlg,
+            T::IEC61966_2_1 => Transfer::Srgb,
+            T::BT709 | T::SMPTE170M | T::GAMMA22 | T::GAMMA28 | T::BT2020_10 | T::BT2020_12 | T::Unspecified => Transfer::Sdr,
+            _ => Transfer::Other,
+        };
+        let (width, height) = y.planes.first().map(|p| (p.width as u32, p.height as u32)).unwrap_or((0, 0));
+        NativeFormat {
+            width,
+            height,
+            planes: y.planes.len(),
+            bit_depth: y.bit_depth,
+            chroma_shift: chroma_shift(copied.format()),
+            matrix,
+            matrix_signalled,
+            range: if full { YuvRange::Full } else { YuvRange::Limited },
+            transfer,
+        }
+    }
+}
+
+/// Borrowed samples of one plane.
+#[derive(Clone, Copy, Debug)]
+pub enum Samples<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+/// A borrowed (possibly windowed) plane: row `y` starts at `y * stride`
+/// samples into `samples` and holds `width` samples.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaneSlice<'a> {
+    pub samples: Samples<'a>,
+    pub width: usize,
+    pub height: usize,
+    /// Distance between row starts, in samples (not bytes).
+    pub stride: usize,
+}
+
+#[allow(dead_code)] // Used by the analysis panel.
+impl<'a> PlaneSlice<'a> {
+    pub fn of(p: &'a Plane) -> PlaneSlice<'a> {
+        let samples = match &p.data {
+            PlaneData::U8(v) => Samples::U8(v),
+            PlaneData::U16(v) => Samples::U16(v),
+        };
+        PlaneSlice { samples, width: p.width, height: p.height, stride: p.width }
+    }
+
+    /// The `w` x `h` window at (`x`, `y`), sharing the samples; `None` when
+    /// it does not fit.
+    pub fn window(&self, x: usize, y: usize, w: usize, h: usize) -> Option<PlaneSlice<'a>> {
+        if x + w > self.width || y + h > self.height {
+            return None;
+        }
+        let start = y * self.stride + x;
+        let len = if h == 0 || w == 0 { 0 } else { (h - 1) * self.stride + w };
+        let samples = match self.samples {
+            Samples::U8(s) => Samples::U8(s.get(start..start + len)?),
+            Samples::U16(s) => Samples::U16(s.get(start..start + len)?),
+        };
+        Some(PlaneSlice { samples, width: w, height: h, stride: self.stride })
+    }
+
+    pub fn row_u8(&self, y: usize) -> Option<&'a [u8]> {
+        match self.samples {
+            Samples::U8(s) if y < self.height => s.get(y * self.stride..y * self.stride + self.width),
+            _ => None,
+        }
+    }
+
+    pub fn row_u16(&self, y: usize) -> Option<&'a [u16]> {
+        match self.samples {
+            Samples::U16(s) if y < self.height => s.get(y * self.stride..y * self.stride + self.width),
+            _ => None,
+        }
+    }
+}
+
+/// Borrowed planes of a `YuvFrame` plus their format.
+#[derive(Clone, Debug)]
+pub struct NativeView<'a> {
+    pub planes: Vec<PlaneSlice<'a>>,
+    pub format: NativeFormat,
+}
+
+#[allow(dead_code)] // Used by the analysis panel.
+impl<'a> NativeView<'a> {
+    /// The same picture area of every plane (`roi` in luma pixels, snapped
+    /// outward to the chroma grid); no samples are copied.
+    pub fn crop(&self, roi: Roi) -> NativeView<'a> {
+        let f = self.format;
+        let r = roi.snapped(f.width, f.height, f.chroma_shift);
+        let planes = self
+            .planes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (sx, sy) = if i == 0 { (0, 0) } else { f.chroma_shift };
+                let (x0, y0) = ((r.x >> sx) as usize, (r.y >> sy) as usize);
+                let x1 = (((r.x + r.w) as usize + (1 << sx) - 1) >> sx).min(p.width);
+                let y1 = (((r.y + r.h) as usize + (1 << sy) - 1) >> sy).min(p.height);
+                p.window(x0.min(x1), y0.min(y1), x1.saturating_sub(x0), y1.saturating_sub(y0)).unwrap_or(*p)
+            })
+            .collect();
+        NativeView { planes, format: NativeFormat { width: r.w, height: r.h, ..f } }
+    }
+}
+
+/// Borrow `frame`'s planes (`format` from the decoder that produced it).
+#[allow(dead_code)] // Used by the analysis panel.
+pub fn native_view<'a>(frame: &'a YuvFrame, format: &NativeFormat) -> NativeView<'a> {
+    NativeView { planes: frame.planes.iter().map(PlaneSlice::of).collect(), format: *format }
+}
+
+// ------------------------------------------------------- sequential decoding
+
+/// Frames to read, in indices of the frame index (presentation order, as the
+/// timeline numbers them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FrameRange {
+    pub start: usize,
+    /// Exclusive; `None` reads to the end of the file.
+    pub end: Option<usize>,
+    /// Every `stride`-th frame from `start` (1 = every frame). Frames in
+    /// between are still decoded (they are references) but not copied, and
+    /// long gaps are crossed with a keyframe seek.
+    pub stride: usize,
+    /// Only keyframes in the range (`stride` is ignored); nothing else is decoded.
+    pub keyframes_only: bool,
+}
+
+impl Default for FrameRange {
+    fn default() -> FrameRange {
+        FrameRange::ALL
+    }
+}
+
+#[allow(dead_code)] // Used by the analysis panel.
+impl FrameRange {
+    pub const ALL: FrameRange = FrameRange { start: 0, end: None, stride: 1, keyframes_only: false };
+
+    pub fn new(start: usize, end: Option<usize>, stride: usize) -> FrameRange {
+        FrameRange { start, end, stride: stride.max(1), keyframes_only: false }
+    }
+
+    pub fn is_all(&self) -> bool {
+        self.start == 0 && self.end.is_none() && self.stride <= 1 && !self.keyframes_only
+    }
+
+    /// Whether `idx` is inside the range and on its stride grid (keyframes
+    /// are checked separately, against the index).
+    pub fn wants(&self, idx: usize) -> bool {
+        idx >= self.start && self.end.is_none_or(|e| idx < e) && (idx - self.start) % self.stride.max(1) == 0
+    }
+
+    /// Frames read from a file of `total` frames (not counting `keyframes_only`).
+    pub fn count(&self, total: usize) -> usize {
+        let end = self.end.unwrap_or(total).min(total);
+        if end <= self.start { 0 } else { (end - self.start).div_ceil(self.stride.max(1)) }
+    }
+}
+
+/// A forward gap longer than this (frames) without a frame index builds one
+/// so the gap can be crossed with a seek.
+const INDEX_FOR_GAP: usize = 1000;
+/// Forward gaps are crossed with a seek when the last keyframe in the gap is
+/// more than this many frames ahead (decoding up to it costs more).
+const SEEK_FOR_GAP: usize = 8;
+
+/// Sequential decoder producing native planes in presentation order (used by
+/// analysis; independent from playback). Frames are numbered like the
+/// timeline: positions in the frame index. Seeking needs the index; it is
+/// built on first use unless one is given with [`SeqDecoder::set_index`].
+pub struct SeqDecoder {
+    path: PathBuf,
+    input: ff::format::context::Input,
+    vidx: usize,
+    tb: f64,
+    start: f64,
+    frame_dur: f64,
+    dec: ff::decoder::Video,
+    native: NativeConverter,
+    eof: bool,
+    flushed: bool,
+    index: Option<Arc<Vec<IndexEntry>>>,
+    /// A decoded frame (and its index) looked at but not handed out yet.
+    pending: Option<(usize, ff::frame::Video)>,
+    /// Index of the last frame decoded (none at the start and after a seek).
+    last: Option<usize>,
+    keyframes_only: bool,
+    /// Packets well before this pts are decoded without non-reference frames.
+    discard_before: f64,
+    roi: Option<Roi>,
+    format: Option<NativeFormat>,
+}
+
+#[allow(dead_code)] // Range, seek and ROI access are used by the analysis panel.
 impl SeqDecoder {
     pub fn open(path: &Path) -> Result<SeqDecoder> {
         init();
         let input = ff::format::input(path)?;
         let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
         let vidx = vs.index();
+        let tb = q2f(vs.time_base());
+        let start = if vs.start_time() != ff::ffi::AV_NOPTS_VALUE { vs.start_time() as f64 * tb } else { 0.0 };
+        let fps = [q2f(vs.avg_frame_rate()), q2f(vs.rate())].into_iter().find(|f| *f > 0.0).unwrap_or(25.0);
         let mut ctx = ff::codec::context::Context::from_parameters(vs.parameters())?;
         ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: 0 });
         let dec = ctx.decoder().video()?;
-        Ok(SeqDecoder { input, vidx, dec, scaler: None, eof: false, flushed: false })
+        Ok(SeqDecoder {
+            path: path.to_path_buf(),
+            input,
+            vidx,
+            tb,
+            start,
+            frame_dur: 1.0 / fps,
+            dec,
+            native: NativeConverter::default(),
+            eof: false,
+            flushed: false,
+            index: None,
+            pending: None,
+            last: None,
+            keyframes_only: false,
+            discard_before: f64::NEG_INFINITY,
+            roi: None,
+            format: None,
+        })
     }
 
-    fn next_raw(&mut self) -> Option<ff::frame::Video> {
+    /// Use an index built elsewhere (the player's), so seeking does not need
+    /// another pass over the file.
+    pub fn set_index(&mut self, index: Arc<Vec<IndexEntry>>) {
+        self.index = Some(index);
+    }
+
+    /// The frame index, built now (a demux-only pass) if not known yet.
+    pub fn index(&mut self) -> Result<Arc<Vec<IndexEntry>>> {
+        if let Some(ix) = &self.index {
+            return Ok(ix.clone());
+        }
+        let ix = Arc::new(build_index(&self.path, &AtomicBool::new(false), &|_| {})?);
+        self.index = Some(ix.clone());
+        Ok(ix)
+    }
+
+    /// Coded size of the stream (before any ROI).
+    pub fn size(&self) -> (u32, u32) {
+        (self.dec.width(), self.dec.height())
+    }
+
+    /// Copy only this area of each frame from now on (luma pixels, snapped
+    /// outward to the chroma grid and clamped to the frame); `None` for the
+    /// whole frame.
+    pub fn set_roi(&mut self, roi: Option<Roi>) {
+        self.roi = roi;
+    }
+
+    /// Layout of the last frame handed out (`None` before the first).
+    pub fn format(&self) -> Option<NativeFormat> {
+        self.format
+    }
+
+    /// Index the next decoded frame is expected to have.
+    pub fn position(&self) -> usize {
+        match (&self.pending, self.last) {
+            (Some((i, _)), _) => *i,
+            (None, Some(l)) => l + 1,
+            (None, None) => 0,
+        }
+    }
+
+    /// Next frame in presentation order.
+    pub fn next(&mut self) -> Option<YuvFrame> {
+        self.next_indexed().map(|(_, f)| f)
+    }
+
+    /// Next frame in presentation order with its index.
+    pub fn next_indexed(&mut self) -> Option<(usize, YuvFrame)> {
+        let (i, f) = self.next_raw()?;
+        let (y, nf) = self.native.convert(&f, self.roi).ok()?;
+        self.format = Some(nf);
+        Some((i, y))
+    }
+
+    /// Decode `n` frames without copying their planes; returns how many there were.
+    pub fn skip(&mut self, n: usize) -> usize {
+        (0..n).take_while(|_| self.next_raw().is_some()).count()
+    }
+
+    /// Position so the next frame handed out is frame `idx`: seek to the
+    /// keyframe at or before it (earlier ones if open-GOP leading frames are
+    /// dropped), then decode and discard up to it. Returns the index the next
+    /// frame will have: `idx`, or the following one if `idx` cannot be
+    /// decoded (or is not a keyframe while reading keyframes only).
+    pub fn seek_to_frame(&mut self, idx: usize) -> Result<usize> {
+        let index = self.index()?;
+        let target = index.get(idx).ok_or_else(|| anyhow!("Frame {idx} is past the end ({} frames)", index.len()))?.pts;
+        // Seek points, latest first: keyframes at or before the target, then
+        // the start of the file.
+        let mut points = index[..=idx].iter().rev().filter(|e| e.key).map(|e| e.pts).chain(std::iter::once(index[0].pts.min(0.0)));
+        let mut at = points.next().unwrap_or(0.0);
+        'seek: loop {
+            self.demux_seek(at);
+            self.discard_before = target;
+            let mut first = true;
+            loop {
+                let Some((i, f)) = self.next_raw() else {
+                    self.discard_before = f64::NEG_INFINITY;
+                    return Err(anyhow!("Frame {idx} could not be decoded"));
+                };
+                if first && i > idx {
+                    // Landed after the target: start from an earlier keyframe.
+                    if let Some(p) = points.next() {
+                        at = p;
+                        continue 'seek;
+                    }
+                }
+                first = false;
+                if i >= idx {
+                    self.discard_before = f64::NEG_INFINITY;
+                    self.pending = Some((i, f));
+                    return Ok(i);
+                }
+            }
+        }
+    }
+
+    /// Read only keyframes from now on (non-key packets are not decoded).
+    pub fn set_keyframes_only(&mut self, on: bool) {
+        self.keyframes_only = on;
+    }
+
+    /// Read `range` (see [`FrameRange`]) as `(index, frame)` pairs.
+    pub fn into_range(mut self, range: FrameRange) -> RangeReader {
+        self.keyframes_only = range.keyframes_only;
+        let range = FrameRange { stride: range.stride.max(1), ..range };
+        RangeReader { dec: self, want: Want::Range { range, next: range.start }, error: None, done: false }
+    }
+
+    /// Read the frames at `indices` (sorted ascending), e.g. another
+    /// stream's keyframes shifted by an offset.
+    pub fn into_frames(self, mut indices: Vec<usize>) -> RangeReader {
+        indices.sort_unstable();
+        indices.dedup();
+        RangeReader { dec: self, want: Want::List(indices.into()), error: None, done: false }
+    }
+
+    /// Make frame `target` (or the first one after it) the next one handed
+    /// out, by decoding forward or seeking, whichever is cheaper. False at
+    /// the end of the stream.
+    fn advance_to(&mut self, target: usize) -> Result<bool> {
+        let pos = self.position();
+        if target < pos {
+            self.seek_to_frame(target)?;
+            return Ok(true);
+        }
+        if target == pos && (self.pending.is_some() || self.last.is_some()) {
+            return Ok(true);
+        }
+        if self.index.is_none() && (self.keyframes_only || target - pos > INDEX_FOR_GAP) {
+            self.index()?;
+        }
+        if let Some(ix) = &self.index {
+            if !self.keyframes_only {
+                let last_key = ix.get(pos + 1..=target.min(ix.len().saturating_sub(1))).and_then(|s| s.iter().rposition(|e| e.key));
+                if last_key.is_some_and(|k| k + 1 > SEEK_FOR_GAP) {
+                    self.seek_to_frame(target)?;
+                    return Ok(true);
+                }
+            }
+            if let Some(e) = ix.get(target) {
+                self.discard_before = e.pts;
+            }
+        }
+        let found = loop {
+            match self.next_raw() {
+                Some((i, f)) if i >= target => {
+                    self.pending = Some((i, f));
+                    break true;
+                }
+                Some(_) => {}
+                None => break false,
+            }
+        };
+        self.discard_before = f64::NEG_INFINITY;
+        Ok(found)
+    }
+
+    /// Position the demuxer at `at` (a keyframe's pts) and flush the decoder.
+    fn demux_seek(&mut self, at: f64) {
+        // Round: truncating could land one tick before the keyframe.
+        let ts = ((at + self.start) / self.tb).round() as i64;
+        unsafe {
+            ff::ffi::av_seek_frame(self.input.as_mut_ptr(), self.vidx as i32, ts, ff::ffi::AVSEEK_FLAG_BACKWARD as i32);
+        }
+        self.dec.flush();
+        self.eof = false;
+        self.flushed = false;
+        self.pending = None;
+        self.last = None;
+    }
+
+    /// Index of a frame just decoded: from its timestamp when the index is
+    /// known (the timeline's numbering), else counted.
+    fn frame_index(&self, f: &ff::frame::Video) -> usize {
+        let counted = self.last.map(|l| l + 1).unwrap_or(0);
+        let pts = f.timestamp().or(f.pts()).map(|t| t as f64 * self.tb - self.start);
+        let i = match (&self.index, pts) {
+            (Some(ix), Some(p)) if !ix.is_empty() => ix.partition_point(|e| e.pts <= p + 1e-4).saturating_sub(1),
+            _ => counted,
+        };
+        // Repeated timestamps must not repeat an index.
+        match self.last {
+            Some(l) if i <= l => l + 1,
+            _ => i,
+        }
+    }
+
+    /// Next decoded frame (the pending one first) with its index, not copied.
+    fn next_raw(&mut self) -> Option<(usize, ff::frame::Video)> {
+        if let Some(p) = self.pending.take() {
+            self.last = Some(p.0);
+            return Some(p);
+        }
+        let f = self.decode()?;
+        let i = self.frame_index(&f);
+        self.last = Some(i);
+        Some((i, f))
+    }
+
+    fn decode(&mut self) -> Option<ff::frame::Video> {
+        if self.keyframes_only {
+            return self.decode_keyframe();
+        }
         let mut frame = ff::frame::Video::empty();
         loop {
             match self.dec.receive_frame(&mut frame) {
@@ -1060,42 +1638,160 @@ impl SeqDecoder {
             let mut pkt = ff::Packet::empty();
             match pkt.read(&mut self.input) {
                 Ok(()) => {
-                    if pkt.stream() == self.vidx {
-                        let _ = self.dec.send_packet(&pkt);
+                    if pkt.stream() != self.vidx {
+                        continue;
                     }
+                    // Frames well before a seek target are only decoded when
+                    // others need them (the index numbers the rest by pts).
+                    // A few frames of margin: discarding must not reach the target.
+                    let discard = self.index.is_some() && pkt.pts().is_some_and(|p| (p as f64 * self.tb - self.start) < self.discard_before - 4.0 * self.frame_dur);
+                    unsafe {
+                        (*self.dec.as_mut_ptr()).skip_frame = if discard { ff::ffi::AVDiscard::AVDISCARD_NONREF } else { ff::ffi::AVDiscard::AVDISCARD_DEFAULT };
+                    }
+                    let _ = self.dec.send_packet(&pkt);
                 }
                 Err(_) => self.eof = true,
             }
         }
     }
 
-    pub fn next(&mut self) -> Option<YuvFrame> {
-        use ff::format::Pixel as P;
-        let f = self.next_raw()?;
-        let fmt = f.format();
-        let direct8 = matches!(fmt, P::YUV420P | P::YUVJ420P | P::YUV422P | P::YUVJ422P | P::YUV444P | P::YUVJ444P | P::GRAY8);
-        let direct16 = matches!(fmt, P::YUV420P10LE | P::YUV420P12LE | P::YUV422P10LE | P::YUV422P12LE | P::YUV444P10LE | P::YUV444P12LE | P::YUV420P16LE | P::YUV444P16LE);
-        if direct8 || direct16 {
-            return Some(copy_planes(&f, direct16));
+    /// The next keyframe, decoded on its own: each one goes into a freshly
+    /// flushed decoder that is then drained. Feeding keyframes alone into one
+    /// decoding session confuses reordering (HEVC derives picture order from
+    /// the frames left out), so frames would come out late or out of order.
+    fn decode_keyframe(&mut self) -> Option<ff::frame::Video> {
+        let mut frame = ff::frame::Video::empty();
+        while !self.eof {
+            let mut pkt = ff::Packet::empty();
+            if pkt.read(&mut self.input).is_err() {
+                self.eof = true;
+                break;
+            }
+            if pkt.stream() != self.vidx || !pkt.is_key() {
+                continue;
+            }
+            self.dec.flush();
+            unsafe {
+                (*self.dec.as_mut_ptr()).skip_frame = ff::ffi::AVDiscard::AVDISCARD_DEFAULT;
+            }
+            let ok = self.dec.send_packet(&pkt).is_ok() && self.dec.send_eof().is_ok() && self.dec.receive_frame(&mut frame).is_ok();
+            // Back to a decoder that accepts packets (draining ended it).
+            self.dec.flush();
+            if ok {
+                return Some(frame);
+            }
         }
-        let depth = unsafe {
-            let d = ff::ffi::av_pix_fmt_desc_get(fmt.into());
-            if d.is_null() { 8 } else { (*d).comp[0].depth as u32 }
-        };
-        let target = if depth > 8 { P::YUV420P16LE } else { P::YUV420P };
-        let key = (fmt, f.width(), f.height());
-        if self.scaler.as_ref().map(|(_, k)| *k != key).unwrap_or(true) {
-            let sc = ff::software::scaling::Context::get(fmt, f.width(), f.height(), target, f.width(), f.height(), ff::software::scaling::Flags::POINT).ok()?;
-            self.scaler = Some((sc, key));
+        None
+    }
+}
+
+enum Want {
+    Range { range: FrameRange, next: usize },
+    List(VecDeque<usize>),
+}
+
+/// Iterator over `(index, frame)` for a [`FrameRange`] or a list of frame
+/// indices (see [`SeqDecoder::into_range`], [`SeqDecoder::into_frames`]).
+/// Indices that do not exist in the file are skipped; iteration ends at the
+/// end of the file or on an error (see [`RangeReader::error`]).
+pub struct RangeReader {
+    dec: SeqDecoder,
+    want: Want,
+    error: Option<anyhow::Error>,
+    done: bool,
+}
+
+#[allow(dead_code)] // Used by the analysis panel.
+impl RangeReader {
+    pub fn decoder(&self) -> &SeqDecoder {
+        &self.dec
+    }
+
+    pub fn decoder_mut(&mut self) -> &mut SeqDecoder {
+        &mut self.dec
+    }
+
+    /// Layout of the frames handed out so far.
+    pub fn format(&self) -> Option<NativeFormat> {
+        self.dec.format()
+    }
+
+    /// Why iteration stopped early (a failed seek or index pass); `None`
+    /// after a normal end.
+    pub fn error(&self) -> Option<&anyhow::Error> {
+        self.error.as_ref()
+    }
+
+    /// Next index wanted, at or after `from`.
+    fn target(&mut self) -> Result<Option<usize>> {
+        match &mut self.want {
+            Want::Range { range, next } => {
+                let (range, next) = (*range, *next);
+                if range.end.is_some_and(|e| next >= e) {
+                    return Ok(None);
+                }
+                if !range.keyframes_only {
+                    return Ok(Some(next));
+                }
+                let ix = self.dec.index()?;
+                let end = range.end.unwrap_or(usize::MAX).min(ix.len());
+                Ok((next..end).find(|&i| ix[i].key))
+            }
+            Want::List(l) => Ok(l.front().copied()),
         }
-        let (sc, _) = self.scaler.as_mut()?;
-        let mut out = ff::frame::Video::empty();
-        sc.run(&f, &mut out).ok()?;
-        let mut y = copy_planes(&out, depth > 8);
-        if depth > 8 {
-            y.bit_depth = 16;
+    }
+
+    /// Whether frame `i` is wanted; drops everything up to `i` from the wish list.
+    fn take(&mut self, i: usize) -> bool {
+        match &mut self.want {
+            Want::Range { range, next } => {
+                let wanted = if range.keyframes_only {
+                    i >= range.start && range.end.is_none_or(|e| i < e) && self.dec.index.as_ref().is_some_and(|ix| ix.get(i).is_some_and(|e| e.key))
+                } else {
+                    range.wants(i)
+                };
+                *next = if range.keyframes_only || i < range.start { (i + 1).max(range.start) } else { range.start + ((i - range.start) / range.stride + 1) * range.stride };
+                wanted
+            }
+            Want::List(l) => {
+                while l.front().is_some_and(|&f| f < i) {
+                    l.pop_front();
+                }
+                l.front() == Some(&i) && l.pop_front().is_some()
+            }
         }
-        Some(y)
+    }
+}
+
+impl Iterator for RangeReader {
+    type Item = (usize, YuvFrame);
+
+    fn next(&mut self) -> Option<(usize, YuvFrame)> {
+        while !self.done {
+            let target = match self.target() {
+                Ok(Some(t)) => t,
+                Ok(None) => break,
+                Err(e) => {
+                    self.error = Some(e);
+                    break;
+                }
+            };
+            match self.dec.advance_to(target) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    self.error = Some(e);
+                    break;
+                }
+            }
+            // The next frame is the target, or a later one if it is missing.
+            let Some((i, frame)) = self.dec.next_indexed() else { break };
+            if self.take(i) {
+                return Some((i, frame));
+            }
+        }
+        self.done = true;
+        None
     }
 }
 
@@ -1166,4 +1862,269 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
     }
     let img = RgbaImage::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad frame"))?;
     Ok(rotate_img(img, rotation))
+}
+
+#[cfg(test)]
+pub(crate) mod test_media {
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    pub struct TestDir(PathBuf);
+
+    impl TestDir {
+        pub fn new(name: &str) -> TestDir {
+            let p = std::env::temp_dir().join(format!("lumen-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TestDir(p)
+        }
+
+        pub fn path(&self, file: &str) -> PathBuf {
+            self.0.join(file)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write a 4:2:0 8-bit Y4M clip; `px(frame, plane, x, y)` gives each sample.
+    pub fn write_y4m(path: &Path, w: usize, h: usize, frames: usize, px: impl Fn(usize, usize, usize, usize) -> u8) {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        writeln!(out, "YUV4MPEG2 W{w} H{h} F25:1 Ip A1:1 C420jpeg").unwrap();
+        for f in 0..frames {
+            out.write_all(b"FRAME\n").unwrap();
+            for (plane, (pw, ph)) in [(w, h), (w.div_ceil(2), h.div_ceil(2)), (w.div_ceil(2), h.div_ceil(2))].into_iter().enumerate() {
+                let data: Vec<u8> = (0..ph).flat_map(|y| (0..pw).map(move |x| (x, y))).map(|(x, y)| px(f, plane, x, y)).collect();
+                out.write_all(&data).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_media::{write_y4m, TestDir};
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    fn hash(f: &YuvFrame) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f.bit_depth.hash(&mut h);
+        for p in &f.planes {
+            (p.width, p.height).hash(&mut h);
+            match &p.data {
+                PlaneData::U8(v) => v.hash(&mut h),
+                PlaneData::U16(v) => v.hash(&mut h),
+            }
+        }
+        h.finish()
+    }
+
+    fn sample(p: &Plane, x: usize, y: usize) -> u32 {
+        p.get(y * p.width + x)
+    }
+
+    /// Frame `f` of the test clip: every frame and plane differs.
+    fn px(f: usize, plane: usize, x: usize, y: usize) -> u8 {
+        ((f * 7 + plane * 60 + x + y * 3) % 251) as u8
+    }
+
+    fn clip(dir: &TestDir) -> PathBuf {
+        let p = dir.path("clip.y4m");
+        write_y4m(&p, 33, 25, 30, px);
+        p
+    }
+
+    #[test]
+    fn sequential_seek_skip_and_ranges_on_y4m() {
+        let dir = TestDir::new("engine-seq");
+        let p = clip(&dir);
+        let mut d = SeqDecoder::open(&p).unwrap();
+        let all: Vec<(usize, YuvFrame)> = std::iter::from_fn(|| d.next_indexed()).collect();
+        assert_eq!(all.iter().map(|f| f.0).collect::<Vec<_>>(), (0..30).collect::<Vec<_>>());
+        let fmt = d.format().unwrap();
+        assert_eq!((fmt.width, fmt.height, fmt.planes, fmt.bit_depth, fmt.chroma_shift), (33, 25, 3, 8, (1, 1)));
+        assert_eq!(sample(&all[4].1.planes[2], 3, 2), px(4, 2, 3, 2) as u32);
+        let hashes: Vec<u64> = all.iter().map(|f| hash(&f.1)).collect();
+
+        // Seeks forward, backward and to the same frame.
+        let mut d = SeqDecoder::open(&p).unwrap();
+        for k in [12, 3, 3, 29, 0, 17] {
+            assert_eq!(d.seek_to_frame(k).unwrap(), k);
+            let (i, f) = d.next_indexed().unwrap();
+            assert_eq!((i, hash(&f)), (k, hashes[k]), "seek to {k}");
+        }
+        assert!(d.seek_to_frame(30).is_err());
+        // After a seek, decoding carries on in order.
+        d.seek_to_frame(5).unwrap();
+        assert_eq!(d.skip(3), 3);
+        assert_eq!(d.position(), 8);
+        let (i, f) = d.next_indexed().unwrap();
+        assert_eq!((i, hash(&f)), (8, hashes[8]));
+        assert_eq!(d.skip(100), 21);
+        assert!(d.next_indexed().is_none());
+
+        let read = |r: FrameRange| -> Vec<usize> {
+            SeqDecoder::open(&p)
+                .unwrap()
+                .into_range(r)
+                .map(|(i, f)| {
+                    assert_eq!(hash(&f), hashes[i]);
+                    i
+                })
+                .collect()
+        };
+        assert_eq!(read(FrameRange::ALL), (0..30).collect::<Vec<_>>());
+        assert_eq!(read(FrameRange::new(2, Some(20), 5)), vec![2, 7, 12, 17]);
+        assert_eq!(read(FrameRange::new(25, Some(100), 1)), vec![25, 26, 27, 28, 29]);
+        assert_eq!(read(FrameRange::new(40, None, 1)), Vec::<usize>::new());
+        assert_eq!(read(FrameRange { keyframes_only: true, ..FrameRange::new(27, None, 9) }), vec![27, 28, 29]);
+        assert_eq!(FrameRange::new(2, Some(20), 5).count(30), 4);
+        let list: Vec<usize> = SeqDecoder::open(&p).unwrap().into_frames(vec![9, 1, 40, 9, 4]).map(|(i, _)| i).collect();
+        assert_eq!(list, vec![1, 4, 9]);
+    }
+
+    #[test]
+    fn roi_copies_and_views_the_same_samples() {
+        let dir = TestDir::new("engine-roi");
+        let p = clip(&dir);
+        // Odd corner and size: snapped outward to even luma coordinates.
+        let roi = Roi::new(5, 3, 10, 6);
+        assert_eq!(roi.snapped(33, 25, (1, 1)), Roi::new(4, 2, 12, 8));
+        assert_eq!(Roi::new(30, 20, 50, 50).snapped(33, 25, (1, 1)), Roi::new(30, 20, 3, 5));
+        assert_eq!(roi.snapped(33, 25, (0, 0)), roi);
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.set_roi(Some(roi));
+        d.seek_to_frame(6).unwrap();
+        let (_, crop) = d.next_indexed().unwrap();
+        let cf = d.format().unwrap();
+        assert_eq!((cf.width, cf.height), (12, 8));
+        assert_eq!((crop.planes[0].width, crop.planes[0].height, crop.planes[1].width, crop.planes[1].height), (12, 8, 6, 4));
+        assert_eq!(sample(&crop.planes[0], 0, 0), px(6, 0, 4, 2) as u32);
+        assert_eq!(sample(&crop.planes[1], 1, 1), px(6, 1, 3, 2) as u32);
+        // Right/bottom edge of an odd-sized frame: the partial chroma sample is kept.
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.set_roi(Some(Roi::new(30, 20, 9, 9)));
+        let (_, edge) = d.next_indexed().unwrap();
+        assert_eq!((edge.planes[0].width, edge.planes[0].height, edge.planes[1].width, edge.planes[1].height), (3, 5, 2, 3));
+
+        // A borrowed view of the full frame, cropped, matches the cropped copy.
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.seek_to_frame(6).unwrap();
+        let (_, full) = d.next_indexed().unwrap();
+        let view = native_view(&full, &d.format().unwrap());
+        let v = view.crop(roi);
+        assert_eq!((v.format.width, v.format.height), (12, 8));
+        for (pv, pc) in v.planes.iter().zip(&crop.planes) {
+            assert_eq!((pv.width, pv.height, pv.stride), (pc.width, pc.height, if pc.width == 12 { 33 } else { 17 }));
+            for y in 0..pc.height {
+                let row: Vec<u32> = pv.row_u8(y).unwrap().iter().map(|&s| s as u32).collect();
+                let want: Vec<u32> = (0..pc.width).map(|x| sample(pc, x, y)).collect();
+                assert_eq!(row, want);
+            }
+        }
+        assert!(view.planes[0].window(30, 0, 4, 1).is_none());
+        assert!(view.planes[0].row_u16(0).is_none());
+    }
+
+    /// The H.264 screen recording used for manual checks (read only), or
+    /// `LUMEN_TEST_VIDEO`. Skipped when neither exists.
+    /// `LUMEN_TEST_FRAMES` sets how many leading frames are checked.
+    fn recording() -> Option<PathBuf> {
+        let p = std::env::var_os("LUMEN_TEST_VIDEO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Users\ttrah\Videos\Screen Recordings\Screen Recording 2025-10-01 205343.mp4"));
+        if p.exists() {
+            Some(p)
+        } else {
+            eprintln!("skipped: no test video at {}", p.display());
+            None
+        }
+    }
+
+    fn test_frames() -> usize {
+        std::env::var("LUMEN_TEST_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(240)
+    }
+
+    #[test]
+    fn frame_accurate_on_long_gop_video() {
+        let Some(p) = recording() else { return };
+        let index = Arc::new(build_index(&p, &AtomicBool::new(false), &|_| {}).unwrap());
+        let n = index.len().min(test_frames());
+        let keys: Vec<usize> = (0..index.len()).filter(|&i| index[i].key).collect();
+        eprintln!("{} frames, keyframes at {:?}", index.len(), &keys[..keys.len().min(20)]);
+        let mut d = SeqDecoder::open(&p).unwrap();
+        let hashes: Vec<u64> = (0..n)
+            .map(|i| {
+                let (j, f) = d.next_indexed().unwrap();
+                assert_eq!(j, i);
+                hash(&f)
+            })
+            .collect();
+
+        // Seeks, including frames just before and after keyframes and
+        // backward jumps.
+        let mut targets = vec![n - 1, 1, n / 2, 0, n / 3, n / 3 + 1];
+        for &k in &keys {
+            for t in [k.saturating_sub(1), k, k + 1] {
+                if t < n {
+                    targets.push(t);
+                }
+            }
+        }
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.set_index(index.clone());
+        for &t in &targets {
+            assert_eq!(d.seek_to_frame(t).unwrap(), t);
+            let (i, f) = d.next_indexed().unwrap();
+            assert_eq!((i, hash(&f)), (t, hashes[t]), "seek to {t}");
+        }
+        // Without an index given (built on first use).
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.seek_to_frame(n - 2).unwrap();
+        assert_eq!(hash(&d.next().unwrap()), hashes[n - 2]);
+
+        // Strided ranges (gaps crossed by seeking or decoding).
+        for stride in [1, 7, 61] {
+            let r = FrameRange::new(3, Some(n), stride);
+            let got: Vec<(usize, u64)> = SeqDecoder::open(&p).unwrap().into_range(r).map(|(i, f)| (i, hash(&f))).collect();
+            let want: Vec<(usize, u64)> = (3..n).step_by(stride).map(|i| (i, hashes[i])).collect();
+            assert_eq!(got, want, "stride {stride}");
+        }
+        // Keyframes only: exactly the keyframes, same pixels.
+        let r = FrameRange { keyframes_only: true, ..FrameRange::new(0, Some(n), 1) };
+        let got: Vec<(usize, u64)> = SeqDecoder::open(&p).unwrap().into_range(r).map(|(i, f)| (i, hash(&f))).collect();
+        let want: Vec<(usize, u64)> = keys.iter().filter(|&&k| k < n).map(|&k| (k, hashes[k])).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn seek_matches_the_player() {
+        let Some(p) = recording() else { return };
+        let index = build_index(&p, &AtomicBool::new(false), &|_| {}).unwrap();
+        let n = index.len().min(test_frames());
+        let shared: SharedIndex = Arc::new(parking_lot::Mutex::new(Some(index.clone())));
+        let player = Player::open(&p, None, shared, egui::Context::default()).unwrap();
+        player.send(Cmd::Native(true));
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.set_index(Arc::new(index.clone()));
+        for (gen, t) in [n / 2, 5, n - 1, 0, n / 4].into_iter().enumerate() {
+            let gen = gen as u64 + 1;
+            player.send(Cmd::Seek { t: index[t].pts, exact: true, gen });
+            let shown = loop {
+                match player.rx.recv_timeout(std::time::Duration::from_secs(20)).expect("player frame") {
+                    Event::Frame(f) if f.gen == gen => break f,
+                    Event::Error(e) => panic!("{e}"),
+                    _ => {}
+                }
+            };
+            assert!((shown.pts - index[t].pts).abs() < 1e-6);
+            d.seek_to_frame(t).unwrap();
+            let (i, f) = d.next_indexed().unwrap();
+            assert_eq!(i, t);
+            assert_eq!(hash(shown.native.as_ref().expect("native planes")), hash(&f), "frame {t}");
+        }
+    }
 }

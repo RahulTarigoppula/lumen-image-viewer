@@ -2,6 +2,7 @@
 //! preview editing, info panel, filmstrip and animation playback.
 
 use super::commands::Command;
+use super::roi::{ImageTransform, RoiEditor, RoiOptions};
 use super::icons as I;
 use super::theme::Palette;
 use super::widgets;
@@ -227,35 +228,22 @@ pub fn locked_center(norm: Vec2, img: (u32, u32)) -> Vec2 {
     Vec2::new(norm.x.clamp(0.0, 1.0) * img.0 as f32, norm.y.clamp(0.0, 1.0) * img.1 as f32)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum CropHandle {
-    Move,
-    N,
-    S,
-    E,
-    W,
-    NE,
-    NW,
-    SE,
-    SW,
-    New,
-}
-
 pub struct CropState {
-    /// x0, y0, x1, y1 in image pixels.
-    pub r: [f32; 4],
-    pub aspect: Option<f32>,
-    drag: Option<(CropHandle, Pos2, [f32; 4])>,
-    /// Image size `r` refers to. The overlay works in the displayed image's
-    /// size, which can differ (e.g. right after a rotate): `r` is rescaled.
-    size: (f32, f32),
-    /// The area the crop started with (in `size`): anything else is the user's work.
+    /// The area (in pixels of the displayed image; rescaled when that changes,
+    /// e.g. right after a rotate).
+    pub roi: RoiEditor,
+    /// The area the crop started with (in the same pixels): anything else is the user's work.
     initial: [f32; 4],
 }
 
 impl CropState {
+    /// x0, y0, x1, y1 in image pixels.
+    pub fn rect(&self) -> [f32; 4] {
+        self.roi.rect().unwrap_or(self.initial)
+    }
+
     fn touched(&self) -> bool {
-        self.r != self.initial || self.aspect.is_some()
+        self.rect() != self.initial || self.roi.aspect().is_some()
     }
 }
 
@@ -641,8 +629,9 @@ impl Viewer {
         }
         self.tool = None;
         let (w, h) = (img.width() as f32, img.height() as f32);
-        let r = [w * 0.1, h * 0.1, w * 0.9, h * 0.9];
-        self.crop = Some(CropState { r, aspect: None, drag: None, size: (w, h), initial: r });
+        let roi = RoiEditor::new((w, h), RoiOptions::crop()).with_rect([w * 0.1, h * 0.1, w * 0.9, h * 0.9]);
+        let initial = roi.rect().unwrap_or_default();
+        self.crop = Some(CropState { roi, initial });
     }
 
     fn fit_zoom(&self, mode: FitMode, img: (u32, u32), view: Vec2, ppp: f32) -> f32 {
@@ -1954,38 +1943,23 @@ impl Viewer {
         ];
         ui.horizontal_wrapped(|ui| {
             for (name, a) in presets {
-                let sel = match (c.aspect, a) {
+                let sel = match (c.roi.aspect(), a) {
                     (None, None) => true,
                     (Some(x), Some(y)) => (x - y).abs() < 1e-3,
                     _ => false,
                 };
                 if ui.selectable_label(sel, name).clicked() {
-                    c.aspect = a;
-                    if let Some(a) = a {
-                        // Fit the current crop to the new aspect around its center.
-                        let cx = (c.r[0] + c.r[2]) / 2.0;
-                        let cy = (c.r[1] + c.r[3]) / 2.0;
-                        let mut w = c.r[2] - c.r[0];
-                        let mut h = w / a;
-                        if h > ih {
-                            h = ih;
-                            w = h * a;
-                        }
-                        if w > iw {
-                            w = iw;
-                            h = w / a;
-                        }
-                        c.r = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
-                        clamp_crop(&mut c.r, iw, ih);
-                    }
+                    // Fits the current crop to the new aspect around its center.
+                    c.roi.set_aspect(a);
                 }
             }
         });
         ui.add_space(8.0);
-        let mut w = (c.r[2] - c.r[0]).round();
-        let mut h = (c.r[3] - c.r[1]).round();
-        let mut x = c.r[0].round();
-        let mut y = c.r[1].round();
+        let r = c.rect();
+        let mut w = (r[2] - r[0]).round();
+        let mut h = (r[3] - r[1]).round();
+        let mut x = r[0].round();
+        let mut y = r[1].round();
         egui::Grid::new("crop-grid").num_columns(4).show(ui, |ui| {
             ui.label("X");
             let cx = ui.add(egui::DragValue::new(&mut x).range(0.0..=iw - 1.0)).changed();
@@ -1998,19 +1972,19 @@ impl Viewer {
             let ch = ui.add(egui::DragValue::new(&mut h).range(1.0..=ih)).changed();
             ui.end_row();
             if cx || cy || cw || ch {
-                if let Some(a) = c.aspect {
+                if let Some(a) = c.roi.aspect() {
                     if cw {
                         h = w / a;
                     } else if ch {
                         w = h * a;
                     }
                 }
-                c.r = [x, y, x + w, y + h];
-                clamp_crop(&mut c.r, iw, ih);
+                c.roi.set_rect(Some([x, y, x + w, y + h]));
             }
         });
         ui.add_space(4.0);
-        ui.label(RichText::new(format!("{} × {} px", (c.r[2] - c.r[0]).round(), (c.r[3] - c.r[1]).round())).color(p.muted));
+        let r = c.rect();
+        ui.label(RichText::new(format!("{} × {} px", (r[2] - r[0]).round(), (r[3] - r[1]).round())).color(p.muted));
         ui.add_space(12.0);
         ui.label(RichText::new("Drag inside to move, drag edges or corners to resize, drag outside to draw a new area. Enter applies, Esc cancels.").size(11.5).color(p.faint));
         ui.add_space(12.0);
@@ -2033,10 +2007,8 @@ impl Viewer {
             }
         });
         if apply {
-            let r = c.r;
+            let (x, y, w, h) = super::roi::pixel_rect(c.rect());
             self.crop = None;
-            let (x, y) = (r[0].round().max(0.0) as u32, r[1].round().max(0.0) as u32);
-            let (w, h) = ((r[2] - r[0]).round().max(1.0) as u32, (r[3] - r[1]).round().max(1.0) as u32);
             self.apply_simple(core, "Crop", |img| crate::edit::ops::crop(img, x, y, w, h));
             self.auto_fit = Some(core.settings.fit_mode);
             self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
@@ -2047,133 +2019,11 @@ impl Viewer {
 
     fn crop_overlay(&mut self, ui: &mut Ui, painter: &egui::Painter, dest: Rect, img: (u32, u32), resp: &egui::Response) {
         let Some(c) = &mut self.crop else { return };
-        let (iw, ih) = (img.0.max(1) as f32, img.1.max(1) as f32);
-        if c.size != (iw, ih) {
-            let (kx, ky) = (iw / c.size.0.max(1.0), ih / c.size.1.max(1.0));
-            c.r = [c.r[0] * kx, c.r[1] * ky, c.r[2] * kx, c.r[3] * ky];
+        let xf = ImageTransform::new(dest, img);
+        if let Some((kx, ky)) = c.roi.set_image_size((xf.size.x, xf.size.y)) {
             c.initial = [c.initial[0] * kx, c.initial[1] * ky, c.initial[2] * kx, c.initial[3] * ky];
-            c.size = (iw, ih);
-            c.drag = None;
-            clamp_crop(&mut c.r, iw, ih);
         }
-        let to_screen = |x: f32, y: f32| Pos2::new(dest.min.x + x / iw * dest.width(), dest.min.y + y / ih * dest.height());
-        let to_img = |p: Pos2| ((p.x - dest.min.x) / dest.width() * iw, (p.y - dest.min.y) / dest.height() * ih);
-        let sr = Rect::from_min_max(to_screen(c.r[0], c.r[1]), to_screen(c.r[2], c.r[3]));
-        // Dim outside
-        let shade = Color32::from_black_alpha(150);
-        painter.rect_filled(Rect::from_min_max(dest.min, Pos2::new(dest.max.x, sr.min.y)), 0.0, shade);
-        painter.rect_filled(Rect::from_min_max(Pos2::new(dest.min.x, sr.max.y), dest.max), 0.0, shade);
-        painter.rect_filled(Rect::from_min_max(Pos2::new(dest.min.x, sr.min.y), Pos2::new(sr.min.x, sr.max.y)), 0.0, shade);
-        painter.rect_filled(Rect::from_min_max(Pos2::new(sr.max.x, sr.min.y), Pos2::new(dest.max.x, sr.max.y)), 0.0, shade);
-        painter.rect_stroke(sr, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Middle);
-        // Rule of thirds
-        for i in 1..3 {
-            let fx = sr.min.x + sr.width() * i as f32 / 3.0;
-            let fy = sr.min.y + sr.height() * i as f32 / 3.0;
-            painter.line_segment([Pos2::new(fx, sr.min.y), Pos2::new(fx, sr.max.y)], Stroke::new(1.0, Color32::from_white_alpha(70)));
-            painter.line_segment([Pos2::new(sr.min.x, fy), Pos2::new(sr.max.x, fy)], Stroke::new(1.0, Color32::from_white_alpha(70)));
-        }
-        for pt in [sr.left_top(), sr.right_top(), sr.left_bottom(), sr.right_bottom()] {
-            painter.rect_filled(Rect::from_center_size(pt, Vec2::splat(10.0)), 2.0, Color32::WHITE);
-        }
-        // Interaction
-        let hit = |pos: Pos2| -> CropHandle {
-            let m = 10.0;
-            let near_l = (pos.x - sr.min.x).abs() < m;
-            let near_r = (pos.x - sr.max.x).abs() < m;
-            let near_t = (pos.y - sr.min.y).abs() < m;
-            let near_b = (pos.y - sr.max.y).abs() < m;
-            let in_y = pos.y > sr.min.y - m && pos.y < sr.max.y + m;
-            let in_x = pos.x > sr.min.x - m && pos.x < sr.max.x + m;
-            match (near_l && in_y, near_r && in_y, near_t && in_x, near_b && in_x) {
-                (true, _, true, _) => CropHandle::NW,
-                (_, true, true, _) => CropHandle::NE,
-                (true, _, _, true) => CropHandle::SW,
-                (_, true, _, true) => CropHandle::SE,
-                (true, _, _, _) => CropHandle::W,
-                (_, true, _, _) => CropHandle::E,
-                (_, _, true, _) => CropHandle::N,
-                (_, _, _, true) => CropHandle::S,
-                _ if sr.contains(pos) => CropHandle::Move,
-                _ => CropHandle::New,
-            }
-        };
-        if let Some(pos) = resp.hover_pos() {
-            let icon = match hit(pos) {
-                CropHandle::NW | CropHandle::SE => egui::CursorIcon::ResizeNwSe,
-                CropHandle::NE | CropHandle::SW => egui::CursorIcon::ResizeNeSw,
-                CropHandle::W | CropHandle::E => egui::CursorIcon::ResizeHorizontal,
-                CropHandle::N | CropHandle::S => egui::CursorIcon::ResizeVertical,
-                CropHandle::Move => egui::CursorIcon::Move,
-                CropHandle::New => egui::CursorIcon::Crosshair,
-            };
-            ui.ctx().set_cursor_icon(icon);
-        }
-        if resp.drag_started() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                c.drag = Some((hit(pos), pos, c.r));
-            }
-        }
-        if resp.dragged() {
-            if let (Some((h, start, orig)), Some(pos)) = (c.drag, resp.interact_pointer_pos()) {
-                let (sx, sy) = to_img(start);
-                let (px, py) = to_img(pos);
-                let (dx, dy) = (px - sx, py - sy);
-                let mut r = orig;
-                match h {
-                    CropHandle::Move => {
-                        let w = r[2] - r[0];
-                        let hh = r[3] - r[1];
-                        r[0] = safe_clamp(orig[0] + dx, 0.0, (iw - w).max(0.0));
-                        r[1] = safe_clamp(orig[1] + dy, 0.0, (ih - hh).max(0.0));
-                        r[2] = r[0] + w;
-                        r[3] = r[1] + hh;
-                    }
-                    CropHandle::New => {
-                        r = [sx.min(px), sy.min(py), sx.max(px), sy.max(py)];
-                        if let Some(a) = c.aspect {
-                            let w = r[2] - r[0];
-                            let hgt = w / a;
-                            if py >= sy { r[3] = r[1] + hgt } else { r[1] = r[3] - hgt }
-                        }
-                    }
-                    _ => {
-                        if matches!(h, CropHandle::W | CropHandle::NW | CropHandle::SW) {
-                            r[0] = orig[0] + dx;
-                        }
-                        if matches!(h, CropHandle::E | CropHandle::NE | CropHandle::SE) {
-                            r[2] = orig[2] + dx;
-                        }
-                        if matches!(h, CropHandle::N | CropHandle::NW | CropHandle::NE) {
-                            r[1] = orig[1] + dy;
-                        }
-                        if matches!(h, CropHandle::S | CropHandle::SW | CropHandle::SE) {
-                            r[3] = orig[3] + dy;
-                        }
-                        if let Some(a) = c.aspect {
-                            let w = (r[2] - r[0]).abs();
-                            let hgt = w / a;
-                            if matches!(h, CropHandle::N | CropHandle::NW | CropHandle::NE) {
-                                r[1] = r[3] - hgt;
-                            } else {
-                                r[3] = r[1] + hgt;
-                            }
-                        }
-                    }
-                }
-                if r[0] > r[2] {
-                    r.swap(0, 2);
-                }
-                if r[1] > r[3] {
-                    r.swap(1, 3);
-                }
-                clamp_crop(&mut r, iw, ih);
-                c.r = r;
-            }
-        }
-        if resp.drag_stopped() {
-            c.drag = None;
-        }
+        c.roi.show(ui, painter, &xf, resp);
     }
 
     /// The prompt behind `confirm_discard`: unapplied tool work first (Discard /
@@ -2310,14 +2160,6 @@ fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
     v.max(lo).min(hi.max(lo))
 }
 
-fn clamp_crop(r: &mut [f32; 4], iw: f32, ih: f32) {
-    let (iw, ih) = (iw.max(1.0), ih.max(1.0));
-    r[0] = safe_clamp(r[0], 0.0, iw - 1.0);
-    r[1] = safe_clamp(r[1], 0.0, ih - 1.0);
-    r[2] = safe_clamp(r[2], r[0] + 1.0, iw);
-    r[3] = safe_clamp(r[3], r[1] + 1.0, ih);
-}
-
 /// Neighbours bigger than this (decoded bytes) are not kept preloaded: half
 /// the cache budget, and never more than a 60 MP image.
 fn preload_limit(budget: u64) -> u64 {
@@ -2449,10 +2291,6 @@ mod tests {
         assert_eq!(safe_clamp(5.0, 0.0, 2.0), 2.0);
         assert_eq!(safe_clamp(-1.0, 0.0, 2.0), 0.0);
         assert!(safe_clamp(1.0, f32::NAN, f32::NAN).is_finite());
-        // Crop rect larger than the (rotated) image.
-        let mut r = [10.0, 10.0, 900.0, 300.0];
-        clamp_crop(&mut r, 200.0, 0.5);
-        assert!(r[0] <= r[2] && r[1] <= r[3] && r[2] <= 200.0);
     }
 
     #[test]
