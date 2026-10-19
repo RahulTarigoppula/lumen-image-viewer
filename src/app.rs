@@ -2227,6 +2227,7 @@ impl eframe::App for App {
             }
         }
         self.dev_actions(&ctx);
+        crate::ui::gate_background_tooltips(&ctx);
         self.handle_dropped(&ctx);
         self.clipboard_keys(&ctx);
         self.shortcuts(&ctx);
@@ -2261,11 +2262,12 @@ impl eframe::App for App {
                             });
                         });
                     });
-                let tree_w = self.core.settings.tree_width.clamp(180.0, 520.0);
+                let range = crate::ui::browser::sidebar_range(&ctx);
+                let tree_w = self.core.settings.tree_width.clamp(*range.start(), *range.end());
                 egui::Panel::left("sidebar")
                     .resizable(true)
                     .default_size(tree_w)
-                    .size_range(180.0..=560.0)
+                    .size_range(range)
                     .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin { left: 0, right: 2, top: 4, bottom: 0 }))
                     .show(ui, |ui| {
                         let t = std::time::Instant::now();
