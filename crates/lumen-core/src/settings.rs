@@ -187,6 +187,11 @@ pub struct Settings {
     pub edge_panels: bool,
     /// Skip the "this sends the coordinates to openstreetmap.org" confirmation.
     pub gps_map_no_confirm: bool,
+    /// Remote AI analysis settings (`lumen_ai::AiSettings`, read by the app).
+    /// Kept as raw JSON so this crate does not depend on the AI client, and a
+    /// build without the `ai` feature keeps them unchanged.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    pub ai: serde_json::Value,
 }
 
 /// "In `mode`, `command` uses exactly `keys`" (empty = unbound). Plain strings so a
@@ -276,6 +281,7 @@ impl Default for Settings {
             thumb_caption: ThumbCaption::NameDetails,
             edge_panels: true,
             gps_map_no_confirm: false,
+            ai: serde_json::Value::Null,
         }
     }
 }

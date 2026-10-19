@@ -7,12 +7,13 @@ tens of thousands of files and on images of hundreds of megapixels.
 
 ## Crates
 
-The repository is a Cargo workspace with two crates:
+The repository is a Cargo workspace:
 
 | Crate | Path | Contents | Depends on |
 |---|---|---|---|
 | `lumen` (binary) | `src/` | UI (egui/eframe), viewer, browser, batch tools, GPU renderer, loader and thumbnail pools, shell integration, FFmpeg video engine (`video` feature), `build.rs` (resources, FFmpeg link libraries) | `lumen-core`, egui, eframe, FFmpeg |
 | `lumen-core` (library `lumen_core`) | `crates/lumen-core/` | Everything with no UI and no FFmpeg: formats, decoders, color, resizing, encoders, metadata, catalog, tags, settings data, edit pixel operations, video metrics and scopes | image, WIC (`windows`), small pure-Rust codecs |
+| `lumen-ai` (library `lumen_ai`, feature `ai`) | `crates/lumen-ai/` | The only network code: OpenAI-compatible (vLLM) client, Test connection, prompts, image preparation, reports, API key storage. See its `API.md` | ureq (rustls), image |
 
 `lumen-core` must never depend on egui, eframe or FFmpeg. The app imports
 the core modules at its crate root (`use lumen_core::{decode, settings, ...}`
@@ -49,6 +50,7 @@ dependency versions are in `[workspace.dependencies]`.
 | Modes | `lumen` | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and A/B analysis |
 | Video (pure) | `lumen-core` | `video/mod.rs`, `video/metrics.rs`, `video/scopes.rs` | Video extensions, PSNR/SSIM, scopes, thumbnailer hook |
 | Video (FFmpeg) | `lumen` | `video/engine.rs`, `video/audio.rs`, `video/analyze.rs`, `video/mode.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, whole-file analysis, UI |
+| Analysis panel | `lumen` | `analysis_ui/*` | Right-side panel of the viewer, compare and video modes (Ctrl+Q): Metrics tab, AI tab, send preview, ROI (R) and finding overlays. Modes only publish where they draw images (`analysis_ui::canvas::publish`) |
 
 Paths in the `lumen-core` rows are relative to `crates/lumen-core/src/`, the
 others to `src/`.
