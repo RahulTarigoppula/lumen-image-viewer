@@ -279,7 +279,7 @@ impl App {
     /// Asks first when the viewer holds unsaved edits of another image.
     pub fn open_file(&mut self, path: &Path) {
         let is_video = crate::video::is_video_ext(&crate::formats::ext_of(path));
-        if !is_video && self.viewer.is_dirty() {
+        if !is_video && self.viewer.has_unsaved_work() {
             if self.viewer.current().map(|c| c == path).unwrap_or(false) {
                 self.mode = Mode::Viewer;
             } else {
@@ -325,7 +325,7 @@ impl App {
                 self.mode = Mode::Video;
             }
             EntryKind::Image => {
-                if self.viewer.is_dirty() {
+                if self.viewer.has_unsaved_work() {
                     if self.viewer.current() == Some(&entry.path) {
                         self.mode = Mode::Viewer;
                     } else {
@@ -346,9 +346,8 @@ impl App {
     }
 
     fn close_viewer(&mut self) {
-        if self.viewer.is_dirty() {
-            self.viewer.confirm_discard = true;
-            self.viewer.pending_nav = None;
+        if self.viewer.has_unsaved_work() {
+            self.viewer.confirm_close();
             return;
         }
         if let Some(p) = self.viewer.current().cloned() {
@@ -439,7 +438,7 @@ impl App {
                 self.apply_theme();
             }
             Exit => {
-                if self.viewer.is_dirty() {
+                if self.viewer.has_unsaved_work() {
                     self.pending_guard = Some(PendingAction::Exit);
                 } else {
                     self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1145,7 +1144,7 @@ impl App {
 
     /// True when the viewer has unsaved edits of one of `files`.
     fn dirty_current_in(&self, files: &[PathBuf]) -> bool {
-        self.viewer.is_dirty() && self.viewer.current().map(|c| files.iter().any(|f| c == f || c.starts_with(f))).unwrap_or(false)
+        self.viewer.has_unsaved_work() && self.viewer.current().map(|c| files.iter().any(|f| c == f || c.starts_with(f))).unwrap_or(false)
     }
 
     fn transfer_files(&mut self, files: Vec<PathBuf>, dest: PathBuf, do_move: bool) {
@@ -1322,14 +1321,18 @@ impl App {
         let p = self.core.pal;
         let name = self.viewer.current().map(|c| crate::ui::viewer::file_name(c)).unwrap_or_default();
         let lossy = self.viewer.current().and_then(|c| lossy_resave_reason(self.viewer.loaded(&self.core).as_ref().map(|l| &l.decoded), c));
-        let can_save = lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
+        // Saving would leave out an open tool's unapplied work: apply it first.
+        let tool_work = self.viewer.tool_has_work();
+        let can_save = !tool_work && lossy.is_none() && self.viewer.current().map(|c| crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(c)).is_some()).unwrap_or(false);
         let mut choice: Option<u8> = None; // 0 cancel, 1 save, 2 discard
         egui::Modal::new(egui::Id::unique("unsaved-guard")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("Unsaved changes");
             ui.add_space(4.0);
             ui.label(format!("\"{name}\" has edits that are not saved."));
-            if let Some(why) = &lossy {
+            if tool_work {
+                ui.label(RichText::new("The open tool has changes that are not applied. Cancel and apply them to keep them.").color(p.muted).size(12.0));
+            } else if let Some(why) = &lossy {
                 ui.label(RichText::new(format!("{why} Use Save as from the viewer.")).color(p.muted).size(12.0));
             } else if !can_save {
                 ui.label(RichText::new("This format cannot be saved in place - use Save as from the viewer.").color(p.muted).size(12.0));
@@ -1381,6 +1384,7 @@ impl App {
             }
             Some(_) => {
                 self.viewer.edit = None;
+                self.viewer.close_tool();
                 if let Some(a) = self.pending_guard.take() {
                     self.perform_pending(a);
                 }
@@ -2158,7 +2162,7 @@ impl App {
             }
             return;
         }
-        if self.viewer.is_dirty() {
+        if self.viewer.has_unsaved_work() {
             self.pending_guard = Some(PendingAction::OpenFile(images[0].clone()));
             return;
         }
@@ -2230,7 +2234,7 @@ impl eframe::App for App {
             crate::devhook::mark(if self.startup_frames == 1 { "first_frame" } else { "first_frame_shown" });
         }
         // Window close (X, Alt+F4, taskbar) with unsaved edits: ask first.
-        if ctx.input(|i| i.viewport().close_requested()) && self.viewer.is_dirty() && !self.allow_close {
+        if ctx.input(|i| i.viewport().close_requested()) && self.viewer.has_unsaved_work() && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.pending_guard.is_none() {
                 self.pending_guard = Some(PendingAction::Exit);

@@ -412,6 +412,9 @@ impl EditTool for Effects {
         let thumbs = self.thumbs.take();
         *self = Effects { thumbs, ..Effects::default() };
     }
+    fn can_apply(&self) -> bool {
+        self.kind != NO_EFFECT
+    }
 }
 
 #[cfg(test)]

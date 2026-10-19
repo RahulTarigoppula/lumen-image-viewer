@@ -300,12 +300,27 @@ impl EditTool for RedEye {
         true
     }
     fn canvas(&mut self, cx: &CanvasCtx, painter: &egui::Painter, resp: &egui::Response) -> bool {
-        // A plain click on empty space drops a default-sized eye box.
+        // A plain click on empty space marks the red pupil under it: the box
+        // grows to the whole red blob (found on the preview copy), or falls
+        // back to a default-sized box when there is no clear blob.
         if cx.interactive && resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos().map(|p| cx.to_image(p)) {
                 if !self.ed.shapes.iter().any(|s| s.contains(p)) {
-                    let r = self.click_size / 2.0;
-                    self.ed.push(Shape::Ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r]));
+                    let k = cx.preview_scale.max(1e-6);
+                    let found = cx.preview.and_then(|img| {
+                        // A pupil is at most about a tenth of the short side.
+                        let short = cx.image_size.0.min(cx.image_size.1) as f32;
+                        let max_r = (short / 10.0).max(self.click_size) * k;
+                        retouch::red_eye_box_at(img, [p[0] * k, p[1] * k], max_r, self.sensitivity / 100.0)
+                    });
+                    let b = match found {
+                        Some(b) => b.map(|v| v / k),
+                        None => {
+                            let r = self.click_size / 2.0;
+                            [p[0] - r, p[1] - r, p[0] + r, p[1] + r]
+                        }
+                    };
+                    self.ed.push(Shape::Ellipse(b));
                     return true;
                 }
             }

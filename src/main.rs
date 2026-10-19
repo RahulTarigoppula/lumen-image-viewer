@@ -41,7 +41,11 @@ fn main() -> eframe::Result {
     // Any failure falls through to a normal start (see shell.rs).
     // The first process owns a per-user mutex; launches that start at the same
     // moment (Explorer "Open" on many files) see it and wait for its pipe.
-    let force_new = args.iter().any(|a| a == "--new-window") || std::env::var_os("LUMEN_DEV_DIR").is_some();
+    // Dev hook instances (LUMEN_DEV_DIR) are automation targets: they never
+    // forward to, nor act as, the running instance, so files opened from
+    // Explorer always reach the user's real window.
+    let dev_instance = std::env::var_os("LUMEN_DEV_DIR").is_some();
+    let force_new = args.iter().any(|a| a == "--new-window") || dev_instance;
     if settings.reuse_window && !force_new {
         let primary = shell::claim_primary();
         if let Some(p) = &initial {
@@ -50,7 +54,9 @@ fn main() -> eframe::Result {
             }
         }
     }
-    shell::start_instance_server();
+    if !dev_instance {
+        shell::start_instance_server();
+    }
 
     let icon = image::load_from_memory(include_bytes!("../assets/lumen-256.png"))
         .ok()

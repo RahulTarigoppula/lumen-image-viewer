@@ -93,6 +93,10 @@ pub trait EditTool: Send {
     fn clone_box(&self) -> Box<dyn EditTool>;
     /// Reset parameters to defaults.
     fn reset(&mut self) {}
+    /// Whether Apply would do anything (e.g. false while Effects has no effect picked).
+    fn can_apply(&self) -> bool {
+        true
+    }
     /// Whether the output size differs from the input (resize, canvas, border ...).
     fn changes_size(&self) -> bool {
         false
