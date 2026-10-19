@@ -100,34 +100,37 @@ Registry: `lumen_analysis::metrics::all()` (frame metrics, display order),
 `metrics::preset("quick" | "encode_qa" | "photo_technical")`. Each metric
 has `info()`: `id`, `name`, `kind` (FullReference / NoReference /
 Temporal), `version` (part of cache keys), `min_size`, `cost_ms(w, h)`
-(estimate for the UI), `heavy`, `has_map`, `direction` and `description`.
+(estimate for the UI), `heavy`, `has_map`, `direction`, `headline` and
+`description`. `headline` lists the keys of the headline value in order of
+preference (`metrics::headline_key(id, keys)` picks one, `MetricResult::main()`
+returns it); it is never just the first value, which for PSNR on RGB is R.
 
 Values are reported as `<id>.<key>`. dB values are capped at 100
 (`PSNR_CAP_DB`), never infinity. "levels" are 8-bit-equivalent code values.
 
-| id | kind | keys (first = headline) | map |
+| id | kind | keys (headline in bold) | map |
 |---|---|---|---|
-| `psnr` | FR | YUV: `y u v avg`, `mse_*`, `maxabs_*` (code values); RGB: `r g b avg` ... | - |
-| `psnr.rgb` | FR | `r g b avg`, `mse_*`, `maxabs_*` (YUV converted, 8-bit levels) | - |
-| `ssim.fast` | FR | `y`, YUV also `u v all`, `y_db` (FFmpeg/x264 8x8 stride 4) | - |
-| `ssim.gauss` | FR | `y`, `db`, `cs` (11x11 Gaussian, matches scikit-image) | SSIM, inverted magma |
-| `ms_ssim` | FR | `y`, `cs1..cs4`, `ssim5` (needs 176x176) | - |
-| `deltae.76` / `.94` / `.2000` | FR | `mean median p95 max above_jnd_pct` (Delta-E > 2.3) | Delta-E |
-| `diff.abs` | FR | `mean p99 max changed_pct` (RGB: largest channel; YUV: luma) | abs diff |
-| `diff.signed` | FR | `mean std min max` (luma B - A) | signed, RdBu |
-| `ssimulacra2` (feature) | FR, heavy | `score` (100 = identical, higher is better) | - |
-| `butteraugli` (feature) | FR, heavy | `score` (max-norm, below 1 good), `pnorm3` | diffmap |
-| `flip` (feature) | FR, heavy | `mean median max` (0..1, LDR, 67 ppd) | error map |
-| `sharpness.laplacian` | NR | `var` (levels^2) | tiles |
-| `sharpness.tenengrad` | NR | `mean_g2`, `edge_pct` | tiles |
-| `noise` | NR | `y cb cr` (Immerkaer sigma, levels, edges masked) | - |
-| `exposure` | NR | `clip_lo_pct clip_hi_pct` (+ per channel for RGB), `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | - |
-| `color_cast` | NR | `delta_e a b hue neutral_pct` + a text note | - |
-| `blockiness` | NR | `score ratio_h ratio_v offset_x offset_y` | tiles |
-| `banding` | NR | `score smooth_pct contour_pct` | contour mask |
-| `temporal.flicker` | T | `flicker delta mean_luma` | - |
-| `temporal.freeze` | T | `duplicate mad run` | - |
-| `temporal.scene` | T | `score cut` | - |
+| `psnr` | FR | YUV: **`y`** `u v avg`, `mse_*`, `maxabs_*` (code values); RGB: `r g b` **`avg`** ... | - |
+| `psnr.rgb` | FR | `r g b` **`avg`**, `mse_*`, `maxabs_*` (YUV converted, 8-bit levels) | - |
+| `ssim.fast` | FR | **`y`**, YUV also `u v all`, `y_db` (FFmpeg/x264 8x8 stride 4) | - |
+| `ssim.gauss` | FR | **`y`**, `db`, `cs` (11x11 Gaussian, matches scikit-image) | SSIM, inverted magma |
+| `ms_ssim` | FR | **`y`**, `cs1..cs4`, `ssim5` (needs 176x176) | - |
+| `deltae.76` / `.94` / `.2000` | FR | **`mean`** `median p95 max above_jnd_pct` (Delta-E > 2.3) | Delta-E |
+| `diff.abs` | FR | **`mean`** `p99 max changed_pct` (RGB: largest channel; YUV: luma) | abs diff |
+| `diff.signed` | FR | **`mean`** `std min max` (luma B - A) | signed, RdBu |
+| `ssimulacra2` (feature) | FR, heavy | **`score`** (100 = identical, higher is better) | - |
+| `butteraugli` (feature) | FR, heavy | **`score`** (max-norm, below 1 good), `pnorm3` | diffmap |
+| `flip` (feature) | FR, heavy | **`mean`** `median max` (0..1, LDR, 67 ppd) | error map |
+| `sharpness.laplacian` | NR | **`var`** (levels^2) | tiles |
+| `sharpness.tenengrad` | NR | **`mean_g2`**, `edge_pct` | tiles |
+| `noise` | NR | **`y`** `cb cr` (Immerkaer sigma, levels, edges masked) | - |
+| `exposure` | NR | **`clip_pct`** (the larger of) `clip_lo_pct clip_hi_pct` (+ per channel for RGB), `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | - |
+| `color_cast` | NR | **`delta_e`** `a b hue neutral_pct` + a text note | - |
+| `blockiness` | NR | **`score`** `ratio_h ratio_v offset_x offset_y` | tiles |
+| `banding` | NR | **`score`** `smooth_pct contour_pct` | contour mask |
+| `temporal.flicker` | T | **`flicker`** `delta mean_luma` | - |
+| `temporal.freeze` | T | **`duplicate`** `mad run` | - |
+| `temporal.scene` | T | **`score`** `cut` | - |
 
 The three heavy metrics come from pure-Rust crates behind cargo features
 `ssimulacra2` (fast-ssim2, BSD-2-Clause), `butteraugli` (BSD-3-Clause) and
@@ -150,7 +153,7 @@ B present they also report B's sequence with a `_b` suffix
 ## 3. Image job
 
 ```rust
-// Once, e.g. in the app state. Pool: cores - 1 threads, below-normal priority.
+// Once, e.g. in the app state. Pool: cores - 1 threads, lowest thread priority (the app passes cores - 2).
 let ctx2 = ctx.clone();
 let analyzer = Analyzer::new(None, Some(Arc::new(move || ctx2.request_repaint())));
 

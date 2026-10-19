@@ -64,6 +64,7 @@ static MS_SSIM: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::HigherIsBetter,
+    headline: &["y"],
     description: "Multi-scale SSIM, 5 scales with Wang 2003 weights",
 };
 

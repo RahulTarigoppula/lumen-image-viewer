@@ -1,14 +1,30 @@
 //! Heatmap overlay painted over an image rectangle, with colormap, range,
 //! opacity and threshold controls and a legend bar. Per-pixel maps are drawn
-//! as a texture at map resolution (max-pooled to at most 4096 px so hotspots
-//! survive); tile maps (64 px cells) are drawn as rectangles. Hovering shows
-//! the map value plus the A/B pixel under the pointer.
+//! as textures of at most 2048 px (max-pooled, so hotspots survive); tile
+//! maps (64 px cells) are drawn as rectangles. Hovering shows the map value
+//! plus the A/B pixel under the pointer.
+//!
+//! Pooling, the auto range and coloring scan every value of the map (12 M
+//! for a 12 MP image), so they run on a worker thread whenever the map or
+//! the coloring changes. The UI thread only uploads the result, in strips of
+//! [`STRIP_ROWS`] rows, a few per frame: one 12 MB upload takes about 30 ms.
+//! Maps of rotated videos are in the stream's native pixels and are drawn
+//! turned like the picture.
 
 use crate::ui::roi::ImageTransform;
 use crate::ui::theme::Palette;
+use crossbeam_channel::{Receiver, TryRecvError};
 use egui::{Color32, ColorImage, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2};
 use lumen_analysis::{heatmap, Colormap, ColorizeOptions, Heatmap, RangeMode};
 use std::sync::Arc;
+
+/// Longest side of the drawn texture. Bigger maps are max-pooled to it
+/// (12 MP: 2000 x 1500 cells, a 12 MB upload instead of 48 MB).
+const OVERLAY_SIDE: u32 = 2048;
+/// Rows per overlay texture (2 MB at 2048 px wide).
+const STRIP_ROWS: usize = 256;
+/// Bytes of texture uploaded per frame (at least one strip).
+const UPLOAD_BUDGET: usize = 2 << 20;
 
 /// What the range controls select (the `RangeMode` values plus the user's lo/hi).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -18,13 +34,25 @@ enum RangeKind {
     Custom,
 }
 
+/// A worker's coloring of the map for one set of options.
+struct Prepared {
+    disp: Arc<Heatmap>,
+    auto: (f32, f32),
+    opts: ColorizeOptions,
+    /// Per-pixel maps, in strips of `STRIP_ROWS` rows.
+    strips: Vec<ColorImage>,
+    /// Tile maps.
+    cells: Vec<Color32>,
+}
+
 pub struct HeatmapView {
     /// Metric id of the map shown.
     id: String,
     /// Full-resolution map (hover values, export).
     full: Option<Arc<Heatmap>>,
-    /// Pooled copy for drawing.
+    /// Pooled copy for drawing and its auto range, once the worker made them.
     disp: Option<Arc<Heatmap>>,
+    auto: Option<(f32, f32)>,
     pub visible: bool,
     pub colormap: Colormap,
     range: RangeKind,
@@ -32,10 +60,21 @@ pub struct HeatmapView {
     pub opacity: f32,
     threshold_on: bool,
     threshold: f32,
-    /// Texture (per-pixel maps) or cell colors (tile maps) for `drawn`.
-    tex: Option<TextureHandle>,
+    /// A new map: the custom range and threshold start from its auto range.
+    fresh: bool,
+    /// Textures of the strips (per-pixel maps; `true`: it shows the current
+    /// map, else it waits to be reused) or cell colors (tile maps) for
+    /// `drawn`; strips still to upload wait in `uploads`. Textures are kept
+    /// from map to map: creating one costs more than refilling it.
+    strips: Vec<Option<(TextureHandle, bool)>>,
+    uploads: Vec<(usize, ColorImage)>,
     cells: Vec<Color32>,
     drawn: Option<ColorizeOptions>,
+    /// The coloring in flight, at most one.
+    pending: Option<(ColorizeOptions, Receiver<Prepared>)>,
+    /// Video frames are measured in native pixels and shown turned (and
+    /// maybe scaled): the display rotation in degrees and the native size.
+    native: Option<(i32, (f32, f32))>,
 }
 
 impl Default for HeatmapView {
@@ -44,6 +83,7 @@ impl Default for HeatmapView {
             id: String::new(),
             full: None,
             disp: None,
+            auto: None,
             visible: true,
             colormap: Colormap::Magma,
             range: RangeKind::Auto,
@@ -51,44 +91,101 @@ impl Default for HeatmapView {
             opacity: 0.65,
             threshold_on: false,
             threshold: 0.0,
-            tex: None,
+            fresh: false,
+            strips: Vec::new(),
+            uploads: Vec::new(),
             cells: Vec::new(),
             drawn: None,
+            pending: None,
+            native: None,
         }
     }
 }
 
-/// True for maps whose cells are larger than a pixel (NR tile maps).
+/// True for maps of a few large cells (NR tile maps), drawn as rectangles.
+/// Pooled or preview maps also have cells over a pixel but millions of
+/// them: those are drawn as textures.
 pub fn is_tile_map(m: &Heatmap) -> bool {
-    m.cell_w > 1.5 || m.cell_h > 1.5
+    (m.cell_w > 1.5 || m.cell_h > 1.5) && m.width as usize * m.height as usize <= 1 << 16
+}
+
+/// A point of a picture of native size `(w, h)` as displayed turned by
+/// `rotation` degrees (the inverse of `metrics_view::native_roi`).
+pub fn rotate_point(p: Pos2, rotation: i32, (w, h): (f32, f32)) -> Pos2 {
+    match rotation.rem_euclid(360) {
+        90 => Pos2::new(h - p.y, p.x),
+        180 => Pos2::new(w - p.x, h - p.y),
+        270 => Pos2::new(p.y, w - p.x),
+        _ => p,
+    }
+}
+
+/// The native point under displayed point `p` (inverse of [`rotate_point`]).
+pub fn unrotate_point(p: Pos2, rotation: i32, (w, h): (f32, f32)) -> Pos2 {
+    match rotation.rem_euclid(360) {
+        90 => Pos2::new(p.y, h - p.x),
+        180 => Pos2::new(w - p.x, h - p.y),
+        270 => Pos2::new(w - p.y, p.x),
+        _ => p,
+    }
 }
 
 impl HeatmapView {
     /// Show `map` (the result of metric `id`), keeping the user's settings
     /// when it is the same metric again.
-    pub fn set_map(&mut self, id: &str, map: Heatmap) {
-        let same = self.id == id;
-        let disp = if is_tile_map(&map) { map.clone() } else { map.for_display() };
-        if !same {
+    pub fn set_map(&mut self, id: &str, map: Arc<Heatmap>) {
+        if self.id != id {
             self.colormap = map.colormap;
             self.range = RangeKind::Auto;
             self.threshold_on = false;
-            self.user = disp.range(RangeMode::Auto);
-            self.threshold = (self.user.0 + self.user.1) / 2.0;
+            self.fresh = true;
         }
         self.id = id.to_string();
-        self.full = Some(Arc::new(map));
-        self.disp = Some(Arc::new(disp));
-        self.drawn = None;
+        // The old full map may be the last owner of 48 MB: free it elsewhere.
+        if let Some(old) = self.full.replace(map) {
+            let _ = std::thread::Builder::new().name("lumen-free".into()).spawn(move || drop(old));
+        }
+        self.reset_drawing();
     }
 
     pub fn clear(&mut self) {
         self.id.clear();
         self.full = None;
+        self.reset_drawing();
+        self.strips.clear();
+    }
+
+    fn reset_drawing(&mut self) {
         self.disp = None;
-        self.tex = None;
+        self.auto = None;
+        for (_, current) in self.strips.iter_mut().flatten() {
+            *current = false;
+        }
+        self.uploads.clear();
         self.cells.clear();
         self.drawn = None;
+        self.pending = None;
+    }
+
+    /// The map is in native pixels of a video of size `.1` displayed turned
+    /// by `.0` degrees (`None`: in the displayed image's pixels).
+    pub fn set_native(&mut self, native: Option<(i32, (u32, u32))>) {
+        self.native = native.map(|(r, (w, h))| (r.rem_euclid(360), (w.max(1) as f32, h.max(1) as f32)));
+    }
+
+    /// Map pixels to displayed image pixels (`size`: the displayed image).
+    fn to_display(&self, p: Pos2, size: Vec2) -> Pos2 {
+        let Some((rot, n)) = self.native else { return p };
+        let q = rotate_point(p, rot, n);
+        let turned = if rot % 180 == 90 { (n.1, n.0) } else { n };
+        Pos2::new(q.x * size.x / turned.0, q.y * size.y / turned.1)
+    }
+
+    /// Displayed image pixels to map pixels (inverse of `to_display`).
+    fn from_display(&self, p: Pos2, size: Vec2) -> Pos2 {
+        let Some((rot, n)) = self.native else { return p };
+        let turned = if rot % 180 == 90 { (n.1, n.0) } else { n };
+        unrotate_point(Pos2::new(p.x * turned.0 / size.x, p.y * turned.1 / size.y), rot, n)
     }
 
     pub fn id(&self) -> Option<&str> {
@@ -97,6 +194,11 @@ impl HeatmapView {
 
     pub fn map(&self) -> Option<&Heatmap> {
         self.full.as_deref()
+    }
+
+    /// The full map, shared (exports on a worker thread).
+    pub fn shared_map(&self) -> Option<Arc<Heatmap>> {
+        self.full.clone()
     }
 
     /// Whether an overlay will be drawn.
@@ -115,32 +217,109 @@ impl HeatmapView {
         ColorizeOptions { colormap: self.colormap, range, invert, threshold: self.threshold_on.then_some(self.threshold), alpha: 255 }
     }
 
-    /// Colorized PNG of the full map with the current settings.
-    pub fn export_png(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let m = self.full.as_ref().ok_or_else(|| std::io::Error::other("no heatmap"))?;
-        let o = ColorizeOptions { alpha: (self.opacity.clamp(0.0, 1.0) * 255.0).round().max(1.0) as u8, ..self.options() };
-        m.write_png(path, &o)
+    /// The options with the range resolved to numbers (the auto range of the
+    /// drawn map once known), for exports that must match the overlay.
+    pub fn resolved_options(&self) -> ColorizeOptions {
+        let o = self.options();
+        let (lo, hi) = self.range_of(o.range);
+        ColorizeOptions { range: RangeMode::User { lo, hi }, ..o }
     }
 
+    /// `(lo, hi)` of a range mode without scanning the map.
+    fn range_of(&self, mode: RangeMode) -> (f32, f32) {
+        let fixed = self.full.as_ref().map(|m| m.fixed_range).unwrap_or((0.0, 1.0));
+        match mode {
+            RangeMode::Auto => self.auto.unwrap_or(fixed),
+            RangeMode::Fixed => fixed,
+            RangeMode::User { lo, hi } => (lo, hi),
+        }
+    }
+
+    /// Picks up the worker's coloring and starts the next one when the map
+    /// or the options changed.
     fn refresh(&mut self, ctx: &egui::Context) {
+        self.upload(ctx);
+        if let Some((_, rx)) = &self.pending {
+            match rx.try_recv() {
+                Ok(p) => {
+                    self.pending = None;
+                    self.apply(ctx, p);
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => self.pending = None,
+            }
+        }
         let o = self.options();
         if self.drawn == Some(o) {
             return;
         }
-        let Some(m) = self.disp.clone() else { return };
-        let rgba = m.colorize(&o);
-        if is_tile_map(&m) {
-            self.tex = None;
-            self.cells = rgba.as_chunks::<4>().0.iter().map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])).collect();
-        } else {
-            self.cells.clear();
-            let img = ColorImage::from_rgba_unmultiplied([m.width as usize, m.height as usize], &rgba);
-            match &mut self.tex {
-                Some(t) => t.set(img, TextureOptions::NEAREST),
-                None => self.tex = Some(ctx.load_texture("analysis-heatmap", img, TextureOptions::NEAREST)),
+        let Some(full) = self.full.clone() else { return };
+        let (disp, auto) = (self.disp.clone(), self.auto);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name("lumen-heatmap".into())
+            .spawn(move || {
+                lumen_analysis::job::lower_current_thread_priority();
+                let disp = disp.unwrap_or_else(|| Arc::new(if is_tile_map(&full) { (*full).clone() } else { full.downsample(OVERLAY_SIDE) }));
+                let auto = auto.unwrap_or_else(|| disp.range(RangeMode::Auto));
+                let range = match o.range {
+                    RangeMode::Auto => auto,
+                    m => disp.range(m),
+                };
+                let rgba = disp.colorize(&ColorizeOptions { range: RangeMode::User { lo: range.0, hi: range.1 }, ..o });
+                let (strips, cells) = if is_tile_map(&full) {
+                    (Vec::new(), rgba.as_chunks::<4>().0.iter().map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])).collect())
+                } else {
+                    let w = disp.width as usize;
+                    let strips = rgba.chunks(w * 4 * STRIP_ROWS).map(|rows| ColorImage::from_rgba_unmultiplied([w, rows.len() / (w * 4)], rows)).collect();
+                    (strips, Vec::new())
+                };
+                let _ = tx.send(Prepared { disp, auto, opts: o, strips, cells });
+                repaint.request_repaint();
+            })
+            .ok();
+        self.pending = Some((o, rx));
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, p: Prepared) {
+        // Recolored strips replace the old ones in place as they upload.
+        self.strips.resize_with(p.strips.len(), || None);
+        self.disp = Some(p.disp);
+        self.auto = Some(p.auto);
+        if std::mem::take(&mut self.fresh) {
+            self.user = p.auto;
+            self.threshold = (p.auto.0 + p.auto.1) / 2.0;
+        }
+        self.cells = p.cells;
+        self.uploads = p.strips.into_iter().enumerate().collect();
+        self.drawn = Some(p.opts);
+        self.upload(ctx);
+    }
+
+    /// Uploads waiting strips, [`UPLOAD_BUDGET`] bytes per frame.
+    fn upload(&mut self, ctx: &egui::Context) {
+        let mut bytes = 0;
+        while bytes < UPLOAD_BUDGET && !self.uploads.is_empty() {
+            let (i, img) = self.uploads.remove(0);
+            bytes += img.pixels.len() * 4;
+            match self.strips.get_mut(i) {
+                Some(Some((t, current))) if t.size() == img.size => {
+                    t.set(img, TextureOptions::NEAREST);
+                    *current = true;
+                }
+                Some(slot) => *slot = Some((ctx.load_texture(format!("analysis-heatmap-{i}"), img, TextureOptions::NEAREST), true)),
+                None => {}
             }
         }
-        self.drawn = Some(o);
+        if !self.uploads.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Map pixels to the screen.
+    fn to_screen(&self, xf: &ImageTransform, p: Pos2) -> Pos2 {
+        xf.to_screen(self.to_display(p, xf.size))
     }
 
     /// Draw the overlay over the image that `xf` maps to the screen, clipped
@@ -151,25 +330,39 @@ impl HeatmapView {
             return;
         }
         self.refresh(ui.ctx());
-        let Some(m) = self.disp.clone() else { return };
         let painter = painter.with_clip_rect(painter.clip_rect().intersect(xf.dest));
-        let tint = Color32::WHITE.gamma_multiply(self.opacity.clamp(0.0, 1.0));
-        let (x0, y0, w, h) = m.extent();
-        if let Some(t) = &self.tex {
-            let r = xf.rect_to_screen([x0, y0, x0 + w, y0 + h]);
-            painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
-        } else {
-            let vis = painter.clip_rect();
-            for j in 0..m.height {
-                for i in 0..m.width {
-                    let c = self.cells[(j * m.width + i) as usize];
-                    if c.a() == 0 {
-                        continue;
+        let opacity = self.opacity.clamp(0.0, 1.0);
+        if let (Some(m), Some(_)) = (self.disp.clone(), self.drawn) {
+            let (x0, y0, w, _) = m.extent();
+            if !self.strips.is_empty() {
+                let tint = Color32::WHITE.gamma_multiply(opacity);
+                for (i, t) in self.strips.iter().enumerate() {
+                    let Some((t, true)) = t else { continue };
+                    // Map pixels covered by the strip (rows i * STRIP_ROWS ..).
+                    let top = y0 + (i * STRIP_ROWS) as f32 * m.cell_h;
+                    let bottom = top + t.size()[1] as f32 * m.cell_h;
+                    let corners = [Pos2::new(x0, top), Pos2::new(x0 + w, top), Pos2::new(x0 + w, bottom), Pos2::new(x0, bottom)];
+                    let uvs = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)];
+                    let mut mesh = egui::Mesh::with_texture(t.id());
+                    for (c, uv) in corners.iter().zip(uvs) {
+                        mesh.vertices.push(egui::epaint::Vertex { pos: self.to_screen(xf, *c), uv, color: tint });
                     }
-                    let (cx, cy) = (x0 + i as f32 * m.cell_w, y0 + j as f32 * m.cell_h);
-                    let r = xf.rect_to_screen([cx, cy, cx + m.cell_w, cy + m.cell_h]);
-                    if r.intersects(vis) {
-                        painter.rect_filled(r, 0.0, c.gamma_multiply(self.opacity.clamp(0.0, 1.0)));
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+            } else {
+                let vis = painter.clip_rect();
+                for j in 0..m.height {
+                    for i in 0..m.width {
+                        let Some(&c) = self.cells.get((j * m.width + i) as usize) else { continue };
+                        if c.a() == 0 {
+                            continue;
+                        }
+                        let (cx, cy) = (x0 + i as f32 * m.cell_w, y0 + j as f32 * m.cell_h);
+                        let r = Rect::from_two_pos(self.to_screen(xf, Pos2::new(cx, cy)), self.to_screen(xf, Pos2::new(cx + m.cell_w, cy + m.cell_h)));
+                        if r.intersects(vis) {
+                            painter.rect_filled(r, 0.0, c.gamma_multiply(opacity));
+                        }
                     }
                 }
             }
@@ -177,7 +370,8 @@ impl HeatmapView {
         let Some(pos) = hover.filter(|p| xf.dest.contains(*p)) else { return };
         let ip = xf.to_image(pos);
         let full = self.full.clone().expect("active map");
-        let value = full.value_at(ip.x, ip.y);
+        let np = self.from_display(ip, xf.size);
+        let value = full.value_at(np.x, np.y);
         let (pa, pb) = pixels(ip.x, ip.y);
         let mut lines = vec![match value {
             Some(v) => format!("{} {}", full.label, fmt_value(v, full.unit)),
@@ -195,7 +389,7 @@ impl HeatmapView {
 
     /// Colormap, range, opacity and threshold controls and the legend.
     pub fn controls(&mut self, ui: &mut Ui, p: &Palette) {
-        let Some(m) = self.disp.clone() else { return };
+        let Some(m) = self.full.clone() else { return };
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.visible, "Overlay");
             egui::ComboBox::from_id_salt("heatmap-colormap").width(90.0).selected_text(self.colormap.name()).show_ui(ui, |ui| {
@@ -203,19 +397,22 @@ impl HeatmapView {
                     ui.selectable_value(&mut self.colormap, c, c.name());
                 }
             });
+            if self.pending.is_some() {
+                ui.spinner();
+            }
         });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Range").color(p.muted));
             let before = self.range;
-            ui.selectable_value(&mut self.range, RangeKind::Auto, "Auto").on_hover_text("1st to 99th percentile");
+            let auto_tip = if m.min_span > 0.0 { "From the ideal value to the 99th percentile" } else { "1st to 99th percentile" };
+            ui.selectable_value(&mut self.range, RangeKind::Auto, "Auto").on_hover_text(auto_tip);
             ui.selectable_value(&mut self.range, RangeKind::Fixed, "Fixed").on_hover_text("The metric's default range");
             ui.selectable_value(&mut self.range, RangeKind::Custom, "Custom");
             if before != self.range && self.range == RangeKind::Custom {
-                let o = ColorizeOptions { range: if before == RangeKind::Fixed { RangeMode::Fixed } else { RangeMode::Auto }, ..self.options() };
-                self.user = m.range(o.range);
+                self.user = self.range_of(if before == RangeKind::Fixed { RangeMode::Fixed } else { RangeMode::Auto });
             }
         });
-        let (lo, hi) = m.range(self.options().range);
+        let (lo, hi) = self.range_of(self.options().range);
         let speed = ((hi - lo).abs() / 200.0).max(1e-4) as f64;
         if self.range == RangeKind::Custom {
             ui.horizontal(|ui| {
@@ -299,8 +496,8 @@ pub fn readout(ui: &Ui, pos: Pos2, text: &str) {
 mod tests {
     use super::*;
 
-    fn map(w: usize, h: usize) -> Heatmap {
-        Heatmap::new(w, h, (0..w * h).map(|i| i as f32).collect(), "abs diff")
+    fn map(w: usize, h: usize) -> Arc<Heatmap> {
+        Arc::new(Heatmap::new(w, h, (0..w * h).map(|i| i as f32).collect(), "abs diff"))
     }
 
     #[test]
@@ -322,7 +519,10 @@ mod tests {
     #[test]
     fn tile_maps_are_detected() {
         assert!(!is_tile_map(&map(3, 3)));
-        assert!(is_tile_map(&map(3, 3).with_cell(64.0, 64.0)));
+        assert!(is_tile_map(&(*map(3, 3)).clone().with_cell(64.0, 64.0)));
+        // A 12 MP map pooled to 2000 x 1500 cells of 2 px is not one.
+        assert!(!is_tile_map(&(*map(2000, 1500)).clone().with_cell(2.0, 2.0)));
+        assert!(!is_tile_map(&map(4000, 3000).downsample(OVERLAY_SIDE)));
     }
 
     #[test]
@@ -332,7 +532,39 @@ mod tests {
         v.range = RangeKind::Custom;
         v.user = (5.0, 50.0);
         assert_eq!(v.options().range, RangeMode::User { lo: 5.0, hi: 50.0 });
+        assert_eq!(v.resolved_options().range, RangeMode::User { lo: 5.0, hi: 50.0 });
         assert_eq!(fmt_value(1.23456, Some(lumen_analysis::Unit::DeltaE)), "1.2346 dE");
         assert_eq!(fmt_value(0.5, None), "0.5000");
+    }
+
+    #[test]
+    fn native_maps_follow_the_turned_picture() {
+        let mut v = HeatmapView::default();
+        // 1920x1080 stream shown turned 90 degrees, at half size (540x960).
+        v.set_native(Some((90, (1920, 1080))));
+        let size = Vec2::new(540.0, 960.0);
+        assert_eq!(v.to_display(Pos2::ZERO, size), Pos2::new(540.0, 0.0));
+        let p = Pos2::new(300.0, 200.0);
+        let back = v.from_display(v.to_display(p, size), size);
+        assert!((back - p).length() < 1e-3, "{back:?}");
+        v.set_native(None);
+        assert_eq!(v.to_display(p, size), p);
+    }
+
+    #[test]
+    fn rotation_round_trips() {
+        let size = (1920.0, 1080.0);
+        for rot in [0, 90, 180, 270] {
+            let p = Pos2::new(100.0, 40.0);
+            let d = rotate_point(p, rot, size);
+            assert_eq!(unrotate_point(d, rot, size), p, "{rot}");
+        }
+        // Turned 90 degrees, the native top-left corner is at the top right.
+        assert_eq!(rotate_point(Pos2::ZERO, 90, size), Pos2::new(1080.0, 0.0));
+        // Matches native_roi: displayed region -> native region.
+        let r = super::super::metrics_view::native_roi(lumen_analysis::Roi::new(0, 0, 10, 20), 90, (1920, 1080));
+        let (a, b) = (rotate_point(Pos2::new(r.x as f32, r.y as f32), 90, size), rotate_point(Pos2::new((r.x + r.w) as f32, (r.y + r.h) as f32), 90, size));
+        let back = Rect::from_two_pos(a, b);
+        assert_eq!((back.min, back.max), (Pos2::new(0.0, 0.0), Pos2::new(10.0, 20.0)));
     }
 }

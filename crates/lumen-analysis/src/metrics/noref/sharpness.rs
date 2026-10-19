@@ -21,6 +21,7 @@ static LAPLACIAN: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::HigherIsBetter,
+    headline: &["var"],
     description: "Variance of the 3x3 Laplacian of luma (8-bit levels squared), with a tile map",
 };
 
@@ -62,6 +63,7 @@ static TENENGRAD: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::HigherIsBetter,
+    headline: &["mean_g2"],
     description: "Mean squared Sobel gradient magnitude above the threshold (8-bit levels squared), with a tile map",
 };
 

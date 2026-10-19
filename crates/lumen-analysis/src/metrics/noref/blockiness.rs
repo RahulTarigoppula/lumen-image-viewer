@@ -68,6 +68,7 @@ static BLOCKINESS: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::LowerIsBetter,
+    headline: &["score"],
     description: "8x8 block boundary to interior gradient ratio with grid offset search, with a tile map",
 };
 
@@ -154,7 +155,7 @@ impl Metric for Blockiness {
         if o.want_map {
             let data = tiles.iter().map(|t| score(ratio(&t.h, &t.hn, ox), ratio(&t.v, &t.vn, oy)) as f32).collect();
             let t = tile as f32;
-            r.map = Some(Heatmap::new(tw, th, data, "Blockiness").with_unit(Unit::Score).with_range(0.0, 1.0).with_cell(t, t).with_style(Colormap::Magma, false, Pool::Max));
+            r.map = Some(Heatmap::new(tw, th, data, "Blockiness").with_unit(Unit::Score).with_range(0.0, 0.5).with_min_span(0.3).with_cell(t, t).with_style(Colormap::Magma, false, Pool::Max));
         }
         Ok(r)
     }

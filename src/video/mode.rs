@@ -359,6 +359,37 @@ struct Analysis {
     bit_max: f64,
 }
 
+/// `name` cut to `max` characters, keeping its start and its extension.
+fn shorten(name: &str, max: usize) -> String {
+    let n = name.chars().count();
+    if n <= max || max < 8 {
+        return name.to_string();
+    }
+    let tail = 6.min(max / 3);
+    let head: String = name.chars().take(max - tail - 3).collect();
+    let end: String = name.chars().skip(n - tail).collect();
+    format!("{head}...{end}")
+}
+
+/// Parts of the transport bar shown at its width (see `VideoMode::transport_fit`).
+#[derive(Clone, Copy, Debug)]
+struct TransportFit {
+    legend: bool,
+    speed_label: bool,
+    skip_secs: bool,
+    loop_label: bool,
+    volume: bool,
+    first_last: bool,
+    frame_word: bool,
+    duration: bool,
+}
+
+impl Default for TransportFit {
+    fn default() -> Self {
+        TransportFit { legend: true, speed_label: true, skip_secs: true, loop_label: true, volume: true, first_last: true, frame_word: true, duration: true }
+    }
+}
+
 pub struct VideoMode {
     sources: Vec<Source>,
     audio: Option<AudioOut>,
@@ -851,13 +882,31 @@ impl VideoMode {
             if widgets::icon_button(ui, I::ARROW_LEFT, "Back to browser (Esc)", false).clicked() {
                 keep = false;
             }
-            ui.label(RichText::new(format!("{}  Video", I::FILM_STRIP)).font(crate::ui::theme::semibold(15.0)));
+            // In a narrow window (a large UI scale, the Analysis panel open)
+            // the title shrinks, the compare controls move into a menu and
+            // long file names are shortened, so nothing runs under the
+            // buttons on the right.
+            let avail = ui.available_width();
+            let narrow = avail < 900.0;
+            let title = if narrow { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
+            ui.label(RichText::new(title).font(crate::ui::theme::semibold(15.0)));
             widgets::separator_v(ui);
+            let pair = self.sources.len() == 2;
+            // Points: back, title, the four buttons on the right, the A / B labels and name buttons' padding.
+            let fixed = 34.0 + if narrow { 30.0 } else { 80.0 } + 13.0 + 4.0 * 34.0 + 12.0 + 2.0 * 44.0 + if pair { 34.0 } else { 0.0 };
+            let controls = if pair { self.compare_controls_width() } else { 0.0 };
+            let min_names = 2.0 * 12.0 * 7.5;
+            let compact = pair && avail - fixed - min_names < controls;
+            let controls = if compact { 50.0 } else { controls };
+            let name_chars = ((avail - fixed - controls) / 2.0 / 7.5).clamp(8.0, 48.0) as usize;
             for (i, label) in ["A", "B"].iter().enumerate() {
-                let name = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_else(|| if i == 0 { "Open video...".into() } else { "Add B to compare...".into() });
+                let name = self.sources.get(i).map(|s| shorten(&crate::ui::viewer::file_name(&s.path), name_chars));
+                let full = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_default();
+                let name = name.unwrap_or_else(|| if i == 0 { "Open video...".into() } else { "Add B to compare...".into() });
                 let color = if i == 0 { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(90, 190, 255) };
                 ui.label(RichText::new(*label).strong().color(color));
-                let resp = ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text("Choose a file");
+                let tip = if full != name { format!("{full}\nChoose a file") } else { "Choose a file".into() };
+                let resp = ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text(tip);
                 if resp.clicked() {
                     let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                     if let Some(f) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_file() {
@@ -874,41 +923,20 @@ impl VideoMode {
                     self.sources[0].player.send(Cmd::Native(false));
                 }
             }
-            if self.sources.len() == 2 {
+            if pair {
                 widgets::separator_v(ui);
-                for m in CompareMode::ALL {
-                    if widgets::icon_button(ui, m.icon(), &format!("{} ({})", m.label(), m.key()), self.mode == m).clicked() {
-                        self.mode = m;
-                    }
-                }
-                if self.mode == CompareMode::Difference {
-                    ui.label(RichText::new("Gain").color(p.muted).size(12.0));
-                    ui.spacing_mut().slider_width = 90.0;
-                    ui.add(egui::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×"));
-                }
-                widgets::separator_v(ui);
-                ui.label(RichText::new("B offset").color(p.muted).size(12.0));
-                let mut off = self.offset_frames;
-                // Typed values apply on Enter (or when the field loses focus);
-                // Esc goes back to the offset in use. egui reports the lost
-                // focus for two frames and applies the typed text on the second,
-                // after the Esc press is gone, so that change is dropped here.
-                if self.offset_editing && ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.offset_cancel = 2;
-                }
-                let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
-                self.offset_field = Some(r.id);
-                self.offset_editing = ui.memory(|m| m.has_focus(r.id));
-                if self.offset_cancel > 0 {
-                    self.offset_cancel -= 1;
-                } else if r.changed() {
-                    self.set_offset(off);
-                }
-                if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
-                    self.swap();
+                if compact {
+                    let r = ui.menu_button(RichText::new(format!("{}  {}", self.mode.icon(), I::CARET_DOWN)).size(15.0), |ui| {
+                        ui.set_min_width(220.0);
+                        self.compare_controls(ui, &p, true);
+                    });
+                    r.response.on_hover_text(format!("{}: compare mode, B offset", self.mode.label()));
+                } else {
+                    self.compare_controls(ui, &p, false);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::analysis_ui::toolbar_button(ui, core);
                 if widgets::icon_button(ui, I::INFO, "Info & metrics (I)", self.show_info).clicked() {
                     self.show_info = !self.show_info;
                 }
@@ -921,6 +949,73 @@ impl VideoMode {
             });
         });
         keep
+    }
+
+    /// Points the compare controls take in the top bar.
+    fn compare_controls_width(&self) -> f32 {
+        let modes = CompareMode::ALL.len() as f32 * 34.0;
+        let gain = if self.mode == CompareMode::Difference { 190.0 } else { 0.0 };
+        modes + gain + 13.0 + 64.0 + 70.0 + 34.0
+    }
+
+    /// Compare mode buttons, the difference gain and B's offset: in the top
+    /// bar, or listed in its menu (`menu`) when the bar is narrow.
+    fn compare_controls(&mut self, ui: &mut Ui, p: &Palette, menu: bool) {
+        let p = *p;
+        let mut modes = |ui: &mut Ui| {
+            for m in CompareMode::ALL {
+                let tip = format!("{} ({})", m.label(), m.key());
+                let clicked = if menu {
+                    ui.add(egui::Button::new(format!("{}   {}", m.icon(), m.label())).selected(self.mode == m).shortcut_text(m.key())).clicked()
+                } else {
+                    widgets::icon_button(ui, m.icon(), &tip, self.mode == m).clicked()
+                };
+                if clicked {
+                    self.mode = m;
+                }
+            }
+        };
+        if menu {
+            modes(ui);
+            ui.separator();
+        } else {
+            modes(ui);
+        }
+        let mut rest = |ui: &mut Ui| {
+            if self.mode == CompareMode::Difference {
+                ui.label(RichText::new("Gain").color(p.muted).size(12.0));
+                ui.spacing_mut().slider_width = 90.0;
+                ui.add(egui::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×"));
+            }
+            if !menu {
+                widgets::separator_v(ui);
+            }
+            ui.label(RichText::new("B offset").color(p.muted).size(12.0));
+            let mut off = self.offset_frames;
+            // Typed values apply on Enter (or when the field loses focus);
+            // Esc goes back to the offset in use. egui reports the lost
+            // focus for two frames and applies the typed text on the second,
+            // after the Esc press is gone, so that change is dropped here.
+            if self.offset_editing && ui.input(|i| i.key_pressed(Key::Escape)) {
+                self.offset_cancel = 2;
+            }
+            let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
+            self.offset_field = Some(r.id);
+            self.offset_editing = ui.memory(|m| m.has_focus(r.id));
+            if self.offset_cancel > 0 {
+                self.offset_cancel -= 1;
+            } else if r.changed() {
+                self.set_offset(off);
+            }
+            if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
+                self.swap();
+            }
+        };
+        if menu {
+            ui.horizontal(|ui| rest(ui));
+        } else {
+            rest(ui);
+        }
     }
 
     fn set_offset(&mut self, off: i64) {
@@ -1365,11 +1460,12 @@ impl VideoMode {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let fit = self.transport_fit(ui);
             let b = |ui: &mut Ui, icon: &str, tip: &str| widgets::icon_button(ui, icon, tip, false).clicked();
-            if b(ui, I::SKIP_BACK, "First frame (Home)") {
+            if fit.first_last && b(ui, I::SKIP_BACK, "First frame (Home)") {
                 self.seek_all(0.0, true);
             }
-            if b(ui, I::CARET_DOUBLE_LEFT, "Back 1 s (Shift+←)") {
+            if fit.skip_secs && b(ui, I::CARET_DOUBLE_LEFT, "Back 1 s (Shift+←)") {
                 let t = self.sources[0].pts() - 1.0;
                 self.seek_all(t, true);
             }
@@ -1383,42 +1479,41 @@ impl VideoMode {
             if b(ui, I::CARET_RIGHT, "Next frame (. or → while paused)") {
                 self.step(1);
             }
-            if b(ui, I::CARET_DOUBLE_RIGHT, "Forward 1 s (Shift+→)") {
+            if fit.skip_secs && b(ui, I::CARET_DOUBLE_RIGHT, "Forward 1 s (Shift+→)") {
                 let t = self.sources[0].pts() + 1.0;
                 self.seek_all(t, true);
             }
-            if b(ui, I::SKIP_FORWARD, "Last frame (End)") {
+            if fit.first_last && b(ui, I::SKIP_FORWARD, "Last frame (End)") {
                 let n = self.sources[0].frame_count().unwrap_or(1);
                 let t = self.sources[0].pts_of(n.saturating_sub(1));
                 self.seek_all(t, true);
             }
             widgets::separator_v(ui);
             let a = &self.sources[0];
-            let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "...".into());
-            ui.label(RichText::new(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration()))).monospace().color(p.text));
+            let (time, frame) = self.position_text(fit.duration, fit.frame_word);
+            ui.label(RichText::new(time).monospace().color(p.text)).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
             ui.add_space(6.0);
-            let fr = ui.add(egui::Button::new(RichText::new(format!("frame {} / {}", a.frame_of(a.pts()), total)).monospace().size(12.0)).frame(false)).on_hover_text("Go to frame or time (G)");
+            let fr = ui.add(egui::Button::new(RichText::new(frame).monospace().size(12.0)).frame(false)).on_hover_text("Go to frame or time (G)");
             if fr.clicked() {
                 self.goto = Some(String::new());
             }
             widgets::separator_v(ui);
             // A-B loop
-            let lab = match self.loop_ab {
-                (None, _) => "Loop A-B",
-                (Some(_), None) => "Set B",
-                _ => "Clear loop",
-            };
-            if ui.add(egui::Button::new(RichText::new(format!("{} {lab}", I::REPEAT)).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text("Ctrl+L").clicked() {
+            let lab = self.loop_label();
+            let text = if fit.loop_label { format!("{} {lab}", I::REPEAT) } else { I::REPEAT.to_string() };
+            if ui.add(egui::Button::new(RichText::new(text).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
                 self.toggle_loop();
             }
-            widgets::separator_v(ui);
-            ui.add_space(6.0);
-            self.timeline_legend(ui, &p);
+            if fit.legend {
+                widgets::separator_v(ui);
+                ui.add_space(6.0);
+                self.timeline_legend(ui, &p);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Volume
                 ui.spacing_mut().slider_width = 90.0;
                 if self.audio.is_some() && self.sources[0].info.has_audio {
-                    if ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).show_value(false)).changed() {
+                    if fit.volume && ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).show_value(false)).changed() {
                         if let Some(a) = self.audio_shared() {
                             a.set_volume(self.volume);
                         }
@@ -1427,8 +1522,10 @@ impl VideoMode {
                     if widgets::icon_button(ui, vi, "Mute (M)", self.muted).clicked() {
                         self.toggle_mute();
                     }
-                } else {
+                } else if fit.volume {
                     ui.label(RichText::new(format!("{} no audio", I::SPEAKER_SLASH)).size(11.5).color(p.faint));
+                } else {
+                    ui.label(RichText::new(I::SPEAKER_SLASH).size(11.5).color(p.faint)).on_hover_text("No audio");
                 }
                 widgets::separator_v(ui);
                 egui::ComboBox::from_id_salt("speed").width(70.0).selected_text(format!("{}×", self.speed)).show_ui(ui, |ui| {
@@ -1438,9 +1535,82 @@ impl VideoMode {
                         }
                     }
                 });
-                ui.label(RichText::new("Speed").size(12.0).color(p.muted));
+                if fit.speed_label {
+                    ui.label(RichText::new("Speed").size(12.0).color(p.muted));
+                }
             });
         });
+    }
+
+    fn loop_label(&self) -> &'static str {
+        match self.loop_ab {
+            (None, _) => "Loop A-B",
+            (Some(_), None) => "Set B",
+            _ => "Clear loop",
+        }
+    }
+
+    /// The time and frame counter of the transport bar (`duration`: with
+    /// the total time, `word`: "frame 12 / 300" rather than "12 / 300").
+    fn position_text(&self, duration: bool, word: bool) -> (String, String) {
+        let a = &self.sources[0];
+        let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "...".into());
+        let time = if duration { format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())) } else { fmt_time(a.pts()) };
+        let frame = format!("{}{} / {total}", if word { "frame " } else { "" }, a.frame_of(a.pts()));
+        (time, frame)
+    }
+
+    /// What fits in the transport bar: at a large UI scale with the
+    /// Analysis panel open the legend, labels and the less used buttons go
+    /// first (Prev / Play / Next, the counters and Speed always stay).
+    fn transport_fit(&self, ui: &Ui) -> TransportFit {
+        let avail = ui.available_width();
+        let s = ui.spacing().item_spacing.x;
+        let pad = ui.spacing().button_padding.x * 2.0;
+        let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_string(), f, Color32::WHITE).size().x;
+        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+        let small = FontId::proportional(12.0);
+        let icon = 30.0 + s;
+        let sep = 9.0 + s;
+        let audio = self.audio.is_some() && self.sources[0].info.has_audio;
+        let width = |f: &TransportFit| -> f32 {
+            let (time, frame) = self.position_text(f.duration, f.frame_word);
+            let mut w = 2.0 * icon + 34.0 + s + sep;
+            w += if f.first_last { 2.0 * icon } else { 0.0 } + if f.skip_secs { 2.0 * icon } else { 0.0 };
+            w += text_w(&time, mono.clone()) + s + 6.0 + text_w(&frame, FontId::monospace(12.0)) + pad + s + sep;
+            w += if f.loop_label { text_w(&format!("{} {}", I::REPEAT, self.loop_label()), small.clone()) } else { text_w(I::REPEAT, small.clone()) } + pad + s;
+            if f.legend {
+                let psnr = if self.analysis.is_some() { 23.0 + text_w("PSNR-Y (20-60 dB)", FontId::proportional(11.0)) } else { 0.0 };
+                w += sep + 6.0 + 3.0 * (19.0 + text_w("B", FontId::proportional(11.0))) + psnr;
+            }
+            // Right: volume or "no audio", speed.
+            w += match (audio, f.volume) {
+                (true, true) => 90.0 + s + icon,
+                (true, false) => icon,
+                (false, true) => text_w(&format!("{} no audio", I::SPEAKER_SLASH), FontId::proportional(11.5)) + s,
+                (false, false) => 16.0 + s,
+            };
+            w += sep + 70.0 + pad + s + if f.speed_label { text_w("Speed", small.clone()) + s } else { 0.0 };
+            // Room between the left and right groups.
+            w + 12.0
+        };
+        let mut f = TransportFit::default();
+        for step in 0..8 {
+            if width(&f) <= avail {
+                break;
+            }
+            match step {
+                0 => f.legend = false,
+                1 => f.speed_label = false,
+                2 => f.skip_secs = false,
+                3 => f.loop_label = false,
+                4 => f.volume = false,
+                5 => f.first_last = false,
+                6 => f.frame_word = false,
+                _ => f.duration = false,
+            }
+        }
+        f
     }
 
     fn set_speed(&mut self, s: f64) {
@@ -1918,7 +2088,9 @@ impl VideoMode {
                 Key::D if compare => self.mode = CompareMode::Difference,
                 Key::O if compare => self.mode = CompareMode::Overlay,
                 Key::C if compare => self.mode = CompareMode::Checker,
-                Key::Tab if compare => {
+                // Tab out of a text field (the Metrics tab's range) moves the
+                // keyboard focus; it is not the flicker key then.
+                Key::Tab if compare && !self.was_editing && ctx.memory(|m| m.focused().is_none()) => {
                     if self.mode != CompareMode::Flicker {
                         self.mode = CompareMode::Flicker;
                     }
@@ -2305,6 +2477,14 @@ fn _yuv(_: &YuvFrame) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_names_keep_start_and_extension() {
+        assert_eq!(shorten("clip.mp4", 20), "clip.mp4");
+        let s = shorten("a_very_long_recording_name_2026.mp4", 20);
+        assert_eq!(s.chars().count(), 20);
+        assert!(s.starts_with("a_very_long") && s.ends_with("26.mp4"), "{s}");
+    }
+
     #[test]
     fn timeline_heights_ignore_lone_iframes() {
         // A long film: 10 frames per column, one big keyframe in every column.

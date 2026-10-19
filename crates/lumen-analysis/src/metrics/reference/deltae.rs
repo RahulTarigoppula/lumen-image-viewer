@@ -73,7 +73,7 @@ fn finish(info: &'static MetricInfo, s: Summary, map: Option<Vec<f32>>, w: usize
     r.push("p95", s.percentile(95.0), Unit::DeltaE, d);
     r.push("max", s.max as f64, Unit::DeltaE, d);
     r.push("above_jnd_pct", 100.0 * (1.0 - s.fraction_between(0.0, 2.3)), Unit::Percent, d);
-    r.map = map.map(|m| Heatmap::new(w, h, m, label).with_unit(Unit::DeltaE).with_range(0.0, 10.0).with_style(Colormap::Magma, false, Pool::Max));
+    r.map = map.map(|m| Heatmap::new(w, h, m, label).with_unit(Unit::DeltaE).with_range(0.0, 10.0).with_min_span(5.0).with_style(Colormap::Magma, false, Pool::Max));
     r
 }
 
@@ -93,6 +93,7 @@ macro_rules! delta_e_metric {
             heavy: false,
             has_map: true,
             direction: Direction::LowerIsBetter,
+            headline: &["mean"],
             description: $desc,
         };
 

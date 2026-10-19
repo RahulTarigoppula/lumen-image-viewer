@@ -55,6 +55,16 @@ fn clip_plane<T: Copy + PartialOrd + Sync>(p: &Plane<'_, T>, lo: T, hi: T) -> (u
         .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
+/// The clipping values: the headline `clip_pct`, the worse of crushed
+/// shadows and blown highlights (either one alone is an exposure problem),
+/// then each side.
+fn push_clip(r: &mut MetricResult, lo: f64, hi: f64) {
+    let lower = Direction::LowerIsBetter;
+    r.push("clip_pct", lo.max(hi), Unit::Percent, lower);
+    r.push("clip_lo_pct", lo, Unit::Percent, lower);
+    r.push("clip_hi_pct", hi, Unit::Percent, lower);
+}
+
 /// `exposure`
 pub struct Exposure;
 
@@ -62,14 +72,15 @@ static EXPOSURE: MetricInfo = MetricInfo {
     id: "exposure",
     name: "Exposure",
     kind: MetricKind::NoReference,
-    version: 1,
+    version: 2,
     inputs: &[InputKind::Lab, InputKind::NativePlanes],
     min_size: (1, 1),
     cost_ms_4k: 4.0,
     heavy: false,
     has_map: false,
-    direction: Direction::Neutral,
-    description: "Clipping, L* statistics, dynamic range in stops and an 11-zone histogram",
+    direction: Direction::LowerIsBetter,
+    headline: &["clip_pct"],
+    description: "Clipping (worst of shadows and highlights first), L* statistics, dynamic range in stops and an 11-zone histogram",
 };
 
 impl Metric for Exposure {
@@ -94,8 +105,7 @@ impl Metric for Exposure {
                     RgbData::U16(d) => clip_any(d, v.stride, v.width, v.height, v.channels, 0u16, 65535u16),
                     RgbData::F32(d) => clip_any(d, v.stride, v.width, v.height, v.channels, 0f32, 1f32),
                 };
-                r.push("clip_lo_pct", pct(c[6]), Unit::Percent, lower);
-                r.push("clip_hi_pct", pct(c[7]), Unit::Percent, lower);
+                push_clip(&mut r, pct(c[6]), pct(c[7]));
                 for (k, ch) in ["r", "g", "b"].iter().enumerate() {
                     r.push(format!("clip_lo_{ch}_pct"), pct(c[k]), Unit::Percent, lower);
                     r.push(format!("clip_hi_{ch}_pct"), pct(c[3 + k]), Unit::Percent, lower);
@@ -111,8 +121,7 @@ impl Metric for Exposure {
                     PlaneView::U8(p) => clip_plane(&p, lo as u8, hi.min(255) as u8),
                     PlaneView::U16(p) => clip_plane(&p, lo as u16, hi.min(65535) as u16),
                 };
-                r.push("clip_lo_pct", pct(cl), Unit::Percent, lower);
-                r.push("clip_hi_pct", pct(ch), Unit::Percent, lower);
+                push_clip(&mut r, pct(cl), pct(ch));
             }
         }
         r.push("l_mean", s.mean, Unit::LStar, neutral);

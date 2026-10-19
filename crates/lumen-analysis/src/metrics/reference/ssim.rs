@@ -253,6 +253,7 @@ static SSIM_FAST: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::HigherIsBetter,
+    headline: &["y"],
     description: "FFmpeg/x264-compatible SSIM: 8x8 windows at stride 4",
 };
 
@@ -526,6 +527,7 @@ static SSIM_GAUSS: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::HigherIsBetter,
+    headline: &["y"],
     description: "SSIM with an 11x11 Gaussian window (sigma 1.5) on luma, with an SSIM map",
 };
 
@@ -558,7 +560,8 @@ impl Metric for SsimGauss {
             r.map = Some(
                 Heatmap::new(out.w, out.h, m, "SSIM")
                     .with_unit(Unit::Index)
-                    .with_range(0.5, 1.0)
+                    .with_range(0.7, 1.0)
+                    .with_min_span(0.1)
                     .with_style(Colormap::Magma, true, Pool::Min)
                     .with_origin(RADIUS as f32 * f, RADIUS as f32 * f)
                     .with_cell(f, f),

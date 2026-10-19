@@ -446,3 +446,43 @@ fn perceptual_v2_identity_and_monotonic() {
     let yv = y.view();
     assert!(val(&run("ssimulacra2", &yv, Some(&yv), &o), "score") > 99.9);
 }
+
+#[test]
+fn every_metric_has_a_deliberate_headline() {
+    // A blue-only shift: R and G are identical, so "the first value" (R)
+    // would read 100 dB. The headline must be the average.
+    let c = color_texture(7);
+    let a = rgba_of(&c);
+    let shifted = (c.0.clone(), c.1.clone(), c.2.iter().map(|v| (v + 30.0).min(255.0)).collect());
+    let b = rgba_of(&shifted);
+    let o = MetricOptions::default();
+    let psnr = run("psnr", &a.view(), Some(&b.view()), &o);
+    let head = psnr.main().unwrap();
+    assert_eq!(head.key, "avg");
+    assert!(head.value < 40.0, "{}", head.value);
+    assert_eq!(val(&psnr, "r"), PSNR_CAP_DB);
+    assert_eq!(run("psnr.rgb", &a.view(), Some(&b.view()), &o).main().unwrap().key, "avg");
+    // YUV: luma.
+    let ya = yuv420(W, H, quantize(&c.0), |_, _| (128, 128));
+    let yb = yuv420(W, H, quantize(&c.1), |_, _| (128, 128));
+    assert_eq!(run("psnr", &ya.view(), Some(&yb.view()), &o).main().unwrap().key, "y");
+    // Exposure: the worse of both clipping sides, whichever it is.
+    let bright: Vec<u8> = (0..W * H).map(|i| if i % 4 == 0 { 255 } else { 128 }).collect();
+    let r = run("exposure", &gray_rgba(W, H, &bright).view(), None, &o);
+    let head = r.main().unwrap();
+    assert_eq!(head.key, "clip_pct");
+    assert!((head.value - 25.0).abs() < 1e-9 && val(&r, "clip_lo_pct") == 0.0);
+    // Every registered metric names a headline its results contain.
+    for m in metrics::all() {
+        let i = m.info();
+        assert!(!i.headline.is_empty(), "{} has no headline", i.id);
+        let bv = b.view();
+        let r = run(i.id, &a.view(), (i.kind == metrics::MetricKind::FullReference).then_some(&bv), &o);
+        let k = r.main().unwrap_or_else(|| panic!("{} has no values", i.id)).key.clone();
+        assert!(i.headline.contains(&k.as_str()), "{}: headline {k} not declared", i.id);
+        assert_eq!(metrics::headline_key(i.id, r.values.iter().map(|v| v.key.as_str())), Some(k.as_str()));
+    }
+    for t in metrics::temporal::all() {
+        assert!(!t.headline.is_empty(), "{} has no headline", t.id);
+    }
+}

@@ -75,8 +75,8 @@ pub fn image_pair(a: &Arc<RgbaImage>, b: Option<&Arc<RgbaImage>>) -> Option<Fram
 pub fn image_spec(metrics: Vec<String>, roi: Option<Roi>, file_a: Option<&Path>, file_b: Option<&Path>, rescaled: bool, source_bits: u8) -> ImageSpec {
     let scope = Scope {
         kind: ScopeKind::Image,
-        file_a: file_a.map(|p| p.display().to_string()),
-        file_b: file_b.map(|p| p.display().to_string()),
+        file_a: file_a.map(crate::analysis_ui::metrics_view::path_text),
+        file_b: file_b.map(crate::analysis_ui::metrics_view::path_text),
         rescaled,
         measured_on: (source_bits > 8).then(|| "8-bit display data".to_string()),
         ..Default::default()
@@ -209,8 +209,8 @@ mod video {
     pub fn submit_video_frame(analyzer: &Analyzer, a: NativeFrame, b: Option<NativeFrame>, idx: usize, metrics: Vec<String>, roi: Option<Roi>, file_a: &Path, file_b: Option<&Path>) -> JobHandle {
         let scope = Scope {
             kind: ScopeKind::VideoFrame,
-            file_a: Some(file_a.display().to_string()),
-            file_b: file_b.map(|p| p.display().to_string()),
+            file_a: Some(crate::analysis_ui::metrics_view::path_text(file_a)),
+            file_b: file_b.map(crate::analysis_ui::metrics_view::path_text),
             frames: Some(lumen_analysis::FrameRange { start: idx as u64, end: idx as u64 + 1, stride: 1 }),
             ..Default::default()
         };
@@ -289,8 +289,8 @@ mod video {
         let r = req.range;
         let scope = Scope {
             kind: ScopeKind::VideoRange,
-            file_a: Some(req.a.path.display().to_string()),
-            file_b: req.b.as_ref().map(|b| b.path.display().to_string()),
+            file_a: Some(crate::analysis_ui::metrics_view::path_text(&req.a.path)),
+            file_b: req.b.as_ref().map(|b| crate::analysis_ui::metrics_view::path_text(&b.path)),
             frames: Some(lumen_analysis::FrameRange {
                 start: r.start as u64,
                 end: r.end.or(req.frames_a).unwrap_or(r.start) as u64,
@@ -446,12 +446,39 @@ mod video {
         FrameRange { start, stride, ..r }
     }
 
-    /// A frame thumbnail strip: A, and B beside it when comparing.
-    pub fn frame_pair_thumb(a: &VideoSide, b: Option<&VideoSide>, offset: i64, idx: usize, height: u32) -> Result<RgbaImage> {
-        let ta = crate::imaging::resize_to_fit(&engine::frame_at(&a.path, a.pts_of(idx))?, height * 4, height);
+    /// The region a range was measured on, as fractions (x0, y0, x1, y1) of
+    /// the picture as displayed and of the native (unrotated) frame.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct ThumbRegion {
+        pub display: [f32; 4],
+        pub native: [f32; 4],
+        /// The stream is shown turned by 90 or 270 degrees.
+        pub turned: bool,
+        /// Its native frame is wider than tall.
+        pub native_landscape: bool,
+    }
+
+    /// `img` cut to `r` (frames come out of the decoder as displayed or
+    /// native; a turned stream's native frame is the other way round).
+    fn crop_region(img: RgbaImage, r: Option<&ThumbRegion>) -> RgbaImage {
+        let Some(r) = r else { return img };
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let f = if r.turned && (w > h) == r.native_landscape { r.native } else { r.display };
+        let (x0, y0) = ((f[0] * w) as u32, (f[1] * h) as u32);
+        let (x1, y1) = (((f[2] * w).ceil() as u32).min(img.width()), ((f[3] * h).ceil() as u32).min(img.height()));
+        if x1 <= x0 || y1 <= y0 {
+            return img;
+        }
+        image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image()
+    }
+
+    /// A frame thumbnail strip: A, and B beside it when comparing, cut to
+    /// the region measured.
+    pub fn frame_pair_thumb(a: &VideoSide, b: Option<&VideoSide>, offset: i64, idx: usize, height: u32, region: Option<&ThumbRegion>) -> Result<RgbaImage> {
+        let ta = crate::imaging::resize_to_fit(&crop_region(engine::frame_at(&a.path, a.pts_of(idx))?, region), height * 4, height);
         let Some(b) = b else { return Ok(ta) };
         let ib = (idx as i64 + offset).max(0) as usize;
-        let tb = crate::imaging::resize_to_fit(&engine::frame_at(&b.path, b.pts_of(ib))?, height * 4, height);
+        let tb = crate::imaging::resize_to_fit(&crop_region(engine::frame_at(&b.path, b.pts_of(ib))?, region), height * 4, height);
         let gap = 2;
         let mut out = RgbaImage::from_pixel(ta.width() + gap + tb.width(), ta.height().max(tb.height()), image::Rgba([0, 0, 0, 0]));
         image::imageops::overlay(&mut out, &ta, 0, 0);
@@ -464,20 +491,21 @@ mod video {
         a: VideoSide,
         b: Option<VideoSide>,
         offset: i64,
+        region: Option<ThumbRegion>,
         tex: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
         tx: crossbeam_channel::Sender<(u64, Option<RgbaImage>)>,
         rx: crossbeam_channel::Receiver<(u64, Option<RgbaImage>)>,
     }
 
     impl VideoThumbs {
-        pub fn new(a: VideoSide, b: Option<VideoSide>, offset: i64) -> VideoThumbs {
+        pub fn new(a: VideoSide, b: Option<VideoSide>, offset: i64, region: Option<ThumbRegion>) -> VideoThumbs {
             let (tx, rx) = crossbeam_channel::unbounded();
-            VideoThumbs { a, b, offset, tex: Default::default(), tx, rx }
+            VideoThumbs { a, b, offset, region, tex: Default::default(), tx, rx }
         }
 
-        /// Whether these thumbnails show `a` and `b` at `offset`.
-        pub fn shows(&self, a: &Path, b: Option<&Path>, offset: i64) -> bool {
-            self.a.path == a && self.b.as_ref().map(|b| b.path.as_path()) == b && self.offset == offset
+        /// Whether these thumbnails show `a` and `b` at `offset`, cut to `region`.
+        pub fn shows(&self, a: &Path, b: Option<&Path>, offset: i64, region: Option<ThumbRegion>) -> bool {
+            self.a.path == a && self.b.as_ref().map(|b| b.path.as_path()) == b && self.offset == offset && self.region == region
         }
     }
 
@@ -492,9 +520,9 @@ mod video {
                 Some(None) => None,
                 None => {
                     self.tex.insert(idx, None);
-                    let (a, b, offset, tx, ctx) = (self.a.clone(), self.b.clone(), self.offset, self.tx.clone(), ctx.clone());
+                    let (a, b, offset, region, tx, ctx) = (self.a.clone(), self.b.clone(), self.offset, self.region, self.tx.clone(), ctx.clone());
                     std::thread::spawn(move || {
-                        let img = frame_pair_thumb(&a, b.as_ref(), offset, idx as usize, 80).ok();
+                        let img = frame_pair_thumb(&a, b.as_ref(), offset, idx as usize, 80, region.as_ref()).ok();
                         let _ = tx.send((idx, img));
                         ctx.request_repaint();
                     });

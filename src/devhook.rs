@@ -6,6 +6,8 @@
 //!   open <path>          open a file or folder
 //!   state                append the app state to state.txt
 //!   ai <args>            drive the Analysis panel's AI tab (see `analysis_ui::dev`)
+//!   key <shortcut>       press a key as the window would get it, e.g. `key Ctrl+Q`
+//!   click <x> <y> [right]  click at window point (x, y) (points, not pixels)
 //! and writes `done.txt` when the batch has been processed.
 
 use std::path::PathBuf;
@@ -24,7 +26,16 @@ pub fn prof(name: &'static str, start: Instant) {
     }
 }
 
-static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// Record a measured duration in milliseconds (no-op unless benchmarking).
+pub fn prof_ms(name: &'static str, ms: f64) {
+    if BENCH_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(mut v) = PROF.lock() {
+            v.push((name, ms));
+        }
+    }
+}
+
+static PROCESS_START:std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static MARKS: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Record a startup milestone (ms since process start). Cheap; always on.
@@ -68,6 +79,10 @@ pub enum DevAction {
     /// `ai ...` lines for the Analysis panel.
     Analysis(String),
     Open(PathBuf),
+    /// `key Ctrl+Q`: a key press injected into this frame's input.
+    Key(String),
+    /// `click x y [right]`: pointer press (`true`) or release at a point.
+    Pointer { pos: egui::Pos2, secondary: bool, pressed: bool },
     State,
 }
 
@@ -90,10 +105,13 @@ impl DevHook {
                 names.dedup();
                 let mut out = String::from("bench:");
                 for n in names {
-                    let xs: Vec<f64> = v.iter().filter(|(m, _)| *m == n).map(|(_, t)| *t).collect();
+                    let mut xs: Vec<f64> = v.iter().filter(|(m, _)| *m == n).map(|(_, t)| *t).collect();
+                    xs.sort_by(f64::total_cmp);
                     let avg = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
-                    let max = xs.iter().cloned().fold(0.0, f64::max);
-                    out += &format!(" {n}=avg {avg:.2}ms max {max:.2}ms;");
+                    let max = xs.last().copied().unwrap_or(0.0);
+                    let p95 = xs.get(xs.len() * 95 / 100).copied().unwrap_or(max);
+                    let over = xs.iter().filter(|t| **t > 16.0).count();
+                    out += &format!(" {n}=avg {avg:.2}ms p95 {p95:.2}ms max {max:.2}ms over16 {over}/{};", xs.len());
                 }
                 self.write_state(&out);
             } else {
@@ -148,6 +166,24 @@ impl DevHook {
                 "run" => out.push(DevAction::Run(arg.to_string())),
                 "open" => out.push(DevAction::Open(PathBuf::from(arg))),
                 "state" => out.push(DevAction::State),
+                "key" => {
+                    out.push(DevAction::Key(arg.to_string()));
+                    // One key per frame, like a person typing.
+                    break;
+                }
+                "click" | "__release" => {
+                    let v: Vec<&str> = arg.split_whitespace().collect();
+                    let num = |i: usize| v.get(i).and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.0);
+                    let pos = egui::Pos2::new(num(0), num(1));
+                    let secondary = v.get(2) == Some(&"right");
+                    let pressed = verb == "click";
+                    out.push(DevAction::Pointer { pos, secondary, pressed });
+                    if pressed {
+                        // Release on the next frame, as a real click does.
+                        self.queue.insert(0, format!("__release {arg}"));
+                    }
+                    break;
+                }
                 "ai" => out.push(DevAction::Analysis(arg.to_string())),
                 "bench" => {
                     self.bench_left = arg.parse().unwrap_or(60);

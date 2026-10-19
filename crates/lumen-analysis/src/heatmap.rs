@@ -72,7 +72,11 @@ pub enum Pool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RangeMode {
-    /// 1st to 99th percentile of the map (symmetric around 0 for signed maps).
+    /// Maps with an ideal value ([`Heatmap::min_span`] > 0): from the ideal
+    /// end of the fixed range to the 99th percentile (1st for SSIM), at least
+    /// `min_span` wide, so near-identical images read as nearly clean while
+    /// small differences stay visible. Other maps: 1st to 99th percentile.
+    /// Signed maps are symmetric around 0.
     #[default]
     Auto,
     /// The metric's default range ([`Heatmap::fixed_range`]).
@@ -104,8 +108,12 @@ pub struct Heatmap {
     pub data: Vec<f32>,
     pub label: String,
     pub unit: Option<Unit>,
-    /// Metric-specific default range (e.g. Delta-E 0..10, SSIM 0.5..1).
+    /// Metric-specific default range (e.g. Delta-E 0..10, SSIM 0.7..1).
     pub fixed_range: (f32, f32),
+    /// Smallest span of the auto range, anchored at the ideal end of
+    /// `fixed_range` (0: no ideal value, plain percentiles).
+    #[serde(default)]
+    pub min_span: f32,
     pub colormap: Colormap,
     pub invert: bool,
     pub pool: Pool,
@@ -126,6 +134,7 @@ impl Heatmap {
             label: label.into(),
             unit: None,
             fixed_range: (0.0, 1.0),
+            min_span: 0.0,
             colormap: Colormap::Magma,
             invert: false,
             pool: Pool::Max,
@@ -143,6 +152,13 @@ impl Heatmap {
 
     pub fn with_range(mut self, lo: f32, hi: f32) -> Self {
         self.fixed_range = (lo, hi);
+        self
+    }
+
+    /// Anchors the auto range at the ideal end of the fixed range, at least
+    /// `span` wide (see [`RangeMode::Auto`]).
+    pub fn with_min_span(mut self, span: f32) -> Self {
+        self.min_span = span;
         self
     }
 
@@ -196,14 +212,27 @@ impl Heatmap {
                 if !mn.is_finite() {
                     return self.fixed_range;
                 }
-                if mx <= mn {
+                if mx <= mn && self.min_span <= 0.0 && self.pool != Pool::MaxAbs {
                     return (mn, mn + 1e-6);
                 }
                 let s = stats::summarize(&self.data, mn, mx, 4096);
                 let (lo, hi) = (s.percentile(1.0) as f32, s.percentile(99.0) as f32);
+                let span = self.min_span;
                 if self.pool == Pool::MaxAbs {
-                    let m = lo.abs().max(hi.abs()).max(1e-6);
+                    let m = lo.abs().max(hi.abs()).max(span).max(1e-6);
                     (-m, m)
+                } else if span > 0.0 {
+                    // Anchored at the ideal value: 0 for errors, the top for SSIM.
+                    match self.pool {
+                        Pool::Min => {
+                            let top = self.fixed_range.1;
+                            (lo.min(top - span), top)
+                        }
+                        _ => {
+                            let bottom = self.fixed_range.0;
+                            (bottom, hi.max(bottom + span))
+                        }
+                    }
                 } else if hi > lo {
                     (lo, hi)
                 } else {
@@ -287,6 +316,7 @@ impl Heatmap {
             label: self.label.clone(),
             unit: self.unit,
             fixed_range: self.fixed_range,
+            min_span: self.min_span,
             colormap: self.colormap,
             invert: self.invert,
             pool: self.pool,
@@ -373,5 +403,27 @@ mod tests {
         let (lo, hi) = signed.range(RangeMode::Auto);
         assert!(lo < 0.0 && (lo + hi).abs() < 1e-6);
         assert_eq!(Colormap::Magma.lut()[0], [0, 0, 4, 255]);
+    }
+
+    #[test]
+    fn auto_range_is_anchored_at_the_ideal_value() {
+        // Near-identical SSIM: 0.999 everywhere but one pixel. The range keeps
+        // its minimum span, so the map reads as nearly clean, not saturated.
+        let mut v = vec![0.999f32; 1000];
+        v[0] = 0.99;
+        let ssim = Heatmap::new(1000, 1, v, "s").with_range(0.7, 1.0).with_min_span(0.1).with_style(Colormap::Magma, true, Pool::Min);
+        let (lo, hi) = ssim.range(RangeMode::Auto);
+        assert!((lo - 0.9).abs() < 1e-6 && hi == 1.0, "{lo} {hi}");
+        // A really bad map stretches to its data.
+        let bad = Heatmap::new(4, 1, vec![0.2, 0.5, 0.8, 1.0], "s").with_range(0.7, 1.0).with_min_span(0.1).with_style(Colormap::Magma, true, Pool::Min);
+        let (lo, hi) = bad.range(RangeMode::Auto);
+        assert!(lo < 0.3 && hi == 1.0);
+        // Identical images: all zero difference stays at the clean end.
+        let same = Heatmap::new(4, 1, vec![0.0; 4], "d").with_range(0.0, 64.0).with_min_span(16.0);
+        assert_eq!(same.range(RangeMode::Auto), (0.0, 16.0));
+        assert_eq!(&same.colorize(&same.default_options())[0..3], &Colormap::Magma.lut()[0][0..3]);
+        let big = Heatmap::new(3, 1, vec![0.0, 10.0, 50.0], "d").with_range(0.0, 64.0).with_min_span(16.0);
+        assert_eq!(big.range(RangeMode::Auto).0, 0.0);
+        assert!(big.range(RangeMode::Auto).1 > 40.0);
     }
 }

@@ -20,7 +20,7 @@ use egui::{CursorIcon, Painter, RichText, Sense, Ui, Vec2};
 use image::RgbaImage;
 use lumen_analysis::cache::{CacheKey, DiskCache, DEFAULT_MAX_BYTES};
 use lumen_analysis::metrics::{self, Direction, MetricKind, Unit};
-use lumen_analysis::{AnalysisReport, Analyzer, JobEvent, JobHandle, MetricResult, Roi, ScopeKind};
+use lumen_analysis::{AnalysisReport, Analyzer, Heatmap, JobEvent, JobHandle, MetricResult, Roi, ScopeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -99,7 +99,7 @@ pub fn threshold(key: &str) -> Option<Threshold> {
         ("butteraugli", "score") => Threshold::lo(1.0, 2.0),
         ("flip", "mean") => Threshold::lo(0.05, 0.15),
         ("noise", "y") => Threshold::lo(2.0, 5.0),
-        ("exposure", "clip_lo_pct" | "clip_hi_pct") => Threshold::lo(0.5, 2.0),
+        ("exposure", "clip_pct" | "clip_lo_pct" | "clip_hi_pct") => Threshold::lo(0.5, 2.0),
         ("color_cast", "delta_e") => Threshold::lo(2.0, 5.0),
         ("blockiness", "score") => Threshold::lo(0.1, 0.3),
         ("banding", "score") => Threshold::lo(1.0, 5.0),
@@ -399,7 +399,9 @@ struct HistoryEntry {
 
 const HISTORY_MAX: usize = 30;
 /// Frames in flight of a range job (decoded A and B plus derived images).
-const RANGE_MEMORY_BUDGET: u64 = 1 << 30;
+/// The decoders hold their own frames on top (HEVC frame threads: several
+/// hundred MB for 4K 10-bit), so this stays well below a GB.
+const RANGE_MEMORY_BUDGET: u64 = 384 << 20;
 
 fn parse_key(hex: &str) -> Option<CacheKey> {
     if hex.len() != 64 {
@@ -464,12 +466,135 @@ fn ui_decimals(u: Unit) -> usize {
     }
 }
 
+/// Unit text in the panel (the CSV keeps `Unit::label`).
+pub fn unit_text(u: Unit) -> &'static str {
+    match u {
+        Unit::CodeSq => "sq. code",
+        Unit::Levels8Sq => "sq. levels",
+        Unit::DeltaE => "dE",
+        u => u.label(),
+    }
+}
+
+/// A human name for value `key` (relative, `"mse_avg"`) of metric `id`.
+pub fn key_label(id: &str, key: &str) -> String {
+    if let Some(k) = key.strip_suffix("_b") {
+        return format!("B: {}", key_label(id, k));
+    }
+    let plane = |p: &str| match p {
+        "y" => "Y",
+        "u" => "U",
+        "v" => "V",
+        "r" => "R",
+        "g" => "G",
+        "b" => "B",
+        "avg" => "average",
+        other => other,
+    }
+    .to_string();
+    let fixed = match (id, key) {
+        ("color_cast", "a") => "a* (green-red)",
+        ("color_cast", "b") => "b* (blue-yellow)",
+        ("color_cast", "delta_e") => "Cast strength",
+        ("color_cast", "hue") => "Hue",
+        ("color_cast", "neutral_pct") => "Near-neutral pixels",
+        (_, "y" | "u" | "v" | "r" | "g" | "b") if id.starts_with("psnr") || id.starts_with("ssim") || id == "ms_ssim" || id == "noise" => return plane(key),
+        (_, "cb") => "Cb",
+        (_, "cr") => "Cr",
+        (_, "avg") => "Average",
+        (_, "all") => "All planes",
+        (_, "global") => "Global (MSE of all frames)",
+        (_, "y_db") => "Y in dB",
+        (_, "db") => "In dB",
+        (_, "cs") => "Contrast-structure",
+        (_, "ssim5") => "SSIM at scale 5",
+        (_, "mean") => "Mean",
+        (_, "median") => "Median",
+        (_, "p95") => "95th percentile",
+        (_, "p99") => "99th percentile",
+        (_, "max") => "Maximum",
+        (_, "min") => "Minimum",
+        (_, "std") => "Standard deviation",
+        (_, "above_jnd_pct") => "Above 2.3 (visible)",
+        (_, "changed_pct") => "Pixels changed",
+        (_, "score") => "Score",
+        (_, "pnorm3") => "3-norm",
+        (_, "var") => "Variance",
+        (_, "mean_g2") => "Mean gradient energy",
+        (_, "edge_pct") => "Edge pixels",
+        (_, "clip_pct") => "Clipped (worse side)",
+        (_, "clip_lo_pct") => "Clipped shadows",
+        (_, "clip_hi_pct") => "Clipped highlights",
+        (_, "l_mean") => "L* mean",
+        (_, "l_median") => "L* median",
+        (_, "dr_stops") => "Dynamic range (stops)",
+        (_, "ratio_h") => "Horizontal edge ratio",
+        (_, "ratio_v") => "Vertical edge ratio",
+        (_, "offset_x") => "Grid offset x",
+        (_, "offset_y") => "Grid offset y",
+        (_, "smooth_pct") => "Smooth area",
+        (_, "contour_pct") => "Contour pixels",
+        (_, "flicker") => "Mean change",
+        (_, "flicker_max") => "Largest change",
+        (_, "delta") => "Luma change",
+        (_, "mean_luma") => "Mean luma",
+        (_, "duplicate") => "Duplicate",
+        (_, "duplicates") => "Duplicate frames",
+        (_, "duplicate_pct") => "Duplicate share",
+        (_, "longest_freeze") => "Longest freeze (frames)",
+        (_, "mad") => "Mean abs difference",
+        (_, "run") => "Freeze run",
+        (_, "cut") => "Cut",
+        (_, "cuts") => "Scene cuts",
+        (_, "score_max") => "Largest score",
+        _ => "",
+    };
+    if !fixed.is_empty() {
+        return fixed.to_string();
+    }
+    if let Some(p) = key.strip_prefix("mse_") {
+        return format!("MSE {}", plane(p));
+    }
+    if let Some(p) = key.strip_prefix("maxabs_") {
+        return format!("Max abs error {}", plane(p));
+    }
+    if let Some(n) = key.strip_prefix("cs") {
+        return format!("Contrast-structure, scale {n}");
+    }
+    if let Some(c) = key.strip_prefix("clip_lo_").and_then(|k| k.strip_suffix("_pct")) {
+        return format!("Clipped shadows {}", plane(c));
+    }
+    if let Some(c) = key.strip_prefix("clip_hi_").and_then(|k| k.strip_suffix("_pct")) {
+        return format!("Clipped highlights {}", plane(c));
+    }
+    if let Some(z) = key.strip_prefix("zone_") {
+        return format!("Zone {z}");
+    }
+    if let Some(p) = key.strip_prefix("l_p") {
+        return format!("L* {}th percentile", p.replace('_', "."));
+    }
+    let mut t = key.replace('_', " ");
+    if let Some(c) = t.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    t
+}
+
 pub fn fmt_value(v: f64, u: Unit) -> String {
+    // dB values are capped for identical inputs (the CSV keeps the 100).
+    if u == Unit::Db && v >= lumen_analysis::PSNR_CAP_DB {
+        return "Identical".into();
+    }
     let d = ui_decimals(u);
-    match u.label() {
+    match unit_text(u) {
         "" => format!("{v:.d$}"),
         l => format!("{v:.d$} {l}"),
     }
+}
+
+/// A path as Windows writes it (paths typed or dropped can mix separators).
+pub fn path_text(p: &Path) -> String {
+    p.display().to_string().replace('/', "\\")
 }
 
 /// Rough duration text for cost hints.
@@ -516,6 +641,22 @@ struct Row {
     has_map: bool,
 }
 
+/// Puts the metric's headline cell first (see `metrics::headline_key`:
+/// PSNR's is the average, not R), the others keep their order.
+fn headline_first(id: &str, cells: &mut Vec<Cell>) {
+    let keys: Vec<String> = cells.iter().map(|c| short_key(id, &c.key).to_string()).collect();
+    let head = metrics::headline_key(id, keys.iter().map(String::as_str)).and_then(|h| keys.iter().position(|k| k == h));
+    if let Some(i) = head.filter(|&i| i > 0) {
+        let c = cells.remove(i);
+        cells.insert(0, c);
+    }
+}
+
+/// `"avg"` of `"psnr.avg"` for metric `psnr`.
+fn short_key<'k>(id: &str, key: &'k str) -> &'k str {
+    key.strip_prefix(id).and_then(|k| k.strip_prefix('.')).unwrap_or(key)
+}
+
 fn rows_of_live(live: &[MetricResult]) -> Vec<Row> {
     let mut v: Vec<Row> = live
         .iter()
@@ -531,6 +672,9 @@ fn rows_of_live(live: &[MetricResult]) -> Vec<Row> {
             has_map: r.map.is_some(),
         })
         .collect();
+    for row in &mut v {
+        headline_first(&row.id, &mut row.cells);
+    }
     // Registry order, like the final report.
     let order = |id: &str| metrics::all().iter().position(|m| m.id() == id).unwrap_or(usize::MAX);
     v.sort_by_key(|r| order(&r.id));
@@ -542,18 +686,20 @@ fn rows_of_report(r: &AnalysisReport) -> Vec<Row> {
         return r
             .metrics
             .iter()
-            .map(|e| Row {
-                id: e.id.clone(),
-                name: e.name.clone(),
-                cells: e.values.iter().map(|v| Cell { key: v.key.clone(), value: v.value, unit: v.unit, direction: v.direction, tip: None, worst: None }).collect(),
-                preview: false,
-                has_map: e.map.as_ref().is_some_and(|m| !m.data.is_empty()),
+            .map(|e| {
+                let mut cells: Vec<Cell> = e.values.iter().map(|v| Cell { key: v.key.clone(), value: v.value, unit: v.unit, direction: v.direction, tip: None, worst: None }).collect();
+                headline_first(&e.id, &mut cells);
+                Row { id: e.id.clone(), name: e.name.clone(), cells, preview: false, has_map: e.map.as_ref().is_some_and(|m| !m.data.is_empty()) }
             })
             .collect();
     }
     let mut rows: Vec<Row> = Vec::new();
     for s in &r.summary {
         let id = plots::metric_of(&s.key).to_string();
+        // Means of per-frame flags say little: see `temporal_rows`.
+        if id.starts_with("temporal.") {
+            continue;
+        }
         let direction = r.columns.iter().find(|c| c.key == s.key).map(|c| c.direction).unwrap_or(if s.key == "psnr.global" { Direction::HigherIsBetter } else { Direction::Neutral });
         let mut tip = format!("Mean of {} frames", s.count);
         if let (Some(lo), Some(hi)) = (s.min, s.max) {
@@ -571,7 +717,122 @@ fn rows_of_report(r: &AnalysisReport) -> Vec<Row> {
             None => rows.push(Row { name: plots::metric_name(&id), id, cells: vec![cell], preview: false, has_map: false }),
         }
     }
+    for row in &mut rows {
+        headline_first(&row.id, &mut row.cells);
+        // A mean of per-frame PSNR is pulled up by identical (capped) frames;
+        // the PSNR of the mean MSE is not.
+        if let Some(i) = row.cells.iter().position(|c| c.key == "psnr.global") {
+            let c = row.cells.remove(i);
+            row.cells.insert(0, c);
+        }
+    }
+    rows.extend(temporal_rows(r));
     rows
+}
+
+/// Range results of the temporal metrics, aggregated per metric: duplicate
+/// frames and the longest freeze, the number of cuts and their frames, mean
+/// and largest flicker (per stream; B's keys end in `_b`).
+fn temporal_rows(r: &AnalysisReport) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for t in metrics::temporal::all() {
+        let mut cells = Vec::new();
+        for suffix in ["", "_b"] {
+            let col = |k: &str| -> Vec<(u64, f64)> { r.series(&format!("{}.{k}{suffix}", t.id)).into_iter().filter_map(|(i, v)| v.map(|v| (i, v))).collect() };
+            let cell = |k: &str, value: f64, unit: Unit, direction: Direction, tip: String, worst: Option<u64>| Cell { key: format!("{}.{k}{suffix}", t.id), value: Some(value), unit, direction, tip: Some(tip), worst };
+            let mean = |v: &[(u64, f64)]| v.iter().map(|x| x.1).sum::<f64>() / v.len().max(1) as f64;
+            let largest = |v: &[(u64, f64)]| v.iter().copied().fold(None, |m: Option<(u64, f64)>, x| if m.is_none_or(|m| x.1 > m.1) { Some(x) } else { m });
+            match t.id {
+                "temporal.freeze" => {
+                    let dup = col("duplicate");
+                    if dup.is_empty() {
+                        continue;
+                    }
+                    let n = dup.iter().filter(|x| x.1 > 0.5).count();
+                    let pct = 100.0 * n as f64 / dup.len() as f64;
+                    let first = dup.iter().find(|x| x.1 > 0.5).map(|x| x.0);
+                    let tip = format!("{n} of {} frames repeat the previous one ({pct:.1}%)", dup.len());
+                    cells.push(cell("duplicates", n as f64, Unit::Count, Direction::LowerIsBetter, tip.clone(), first));
+                    cells.push(cell("duplicate_pct", pct, Unit::Percent, Direction::LowerIsBetter, tip, first));
+                    // The run counter counts repeats; the freeze shows one frame more.
+                    if let Some((at, run)) = largest(&col("run")).filter(|x| x.1 > 0.0) {
+                        let start = at.saturating_sub(run as u64);
+                        cells.push(cell("longest_freeze", run + 1.0, Unit::Count, Direction::LowerIsBetter, format!("Frames {start}-{at} show the same picture (click to show)"), Some(start)));
+                    }
+                    let mad = col("mad");
+                    if !mad.is_empty() {
+                        cells.push(cell("mad", mean(&mad), Unit::Levels8, Direction::Neutral, format!("Mean of {} frames", mad.len()), None));
+                    }
+                }
+                "temporal.scene" => {
+                    let cut = col("cut");
+                    if cut.is_empty() {
+                        continue;
+                    }
+                    let at: Vec<u64> = cut.iter().filter(|x| x.1 > 0.5).map(|x| x.0).collect();
+                    let list = at.iter().take(24).map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+                    let tip = match at.len() {
+                        0 => "No cuts".to_string(),
+                        n if n > 24 => format!("At frames {list} and {} more (click: the first)", n - 24),
+                        _ => format!("At frames {list} (click: the first)"),
+                    };
+                    cells.push(cell("cuts", at.len() as f64, Unit::Count, Direction::Neutral, tip, at.first().copied()));
+                    if let Some((f, v)) = largest(&col("score")) {
+                        cells.push(cell("score_max", v, Unit::Score, Direction::Neutral, format!("At frame {f} (click to show)"), Some(f)));
+                    }
+                }
+                _ => {
+                    let fl = col("flicker");
+                    if fl.is_empty() {
+                        continue;
+                    }
+                    cells.push(cell("flicker", mean(&fl), Unit::Levels8, Direction::LowerIsBetter, format!("Mean change of mean luma over {} frames", fl.len()), None));
+                    if let Some((f, v)) = largest(&fl) {
+                        cells.push(cell("flicker_max", v, Unit::Levels8, Direction::LowerIsBetter, format!("At frame {f} (click to show)"), Some(f)));
+                    }
+                    let luma = col("mean_luma");
+                    if !luma.is_empty() {
+                        cells.push(cell("mean_luma", mean(&luma), Unit::Levels8, Direction::Neutral, format!("Mean of {} frames", luma.len()), None));
+                    }
+                }
+            }
+        }
+        if !cells.is_empty() {
+            rows.push(Row { id: t.id.to_string(), name: t.name.to_string(), cells, preview: false, has_map: false });
+        }
+    }
+    rows
+}
+
+/// Analysis pool size: cores - 2, so the UI thread and the GPU driver's
+/// thread keep a core each while a job runs (frames stay under 16 ms).
+fn analysis_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(2).max(1)
+}
+
+/// Frees `v` on another thread: results of a 12 MP job hold several 48 MB
+/// maps, and returning that memory to the system takes milliseconds.
+fn drop_later<T: Send + 'static>(v: T) {
+    let _ = std::thread::Builder::new().name("lumen-free".into()).spawn(move || drop(v));
+}
+
+/// Whether report `r` measured what `s` shows: the same files and, for a
+/// single video frame, the frame on screen (a range covers many frames and
+/// says so in its labels).
+fn report_matches(r: &AnalysisReport, s: &super::Subject) -> bool {
+    let same = |f: &Option<String>, i: &Option<super::SubjectImage>| match (f, i) {
+        (None, None) => true,
+        (Some(f), Some(i)) => f.eq_ignore_ascii_case(&path_text(&i.path)),
+        _ => false,
+    };
+    if !same(&r.scope.file_a, &s.a) || !same(&r.scope.file_b, &s.b) {
+        return false;
+    }
+    match r.scope.kind {
+        ScopeKind::Image => !s.kind.is_video(),
+        ScopeKind::VideoFrame => s.kind.is_video() && r.scope.frames.map(|f| f.start) == s.frame().map(|f| f.index),
+        ScopeKind::VideoRange => s.kind.is_video(),
+    }
 }
 
 // ------------------------------------------------------------------ the tab
@@ -587,6 +848,8 @@ struct Run {
     key: CacheKey,
     history: Option<CacheKey>,
     started: Instant,
+    /// The panel's region when the run started (see `MetricsTab::result_roi`).
+    roi: Option<Roi>,
     #[cfg(feature = "video")]
     decode: Option<Arc<adapters::DecodeInfo>>,
 }
@@ -598,6 +861,8 @@ struct VideoRun {
     a: adapters::VideoSide,
     b: Option<adapters::VideoSide>,
     offset: i64,
+    /// The region measured (thumbnails show it).
+    region: Option<adapters::ThumbRegion>,
 }
 
 pub struct MetricsTab {
@@ -617,6 +882,18 @@ pub struct MetricsTab {
     plot_span: (u64, u64),
     plots: Plots,
     heat: HeatmapView,
+    /// Heatmaps of the shown report (id, name, map), taken out of it so the
+    /// report clones cheaply (cache, exports) and the overlay shares them.
+    maps: Vec<(String, String, Arc<Heatmap>)>,
+    /// The region the shown results were measured on (`Some(None)`: the
+    /// whole picture); `None` for results from the history. Results go
+    /// stale when the panel's region no longer matches.
+    result_roi: Option<Option<Roi>>,
+    /// The panel's region this frame.
+    cur_roi: Option<Roi>,
+    /// "Report bundle folder" was chosen: the host adds the AI cards and
+    /// calls [`MetricsTab::export_bundle`] (inner `None`: ask for the folder).
+    bundle_request: Option<Option<PathBuf>>,
     expanded: HashSet<String>,
     history: Vec<HistoryEntry>,
     show_history: bool,
@@ -636,6 +913,8 @@ pub struct MetricsTab {
     run_requested: bool,
     /// Dev hook: scroll the panel by this many points on the next frame.
     dev_scroll: f32,
+    /// Why full-reference metrics cannot run (videos of different sizes).
+    size_mismatch: Option<String>,
 }
 
 impl Default for MetricsTab {
@@ -665,6 +944,10 @@ impl MetricsTab {
             plot_span: (0, 1),
             plots: Plots::default(),
             heat: HeatmapView::default(),
+            maps: Vec::new(),
+            result_roi: None,
+            cur_roi: None,
+            bundle_request: None,
             expanded: HashSet::new(),
             history: Vec::new(),
             show_history: false,
@@ -680,6 +963,7 @@ impl MetricsTab {
             shown: None,
             run_requested: false,
             dev_scroll: 0.0,
+            size_mismatch: None,
         }
     }
 
@@ -690,7 +974,7 @@ impl MetricsTab {
     fn analyzer(&mut self, ctx: &egui::Context) -> &Analyzer {
         self.analyzer.get_or_insert_with(|| {
             let ctx = ctx.clone();
-            Analyzer::new(None, Some(Arc::new(move || ctx.request_repaint())))
+            Analyzer::new(Some(analysis_threads()), Some(Arc::new(move || ctx.request_repaint())))
         })
     }
 
@@ -764,7 +1048,7 @@ impl MetricsTab {
             "run" => self.request_run(),
             "cancel" => self.cancel(),
             "scroll" => self.dev_scroll = rest.parse().unwrap_or(0.0),
-            "map" => match self.report.as_ref().and_then(|r| r.map(rest).cloned()) {
+            "map" => match self.map_of(rest) {
                 Some(m) => {
                     self.heat.set_map(rest, m);
                     self.heat.visible = true;
@@ -787,7 +1071,7 @@ impl MetricsTab {
                         "json" => self.export_report(false, path),
                         "png" => self.export_heatmap(true, path),
                         "tiff" => self.export_heatmap(false, path),
-                        "bundle" => self.export_bundle(path),
+                        "bundle" => self.bundle_request = Some(path),
                         "pairs" => self.export_worst(path),
                         _ => {}
                     }
@@ -801,9 +1085,10 @@ impl MetricsTab {
             .map(|r| rows_of_report(r).iter().filter_map(|row| row.cells.first().map(|c| format!("{}={}", c.key, c.value.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into())))).collect())
             .unwrap_or_default();
         format!(
-            "metrics: kind={:?} running={} status={:?} frames={} selected=[{}] values=[{}] map={:?} notes={} history={} worst={:?}",
+            "metrics: kind={:?} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} notes={} history={} worst={:?}",
             self.kind,
             self.run.is_some(),
+            self.stale(),
             self.status.as_ref().map(|s| s.0.clone()),
             self.report.as_ref().map(|r| r.frames.len()).unwrap_or(0),
             self.selected.iter().cloned().collect::<Vec<_>>().join(","),
@@ -816,15 +1101,34 @@ impl MetricsTab {
     }
 
     /// Headline results of the shown report as (name, value, unit), for
-    /// the AI tab's context.
-    pub fn metric_context(&self) -> Vec<(String, f64, String)> {
+    /// the AI tab's context: only when they were measured on what the AI
+    /// tab sends (`subject`, its region `roi` in A's pixels), else none.
+    /// Range results are labelled as such.
+    pub fn metric_context(&self, subject: &super::Subject, roi: Option<(u32, u32, u32, u32)>) -> Vec<(String, f64, String)> {
         let Some(r) = &self.report else { return Vec::new() };
+        if !report_matches(r, subject) || self.run.is_some() {
+            return Vec::new();
+        }
+        let roi = roi.map(|(x, y, w, h)| Roi::new(x, y, w, h));
+        match self.result_roi {
+            Some(measured) if measured != roi => return Vec::new(),
+            // From the history: the region it was measured on is the report's.
+            None if r.scope.kind == ScopeKind::Image && r.scope.roi != roi => return Vec::new(),
+            _ => {}
+        }
+        let range = (r.scope.kind == ScopeKind::VideoRange).then(|| r.scope.frames.unwrap_or_default());
         rows_of_report(r)
             .into_iter()
             .filter_map(|row| {
                 let c = row.cells.into_iter().next()?;
-                let name = if r.metrics.is_empty() { format!("{} (mean)", c.key) } else { format!("{} ({})", row.name, c.key) };
-                Some((name, c.value?, c.unit.label().to_string()))
+                let mut name = format!("{}, {}", row.name, key_label(&row.id, short_key(&row.id, &c.key)));
+                if let Some(f) = range {
+                    let frames = format!("frames {}-{}", f.start, f.end.saturating_sub(1));
+                    // Temporal rows and the global PSNR are not per-frame means.
+                    let mean = !row.id.starts_with("temporal.") && c.key != "psnr.global";
+                    name += &if mean { format!(" (mean over {frames})") } else { format!(" ({frames})") };
+                }
+                Some((name, c.value?, unit_text(c.unit).to_string()))
             })
             .collect()
     }
@@ -851,8 +1155,26 @@ impl MetricsTab {
         !self.series.is_empty()
     }
 
-    pub fn heatmap(&self) -> &HeatmapView {
-        &self.heat
+    /// Whether [`MetricsTab::paint_heatmap`] draws anything (not while the
+    /// results are stale).
+    pub fn overlay_active(&self) -> bool {
+        self.heat.active() && !self.stale()
+    }
+
+    /// The results (and maps) were measured on another region than the panel's.
+    fn stale(&self) -> bool {
+        self.result_roi.is_some_and(|r| r != self.cur_roi)
+    }
+
+    /// The shown report's heatmap of metric `id`.
+    fn map_of(&self, id: &str) -> Option<Arc<Heatmap>> {
+        self.maps.iter().find(|m| m.0 == id).map(|m| m.2.clone())
+    }
+
+    /// A "Report bundle folder" export waiting for the host (see
+    /// [`MetricsTab::export_bundle`]); inner `None`: ask for the folder.
+    pub fn take_bundle_request(&mut self) -> Option<Option<PathBuf>> {
+        self.bundle_request.take()
     }
 
     /// Follow the host's subject: a new file resets results and loads its history.
@@ -871,6 +1193,8 @@ impl MetricsTab {
         self.live.clear();
         self.series = Series::default();
         self.heat.clear();
+        self.maps.clear();
+        self.result_roi = None;
         self.status = None;
         self.expanded.clear();
         if !s.is_video() {
@@ -891,15 +1215,28 @@ impl MetricsTab {
     }
 
     /// Why metric `id` cannot run on this subject and scope, if it cannot.
-    fn blocked(&self, kind: MetricKind) -> Option<&'static str> {
+    fn blocked(&self, kind: MetricKind) -> Option<String> {
         let has_b = matches!(self.kind, Kind::Compare | Kind::VideoPair);
         let video = matches!(self.kind, Kind::Video | Kind::VideoPair);
         match kind {
-            MetricKind::FullReference if !has_b => Some("Needs a reference: compare two images or load a B video"),
-            MetricKind::Temporal if !video => Some("Needs a video"),
-            MetricKind::Temporal if self.temporal != Temporal::Range => Some("Needs a frame range"),
+            MetricKind::FullReference if !has_b => Some("Needs a reference: compare two images or load a B video".into()),
+            MetricKind::FullReference if self.size_mismatch.is_some() => self.size_mismatch.clone(),
+            MetricKind::Temporal if !video => Some("Needs a video".into()),
+            MetricKind::Temporal if self.temporal != Temporal::Range => Some("Needs a frame range".into()),
             _ => None,
         }
+    }
+
+    /// Videos of different sizes cannot be compared pixel by pixel (images
+    /// can: B is resampled to A's size).
+    fn update_size_mismatch(&mut self, s: &Subject) {
+        self.size_mismatch = match s {
+            #[cfg(feature = "video")]
+            Subject::Video(VideoSubject { a, b: Some(b), .. }) if a.size != b.size => {
+                Some(format!("A is {}x{} and B {}x{}: full-reference metrics need videos of the same size", a.size.0, a.size.1, b.size.0, b.size.1))
+            }
+            _ => None,
+        };
     }
 
     /// The selected metrics that can run now, frame metrics in registry order then temporal ones.
@@ -918,6 +1255,7 @@ impl MetricsTab {
     /// Run the selected metric set on the current scope (the Run button, Shift+Q).
     pub fn run(&mut self, ctx: &MetricsCtx, egui_ctx: &egui::Context) {
         self.sync(&ctx.subject);
+        self.update_size_mismatch(&ctx.subject);
         let ids = self.runnable();
         if ids.is_empty() {
             self.set_status("Choose at least one metric that applies here", true);
@@ -950,6 +1288,7 @@ impl MetricsTab {
                     key,
                     history: hist,
                     started: Instant::now(),
+                    roi,
                     #[cfg(feature = "video")]
                     decode: None,
                 });
@@ -964,8 +1303,8 @@ impl MetricsTab {
 
     #[cfg(feature = "video")]
     #[allow(clippy::too_many_arguments)]
-    fn run_video(&mut self, v: &VideoSubject, ids: Vec<String>, roi: Option<Roi>, fa: PathBuf, fb: Option<PathBuf>, hist: Option<CacheKey>, egui_ctx: &egui::Context) {
-        let roi = roi.map(|r| native_roi(r, v.a.rotation, v.a.size));
+    fn run_video(&mut self, v: &VideoSubject, ids: Vec<String>, panel_roi: Option<Roi>, fa: PathBuf, fb: Option<PathBuf>, hist: Option<CacheKey>, egui_ctx: &egui::Context) {
+        let roi = panel_roi.map(|r| native_roi(r, v.a.rotation, v.a.size));
         if self.temporal == Temporal::Frame {
             let Some(cur) = v.current else {
                 self.set_status("No frame on screen yet", true);
@@ -988,7 +1327,7 @@ impl MetricsTab {
             let frames = Some(lumen_analysis::FrameRange { start: cur as u64, end: cur as u64 + 1, stride: 1 });
             let key = run_key("video_frame", &fa, fb.as_deref(), &ids, roi, frames, v.offset);
             let handle = adapters::submit_video_frame(self.analyzer(egui_ctx), a, b, cur, ids, roi, &fa, fb.as_deref());
-            self.start(Run { handle, key, history: hist, started: Instant::now(), decode: None });
+            self.start(Run { handle, key, history: hist, started: Instant::now(), roi: panel_roi, decode: None });
             return;
         }
         let total = v.a.frames();
@@ -1012,17 +1351,23 @@ impl MetricsTab {
         let end = r.end.or(total).unwrap_or(r.start + 1);
         let frames = Some(lumen_analysis::FrameRange { start: r.start as u64, end: end as u64, stride: r.stride as u64 });
         let key = run_key("video_range", &fa, fb.as_deref(), &ids, roi, frames, v.offset);
-        self.video_run = Some(VideoRun { a: req.a.clone(), b: req.b.clone(), offset: v.offset });
+        // The panel's region is in displayed pixels, `roi` in native ones.
+        let turned = v.a.rotation.rem_euclid(180) == 90;
+        let (nw, nh) = (v.a.size.0.max(1) as f32, v.a.size.1.max(1) as f32);
+        let (dw, dh) = if turned { (nh, nw) } else { (nw, nh) };
+        let frac = |r: Roi, w: f32, h: f32| [r.x as f32 / w, r.y as f32 / h, (r.x + r.w) as f32 / w, (r.y + r.h) as f32 / h];
+        let region = panel_roi.zip(roi).map(|(d, n)| adapters::ThumbRegion { display: frac(d, dw, dh), native: frac(n, nw, nh), turned, native_landscape: nw > nh });
+        self.video_run = Some(VideoRun { a: req.a.clone(), b: req.b.clone(), offset: v.offset, region });
         let job = adapters::submit_video_range(self.analyzer(egui_ctx), req);
         self.plot_span = (r.start as u64, end.saturating_sub(1).max(r.start) as u64);
-        self.start(Run { handle: job.handle, key, history: hist, started: Instant::now(), decode: Some(job.info) });
+        self.start(Run { handle: job.handle, key, history: hist, started: Instant::now(), roi: panel_roi, decode: Some(job.info) });
     }
 
     fn start(&mut self, run: Run) {
         if let Some(old) = self.run.take() {
             old.handle.cancel();
         }
-        self.live.clear();
+        drop_later(std::mem::take(&mut self.live));
         self.series = Series::default();
         self.report = None;
         self.status = None;
@@ -1037,6 +1382,12 @@ impl MetricsTab {
 
     /// Take the job's events; call every frame (the tab's `ui` does).
     pub fn poll(&mut self, ctx: &egui::Context) {
+        let t0 = Instant::now();
+        self.poll_job(ctx);
+        crate::devhook::prof("metrics_poll", t0);
+    }
+
+    fn poll_job(&mut self, ctx: &egui::Context) {
         for rx in std::mem::take(&mut self.bg) {
             match rx.try_recv() {
                 Ok(Ok(m)) => self.set_status(m, false),
@@ -1074,15 +1425,37 @@ impl MetricsTab {
                 let ms = run.started.elapsed().as_secs_f32() * 1000.0;
                 self.set_status(format!("Done in {}", fmt_cost(ms.max(1.0))), false);
                 self.finish(report, Some((run.key, run.history)));
+                self.result_roi = Some(run.roi);
             }
-            Err(e) if e.is_empty() => self.set_status("Cancelled", false),
+            Err(e) if e.is_empty() => {
+                let prog = run.handle.progress();
+                #[cfg(feature = "video")]
+                let range = run.decode.is_some();
+                #[cfg(not(feature = "video"))]
+                let range = false;
+                match prog.total() {
+                    t if t > 1 && range => self.set_status(format!("Cancelled after {} of {t} frames", prog.done()), false),
+                    _ => self.set_status("Cancelled", false),
+                }
+            }
             Err(e) => self.set_status(e, true),
         }
     }
 
     /// Show a finished report and store it in the history (`store`).
-    fn finish(&mut self, report: AnalysisReport, store: Option<(CacheKey, Option<CacheKey>)>) {
-        self.live.clear();
+    fn finish(&mut self, mut report: AnalysisReport, store: Option<(CacheKey, Option<CacheKey>)>) {
+        drop_later(std::mem::take(&mut self.live));
+        self.result_roi = None;
+        // Moved, not copied: a 12 MP map is 48 MB.
+        let maps = report
+            .metrics
+            .iter_mut()
+            .filter_map(|m| {
+                let map = m.map.take().filter(|x| !x.data.is_empty())?;
+                Some((m.id.clone(), m.name.clone(), Arc::new(map)))
+            })
+            .collect();
+        drop_later(std::mem::replace(&mut self.maps, maps));
         if !report.frames.is_empty() {
             self.series = Series::from_report(&report);
             if let Some(f) = report.scope.frames {
@@ -1091,11 +1464,11 @@ impl MetricsTab {
         }
         // Keep the overlay of the same metric, else show a difference map;
         // no-reference tile maps only when asked (they cover the photo).
-        let pick = self.heat.id().map(str::to_string).filter(|id| report.map(id).is_some_and(|m| !m.data.is_empty())).or_else(|| {
-            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().map(|s| s.to_string()).find(|id| report.map(id).is_some_and(|m| !m.data.is_empty()))
+        let pick = self.heat.id().and_then(|id| self.map_of(id).map(|m| (id.to_string(), m))).or_else(|| {
+            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().find_map(|id| self.map_of(id).map(|m| (id.to_string(), m)))
         });
         match pick {
-            Some(id) => self.heat.set_map(&id, report.map(&id).cloned().expect("picked")),
+            Some((id, m)) => self.heat.set_map(&id, m),
             None => self.heat.clear(),
         }
         if let Some((key, Some(hkey))) = store {
@@ -1113,10 +1486,7 @@ impl MetricsTab {
             self.history.retain(|h| h.key != entry.key);
             self.history.insert(0, entry);
             self.history.truncate(HISTORY_MAX);
-            let mut stored = report.clone();
-            for m in &mut stored.metrics {
-                m.map = None;
-            }
+            let stored = report.clone();
             let (cache, history) = (self.cache(), self.history.clone());
             std::thread::spawn(move || {
                 let _ = cache.put(&key, &stored);
@@ -1133,6 +1503,8 @@ impl MetricsTab {
                 self.series = Series::default();
                 self.set_status(format!("From history, {}", fmt_time(h.created_unix)), false);
                 self.finish(r, None);
+                // Whatever region it had, it is what the user asked to see.
+                self.result_roi = None;
             }
             None => {
                 self.history.retain(|x| x.key != h.key);
@@ -1148,6 +1520,18 @@ impl MetricsTab {
     /// With the pointer at `hover`, `pixels(x, y)` gives the A and B pixels
     /// for the readout.
     pub fn paint_heatmap(&mut self, ui: &Ui, painter: &Painter, xf: &ImageTransform, hover: Option<egui::Pos2>, pixels: &dyn Fn(f32, f32) -> (Option<[u8; 4]>, Option<[u8; 4]>)) {
+        if self.stale() {
+            return;
+        }
+        // Video frames are measured in native pixels; the picture may be turned.
+        #[cfg(feature = "video")]
+        let native = match (&self.video, self.kind) {
+            (Some(v), Kind::Video | Kind::VideoPair) => Some((v.a.rotation, v.a.size)),
+            _ => None,
+        };
+        #[cfg(not(feature = "video"))]
+        let native = None;
+        self.heat.set_native(native);
         self.heat.paint(ui, painter, xf, hover, pixels);
     }
 
@@ -1180,6 +1564,8 @@ impl MetricsTab {
         let p = *ctx.pal;
         self.shown = Some(Instant::now());
         self.sync(&ctx.subject);
+        self.update_size_mismatch(&ctx.subject);
+        self.cur_roi = ctx.roi;
         self.poll(ui.ctx());
         if std::mem::take(&mut self.run_requested) && self.kind != Kind::None {
             self.run(ctx, ui.ctx());
@@ -1195,8 +1581,11 @@ impl MetricsTab {
         ui.add_space(6.0);
         self.run_row(ui, &p, ctx);
         ui.add_space(6.0);
+        if self.report.is_none() && self.live.is_empty() && self.run.is_none() && self.status.is_none() {
+            ui.label(RichText::new(format!("{}  Pick metrics and press Run, or draw a region with R", I::INFO)).color(p.muted));
+        }
         self.results(ui, &p);
-        if self.heat.map().is_some() || self.report.as_ref().is_some_and(|r| r.metrics.iter().any(|m| m.map.as_ref().is_some_and(|m| !m.data.is_empty()))) {
+        if !self.stale() && (self.heat.map().is_some() || !self.maps.is_empty()) {
             ui.add_space(6.0);
             self.heatmap_section(ui, &p);
         }
@@ -1227,12 +1616,17 @@ impl MetricsTab {
             ui.horizontal(|ui| {
                 let field = |ui: &mut Ui, label: &str, text: &mut String, hint: &str| {
                     ui.label(RichText::new(label).color(p.muted));
-                    ui.add(egui::TextEdit::singleline(text).desired_width(52.0).hint_text(hint)).on_hover_text("Frame number, seconds (4.5s) or minutes:seconds (1:02)").changed()
+                    ui.add(egui::TextEdit::singleline(text).desired_width(64.0).hint_text(hint)).on_hover_text("Frame number, seconds (4.5s) or minutes:seconds (1:02)").changed()
                 };
-                field(ui, "Start", &mut self.range_text[0], "0");
-                field(ui, "End", &mut self.range_text[1], "end");
+                let mut edited = field(ui, "Start", &mut self.range_text[0], "0");
+                edited |= field(ui, "End", &mut self.range_text[1], "end");
                 if field(ui, "Stride", &mut self.range_text[2], "1") {
                     self.save_selection();
+                    edited = true;
+                }
+                // "Range set to frames ..." from a plot drag no longer applies.
+                if edited {
+                    self.status = None;
                 }
             });
             ui.horizontal(|ui| {
@@ -1247,11 +1641,13 @@ impl MetricsTab {
                     if let Some((a, b)) = loop_ab {
                         self.range_text[0] = a.to_string();
                         self.range_text[1] = (b + 1).to_string();
+                        self.set_status(format!("Range set to the A-B loop, frames {a}-{b}"), false);
                     }
                 }
                 if ui.small_button("Whole file").clicked() {
                     self.range_text[0].clear();
                     self.range_text[1].clear();
+                    self.status = None;
                 }
                 match parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], s.fps(), total) {
                     Ok(r) => {
@@ -1295,7 +1691,7 @@ impl MetricsTab {
         let (w, h) = s.size().unwrap_or((1920, 1080));
         let (w, h) = roi.map(|r| (r.w, r.h)).unwrap_or((w, h));
         let frames = self.frames_to_measure(s).max(1) as f32;
-        let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1) as f32;
+        let threads = analysis_threads() as f32;
         // Frames run in parallel in range jobs.
         let scale = if frames > 1.0 { frames / threads } else { 1.0 };
         let groups = [(MetricKind::FullReference, "Full reference (A vs B)"), (MetricKind::NoReference, "No reference"), (MetricKind::Temporal, "Temporal")];
@@ -1311,7 +1707,7 @@ impl MetricsTab {
             };
             let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).color(if blocked.is_some() { p.faint } else { p.text });
             egui::CollapsingHeader::new(head).id_salt(("metrics-group", title)).default_open(false).show(ui, |ui| {
-                if let Some(why) = blocked {
+                if let Some(why) = &blocked {
                     ui.label(RichText::new(why).size(11.0).color(p.faint));
                 }
                 let mut entries: Vec<(&'static str, &'static str, &'static str, Option<f32>, bool)> = Vec::new();
@@ -1377,7 +1773,14 @@ impl MetricsTab {
                 });
             }
         });
-        if let Some((msg, err)) = &self.status {
+        if self.stale() && self.run.is_none() && self.report.is_some() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}  Region changed: Run again", I::WARNING)).color(p.warn));
+                if ui.small_button("Run").on_hover_text("Shift+Q").clicked() {
+                    self.run(ctx, ui.ctx());
+                }
+            });
+        } else if let Some((msg, err)) = &self.status {
             ui.label(RichText::new(msg).size(12.0).color(if *err { p.danger } else { p.muted }));
         }
     }
@@ -1406,10 +1809,16 @@ impl MetricsTab {
     }
 
     fn results(&mut self, ui: &mut Ui, p: &Palette) {
-        let rows = match &self.report {
+        let mut rows = match &self.report {
             Some(r) => rows_of_report(r),
             None => rows_of_live(&self.live),
         };
+        for row in &mut rows {
+            row.has_map |= self.maps.iter().any(|m| m.0 == row.id);
+        }
+        // Stale results stay readable, dimmed, until the next run.
+        let stale = self.stale() && self.report.is_some();
+        let (text, muted) = if stale { (p.faint, p.faint) } else { (p.text, p.muted) };
         let notes: Vec<String> = self.report.as_ref().map(|r| r.notes.iter().cloned().chain(r.metrics.iter().flat_map(|m| m.notes.iter().map(move |n| format!("{}: {n}", m.name)))).collect()).unwrap_or_default();
         if rows.is_empty() && notes.is_empty() {
             return;
@@ -1421,12 +1830,17 @@ impl MetricsTab {
             for row in &rows {
                 let Some(head) = row.cells.first() else { continue };
                 let open = self.expanded.contains(&row.id);
-                Self::chip(ui, p, head.value.and_then(|v| grade(&head.key, v)));
+                Self::chip(ui, p, head.value.filter(|_| !stale).and_then(|v| grade(&head.key, v)));
                 ui.horizontal(|ui| {
-                    let caret = if row.cells.len() > 1 { if open { I::CARET_DOWN } else { I::CARET_RIGHT } } else { " " };
-                    let name = ui.add(egui::Label::new(RichText::new(format!("{caret} {}", row.name)).color(p.text)).sense(Sense::click()));
+                    let many = row.cells.len() > 1;
+                    let caret = if many { if open { I::CARET_DOWN } else { I::CARET_RIGHT } } else { " " };
+                    let name = ui.add(egui::Label::new(RichText::new(format!("{caret} {}", row.name)).color(text)).sense(Sense::click()));
                     if name.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         toggle = Some(row.id.clone());
+                    }
+                    // Which value the row shows (PSNR: avg, Exposure: clip_pct).
+                    if many {
+                        ui.label(RichText::new(key_label(&row.id, short_key(&row.id, &head.key))).size(11.0).color(p.faint));
                     }
                     if row.preview {
                         ui.label(RichText::new("preview").size(10.0).color(p.warn));
@@ -1438,7 +1852,7 @@ impl MetricsTab {
                         }
                     }
                 });
-                let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(p.text).strong());
+                let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
                 if let Some(t) = &head.tip {
                     if v.on_hover_text(t).clicked() {
                         seek = head.worst;
@@ -1447,14 +1861,15 @@ impl MetricsTab {
                 Self::arrow(ui, p, head.direction);
                 ui.end_row();
                 if open {
-                    for c in &row.cells[1..] {
-                        Self::chip(ui, p, c.value.and_then(|v| grade(&c.key, v)));
-                        let short = c.key.strip_prefix(&row.id).map(|k| k.trim_start_matches('.')).unwrap_or(&c.key);
-                        let lab = ui.add(egui::Label::new(RichText::new(format!("    {short}")).color(p.muted).size(12.0)).sense(Sense::click()));
+                    // Every value with its key, the headline too.
+                    for c in &row.cells {
+                        Self::chip(ui, p, c.value.filter(|_| !stale).and_then(|v| grade(&c.key, v)));
+                        let short = key_label(&row.id, short_key(&row.id, &c.key));
+                        let lab = ui.add(egui::Label::new(RichText::new(format!("    {short}")).color(muted).size(12.0)).sense(Sense::click()));
                         if c.worst.is_some() && lab.on_hover_text("Click to show the worst frame").clicked() {
                             seek = c.worst;
                         }
-                        let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(p.muted).size(12.0));
+                        let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(12.0));
                         if let Some(t) = &c.tip {
                             v.on_hover_text(t);
                         }
@@ -1470,7 +1885,7 @@ impl MetricsTab {
             }
         }
         if let Some(id) = show_map {
-            let map = self.report.as_ref().and_then(|r| r.map(&id).cloned()).or_else(|| self.live.iter().find(|m| m.id == id).and_then(|m| m.map.clone()));
+            let map = self.map_of(&id).or_else(|| self.live.iter().find(|m| m.id == id).and_then(|m| m.map.clone()).map(Arc::new));
             if let Some(m) = map {
                 self.heat.set_map(&id, m);
                 self.heat.visible = true;
@@ -1488,11 +1903,7 @@ impl MetricsTab {
     }
 
     fn heatmap_section(&mut self, ui: &mut Ui, p: &Palette) {
-        let maps: Vec<(String, String)> = self
-            .report
-            .as_ref()
-            .map(|r| r.metrics.iter().filter(|m| m.map.as_ref().is_some_and(|m| !m.data.is_empty())).map(|m| (m.id.clone(), m.name.clone())).collect())
-            .unwrap_or_default();
+        let maps: Vec<(String, String)> = self.maps.iter().map(|m| (m.0.clone(), m.1.clone())).collect();
         egui::CollapsingHeader::new(RichText::new("Heatmap").color(p.text)).id_salt("metrics-heatmap").default_open(true).show(ui, |ui| {
             if !maps.is_empty() {
                 let cur = self.heat.id().map(str::to_string).unwrap_or_default();
@@ -1506,7 +1917,7 @@ impl MetricsTab {
                     }
                 });
                 if let Some(id) = pick {
-                    if let Some(m) = self.report.as_ref().and_then(|r| r.map(&id).cloned()) {
+                    if let Some(m) = self.map_of(&id) {
                         self.heat.set_map(&id, m);
                     }
                 }
@@ -1521,8 +1932,8 @@ impl MetricsTab {
         let Subject::Video(_) = s else { return };
         egui::CollapsingHeader::new(RichText::new("Worst frames").color(p.text)).id_salt("metrics-worst").default_open(true).show(ui, |ui| {
             let b_path = vr.b.as_ref().map(|b| b.path.as_path());
-            if self.thumbs.as_ref().is_none_or(|t| !t.shows(&vr.a.path, b_path, vr.offset)) {
-                self.thumbs = Some(adapters::VideoThumbs::new(vr.a.clone(), vr.b.clone(), vr.offset));
+            if self.thumbs.as_ref().is_none_or(|t| !t.shows(&vr.a.path, b_path, vr.offset, vr.region)) {
+                self.thumbs = Some(adapters::VideoThumbs::new(vr.a.clone(), vr.b.clone(), vr.offset, vr.region));
             }
             let thumbs = self.thumbs.as_mut().map(|t| t as &mut dyn plots::FrameThumbs);
             if let Some(a) = self.plots.worst_ui(ui, p, &self.series, thumbs) {
@@ -1604,7 +2015,7 @@ impl MetricsTab {
                 ui.separator();
                 if ui.button("Report bundle folder").clicked() {
                     ui.close();
-                    self.export_bundle(None);
+                    self.bundle_request = Some(None);
                 }
             });
         });
@@ -1630,7 +2041,7 @@ impl MetricsTab {
         let Some(r) = &self.report else { return };
         let res = if csv { r.write_csv(&path) } else { r.write_json(&path) };
         match res {
-            Ok(()) => self.set_status(format!("Saved {}", path.display()), false),
+            Ok(()) => self.set_status(format!("Saved {}", path_text(&path)), false),
             Err(e) => self.set_status(format!("Could not save: {e}"), true),
         }
     }
@@ -1641,11 +2052,13 @@ impl MetricsTab {
         let (ext, name) = if png { ("png", "PNG") } else { ("tif", "TIFF") };
         let file = format!("{}_{}.{ext}", self.stem(), id.replace('.', "_"));
         let Some(path) = path.or_else(|| self.dialog().add_filter(name, &[ext]).set_file_name(file).save_file()) else { return };
-        let res = if png { self.heat.export_png(&path) } else { self.heat.map().map(|m| m.write_tiff(&path)).unwrap_or(Ok(())) };
-        match res {
-            Ok(()) => self.set_status(format!("Saved {}", path.display()), false),
-            Err(e) => self.set_status(format!("Could not save: {e}"), true),
-        }
+        let Some(map) = self.heat.shared_map() else { return };
+        // The overlay's coloring with its opacity; written off the UI thread.
+        let o = lumen_analysis::ColorizeOptions { alpha: (self.heat.opacity.clamp(0.0, 1.0) * 255.0).round().max(1.0) as u8, ..self.heat.resolved_options() };
+        self.background(move || {
+            let res = if png { map.write_png(&path, &o) } else { map.write_tiff(&path) };
+            res.map(|()| format!("Saved {}", path_text(&path))).map_err(|e| format!("Could not save: {e}"))
+        });
     }
 
     /// Worst frames of the ranked column as A/B PNG pairs into `dir` (asked when `None`).
@@ -1657,20 +2070,25 @@ impl MetricsTab {
             let frames = self.plots.worst_frames(&self.series);
             let Some(dir) = dir.or_else(|| self.dialog().pick_folder()) else { return };
             self.background(move || match adapters::export_frame_pairs(&vr.a, vr.b.as_ref(), vr.offset, &frames, &dir) {
-                Ok(files) => Ok(format!("Saved {} frames to {}", files.len(), dir.display())),
+                Ok(files) => Ok(format!("Saved {} frames to {}", files.len(), path_text(&dir))),
                 Err(e) => Err(format!("Could not export frames: {e:#}")),
             });
         }
     }
 
     /// A folder with the report as JSON and CSV, every heatmap as PNG and
-    /// TIFF, and the worst frames of a video range as PNG pairs.
-    fn export_bundle(&mut self, parent: Option<PathBuf>) {
+    /// TIFF, the worst frames of a video range as PNG pairs and the AI
+    /// results for the same files (`ai_cards`, Markdown) when there are any.
+    /// `parent`: where the folder goes (`None`: ask).
+    pub fn export_bundle(&mut self, parent: Option<PathBuf>, ai_cards: Vec<String>) {
         let Some(report) = self.report.clone() else { return };
         let Some(parent) = parent.or_else(|| self.dialog().pick_folder()) else { return };
         let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let dir = parent.join(format!("{}_analysis_{stamp}", self.stem()));
-        let opts = self.heat.options();
+        let dir = PathBuf::from(path_text(&parent.join(format!("{}_analysis_{stamp}", self.stem()))));
+        let maps = self.maps.clone();
+        // The map on screen is written as it is shown; the others with their defaults.
+        let shown = self.heat.id().map(str::to_string);
+        let opts = self.heat.resolved_options();
         let opacity = self.heat.opacity;
         #[cfg(feature = "video")]
         let frames = self.video_run.clone().filter(|_| !self.series.is_empty()).map(|vr| (vr, self.plots.worst_frames(&self.series)));
@@ -1680,14 +2098,18 @@ impl MetricsTab {
                 report.write_json(&dir.join("report.json"))?;
                 report.write_csv(&dir.join("report.csv"))?;
                 let mut n = 2;
-                for m in &report.metrics {
-                    let Some(map) = m.map.as_ref().filter(|m| !m.data.is_empty()) else { continue };
-                    let base = m.id.replace('.', "_");
-                    let o = if m.map.as_ref().is_some_and(|x| x.colormap == opts.colormap) { opts } else { map.default_options() };
+                for (id, _, map) in &maps {
+                    let base = id.replace('.', "_");
+                    let o = if shown.as_deref() == Some(id.as_str()) { opts } else { map.default_options() };
                     let o = lumen_analysis::ColorizeOptions { alpha: (opacity.clamp(0.1, 1.0) * 255.0) as u8, threshold: None, ..o };
                     map.write_png(&dir.join(format!("heatmap_{base}.png")), &o)?;
                     map.write_tiff(&dir.join(format!("heatmap_{base}.tif")))?;
                     n += 2;
+                }
+                if !ai_cards.is_empty() {
+                    let md = format!("# AI analysis\n\n{}", ai_cards.join("\n---\n\n"));
+                    lumen_analysis::report::write_atomic(&dir.join("ai_cards.md"), md.as_bytes())?;
+                    n += 1;
                 }
                 #[cfg(feature = "video")]
                 if let Some((vr, frames)) = frames {
@@ -1696,7 +2118,7 @@ impl MetricsTab {
                 Ok(n)
             })();
             match res {
-                Ok(n) => Ok(format!("Saved {n} files to {}", dir.display())),
+                Ok(n) => Ok(format!("Saved {n} files to {}", path_text(&dir))),
                 Err(e) => Err(format!("Could not save the bundle: {e:#}")),
             }
         });
@@ -1785,12 +2207,39 @@ mod tests {
     }
 
     #[test]
+    fn headline_cells_come_first() {
+        use lumen_analysis::metrics::Value;
+        // A blue-only shift: R and G identical. The row shows the average.
+        let mut b = lumen_analysis::report::ReportBuilder::new(Default::default());
+        let mut r = MetricResult { id: "psnr".into(), ..Default::default() };
+        for (k, v) in [("r", 100.0), ("g", 100.0), ("b", 18.9), ("avg", 23.6)] {
+            r.values.push(Value::new(k, v, Unit::Db, Direction::HigherIsBetter));
+        }
+        let mut e = MetricResult { id: "exposure".into(), ..Default::default() };
+        for (k, v) in [("clip_pct", 12.0), ("clip_lo_pct", 0.0), ("clip_hi_pct", 12.0)] {
+            e.values.push(Value::new(k, v, Unit::Percent, Direction::LowerIsBetter));
+        }
+        b.add_metric(metrics::get("psnr").unwrap().info(), r.clone());
+        b.add_metric(metrics::get("exposure").unwrap().info(), e);
+        let rows = rows_of_report(&b.finish(None));
+        assert_eq!(rows[0].cells[0].key, "psnr.avg");
+        assert_eq!(grade(&rows[0].cells[0].key, 23.6), Some(Grade::Poor));
+        // Every key is still there, in order after the headline.
+        assert_eq!(rows[0].cells.iter().map(|c| short_key("psnr", &c.key)).collect::<Vec<_>>(), ["avg", "r", "g", "b"]);
+        assert_eq!(rows[1].cells[0].key, "exposure.clip_pct");
+        assert_eq!(grade(&rows[1].cells[0].key, 12.0), Some(Grade::Poor));
+        assert_eq!(rows_of_live(&[r])[0].cells[0].key, "psnr.avg");
+    }
+
+    #[test]
     fn live_rows_in_registry_order() {
         let mk = |id: &str| MetricResult { id: id.into(), values: vec![lumen_analysis::metrics::Value::new("y", f64::INFINITY, Unit::Db, Direction::HigherIsBetter)], ..Default::default() };
         let rows = rows_of_live(&[mk("noise"), mk("psnr")]);
         assert_eq!(rows[0].id, "psnr");
         assert_eq!(rows[0].cells[0].value, Some(lumen_analysis::PSNR_CAP_DB));
         assert_eq!(fmt_value(41.234, Unit::Db), "41.23 dB");
+        assert_eq!(fmt_value(lumen_analysis::PSNR_CAP_DB, Unit::Db), "Identical");
+        assert_eq!(path_text(Path::new("C:/a\\b/c.csv")), "C:\\a\\b\\c.csv");
         assert_eq!(fmt_value(0.98765, Unit::Index), "0.9877");
         assert_eq!(fmt_cost(1500.0), "1.5 s");
     }

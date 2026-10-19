@@ -59,6 +59,8 @@ pub struct TemporalInfo {
     pub id: &'static str,
     pub name: &'static str,
     pub version: u32,
+    /// Headline keys, as [`super::MetricInfo::headline`].
+    pub headline: &'static [&'static str],
     pub description: &'static str,
     pub make: fn(&MetricOptions) -> Box<dyn TemporalMetric>,
 }
@@ -144,6 +146,7 @@ impl TemporalMetric for Scene {
 static TEMPORAL: &[TemporalInfo] = &[
     TemporalInfo {
         id: "temporal.flicker",
+        headline: &["flicker"],
         name: "Flicker",
         version: 1,
         description: "Frame-to-frame change of mean luma",
@@ -151,6 +154,7 @@ static TEMPORAL: &[TemporalInfo] = &[
     },
     TemporalInfo {
         id: "temporal.freeze",
+        headline: &["duplicates", "duplicate"],
         name: "Freeze / duplicates",
         version: 1,
         description: "Duplicate frames (mean absolute difference below a threshold) and run length",
@@ -158,6 +162,7 @@ static TEMPORAL: &[TemporalInfo] = &[
     },
     TemporalInfo {
         id: "temporal.scene",
+        headline: &["cuts", "score"],
         name: "Scene change",
         version: 1,
         description: "FFmpeg scdet-style scene score (0..100) and cut flag",

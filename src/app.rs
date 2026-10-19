@@ -40,6 +40,11 @@ pub struct Core {
     pub ai: crate::analysis_ui::ai::AiState,
     /// The Analysis panel's Metrics tab (video mode draws its graphs).
     pub metrics: crate::analysis_ui::metrics_view::MetricsTab,
+    /// The Analysis panel is open (set by the app each frame, for the modes'
+    /// toolbar buttons).
+    pub analysis_open: bool,
+    /// A mode's toolbar button or "Analyze..." menu item was used this frame.
+    pub analysis_request: Option<crate::analysis_ui::PanelRequest>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,6 +171,10 @@ pub struct App {
     slideshow_from_viewer: bool,
     /// Frames started so far, up to 2 (startup milestones).
     startup_frames: u8,
+    /// When the previous frame started (dev hook `bench`: frame intervals).
+    last_frame_start: Option<Instant>,
+    /// Dev hook pointer events for the next frame's raw input.
+    dev_input: Vec<egui::Event>,
     /// A text field had keyboard focus at the end of the last frame.
     was_editing: bool,
     /// The window had the keyboard focus last frame (folders are re-listed
@@ -256,6 +265,8 @@ impl App {
                 #[cfg(feature = "ai")]
                 ai,
                 metrics: Default::default(),
+                analysis_open: false,
+                analysis_request: None,
             },
             mode: Mode::Browser,
             browser,
@@ -294,6 +305,8 @@ impl App {
             file_undo: Vec::new(),
             slideshow_from_viewer: false,
             startup_frames: 0,
+            last_frame_start: None,
+            dev_input: Vec::new(),
             was_editing: false,
             window_focused: true,
             file_jobs: FileJobs::new(ctx.clone()),
@@ -304,7 +317,12 @@ impl App {
         };
         crate::devhook::mark("app_struct");
         crate::ui::keymap::install(&app.core.settings);
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        // Ctrl+Q is the Analysis panel, not egui's "quit" (its default quit
+        // shortcut also matches Ctrl+Shift+Q, which is Run AI analysis).
+        ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+            o.quit_shortcuts.clear();
+        });
         crate::devhook::mark("keymap");
         for msg in crate::ui::batch::recover_pending_renames() {
             app.core.toasts.info(msg);
@@ -1830,8 +1848,14 @@ impl App {
         // Mode shortcuts are off while typing or while a tool window has the user's attention.
         let mode_map = mode_map.filter(|_| !typing && !self.tool_window_active);
         let typeahead = mode_map == Some(KeyMode::Browser) && self.browser.typeahead_active();
+        // Esc with a menu or a list open only closes it (egui does), it does
+        // not also leave the viewer or the mode.
+        let popup = egui::Popup::is_any_open(ctx);
         let mut fire = ctx.input_mut(|i| {
             keymap::consume(i, |key, mods| {
+                if popup && key == Key::Escape {
+                    return None;
+                }
                 // Mid-word letters belong to the type-ahead search, not to single-letter commands.
                 let plain = !mods.ctrl && !mods.command && !mods.alt;
                 if typeahead && plain && key.name().len() == 1 {
@@ -2429,6 +2453,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        raw.events.append(&mut self.dev_input);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let protect = self.viewer.protected_paths();
         let changed = self.core.loader.poll(&protect);
@@ -2467,9 +2495,17 @@ impl eframe::App for App {
         let _ = ctx;
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let frame_start = std::time::Instant::now();
+        // `bench`: time between frames and eframe's CPU time of the last
+        // frame (logic, layout, tessellation, texture uploads and painting).
+        if let Some(t) = self.last_frame_start.replace(frame_start) {
+            crate::devhook::prof_ms("frame_interval", frame_start.duration_since(t).as_secs_f64() * 1000.0);
+        }
+        if let Some(cpu) = frame.info().cpu_usage {
+            crate::devhook::prof_ms("frame_cpu", cpu as f64 * 1000.0);
+        }
         if self.startup_frames < 2 {
             self.startup_frames += 1;
             // The second frame starts once the first one has been painted and presented.
@@ -2507,11 +2543,14 @@ impl eframe::App for App {
             // frames it holds) elsewhere.
             self.core.metrics.set_video(None);
         }
+        self.core.analysis_open = self.analysis.open;
         let subject = self.analysis_subject();
+        let t_panel = Instant::now();
         let mut analysis_actions = match (&subject, self.analysis.open) {
             (Some(s), true) => self.analysis.side_panel(ui, &mut self.core, s),
             _ => Vec::new(),
         };
+        crate::devhook::prof("analysis_panel", t_panel);
 
         match self.mode {
             Mode::Browser => {
@@ -2640,7 +2679,9 @@ impl eframe::App for App {
                 let mut keep = true;
                 egui::CentralPanel::no_frame().show(ui, |ui| {
                     if let Some(c) = &mut self.compare {
+                        let t = Instant::now();
                         keep = c.ui(ui, &mut self.core);
+                        crate::devhook::prof("compare", t);
                     }
                 });
                 let deleted = self.compare.as_mut().map(|c| c.take_deleted()).unwrap_or_default();
@@ -2676,8 +2717,15 @@ impl eframe::App for App {
             }
         }
 
+        let t_overlay = Instant::now();
         analysis_actions.extend(self.analysis.overlay(ui, &mut self.core, subject.as_ref()));
+        crate::devhook::prof("analysis_overlay", t_overlay);
         self.analysis_actions(&ctx, analysis_actions);
+        match self.core.analysis_request.take() {
+            Some(crate::analysis_ui::PanelRequest::Toggle) => self.run(Command::ToggleAnalysis),
+            Some(crate::analysis_ui::PanelRequest::Open) if !self.analysis.open => self.run(Command::ToggleAnalysis),
+            _ => {}
+        }
         self.dialogs(&ctx);
         self.guard_dialog(&ctx);
         // Leaving video mode by any route stops playback.
@@ -2731,6 +2779,24 @@ impl App {
                     let (reply, actions) = crate::analysis_ui::dev(&mut self.analysis, &mut self.core, subject.as_ref(), &args);
                     self.analysis_actions(ctx, actions);
                     self.dev.write_state(&reply);
+                }
+                crate::devhook::DevAction::Key(name) => match crate::ui::keymap::parse_shortcut(&name) {
+                    Some(sc) => ctx.input_mut(|i| {
+                        // Windows reports Ctrl as both ctrl and command.
+                        let m = egui::Modifiers { ctrl: sc.modifiers.ctrl || sc.modifiers.command, command: sc.modifiers.ctrl || sc.modifiers.command, ..sc.modifiers };
+                        i.modifiers = m;
+                        for pressed in [true, false] {
+                            i.events.push(egui::Event::Key { key: sc.logical_key, physical_key: Some(sc.logical_key), pressed, repeat: false, modifiers: m });
+                        }
+                    }),
+                    None => self.dev.write_state(&format!("unknown key {name}")),
+                },
+                crate::devhook::DevAction::Pointer { pos, secondary, pressed } => {
+                    // Pointer state is built from raw input: see `raw_input_hook`.
+                    let button = if secondary { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
+                    self.dev_input.push(egui::Event::PointerMoved(pos));
+                    self.dev_input.push(egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE });
+                    ctx.request_repaint();
                 }
                 crate::devhook::DevAction::Open(p) => {
                     if p.is_dir() {

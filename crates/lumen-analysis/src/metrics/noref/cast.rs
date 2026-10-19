@@ -24,6 +24,7 @@ static CAST: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::LowerIsBetter,
+    headline: &["delta_e"],
     description: "Mean a*/b* of near-neutral pixels (gray-world fallback), magnitude and hue",
 };
 
