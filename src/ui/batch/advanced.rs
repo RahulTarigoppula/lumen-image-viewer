@@ -52,7 +52,7 @@ fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 fn font_combo(ui: &mut Ui, id: &str, font: &mut String) {
-    egui::ComboBox::from_id_salt(id).width(150.0).selected_text(font.as_str()).show_ui(ui, |ui| {
+    crate::ui::widgets::combo(id).width(150.0).selected_text(font.as_str()).show_ui(ui, |ui| {
         for f in crate::edit::text::families() {
             if ui.selectable_label(f.name.eq_ignore_ascii_case(font), &f.name).clicked() {
                 *font = f.name.clone();
@@ -69,7 +69,7 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
     egui::Grid::new(gid("grid")).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match step {
         Step::Resize(r) => {
             row(ui, "Mode", |ui| {
-                egui::ComboBox::from_id_salt(gid("rmode")).width(150.0).selected_text(r.spec.mode.label()).show_ui(ui, |ui| {
+                crate::ui::widgets::combo(gid("rmode")).width(150.0).selected_text(r.spec.mode.label()).show_ui(ui, |ui| {
                     for m in ResizeMode::ALL {
                         ui.selectable_value(&mut r.spec.mode, m, m.label());
                     }
@@ -78,24 +78,24 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             match r.spec.mode {
                 ResizeMode::None => {}
                 ResizeMode::Percent => row(ui, "Scale", |ui| {
-                    ui.add(egui::DragValue::new(&mut r.spec.percent).range(1.0..=1000.0).suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.percent).range(1.0..=1000.0).suffix(" %"));
                 }),
                 ResizeMode::Fit => row(ui, "Box", |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
                         ui.label("x");
-                        ui.add(egui::DragValue::new(&mut r.spec.b).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.b).range(1..=60000).suffix(" px"));
                     });
                 }),
                 _ => row(ui, "Size", |ui| {
-                    ui.add(egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
                 }),
             }
             row(ui, "", |ui| {
-                ui.checkbox(&mut r.spec.no_upscale, "Don't enlarge smaller images");
+                crate::ui::widgets::checkbox(ui, &mut r.spec.no_upscale, "Don't enlarge smaller images");
             });
             row(ui, "Filter", |ui| {
-                egui::ComboBox::from_id_salt(gid("rfilter")).width(150.0).selected_text(r.filter.label()).show_ui(ui, |ui| {
+                crate::ui::widgets::combo(gid("rfilter")).width(150.0).selected_text(r.filter.label()).show_ui(ui, |ui| {
                     for f in Filter::ALL {
                         ui.selectable_value(&mut r.filter, f, f.label());
                     }
@@ -105,18 +105,16 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Crop(c) => {
             row(ui, "Crop by", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut c.mode, CropMode::Aspect, "Aspect ratio");
-                    ui.selectable_value(&mut c.mode, CropMode::Size, "Size");
-                    ui.selectable_value(&mut c.mode, CropMode::Rect, "Rectangle");
+                    crate::ui::widgets::segmented_value(ui, &mut c.mode, &[(CropMode::Aspect, "Aspect ratio"), (CropMode::Size, "Size"), (CropMode::Rect, "Rectangle")]);
                 });
             });
             match c.mode {
                 CropMode::Aspect => {
                     row(ui, "Ratio", |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut c.aspect_w).range(0.1..=100.0).speed(0.1));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_w).range(0.1..=100.0).speed(0.1));
                             ui.label(":");
-                            ui.add(egui::DragValue::new(&mut c.aspect_h).range(0.1..=100.0).speed(0.1));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_h).range(0.1..=100.0).speed(0.1));
                             for (a, b) in [(1.0, 1.0), (3.0, 2.0), (4.0, 3.0), (16.0, 9.0)] {
                                 if ui.small_button(format!("{a}:{b}")).clicked() {
                                     c.aspect_w = a;
@@ -130,16 +128,16 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                     if c.mode == CropMode::Rect {
                         row(ui, "Left, top", |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut c.x).range(0..=60000).suffix(" px"));
-                                ui.add(egui::DragValue::new(&mut c.y).range(0..=60000).suffix(" px"));
+                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.x).range(0..=60000).suffix(" px"));
+                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.y).range(0..=60000).suffix(" px"));
                             });
                         });
                     }
                     row(ui, "Size", |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut c.w).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.w).range(1..=60000).suffix(" px"));
                             ui.label("x");
-                            ui.add(egui::DragValue::new(&mut c.h).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.h).range(1..=60000).suffix(" px"));
                         });
                     });
                 }
@@ -153,27 +151,25 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Canvas(c) => {
             row(ui, "Canvas", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut c.mode, CanvasMode::Add, "Add to sides");
-                    ui.selectable_value(&mut c.mode, CanvasMode::Absolute, "Size");
-                    ui.selectable_value(&mut c.mode, CanvasMode::Percent, "Percent");
+                    crate::ui::widgets::segmented_value(ui, &mut c.mode, &[(CanvasMode::Add, "Add to sides"), (CanvasMode::Absolute, "Size"), (CanvasMode::Percent, "Percent")]);
                 });
             });
             match c.mode {
                 CanvasMode::Add => row(ui, "Per side", |ui| {
-                    ui.add(egui::DragValue::new(&mut c.add).range(0..=20000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.add).range(0..=20000).suffix(" px"));
                 }),
                 CanvasMode::Absolute => row(ui, "Size", |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut c.w).range(1..=40000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.w).range(1..=40000).suffix(" px"));
                         ui.label("x");
-                        ui.add(egui::DragValue::new(&mut c.h).range(1..=40000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.h).range(1..=40000).suffix(" px"));
                     });
                 }),
                 CanvasMode::Percent => row(ui, "Size", |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut c.percent_w).range(1.0..=1000.0).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.percent_w).range(1.0..=1000.0).suffix(" %"));
                         ui.label("x");
-                        ui.add(egui::DragValue::new(&mut c.percent_h).range(1.0..=1000.0).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.percent_h).range(1.0..=1000.0).suffix(" %"));
                     });
                 }),
             }
@@ -195,12 +191,12 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                 });
             });
             row(ui, "Fine angle", |ui| {
-                ui.add(egui::Slider::new(&mut r.angle, -45.0..=45.0).suffix(" deg").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut r.angle, -45.0..=45.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(1));
             });
             if r.angle != 0.0 {
                 row(ui, "", |ui| {
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut r.crop, "Crop corners");
+                        crate::ui::widgets::checkbox(ui, &mut r.crop, "Crop corners");
                         if !r.crop {
                             color_rgba(ui, &mut r.bg, true);
                         }
@@ -209,30 +205,28 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             }
             row(ui, "Flip", |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut r.flip_h, "Horizontal");
-                    ui.checkbox(&mut r.flip_v, "Vertical");
+                    crate::ui::widgets::checkbox(ui, &mut r.flip_h, "Horizontal");
+                    crate::ui::widgets::checkbox(ui, &mut r.flip_v, "Vertical");
                 });
             });
             row(ui, "Apply to", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut r.when, RotateWhen::Always, "All");
-                    ui.selectable_value(&mut r.when, RotateWhen::Portrait, "Portrait");
-                    ui.selectable_value(&mut r.when, RotateWhen::Landscape, "Landscape");
+                    crate::ui::widgets::segmented_value(ui, &mut r.when, &[(RotateWhen::Always, "All"), (RotateWhen::Portrait, "Portrait"), (RotateWhen::Landscape, "Landscape")]);
                 });
             });
         }
         Step::Adjust(a) => {
             row(ui, "Brightness", |ui| {
-                ui.add(egui::Slider::new(&mut a.brightness, -100.0..=100.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.brightness, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
             });
             row(ui, "Contrast", |ui| {
-                ui.add(egui::Slider::new(&mut a.contrast, -100.0..=100.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.contrast, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
             });
             row(ui, "Gamma", |ui| {
-                ui.add(egui::Slider::new(&mut a.gamma, 0.2..=3.0).fixed_decimals(2));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.gamma, 0.2..=3.0).origin(1.0).default_value(1.0).fixed_decimals(2));
             });
             row(ui, "Saturation", |ui| {
-                ui.add(egui::Slider::new(&mut a.saturation, -100.0..=100.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.saturation, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
             });
         }
         Step::AutoLevels => row(ui, "", |ui| {
@@ -240,50 +234,48 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         }),
         Step::Effect { effect } => row(ui, "Effect", |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(effect, EffectKind::Grayscale, "Grayscale");
-                ui.selectable_value(effect, EffectKind::Sepia, "Sepia");
-                ui.selectable_value(effect, EffectKind::Invert, "Invert");
+                crate::ui::widgets::segmented_value(ui, effect, &[(EffectKind::Grayscale, "Grayscale"), (EffectKind::Sepia, "Sepia"), (EffectKind::Invert, "Invert")]);
             });
         }),
         Step::Sharpen(s) => {
             row(ui, "Amount", |ui| {
-                ui.add(egui::Slider::new(&mut s.amount, 0.0..=500.0).suffix(" %").fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.amount, 0.0..=500.0).suffix(" %").fixed_decimals(0));
             });
             row(ui, "Radius", |ui| {
-                ui.add(egui::Slider::new(&mut s.radius, 0.2..=10.0).suffix(" px").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.radius, 0.2..=10.0).suffix(" px").fixed_decimals(1));
             });
             row(ui, "Threshold", |ui| {
-                ui.add(egui::Slider::new(&mut s.threshold, 0..=64));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.threshold, 0..=64));
             });
         }
         Step::Border(b) => {
             row(ui, "Width", |ui| {
-                ui.add(egui::DragValue::new(&mut b.width).range(0.0..=2000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.width).range(0.0..=2000.0).suffix(" px"));
             });
             row(ui, "Bottom", |ui| {
-                ui.add(egui::DragValue::new(&mut b.bottom).range(0.0..=4000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.bottom).range(0.0..=4000.0).suffix(" px"));
             });
             row(ui, "Color", |ui| {
                 color_rgba(ui, &mut b.color, true);
             });
             row(ui, "Line", |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut b.line_width).range(0.0..=200.0).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.line_width).range(0.0..=200.0).suffix(" px"));
                     color_rgba(ui, &mut b.line_color, true);
                 });
             });
             row(ui, "Corner radius", |ui| {
-                ui.add(egui::DragValue::new(&mut b.radius).range(0.0..=2000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.radius).range(0.0..=2000.0).suffix(" px"));
             });
             row(ui, "", |ui| {
-                ui.checkbox(&mut b.shadow, "Drop shadow");
+                crate::ui::widgets::checkbox(ui, &mut b.shadow, "Drop shadow");
             });
             if b.shadow {
                 row(ui, "Shadow", |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut b.shadow_blur).range(0.0..=500.0).prefix("blur "));
-                        ui.add(egui::DragValue::new(&mut b.shadow_offset).range(-500.0..=500.0).prefix("offset "));
-                        ui.add(egui::DragValue::new(&mut b.shadow_opacity).range(0.0..=100.0).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_blur).range(0.0..=500.0).prefix("blur "));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_offset).range(-500.0..=500.0).prefix("offset "));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_opacity).range(0.0..=100.0).suffix(" %"));
                     });
                 });
                 row(ui, "Behind", |ui| {
@@ -301,42 +293,40 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             row(ui, "Font", |ui| {
                 ui.horizontal(|ui| {
                     font_combo(ui, &gid("tfont"), &mut t.font);
-                    ui.checkbox(&mut t.bold, "B");
-                    ui.checkbox(&mut t.italic, "I");
+                    crate::ui::widgets::checkbox(ui, &mut t.bold, "B");
+                    crate::ui::widgets::checkbox(ui, &mut t.italic, "I");
                 });
             });
             row(ui, "Size", |ui| {
-                ui.add(egui::Slider::new(&mut t.size_pct, 0.5..=30.0).suffix(" % of short side").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut t.size_pct, 0.5..=30.0).suffix(" % of short side").fixed_decimals(1));
             });
             row(ui, "Color", |ui| {
                 ui.horizontal(|ui| {
                     color_rgba(ui, &mut t.color, true);
-                    ui.add(egui::Slider::new(&mut t.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut t.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
                 });
             });
             row(ui, "Position", |ui| {
                 ui.horizontal(|ui| {
                     anchor_grid(ui, p, &mut t.anchor);
-                    ui.add(egui::DragValue::new(&mut t.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
                 });
             });
             row(ui, "Align", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut t.align, 0, "Left");
-                    ui.selectable_value(&mut t.align, 1, "Center");
-                    ui.selectable_value(&mut t.align, 2, "Right");
+                    crate::ui::widgets::segmented_value(ui, &mut t.align, &[(0, "Left"), (1, "Center"), (2, "Right")]);
                 });
             });
             row(ui, "Outline", |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut t.outline_pct).range(0.0..=30.0).speed(0.2).suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.outline_pct).range(0.0..=30.0).speed(0.2).suffix(" %"));
                     color_rgba(ui, &mut t.outline_color, true);
                 });
             });
             row(ui, "", |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut t.shadow, "Shadow");
-                    ui.checkbox(&mut t.background, "Background");
+                    crate::ui::widgets::checkbox(ui, &mut t.shadow, "Shadow");
+                    crate::ui::widgets::checkbox(ui, &mut t.background, "Background");
                     if t.background {
                         color_rgba(ui, &mut t.bg_color, true);
                     }
@@ -346,8 +336,7 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Watermark(w) => {
             row(ui, "Source", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut w.source, WatermarkSource::Text, "Text");
-                    ui.selectable_value(&mut w.source, WatermarkSource::Image, "Image (PNG logo)");
+                    crate::ui::widgets::segmented_value(ui, &mut w.source, &[(WatermarkSource::Text, "Text"), (WatermarkSource::Image, "Image (PNG logo)")]);
                 });
             });
             match w.source {
@@ -361,7 +350,7 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                     row(ui, "Font", |ui| {
                         ui.horizontal(|ui| {
                             font_combo(ui, &gid("wfont"), &mut w.font);
-                            ui.checkbox(&mut w.bold, "B");
+                            crate::ui::widgets::checkbox(ui, &mut w.bold, "B");
                             color_rgba(ui, &mut w.color, false);
                         });
                     });
@@ -377,29 +366,28 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             }
             row(ui, "Size", |ui| {
                 let suffix = if w.source == WatermarkSource::Image { " % of width" } else { " % of short side" };
-                ui.add(egui::Slider::new(&mut w.size_pct, 0.5..=100.0).suffix(suffix).fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut w.size_pct, 0.5..=100.0).suffix(suffix).fixed_decimals(1));
             });
             row(ui, "Opacity", |ui| {
-                ui.add(egui::Slider::new(&mut w.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut w.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
             });
             row(ui, "Layout", |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut w.tiled, false, "Single");
-                    ui.selectable_value(&mut w.tiled, true, "Tiled");
+                    crate::ui::widgets::segmented_value(ui, &mut w.tiled, &[(false, "Single"), (true, "Tiled")]);
                 });
             });
             if w.tiled {
                 row(ui, "Angle", |ui| {
-                    ui.add(egui::Slider::new(&mut w.angle, -90.0..=90.0).suffix(" deg").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut w.angle, -90.0..=90.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(0));
                 });
                 row(ui, "Gap", |ui| {
-                    ui.add(egui::Slider::new(&mut w.gap_pct, 0.0..=60.0).suffix(" %").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut w.gap_pct, 0.0..=60.0).suffix(" %").fixed_decimals(0));
                 });
             } else {
                 row(ui, "Position", |ui| {
                     ui.horizontal(|ui| {
                         anchor_grid(ui, p, &mut w.anchor);
-                        ui.add(egui::DragValue::new(&mut w.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut w.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
                     });
                 });
             }
@@ -407,7 +395,7 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Dpi { dpi } => {
             row(ui, "Resolution", |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(dpi).range(1..=4800).suffix(" dpi"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(dpi).range(1..=4800).suffix(" dpi"));
                     for d in [72u16, 96, 150, 300] {
                         if ui.small_button(d.to_string()).clicked() {
                             *dpi = d;
@@ -436,7 +424,7 @@ pub fn pipeline_ui(ui: &mut Ui, p: &Palette, pipe: &mut Pipeline, selected: &mut
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let e = &mut pipe.steps[i];
-                ui.checkbox(&mut e.enabled, "").on_hover_text("Enable or skip this step");
+                crate::ui::widgets::checkbox(ui, &mut e.enabled, "").on_hover_text("Enable or skip this step");
                 ui.label(RichText::new(format!("{}.", i + 1)).color(p.faint));
                 let enabled = e.enabled;
                 let (label, summary) = (e.step.label(), e.step.summary());
@@ -538,7 +526,7 @@ impl PresetUi {
     pub fn ui(&mut self, ui: &mut Ui, p: &Palette, s: &mut ConvertSettings) {
         ui.horizontal_wrapped(|ui| {
             let label = self.chosen.clone().unwrap_or_else(|| if self.file.presets.is_empty() { "No presets".into() } else { "Choose a preset".into() });
-            egui::ComboBox::from_id_salt("bc-presets").width(170.0).selected_text(label).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("bc-presets").width(170.0).selected_text(label).show_ui(ui, |ui| {
                 for pr in &self.file.presets {
                     if ui.selectable_label(self.chosen.as_deref() == Some(pr.name.as_str()), &pr.name).clicked() {
                         self.chosen = Some(pr.name.clone());

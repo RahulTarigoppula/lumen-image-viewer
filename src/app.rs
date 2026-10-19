@@ -632,7 +632,7 @@ impl App {
                 let t: Vec<String> = self.targets().iter().map(|p| p.display().to_string()).collect();
                 if !t.is_empty() {
                     fileops::copy_text(&t.join("\r\n"));
-                    self.core.toasts.info(if t.len() == 1 { "Path copied".to_string() } else { format!("{} paths copied", t.len()) });
+                    self.core.toasts.success(if t.len() == 1 { "Path copied".to_string() } else { format!("{} paths copied", t.len()) });
                 }
             }
             CopyFiles => {
@@ -643,7 +643,7 @@ impl App {
                 let files = self.targets();
                 if !files.is_empty() {
                     match fileops::copy_files_to_clipboard(&files) {
-                        Ok(()) => self.core.toasts.info(format!("{} file(s) copied - paste in Explorer or another folder", files.len())),
+                        Ok(()) => self.core.toasts.success(format!("{} file(s) copied - paste in Explorer or another folder", files.len())),
                         Err(e) => self.core.toasts.error(e.to_string()),
                     }
                 }
@@ -939,7 +939,7 @@ impl App {
                     }
                 };
                 match fileops::copy_image_to_clipboard(&img) {
-                    Ok(()) => self.core.toasts.info("Image copied to clipboard"),
+                    Ok(()) => self.core.toasts.success("Image copied to clipboard"),
                     Err(e) => self.core.toasts.error(format!("Copy failed: {e}")),
                 }
             }
@@ -1312,7 +1312,7 @@ impl App {
                     self.viewer.remove_path(f);
                     self.browser.selected.remove(f);
                 }
-                self.core.toasts.info(format!("Moved {} item(s) to the Recycle Bin", files.len()));
+                self.core.toasts.success(format!("Moved {} item(s) to the Recycle Bin", files.len()));
                 if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
                     self.mode = Mode::Browser;
                 }
@@ -2024,7 +2024,8 @@ impl App {
             } else {
                 format!("Move {} items to the Recycle Bin?", files.len())
             };
-            match widgets::show_confirm(ctx, "Delete", &body, "Delete", true, &p) {
+            // Red, but Enter still confirms: the Recycle Bin can undo it (as in Explorer).
+            match widgets::show_confirm_with(ctx, "Delete", &body, "Delete", widgets::ButtonKind::Danger, true, &p) {
                 Some(true) => {
                     self.confirm = None;
                     self.delete_files(files);
@@ -2149,22 +2150,25 @@ impl App {
         }
         if self.show_about {
             let mut open = true;
-            egui::Window::new("About Lumen").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-                ui.set_width(380.0);
+            crate::ui::widgets::app_window("about", "About Lumen").open(&mut open).width(420.0).anchored().show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Image::new(egui::include_image!("../assets/lumen-256.png")).fit_to_exact_size(Vec2::splat(56.0)));
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Lumen").font(theme::semibold(22.0)));
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new("Lumen").font(theme::text::display()));
                         ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(p.muted));
                     });
                 });
+                ui.add_space(12.0);
+                ui.add(egui::Label::new("A fast, private image & video viewer, browser, editor and converter for Windows.").wrap());
                 ui.add_space(8.0);
-                ui.label("A fast, private image & video viewer, browser, editor and converter for Windows.");
-                ui.add_space(4.0);
-                ui.label(RichText::new(format!("{}  No telemetry, no accounts. Lumen itself never connects to the internet; map links open in your browser only when you ask.", I::SHIELD_CHECK)).color(p.ok));
-                ui.add_space(8.0);
+                ui.horizontal_top(|ui| {
+                    ui.label(RichText::new(I::SHIELD_CHECK).size(theme::size::ICON_TOOLBAR).color(p.ok));
+                    ui.add(egui::Label::new(RichText::new("No telemetry, no accounts. Lumen itself never connects to the internet; map links open in your browser only when you ask.").color(p.muted)).wrap());
+                });
+                ui.add_space(12.0);
                 ui.hyperlink_to("github.com/RahulTarigoppula/lumen-image-viewer", "https://github.com/RahulTarigoppula/lumen-image-viewer");
-                ui.label(RichText::new("MIT licensed. Icons: Phosphor (MIT). Video decoding: FFmpeg (LGPL).").size(11.5).color(p.faint));
+                ui.label(RichText::new("MIT licensed. Icons: Phosphor (MIT). Video decoding: FFmpeg (LGPL).").size(theme::text::SMALL).color(p.faint));
             });
             self.show_about = open;
         }
@@ -2271,7 +2275,7 @@ impl App {
         let p = self.core.pal;
         let mut open = true;
         let km = keymap::active();
-        egui::Window::new("Keyboard shortcuts").open(&mut open).collapsible(false).default_size([640.0, 560.0]).show(ctx, |ui| {
+        crate::ui::widgets::app_window("shortcuts-help", "Keyboard shortcuts").open(&mut open).default_size(640.0, 560.0).min_size(360.0, 240.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Preset: {}", keymap::Preset::from_id(&self.core.settings.keymap_preset).label())).color(p.muted));
                 if ui.link("Change shortcuts...").clicked() {
@@ -2285,11 +2289,11 @@ impl App {
                 // Generated from the active keymap, so this list is always correct.
                 let no_wrap = |t: RichText| egui::Label::new(t).wrap_mode(egui::TextWrapMode::Extend);
                 let title = |ui: &mut egui::Ui, t: &str| {
-                    ui.add_space(8.0);
-                    ui.add(no_wrap(RichText::new(t).strong().size(13.5).color(p.text)));
+                    ui.add_space(10.0);
+                    ui.add(no_wrap(RichText::new(t).font(theme::text::subtitle()).color(p.text)));
                     ui.end_row();
                 };
-                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 6.0]).show(ui, |ui| {
+                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).show(ui, |ui| {
                     for mode in KeyMode::ALL {
                         title(ui, mode.label());
                         for c in Command::all() {
@@ -2297,8 +2301,12 @@ impl App {
                             if keys.is_empty() {
                                 continue;
                             }
-                            ui.add(no_wrap(RichText::new(format!("{}  {}", c.icon(), c.label()))));
-                            ui.add(no_wrap(RichText::new(keys).monospace().color(p.accent)));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(c.icon()).size(theme::size::ICON).color(p.muted)));
+                                ui.add(no_wrap(RichText::new(c.label())));
+                            });
+                            crate::ui::widgets::shortcut_keys(ui, &p, &keys);
                             ui.end_row();
                         }
                     }
@@ -2313,7 +2321,7 @@ impl App {
                         ("Back / forward buttons", "Previous / next image"),
                     ] {
                         ui.add(no_wrap(RichText::new(v)));
-                        ui.add(no_wrap(RichText::new(k).monospace().color(p.accent)));
+                        ui.add(no_wrap(RichText::new(k).color(p.muted)));
                         ui.end_row();
                     }
                 });
@@ -2326,48 +2334,49 @@ impl App {
 
     fn menu(&mut self, ui: &mut egui::Ui) {
         let mut fire = None;
-        let p = self.core.pal;
+        use crate::ui::widgets::{menu_item, menu_toggle, submenu};
         let item = |ui: &mut egui::Ui, c: Command, fire: &mut Option<Command>| {
-            if ui.add(egui::Button::new(format!("{}   {}", c.icon(), c.label())).shortcut_text(RichText::new(c.shortcut()).color(p.faint))).clicked() {
+            if menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
                 *fire = Some(c);
                 ui.close();
             }
         };
         ui.menu_button(RichText::new(I::LIST).size(18.0), |ui| {
-            ui.set_min_width(270.0);
+            ui.set_min_width(280.0);
             item(ui, Command::OpenFile, &mut fire);
             item(ui, Command::OpenFolder, &mut fire);
-            ui.menu_button(format!("{}   Recent folders", I::CLOCK_COUNTER_CLOCKWISE), |ui| {
+            submenu(ui, I::CLOCK_COUNTER_CLOCKWISE, "Recent folders", |ui| {
+                ui.set_min_width(240.0);
                 for r in self.core.settings.recent_folders.clone() {
-                    if ui.button(r.display().to_string()).clicked() {
+                    if menu_item(ui, I::FOLDER, &r.display().to_string(), "").clicked() {
                         self.navigate(r);
                         ui.close();
                     }
                 }
             });
             ui.separator();
-            ui.menu_button(format!("{}   Edit", I::PENCIL_SIMPLE), |ui| {
+            submenu(ui, I::PENCIL_SIMPLE, "Edit", |ui| {
                 for c in [Command::SelectAll, Command::SelectNone, Command::InvertSelection, Command::CopyFiles, Command::PasteFiles, Command::CopyTo, Command::MoveTo, Command::Rename, Command::Delete, Command::NewFolder] {
                     item(ui, c, &mut fire);
                 }
             });
-            ui.menu_button(format!("{}   View", I::EYE), |ui| {
+            submenu(ui, I::EYE, "View", |ui| {
                 for c in [Command::ToggleDetails, Command::TogglePreviewPane, Command::ThumbBigger, Command::ThumbSmaller, Command::ShowFlaggedOnly, Command::ToggleFullscreen, Command::ToggleTheme] {
                     item(ui, c, &mut fire);
                 }
                 ui.separator();
-                ui.menu_button(format!("{}   Thumbnail captions", I::TEXTBOX), |ui| {
+                submenu(ui, I::TEXTBOX, "Thumbnail captions", |ui| {
                     let s = &mut self.core.settings;
                     let cur = if s.show_thumb_captions { s.thumb_caption } else { crate::settings::ThumbCaption::None };
                     for c in crate::settings::ThumbCaption::ALL {
-                        if ui.radio(cur == c, c.label()).clicked() {
+                        if menu_toggle(ui, cur == c, c.label(), "").clicked() {
                             s.set_thumb_caption(c);
                             ui.close();
                         }
                     }
                 });
             });
-            ui.menu_button(format!("{}   Image", I::IMAGE), |ui| {
+            submenu(ui, I::IMAGE, "Image", |ui| {
                 for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::FlipVertical, Command::Crop, Command::Resize, Command::CanvasSize, Command::AutoEnhance, Command::AdjustColors, Command::Levels, Command::Curves, Command::Sharpen, Command::Blur, Command::Effects, Command::FreeRotate, Command::AddText, Command::AddBorder, Command::Watermark, Command::SetWallpaper, Command::Print] {
                     item(ui, c, &mut fire);
                 }
@@ -2376,7 +2385,7 @@ impl App {
                     item(ui, c, &mut fire);
                 }
             });
-            ui.menu_button(format!("{}   Tools", I::WRENCH), |ui| {
+            submenu(ui, I::WRENCH, "Tools", |ui| {
                 for c in [Command::BatchConvert, Command::BatchRename, Command::ContactSheet, Command::FindDuplicates, Command::CreateMultiPage, Command::ImageStrip, Command::CreateZip, Command::Slideshow, Command::Compare, Command::OpenVideoMode] {
                     item(ui, c, &mut fire);
                 }

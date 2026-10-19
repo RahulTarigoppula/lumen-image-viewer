@@ -16,7 +16,7 @@ use self::sheet::{SheetItem, SheetSettings};
 use crate::app::Core;
 use crate::catalog::human_size;
 use crate::formats::SaveFormat;
-use crate::ui::batch::{card, danger_button, empty_state, file_name, footer_row, hint, primary_button, window_body, window_size};
+use crate::ui::batch::{card, danger_button, empty_state, file_name, footer_row, hint, primary_button, window_body};
 use crate::ui::icons as I;
 use crate::ui::theme::Palette;
 use crossbeam_channel::Receiver;
@@ -289,14 +289,10 @@ impl ContactSheet {
         self.poll(ctx);
         let mut open = true;
         let mut close = false;
-        egui::Window::new(format!("{}  Contact sheet", I::GRID_NINE))
+        crate::ui::widgets::app_window("contact-sheet", "Contact sheet")
             .open(&mut open)
-            .default_size(window_size(ctx, 980.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .min_size(crate::ui::batch::window_size(ctx, 600.0, 400.0))
-            .resizable(true)
-            .collapsible(false)
+            .default_size(980.0, 680.0)
+            .min_size(600.0, 400.0)
             .show(ctx, |ui| {
                 close = window_body(ui, |ui| self.ui(ui, &p));
             });
@@ -361,15 +357,15 @@ impl ContactSheet {
                         if primary_button(ui, p, ok, &label).clicked() {
                             start = true;
                         }
-                        if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                        if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
                             close = true;
                         }
                         if let Some(Ok(paths)) = self.job.as_ref().and_then(|j| j.result.as_ref()) {
                             if let Some(first) = paths.first().cloned() {
-                                if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                                if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
                                     crate::fileops::show_in_explorer(&first);
                                 }
-                                if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                                if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
                                     crate::fileops::open_with_default(&first);
                                 }
                             }
@@ -405,7 +401,7 @@ impl ContactSheet {
                 }
                 let pending = self.preview_version < self.version || self.items.is_none();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("PREVIEW - PAGE 1").size(11.0).color(p.faint).strong());
+                    ui.label(RichText::new("Preview, page 1").font(crate::ui::theme::text::caption()).color(p.muted));
                     if pending {
                         ui.spinner();
                     }
@@ -440,26 +436,26 @@ impl ContactSheet {
             egui::Grid::new("cs-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Grid");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut s.cols).range(1..=20).suffix(" cols"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.cols).range(1..=20).suffix(" cols"));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut s.rows).range(1..=30).suffix(" rows"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.rows).range(1..=30).suffix(" rows"));
                 });
                 ui.end_row();
                 ui.label("Thumbnail");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut s.cell_w).range(32..=2000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.cell_w).range(32..=2000).suffix(" px"));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut s.cell_h).range(32..=2000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.cell_h).range(32..=2000).suffix(" px"));
                 });
                 ui.end_row();
                 ui.label("Spacing");
-                ui.add(egui::DragValue::new(&mut s.spacing).range(0..=200).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.spacing).range(0..=200).suffix(" px"));
                 ui.end_row();
                 ui.label("Margin");
-                ui.add(egui::DragValue::new(&mut s.margin).range(0..=400).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin).range(0..=400).suffix(" px"));
                 ui.end_row();
                 ui.label("");
-                ui.checkbox(&mut s.crop_fill, "Crop thumbnails to fill");
+                crate::ui::widgets::checkbox(ui, &mut s.crop_fill, "Crop thumbnails to fill");
                 ui.end_row();
             });
             hint(ui, p, &format!("{} per page · {} page{} · {} × {} px", l.per_page, l.pages, if l.pages == 1 { "" } else { "s" }, l.width, l.height));
@@ -470,14 +466,14 @@ impl ContactSheet {
         ui.add_space(8.0);
         card(ui, p, I::TEXT_T, "Captions & colors", |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut s.cap_name, "File name");
-                ui.checkbox(&mut s.cap_dims, "Dimensions");
-                ui.checkbox(&mut s.cap_date, "Date");
-                ui.checkbox(&mut s.cap_size, "File size");
+                crate::ui::widgets::checkbox(ui, &mut s.cap_name, "File name");
+                crate::ui::widgets::checkbox(ui, &mut s.cap_dims, "Dimensions");
+                crate::ui::widgets::checkbox(ui, &mut s.cap_date, "Date");
+                crate::ui::widgets::checkbox(ui, &mut s.cap_size, "File size");
             });
             egui::Grid::new("cs-captions").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Text size");
-                ui.add(egui::Slider::new(&mut s.caption_px, 9.0..=40.0).fixed_decimals(0).suffix(" px"));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.caption_px, 9.0..=40.0).fixed_decimals(0).suffix(" px"));
                 ui.end_row();
                 ui.label("Background");
                 ui.horizontal(|ui| {
@@ -503,10 +499,10 @@ impl ContactSheet {
             ui.add(egui::TextEdit::singleline(&mut s.title).hint_text("Title (optional)").desired_width(f32::INFINITY));
             egui::Grid::new("cs-header").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Title size");
-                ui.add(egui::Slider::new(&mut s.title_px, 12.0..=96.0).fixed_decimals(0).suffix(" px"));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.title_px, 12.0..=96.0).fixed_decimals(0).suffix(" px"));
                 ui.end_row();
                 ui.label("");
-                ui.checkbox(&mut s.page_numbers, "Page numbers");
+                crate::ui::widgets::checkbox(ui, &mut s.page_numbers, "Page numbers");
                 ui.end_row();
             });
         });
@@ -514,7 +510,7 @@ impl ContactSheet {
         card(ui, p, I::FLOPPY_DISK, "Output", |ui| {
             egui::Grid::new("cs-out").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Format");
-                egui::ComboBox::from_id_salt("cs-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
+                crate::ui::widgets::combo("cs-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
                     for f in [SaveFormat::Jpeg, SaveFormat::Png, SaveFormat::WebP, SaveFormat::Tiff, SaveFormat::Bmp] {
                         ui.selectable_value(&mut s.format, f, if f == SaveFormat::WebP { "WebP" } else { f.label() });
                     }
@@ -522,7 +518,7 @@ impl ContactSheet {
                 ui.end_row();
                 if s.format == SaveFormat::Jpeg {
                     ui.label("Quality");
-                    ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 40..=100));
                     ui.end_row();
                 }
                 ui.label("File name");
@@ -973,14 +969,10 @@ impl Duplicates {
         self.poll(&mut events, core);
         let mut open = true;
         let mut close = false;
-        egui::Window::new(format!("{}  Find duplicate & similar images", I::COPY_SIMPLE))
+        crate::ui::widgets::app_window("duplicates", "Find duplicate & similar images")
             .open(&mut open)
-            .default_size(window_size(ctx, 900.0, 680.0)).max_size(window_size(ctx, 4000.0, 4000.0)).constrain(true)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .min_size(crate::ui::batch::window_size(ctx, 560.0, 380.0))
-            .resizable(true)
-            .collapsible(false)
+            .default_size(900.0, 680.0)
+            .min_size(560.0, 380.0)
             .show(ctx, |ui| {
                 close = window_body(ui, |ui| self.ui(ui, &p, core, &mut events));
             });
@@ -1058,11 +1050,10 @@ impl Duplicates {
                 },
                 |ui| {
                     let enabled = n > 0 && !busy;
-                    let fill = if enabled { p.danger } else { p.danger.gamma_multiply(0.4) };
-                    if ui.add_enabled(enabled, egui::Button::new(RichText::new(format!("{}  Move {n} marked to Recycle Bin", I::TRASH)).color(Color32::WHITE)).fill(fill).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                    if ui.add_enabled_ui(enabled, |ui| crate::ui::widgets::danger_button(ui, p, &format!("{}  Move {n} marked to Recycle Bin", I::TRASH))).inner.clicked() {
                         confirm = true;
                     }
-                    if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                    if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
                         close = true;
                     }
                 },
@@ -1079,11 +1070,11 @@ impl Duplicates {
                     ui.add(egui::Label::new(RichText::new(short_path(&self.folder, 72)).strong()).truncate()).on_hover_text(self.folder.display().to_string());
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.include_subfolders, "Include subfolders");
-                    ui.checkbox(&mut self.find_similar, "Find similar images");
+                    crate::ui::widgets::checkbox(ui, &mut self.include_subfolders, "Include subfolders");
+                    crate::ui::widgets::checkbox(ui, &mut self.find_similar, "Find similar images");
                     ui.add_enabled_ui(self.find_similar, |ui| {
                         ui.label(RichText::new("Similarity").color(p.muted));
-                        ui.add(egui::Slider::new(&mut self.similarity, 70..=100).suffix(" %")).on_hover_text("Lower values find more loosely similar pictures (crops, edits, re-encodes)");
+                        ui.add(crate::ui::widgets::Slider::new(&mut self.similarity, 70..=100).suffix(" %")).on_hover_text("Lower values find more loosely similar pictures (crops, edits, re-encodes)");
                     });
                     let stale = self.scanned.is_some_and(|(sim, rec)| (self.find_similar && !sim) || rec != self.include_subfolders);
                     let label = if self.scanned.is_none() { "Scan" } else { "Scan again" };
@@ -1106,7 +1097,7 @@ impl Duplicates {
                     ui.spinner();
                     let phase = job.progress.phase.lock().clone();
                     let (d, t) = (job.progress.done.load(Ordering::Relaxed), job.progress.total.load(Ordering::Relaxed));
-                    ui.label(RichText::new(if t > 0 { format!("{phase}...  {d} / {t}") } else { format!("{phase}...") }).font(crate::ui::theme::semibold(14.0)));
+                    ui.label(RichText::new(if t > 0 { format!("{phase}...  {d} / {t}") } else { format!("{phase}...") }).font(crate::ui::theme::text::subtitle()));
                     ui.add_space(6.0);
                     ui.add(egui::ProgressBar::new(job.progress.fraction()).fill(p.accent).desired_width(360.0f32.min(ui.available_width())).desired_height(6.0));
                     ui.add_space(8.0);
@@ -1158,12 +1149,12 @@ impl Duplicates {
                 // Wraps onto a second line when narrow.
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Keep").color(p.muted));
-                    egui::ComboBox::from_id_salt("dup-keep").selected_text(keep_rule.label()).show_ui(ui, |ui| {
+                    crate::ui::widgets::combo("dup-keep").selected_text(keep_rule.label()).show_ui(ui, |ui| {
                         for r in KeepRule::ALL {
                             ui.selectable_value(keep_rule, r, r.label());
                         }
                     });
-                    ui.checkbox(bulk_similar, "Include similar groups")
+                    crate::ui::widgets::checkbox(ui, bulk_similar, "Include similar groups")
                         .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure");
                     if ui.button(format!("{}  Mark all but the best", I::LIST_CHECKS)).on_hover_text("In every identical group (and, if allowed, every similar group), mark all copies except the one to keep").clicked() {
                         *mark_all = true;
@@ -1414,7 +1405,7 @@ fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &m
         if resp.clicked() {
             events.push(DupEvent::Open(it.path.clone()));
         }
-        if ui.checkbox(marked, RichText::new(file_name(&it.path)).size(12.5)).changed() {
+        if crate::ui::widgets::checkbox(ui, marked, RichText::new(file_name(&it.path)).size(12.5)).changed() {
             changed = true;
         }
         let dims = it.dims.map(|(w, h)| format!("{w} × {h} · ")).unwrap_or_default();
