@@ -1087,7 +1087,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             }
             row(ui, p, "Test connection", "Checks the server, lists its models and picks one that accepts images", |ui| {
                 let testing = ai.testing();
-                if ui.add_enabled(!testing, egui::Button::new(RichText::new(format!("{}  Test connection", I::PLUGS_CONNECTED)).color(Color32::WHITE)).fill(p.accent)).clicked() {
+                if ui.add_enabled(!testing, egui::Button::new(RichText::new(format!("{}  Test connection", I::PLUGS_CONNECTED)).color(Color32::WHITE)).fill(crate::analysis_ui::look::accent_fill(p))).clicked() {
                     ai.test_connection();
                 }
                 if testing {
