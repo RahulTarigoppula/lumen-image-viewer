@@ -562,6 +562,8 @@ struct ScanJob {
 
 pub struct Duplicates {
     pub folder: PathBuf,
+    /// The browser's file list, used for the first scan only: "Scan again"
+    /// lists the folder afresh so files added since are found.
     files: Vec<PathBuf>,
     include_subfolders: bool,
     find_similar: bool,
@@ -651,7 +653,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
             (0..items.len()).filter(|&i| items[i].content.is_some_and(|c| seen[&(items[i].size, c)] > 1)).collect()
         };
         prog.set_phase(if similar { "Analyzing images" } else { "Reading image sizes" }, need.len());
-        type Info = (usize, Option<(u32, u32)>, Option<i64>, Option<(u64, f32)>);
+        type Info = (usize, Option<(u32, u32)>, Option<i64>, Option<(u128, f32)>);
         let info: Vec<Info> = need
             .par_iter()
             .map(|&i| {
@@ -686,7 +688,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
         if similar {
             // Identical pixels: only files with the same size and the same
             // dHash can match, and only when their bytes differ.
-            let mut by_look: HashMap<((u32, u32), u64), Vec<usize>> = HashMap::new();
+            let mut by_look: HashMap<((u32, u32), u128), Vec<usize>> = HashMap::new();
             for (i, it) in items.iter().enumerate() {
                 if let (Some(d), Some(h)) = (it.dims, it.dhash) {
                     by_look.entry((d, h)).or_default().push(i);
@@ -908,6 +910,24 @@ impl Duplicates {
         }
     }
 
+    /// Why some images took no part in similarity matching, if any did not.
+    fn skipped_note(&self) -> Option<String> {
+        if !self.scanned.is_some_and(|s| s.0) || !self.find_similar {
+            return None;
+        }
+        let plain = self.items.iter().filter(|it| it.dhash.is_some() && it.detail < dupes::MIN_DETAIL).count();
+        let unread = self.items.iter().filter(|it| it.dhash.is_none()).count();
+        let n = |k: usize| if k == 1 { "1 image".to_string() } else { format!("{k} images") };
+        let mut parts = Vec::new();
+        if plain > 0 {
+            parts.push(format!("{} too plain to compare by look", n(plain)));
+        }
+        if unread > 0 {
+            parts.push(format!("{} could not be read", n(unread)));
+        }
+        (!parts.is_empty()).then(|| format!("{}: only exact copies of {} are found.", parts.join(", "), if plain + unread == 1 { "it" } else { "them" }))
+    }
+
     fn mark_best(&mut self, gi: usize) {
         self.ensure_groups_current();
         let Some(g) = self.groups.get(gi) else { return };
@@ -1067,11 +1087,13 @@ impl Duplicates {
                     });
                     let stale = self.scanned.is_some_and(|(sim, rec)| (self.find_similar && !sim) || rec != self.include_subfolders);
                     let label = if self.scanned.is_none() { "Scan" } else { "Scan again" };
-                    if stale {
-                        if primary_button(ui, p, true, &format!("{}  {label}", I::MAGNIFYING_GLASS)).clicked() {
-                            self.start_scan(ui.ctx());
-                        }
-                    } else if ui.button(format!("{}  {label}", I::ARROWS_CLOCKWISE)).clicked() {
+                    let clicked = if stale {
+                        primary_button(ui, p, true, &format!("{}  {label}", I::MAGNIFYING_GLASS)).clicked()
+                    } else {
+                        ui.button(format!("{}  {label}", I::ARROWS_CLOCKWISE)).clicked()
+                    };
+                    if clicked {
+                        self.files.clear();
                         self.start_scan(ui.ctx());
                     }
                 });
@@ -1111,6 +1133,9 @@ impl Duplicates {
                     return;
                 }
                 empty_state(ui, p, I::CHECK_CIRCLE, "No duplicates found", &format!("{} images checked. Try a lower similarity or include subfolders.", self.items.len()));
+                if let Some(note) = self.skipped_note() {
+                    ui.vertical_centered(|ui| ui.label(RichText::new(format!("{}  {note}", I::INFO)).color(p.muted)));
+                }
                 return;
             }
             // Summary + auto-mark
@@ -1126,6 +1151,7 @@ impl Duplicates {
             let mut mark_all = false;
             let keep_before = self.keep_rule;
             let ng = self.groups.len();
+            let skipped = self.skipped_note();
             let summary = |ui: &mut Ui, keep_rule: &mut KeepRule, bulk_similar: &mut bool, marked: &mut HashSet<PathBuf>, mark_all: &mut bool, bulk_note: &Option<String>| {
                 ui.add(egui::Label::new(RichText::new(format!("{ng} group{} · {files_in_groups} files · up to {} reclaimable", if ng == 1 { "" } else { "s" }, human_size(reclaim))).strong()).wrap());
                 ui.add_space(2.0);
@@ -1146,7 +1172,7 @@ impl Duplicates {
                         marked.clear();
                     }
                 });
-                if let Some(note) = bulk_note {
+                for note in [bulk_note.as_ref(), skipped.as_ref()].into_iter().flatten() {
                     ui.label(RichText::new(format!("{}  {note}", I::INFO)).color(p.muted));
                 }
                 ui.add_space(4.0);
@@ -1321,7 +1347,7 @@ mod tests {
         // clone.jpg and dup_of_05.jpg are byte-identical; draw.jpg is a bigger,
         // annotated edit of the same size.
         let at = |s: u64| Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s));
-        let img = |name: &str, size: u64, content: u64, dhash: u64, t: u64| super::ScanItem { content: Some(content), dhash: Some(dhash), detail: 20.0, dims: Some((1200, 800)), ..super::ScanItem::new(name.into(), size, at(t)) };
+        let img = |name: &str, size: u64, content: u64, dhash: u128, t: u64| super::ScanItem { content: Some(content), dhash: Some(dhash), detail: 20.0, dims: Some((1200, 800)), ..super::ScanItem::new(name.into(), size, at(t)) };
         let items = vec![img("clone.jpg", 195_656, 7, 0xF0F0_F0F0, 1_000), img("draw.jpg", 328_713, 8, 0xF0F0_F0F7, 1_060), img("dup_of_05.jpg", 195_656, 7, 0xF0F0_F0F0, 2_000)];
         let mut d = super::Duplicates::blank(std::path::PathBuf::from("C:\\x"), Vec::new());
         d.replace_items(items);
