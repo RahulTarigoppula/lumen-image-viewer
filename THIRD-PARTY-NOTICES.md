@@ -16,6 +16,12 @@ following components:
 | [cpal](https://github.com/RustAudio/cpal) | Apache-2.0 | Audio output |
 | [Phosphor Icons](https://phosphoricons.com) | MIT | Icon font (`assets/PHOSPHOR-LICENSE-MIT.txt`) |
 | [windows-rs](https://github.com/microsoft/windows-rs) | MIT OR Apache-2.0 | Windows APIs (WIC, shell, GDI) |
+| [fast-ssim2](https://github.com/imazen/fast-ssim2) | BSD-2-Clause | SSIMULACRA2 metric |
+| [butteraugli](https://github.com/imazen/butteraugli) (Rust port) | BSD-3-Clause | Butteraugli metric |
+| [flip-rs](https://github.com/Tavrin/flip-rs) (port of NVIDIA FLIP) | BSD-3-Clause | FLIP metric |
+| [blake3](https://github.com/BLAKE3-team/BLAKE3) | CC0-1.0 OR Apache-2.0 | Analysis cache keys |
+| [ureq](https://github.com/algesten/ureq), [rustls](https://github.com/rustls/rustls), [ring](https://github.com/briansmith/ring) | MIT OR Apache-2.0 (ring: ISC-style) | HTTP client for the optional AI analysis feature only |
+| Matplotlib colormaps (magma, viridis) | CC0 | Heatmap color tables |
 
 Codecs such as H.264/HEVC may be covered by patents in some countries; this is
 the same situation as for VLC, mpv and other open-source players.
