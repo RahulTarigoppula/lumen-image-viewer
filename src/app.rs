@@ -519,6 +519,14 @@ impl App {
 
     pub fn run(&mut self, cmd: Command) {
         use Command::*;
+        // Playback commands (palette, menus) go to the video when it is on screen.
+        if self.mode == Mode::Video {
+            if let Some(v) = &mut self.video {
+                if v.run_command(cmd) {
+                    return;
+                }
+            }
+        }
         let fit = self.core.settings.fit_mode;
         let wrap = self.core.settings.loop_navigation;
         match cmd {
