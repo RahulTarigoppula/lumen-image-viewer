@@ -291,7 +291,7 @@ impl PrintWindow {
                 let options: Vec<_> = PER_PAGE_CHOICES.iter().copied().zip(labels.iter().map(String::as_str)).collect();
                 crate::ui::widgets::segmented_value(ui, &mut o.per_page, &options);
             });
-            egui::Grid::new("pr-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("pr-layout").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Orientation");
                 crate::ui::widgets::combo("pr-orient")
                     .selected_text(match o.orientation {

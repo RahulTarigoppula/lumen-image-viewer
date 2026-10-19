@@ -433,7 +433,7 @@ impl ContactSheet {
         let s = &mut self.s;
         ui.spacing_mut().slider_width = 110.0;
         card(ui, p, I::GRID_NINE, "Layout", |ui| {
-            egui::Grid::new("cs-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("cs-layout").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Grid");
                 ui.horizontal(|ui| {
                     crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.cols).range(1..=20).suffix(" cols"));
@@ -471,13 +471,13 @@ impl ContactSheet {
                 crate::ui::widgets::checkbox(ui, &mut s.cap_date, "Date");
                 crate::ui::widgets::checkbox(ui, &mut s.cap_size, "File size");
             });
-            egui::Grid::new("cs-captions").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("cs-captions").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Text size");
                 ui.add(crate::ui::widgets::Slider::new(&mut s.caption_px, 9.0..=40.0).fixed_decimals(0).suffix(" px"));
                 ui.end_row();
                 ui.label("Background");
                 ui.horizontal(|ui| {
-                    ui.color_edit_button_srgb(&mut s.bg);
+                    crate::ui::widgets::color_button(ui, &mut s.bg);
                     for (name, bg, fg) in [("White", [255, 255, 255], [40, 42, 48]), ("Gray", [128, 128, 128], [250, 250, 250]), ("Black", [18, 18, 20], [225, 225, 230])] {
                         if ui.small_button(name).clicked() {
                             s.bg = bg;
@@ -487,7 +487,7 @@ impl ContactSheet {
                 });
                 ui.end_row();
                 ui.label("Text");
-                ui.color_edit_button_srgb(&mut s.fg);
+                crate::ui::widgets::color_button(ui, &mut s.fg);
                 ui.end_row();
             });
             if sheet::fonts().regular.is_none() {
@@ -497,7 +497,7 @@ impl ContactSheet {
         ui.add_space(8.0);
         card(ui, p, I::TEXT_AA, "Header", |ui| {
             ui.add(egui::TextEdit::singleline(&mut s.title).hint_text("Title (optional)").desired_width(f32::INFINITY));
-            egui::Grid::new("cs-header").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("cs-header").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Title size");
                 ui.add(crate::ui::widgets::Slider::new(&mut s.title_px, 12.0..=96.0).fixed_decimals(0).suffix(" px"));
                 ui.end_row();
@@ -508,7 +508,7 @@ impl ContactSheet {
         });
         ui.add_space(8.0);
         card(ui, p, I::FLOPPY_DISK, "Output", |ui| {
-            egui::Grid::new("cs-out").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("cs-out").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Format");
                 crate::ui::widgets::combo("cs-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
                     for f in [SaveFormat::Jpeg, SaveFormat::Png, SaveFormat::WebP, SaveFormat::Tiff, SaveFormat::Bmp] {

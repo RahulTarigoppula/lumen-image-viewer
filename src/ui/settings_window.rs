@@ -161,10 +161,10 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     }
     // Size and position come from the app window every frame (nothing remembered),
     // so the window always fits, at any interface size and after maximize / restore,
-    // and keeps the same width on every page. 32 pt stay free on every side, so the
-    // status bar remains readable.
+    // and keeps the same width on every page. The app stays visible around it
+    // (`widgets::WINDOW_MARGIN`), so it reads as a window, not a new screen.
     let cap = widgets::AppWindow::cap(ctx);
-    let size = Vec2::new(cap.x.min(900.0), cap.y);
+    let size = Vec2::new(cap.x.min(860.0), cap.y.min(680.0));
     widgets::app_window("settings", "Settings")
         .open(open)
         .fixed_size(size)
@@ -514,7 +514,7 @@ fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -
         let center = rect.center();
         let painter = ui.painter();
         painter.circle_filled(center, 8.0, c);
-        painter.circle_stroke(center, 8.0, Stroke::new(1.0, swatch_ring(p)));
+        painter.circle_stroke(center, 8.0, Stroke::new(1.0, swatch_ring(p, c)));
         if selected {
             painter.circle_stroke(center, 11.0, Stroke::new(2.0, p.accent));
         } else if resp.hovered() {
@@ -527,8 +527,15 @@ fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -
     resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn swatch_ring(p: &Palette) -> Color32 {
-    if p.dark { Color32::from_white_alpha(70) } else { Color32::from_black_alpha(50) }
+/// Outline of a swatch: stronger when the color is close to the card behind it (a
+/// white swatch on a light card, a black one on a dark card), so it never vanishes.
+fn swatch_ring(p: &Palette, c: Color32) -> Color32 {
+    let luma = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    if p.dark {
+        Color32::from_white_alpha(if luma < 60.0 { 110 } else { 70 })
+    } else {
+        Color32::from_black_alpha(if luma > 200.0 { 120 } else { 50 })
+    }
 }
 
 /// The "custom color" swatch: a circle with an eyedropper that opens a color picker.
@@ -541,7 +548,7 @@ fn custom_swatch(ui: &mut Ui, p: &Palette, value: &mut [u8; 3], presets: &[[u8; 
         let painter = ui.painter();
         let fill = if custom { Color32::from_rgb(value[0], value[1], value[2]) } else { p.faint_bg };
         painter.circle_filled(c, 8.0, fill);
-        painter.circle_stroke(c, 8.0, Stroke::new(1.0, swatch_ring(p)));
+        painter.circle_stroke(c, 8.0, Stroke::new(1.0, swatch_ring(p, fill)));
         let glyph = if custom { theme::text_on(fill) } else if resp.hovered() { p.text } else { p.muted };
         painter.text(c, Align2::CENTER_CENTER, I::EYEDROPPER, FontId::proportional(size::ICON_CARET), glyph);
         if custom {
@@ -634,7 +641,7 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
                 st.scale_edit = None;
                 c = true;
             }
-            if (s.ui_scale - 1.0).abs() > 0.001 && ui.add(egui::Button::new("Reset").frame_when_inactive(false)).on_hover_text("Back to 100%").clicked() {
+            if (s.ui_scale - 1.0).abs() > 0.001 && ui.add(egui::Button::new(format!("{}  Reset", I::ARROW_COUNTER_CLOCKWISE)).min_size(Vec2::new(0.0, size::COMPACT))).on_hover_text("Back to 100%").clicked() {
                 s.ui_scale = 1.0;
                 st.scale_edit = None;
                 c = true;
