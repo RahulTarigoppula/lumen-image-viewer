@@ -207,6 +207,9 @@ impl EditTool for Levels {
     fn reset(&mut self) {
         *self = Levels::default();
     }
+    fn can_apply(&self) -> bool {
+        self.p != [LevelsParams::default(); 4]
+    }
 }
 
 // ---------------------------------------------------------------- Curves
@@ -360,6 +363,10 @@ impl EditTool for Curves {
     }
     fn reset(&mut self) {
         *self = Curves::default();
+    }
+    fn can_apply(&self) -> bool {
+        // Points on the diagonal leave the image as it is.
+        self.pts.iter().flatten().any(|[x, y]| (x - y).abs() > 1e-3)
     }
 }
 
