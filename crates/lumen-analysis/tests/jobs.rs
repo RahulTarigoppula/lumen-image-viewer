@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Longest wait for any job event. Generous on purpose: a whole-workspace
+/// test run on a loaded machine is slow, but nothing may wait forever.
+const LIMIT: Duration = Duration::from_secs(300);
+
 fn frame_pair(w: usize, h: usize, seed: u64, noise: f64) -> (OwnedFrame, OwnedFrame) {
     let t = texture(w, h, seed);
     (
@@ -35,7 +39,7 @@ fn image_job_streams_results_and_report() {
     let mut h1 = an.submit_image(spec, a, Some(b));
     let mut metric_events = 0;
     let report = loop {
-        match h1.recv_timeout(Duration::from_secs(30)).expect("event") {
+        match h1.recv_timeout(LIMIT).expect("event") {
             JobEvent::Metric(r) => {
                 assert!(!r.preview);
                 metric_events += 1;
@@ -75,7 +79,7 @@ fn identical_image_csv_reads_cap_not_inf() {
     let (w, h) = (64, 64);
     let img: SharedFrame = Arc::new(gray_rgba(w, h, &quantize(&texture(w, h, 1))));
     let spec = ImageSpec { metrics: vec!["psnr".into(), "ssim.fast".into()], ..Default::default() };
-    let r = an.submit_image(spec, img.clone(), Some(img)).wait().unwrap();
+    let r = an.submit_image(spec, img.clone(), Some(img)).wait_timeout(LIMIT).unwrap();
     let csv = r.to_csv();
     assert!(csv.contains("psnr.r,100.0000,dB,higher"), "{csv}");
     assert!(csv.contains("ssim.fast.y_db,100.0000,dB,higher"), "{csv}");
@@ -87,14 +91,14 @@ fn image_job_errors_and_skips() {
     let an = Analyzer::new(Some(2), None);
     let small: SharedFrame = Arc::new(gray_rgba(32, 32, &[9; 1024]));
     // Unknown metric fails the job.
-    let r = an.submit_image(ImageSpec { metrics: vec!["nope".into()], ..Default::default() }, small.clone(), None).wait();
+    let r = an.submit_image(ImageSpec { metrics: vec!["nope".into()], ..Default::default() }, small.clone(), None).wait_timeout(LIMIT);
     assert!(r.unwrap_err().contains("unknown metric"));
     // FR metric without B and a too-small MS-SSIM are skipped with notes.
     let other: SharedFrame = Arc::new(gray_rgba(32, 32, &[10; 1024]));
-    let r = an.submit_image(ImageSpec { metrics: vec!["psnr".into(), "noise".into()], ..Default::default() }, small.clone(), None).wait().unwrap();
+    let r = an.submit_image(ImageSpec { metrics: vec!["psnr".into(), "noise".into()], ..Default::default() }, small.clone(), None).wait_timeout(LIMIT).unwrap();
     assert!(r.notes.iter().any(|n| n.starts_with("psnr: skipped")), "{:?}", r.notes);
     assert!(r.value("noise.y").is_some());
-    let r = an.submit_image(ImageSpec { metrics: vec!["ms_ssim".into()], ..Default::default() }, small, Some(other)).wait().unwrap();
+    let r = an.submit_image(ImageSpec { metrics: vec!["ms_ssim".into()], ..Default::default() }, small, Some(other)).wait_timeout(LIMIT).unwrap();
     assert!(r.notes[0].contains("176x176"), "{:?}", r.notes);
 }
 
@@ -109,9 +113,9 @@ fn new_submission_supersedes_previous() {
     let h2 = an.submit_image(spec, a.clone(), Some(a));
     assert!(h2.generation > h1.generation);
     assert_eq!(an.latest_generation(), h2.generation);
-    let r1 = h1.wait();
+    let r1 = h1.wait_timeout(LIMIT);
     assert!(r1.is_err() || r1.is_ok(), "first job ends either way");
-    assert!(h2.wait().is_ok());
+    assert!(h2.wait_timeout(LIMIT).is_ok());
 }
 
 #[test]
@@ -192,9 +196,10 @@ fn video_job_through_channel_with_budget_and_cancel() {
     });
     // A tiny budget forces one frame in flight; results are still complete.
     let spec = VideoSpec { metrics: vec!["psnr".into(), "ssim.gauss".into()], memory_budget: 1, total_frames: Some(40), ..Default::default() };
-    let rep = an.submit_video(spec, rx).wait().unwrap();
+    let rep = an.submit_video(spec, rx).wait_timeout(LIMIT).unwrap();
     assert_eq!(rep.frames.len(), 40);
-    assert!(rep.notes.iter().any(|n| n.contains("1 frame(s) in flight")), "{:?}", rep.notes);
+    // The window size is normal operation, not something to warn about.
+    assert!(rep.notes.is_empty(), "{:?}", rep.notes);
     // An endless stream, cancelled after a few rows.
     let endless = (0u64..).map(move |i| {
         let (a, b) = frame_pair(w, h, i % 5, 2.0);
@@ -203,7 +208,7 @@ fn video_job_through_channel_with_budget_and_cancel() {
     let mut hdl = an.submit_video(VideoSpec { metrics: vec!["psnr".into()], ..Default::default() }, endless);
     let mut seen = 0;
     loop {
-        match hdl.recv_timeout(Duration::from_secs(30)).expect("event") {
+        match hdl.recv_timeout(LIMIT).expect("event") {
             JobEvent::Row(_) => {
                 seen += 1;
                 if seen == 5 {
@@ -290,7 +295,7 @@ fn heavy_metrics_preview_first() {
     let mut hd = an.submit_image(spec, a, Some(b));
     let (mut partial, mut fin) = (None, None);
     loop {
-        match hd.recv_timeout(Duration::from_secs(120)).expect("event") {
+        match hd.recv_timeout(LIMIT).expect("event") {
             JobEvent::Partial(r) => partial = Some(r),
             JobEvent::Metric(r) if r.id == "flip" => fin = Some(r),
             JobEvent::Done(_) => break,
@@ -304,4 +309,28 @@ fn heavy_metrics_preview_first() {
     let pm = p.map.unwrap();
     assert_eq!((pm.width, pm.cell_w), (640, 2.0));
     assert_eq!(f.map.unwrap().width, 1280);
+}
+
+/// A frame whose pixels cannot be read: its metrics panic.
+struct Broken;
+
+impl FrameSource for Broken {
+    fn view(&self) -> lumen_analysis::FrameView<'_> {
+        panic!("unreadable frame (test)")
+    }
+}
+
+#[test]
+fn panicking_frame_never_hangs_a_video_job() {
+    let an = Analyzer::new(Some(2), None);
+    let (w, h) = (64, 48);
+    let frames = (0u64..6).map(move |i| {
+        let (a, b) = frame_pair(w, h, i, 2.0);
+        // Frame 3 of B cannot be read; the first frame sizes the job, so it is fine.
+        let b: SharedFrame = if i == 3 { Arc::new(Broken) } else { Arc::new(b) };
+        (i, Arc::new(a) as SharedFrame, Some(b))
+    });
+    let rep = an.submit_video(VideoSpec { metrics: vec!["psnr".into()], ..Default::default() }, frames).wait_timeout(LIMIT).unwrap();
+    assert_eq!(rep.frames.len(), 6);
+    assert!(rep.notes.iter().any(|n| n.contains("internal error")), "{:?}", rep.notes);
 }

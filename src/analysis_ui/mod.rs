@@ -139,6 +139,25 @@ impl Subject {
     }
 }
 
+/// What a mode's toolbar button or context menu asks of the panel
+/// (`Core::analysis_request`; the app applies it after the mode's UI).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanelRequest {
+    Toggle,
+    /// "Analyze...": open it (stays open when it already is).
+    Open,
+}
+
+/// The Analysis button of the viewer, compare and video toolbars (chart
+/// icon), shown selected while the panel is open.
+pub fn toolbar_button(ui: &mut egui::Ui, core: &mut crate::app::Core) {
+    let cmd = crate::ui::commands::Command::ToggleAnalysis;
+    let tip = format!("Analysis: metrics and AI  ({})", cmd.shortcut());
+    if crate::ui::widgets::icon_button(ui, cmd.icon(), &tip, core.analysis_open).clicked() {
+        core.analysis_request = Some(PanelRequest::Toggle);
+    }
+}
+
 pub fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
 }
@@ -178,6 +197,23 @@ pub fn privacy_note(core: &crate::app::Core) -> &'static str {
     "Lumen itself never connects to the internet; map links open in your browser only when you ask. Ratings and tags are stored locally."
 }
 
+/// Writes the report bundle the Metrics tab asked for, with the AI tab's
+/// results for the same files as Markdown cards.
+pub fn export_bundle_requested(core: &mut crate::app::Core, subject: Option<&Subject>) {
+    let Some(parent) = core.metrics.take_bundle_request() else { return };
+    #[cfg(feature = "ai")]
+    let cards: Vec<String> = match subject.and_then(|s| s.file_key()) {
+        Some(key) => core.ai.records(&key).iter().filter_map(|r| r.result().map(|res| ai_view::markdown(r, res))).collect(),
+        None => Vec::new(),
+    };
+    #[cfg(not(feature = "ai"))]
+    let cards = {
+        let _ = subject;
+        Vec::new()
+    };
+    core.metrics.export_bundle(parent, cards);
+}
+
 /// Dev hook `ai <verb> [args]` for automated UI tests (LUMEN_DEV_DIR only).
 /// Returns a line for state.txt and requests for the app.
 pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Option<&Subject>, args: &str) -> (String, Vec<PanelAction>) {
@@ -190,7 +226,14 @@ pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Opti
         "metrics" => {
             panel.open = true;
             panel.tab = panel::Tab::Metrics;
-            return (core.metrics.dev(rest), actions);
+            let mut state = core.metrics.dev(rest);
+            export_bundle_requested(core, subject);
+            // What an AI run would be told about the metrics right now.
+            if let Some(s) = subject {
+                let ctx: Vec<String> = core.metrics.metric_context(s, panel.roi_pixels()).iter().map(|(n, v, u)| format!("{n}={v:.4}{u}")).collect();
+                state += &format!(" ai_context=[{}]", ctx.join("; "));
+            }
+            return (state, actions);
         }
         "close" => panel.open = false,
         "settings" => actions.push(PanelAction::OpenSettings("Ai")),

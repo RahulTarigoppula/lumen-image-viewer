@@ -133,6 +133,7 @@ static NOISE: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::LowerIsBetter,
+    headline: &["y"],
     description: "Immerkaer noise sigma per plane (Y, Cb, Cr) in 8-bit levels, edges masked",
 };
 

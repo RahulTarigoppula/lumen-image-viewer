@@ -161,9 +161,10 @@ impl MetricResult {
         self.values.iter().find(|v| v.key == key).map(|v| v.value)
     }
 
-    /// The headline value (first value).
+    /// The headline value (see [`headline_key`]).
     pub fn main(&self) -> Option<&Value> {
-        self.values.first()
+        let k = headline_key(&self.id, self.values.iter().map(|v| v.key.as_str()))?;
+        self.values.iter().find(|v| v.key == k)
     }
 }
 
@@ -247,6 +248,10 @@ pub struct MetricInfo {
     pub has_map: bool,
     /// Headline value direction.
     pub direction: Direction,
+    /// Keys of the headline value in order of preference (the first one a
+    /// result has wins; `["y", "avg"]`: Y for YUV, the average for RGB).
+    /// Never "whichever value comes first": PSNR's first RGB value is R.
+    pub headline: &'static [&'static str],
     pub description: &'static str,
 }
 
@@ -323,6 +328,17 @@ pub fn all() -> &'static [&'static dyn Metric] {
 /// Metric by id.
 pub fn get(id: &str) -> Option<&'static dyn Metric> {
     REGISTRY.iter().copied().find(|m| m.id() == id)
+}
+
+/// Preferred headline keys of a frame or temporal metric (relative keys).
+pub fn headline_keys(id: &str) -> &'static [&'static str] {
+    get(id).map(|m| m.info().headline).or_else(|| temporal::get(id).map(|t| t.headline)).unwrap_or(&[])
+}
+
+/// The headline among `keys` (relative, `"avg"`) of metric `id`: its first
+/// preferred key present, else the first key (unknown metrics).
+pub fn headline_key<'k>(id: &str, keys: impl Iterator<Item = &'k str> + Clone) -> Option<&'k str> {
+    headline_keys(id).iter().find_map(|h| keys.clone().find(|k| k == h)).or_else(|| keys.clone().next())
 }
 
 /// Named metric sets for the UI: `"quick"`, `"encode_qa"`, `"photo_technical"`.

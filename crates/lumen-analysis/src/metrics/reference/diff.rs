@@ -87,6 +87,7 @@ static DIFF_ABS: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::LowerIsBetter,
+    headline: &["mean"],
     description: "Absolute difference in 8-bit levels (RGB: largest channel; YUV: luma)",
 };
 
@@ -138,7 +139,7 @@ impl Metric for DiffAbs {
         r.push("p99", s.percentile(99.0), Unit::Levels8, d);
         r.push("max", s.max as f64, Unit::Levels8, d);
         r.push("changed_pct", 100.0 * changed as f64 / (w * h) as f64, Unit::Percent, d);
-        r.map = map.map(|m| Heatmap::new(w, h, m, "Abs difference").with_unit(Unit::Levels8).with_range(0.0, 32.0).with_style(Colormap::Magma, false, Pool::Max));
+        r.map = map.map(|m| Heatmap::new(w, h, m, "Abs difference").with_unit(Unit::Levels8).with_range(0.0, 64.0).with_min_span(16.0).with_style(Colormap::Magma, false, Pool::Max));
         Ok(r)
     }
 }
@@ -157,6 +158,7 @@ static DIFF_SIGNED: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::Neutral,
+    headline: &["mean"],
     description: "Luma B minus A in 8-bit levels: bias (mean) and spread",
 };
 
@@ -221,7 +223,7 @@ impl Metric for DiffSigned {
         r.push("min", tot.2 as f64, Unit::Levels8, Direction::Neutral);
         r.push("max", tot.3 as f64, Unit::Levels8, Direction::Neutral);
         if o.want_map {
-            r.map = Some(Heatmap::new(w, h, map, "Signed difference (B - A)").with_unit(Unit::Levels8).with_range(-16.0, 16.0).with_style(Colormap::RdBu, false, Pool::MaxAbs));
+            r.map = Some(Heatmap::new(w, h, map, "Signed difference (B - A)").with_unit(Unit::Levels8).with_range(-32.0, 32.0).with_min_span(8.0).with_style(Colormap::RdBu, false, Pool::MaxAbs));
         }
         Ok(r)
     }

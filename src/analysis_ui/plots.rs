@@ -3,7 +3,7 @@
 //! 0.36). Click to seek, drag to select a new frame range, a horizontal
 //! threshold line per family, and a worst-frames list with thumbnails.
 
-use super::metrics_view::threshold;
+use super::metrics_view::{key_label, threshold, unit_text};
 use crate::ui::theme::Palette;
 use egui::{Color32, CursorIcon, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use lumen_analysis::metrics::{Direction, Unit};
@@ -128,6 +128,28 @@ impl Series {
         v
     }
 
+    /// The `n` worst frames of `key` at least `gap` frames apart, worst
+    /// first: a bad stretch is listed once, not as its 8 neighbours.
+    pub fn worst_spaced(&self, key: &str, n: usize, gap: u64) -> Vec<(u64, f64)> {
+        let mut out: Vec<(u64, f64)> = Vec::new();
+        for w in self.worst(key, usize::MAX) {
+            if out.len() >= n {
+                break;
+            }
+            if out.iter().all(|o| o.0.abs_diff(w.0) >= gap) {
+                out.push(w);
+            }
+        }
+        out
+    }
+
+    /// Spacing of the worst-frames list: 1/(4 n) of the frames covered, at
+    /// least 3 frames.
+    pub fn worst_gap(&self, n: usize) -> u64 {
+        let (lo, hi) = self.data.iter().flatten().fold((u64::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.0)));
+        (hi.saturating_sub(lo) / (4 * n.max(1) as u64)).max(3)
+    }
+
     /// Columns that make sense for the worst-frames list (each family's
     /// headline columns with a direction).
     pub fn rankable(&self) -> Vec<&str> {
@@ -199,12 +221,22 @@ fn x_of_frame(rect: Rect, span: (u64, u64), f: f64) -> f32 {
 }
 
 /// Value range of the plotted columns, padded; flat data gets a small band.
-fn y_range(s: &Series, cols: &[usize], extra: Option<f64>) -> Option<(f64, f64)> {
+/// The padding never goes past what the unit can reach (PSNR is capped at
+/// 100 dB, SSIM at 1, percentages at 0 and 100).
+fn y_range(s: &Series, cols: &[usize], unit: Unit, extra: Option<f64>) -> Option<(f64, f64)> {
     let mut it = cols.iter().flat_map(|&i| s.data[i].iter().map(|p| p.1)).chain(extra);
     let first = it.next()?;
     let (lo, hi) = it.fold((first, first), |(a, b), v| (a.min(v), b.max(v)));
     let pad = if hi > lo { (hi - lo) * 0.08 } else { lo.abs().max(1.0) * 0.01 };
-    Some((lo - pad, hi + pad))
+    let (min, max) = match unit {
+        Unit::Db => (f64::NEG_INFINITY, lumen_analysis::PSNR_CAP_DB),
+        Unit::Index => (f64::NEG_INFINITY, 1.0),
+        Unit::Percent => (0.0, 100.0),
+        Unit::Count | Unit::Pixels | Unit::CodeSq | Unit::Levels8Sq => (0.0, f64::INFINITY),
+        _ => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    let (a, b) = ((lo - pad).max(min.min(lo)), (hi + pad).min(max.max(hi)));
+    Some(if b > a { (a, b) } else { (lo - pad, hi + pad) })
 }
 
 /// Min/max of each pixel column, so long series draw as an envelope.
@@ -260,6 +292,8 @@ impl Plots {
     pub fn ui(&mut self, ui: &mut Ui, p: &Palette, s: &Series, span: (u64, u64), current: Option<u64>, plot_height: f32) -> Option<PlotAction> {
         let mut action = None;
         let span = (span.0, span.1.max(span.0 + 1));
+        // The graphs cover the measured range, not the whole timeline above.
+        ui.label(RichText::new(format!("Measured range: frames {}-{}", span.0, span.1)).size(11.0).color(p.muted));
         for fam in s.families() {
             if let Some(a) = self.family_plot(ui, p, s, &fam, span, current, plot_height) {
                 action = Some(a);
@@ -278,7 +312,7 @@ impl Plots {
             for (n, &i) in fam.cols.iter().enumerate() {
                 let c = &s.cols[i];
                 let short = c.key.strip_prefix(&fam.id).map(|k| k.trim_start_matches('.')).unwrap_or(&c.key);
-                ui.label(RichText::new(format!("- {short}")).size(11.0).color(SERIES_COLORS[n % SERIES_COLORS.len()]));
+                ui.label(RichText::new(format!("- {}", key_label(&fam.id, short))).size(11.0).color(SERIES_COLORS[n % SERIES_COLORS.len()]));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut on = thr.is_some();
@@ -298,7 +332,7 @@ impl Plots {
         let painter = ui.painter_at(rect.expand(1.0));
         painter.rect_filled(rect, 3.0, p.raised);
         painter.rect_stroke(rect, 3.0, Stroke::new(1.0, p.border), StrokeKind::Inside);
-        let Some((lo, hi)) = y_range(s, &fam.cols, thr) else {
+        let Some((lo, hi)) = y_range(s, &fam.cols, fam.unit, thr) else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "No values", FontId::proportional(11.0), p.faint);
             return None;
         };
@@ -354,6 +388,14 @@ impl Plots {
             let x = x_of_frame(inner, span, c as f64);
             painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(1.0, p.text));
         }
+        // Frame numbers along the x axis: the ends and the middle.
+        let (axis, _) = ui.allocate_exact_size(Vec2::new(width, 12.0), Sense::hover());
+        let ap = ui.painter_at(axis);
+        let font = FontId::proportional(10.0);
+        let midf = (span.0 + span.1) / 2;
+        ap.text(Pos2::new(inner.min.x, axis.min.y), egui::Align2::LEFT_TOP, span.0.to_string(), font.clone(), p.faint);
+        ap.text(Pos2::new(x_of_frame(inner, span, midf as f64), axis.min.y), egui::Align2::CENTER_TOP, midf.to_string(), font.clone(), p.faint);
+        ap.text(Pos2::new(inner.max.x, axis.min.y), egui::Align2::RIGHT_TOP, span.1.to_string(), font, p.faint);
         // Hover readout.
         if let Some(pos) = resp.hover_pos() {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -367,7 +409,9 @@ impl Plots {
                 let near = [k.checked_sub(1), Some(k)].into_iter().flatten().filter_map(|k| d.get(k)).min_by_key(|q| q.0.abs_diff(f));
                 if let Some(&(nf, v)) = near {
                     let at = if nf == f { String::new() } else { format!(" (frame {nf})") };
-                    lines.push(format!("{} {}{at}", s.cols[i].key, fmt_axis(v, s.cols[i].unit)));
+                    let c = &s.cols[i];
+                    let short = c.key.strip_prefix(&fam.id).map(|k| k.trim_start_matches('.')).unwrap_or(&c.key);
+                    lines.push(format!("{} {} {}{at}", key_label(&fam.id, short), fmt_axis(v, c.unit), unit_text(c.unit)));
                 }
             }
             super::heatmap_view::readout(ui, pos, &lines.join("\n"));
@@ -412,9 +456,10 @@ impl Plots {
         let mut key = self.rank_key.clone().unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Worst frames by").color(p.muted));
-            egui::ComboBox::from_id_salt("worst-key").selected_text(&key).show_ui(ui, |ui| {
+            let label = |k: &str| format!("{}, {}", metric_name(metric_of(k)), key_label(metric_of(k), k.rsplit_once('.').map(|x| x.1).unwrap_or(k)));
+            egui::ComboBox::from_id_salt("worst-key").selected_text(label(&key)).show_ui(ui, |ui| {
                 for k in &keys {
-                    ui.selectable_value(&mut key, k.clone(), k);
+                    ui.selectable_value(&mut key, k.clone(), label(k));
                 }
             });
         });
@@ -422,7 +467,7 @@ impl Plots {
         let mut action = None;
         let mut thumbs = thumbs;
         let unit = s.cols.iter().find(|c| c.key == key).map(|c| c.unit).unwrap_or(Unit::Score);
-        for (f, v) in s.worst(&key, self.worst_n) {
+        for (f, v) in s.worst_spaced(&key, self.worst_n, s.worst_gap(self.worst_n)) {
             let r = ui
                 .horizontal(|ui| {
                     if let Some(t) = thumbs.as_deref_mut() {
@@ -438,7 +483,7 @@ impl Plots {
                         }
                     }
                     ui.label(RichText::new(format!("Frame {f}")).color(p.text));
-                    ui.label(RichText::new(format!("{} {}", fmt_axis(v, unit), unit.label())).color(p.muted));
+                    ui.label(RichText::new(format!("{} {}", fmt_axis(v, unit), unit_text(unit))).color(p.muted));
                 })
                 .response
                 .interact(Sense::click());
@@ -452,7 +497,8 @@ impl Plots {
     /// Frames listed by [`Plots::worst_ui`].
     pub fn worst_frames(&self, s: &Series) -> Vec<u64> {
         let key = self.rank_key.clone().or_else(|| s.default_rank_key()).unwrap_or_default();
-        s.worst(&key, if self.worst_n == 0 { 8 } else { self.worst_n }).into_iter().map(|w| w.0).collect()
+        let n = if self.worst_n == 0 { 8 } else { self.worst_n };
+        s.worst_spaced(&key, n, s.worst_gap(n)).into_iter().map(|w| w.0).collect()
     }
 }
 
@@ -510,6 +556,21 @@ mod tests {
     }
 
     #[test]
+    fn worst_frames_are_spread_out() {
+        let mut s = Series::default();
+        // A bad stretch at 100-110 and a smaller dip at 300.
+        for i in 0..400u64 {
+            let y = if (100..=110).contains(&i) { 20.0 + (i - 100) as f64 * 0.1 } else if i == 300 { 30.0 } else { 45.0 };
+            s.push(&row(i, &[("psnr.y", y, Unit::Db, Direction::HigherIsBetter)]));
+        }
+        assert_eq!(s.worst_gap(4), 24);
+        let w: Vec<u64> = s.worst_spaced("psnr.y", 3, 24).iter().map(|w| w.0).collect();
+        assert_eq!(w[0], 100);
+        assert!(w.contains(&300), "{w:?}");
+        assert!(w.windows(2).all(|p| p[0].abs_diff(p[1]) >= 24));
+    }
+
+    #[test]
     fn report_round_trip() {
         let s = series();
         let mut b = lumen_analysis::report::ReportBuilder::new(Default::default());
@@ -532,7 +593,9 @@ mod tests {
         let pts: Vec<(u64, f64)> = (0..10_000).map(|i| (i, (i % 7) as f64)).collect();
         let d = decimate(&pts, rect, (0, 9_999), &|v| v as f32);
         assert!(d.len() <= 202, "{}", d.len());
-        let (lo, hi) = y_range(&series(), &[0], None).unwrap();
-        assert!(lo < 28.0 && hi > 100.0);
+        let (lo, hi) = y_range(&series(), &[0], Unit::Db, None).unwrap();
+        assert!(lo < 28.0 && hi == lumen_analysis::PSNR_CAP_DB);
+        let (_, hi) = y_range(&series(), &[3], Unit::Index, None).unwrap();
+        assert_eq!(hi, 1.0);
     }
 }

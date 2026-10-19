@@ -347,9 +347,14 @@ impl RoiEditor {
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), if warn { WARN } else { Color32::WHITE });
             let pad = Vec2::new(6.0, 3.0);
             let size = galley.size() + pad * 2.0;
-            // Below the rectangle, or inside it when that would leave the view.
+            // Below the rectangle, or inside it when that would leave the view;
+            // always inside the visible pane (a region at its right edge with
+            // the "too small" note would otherwise be cut off).
+            let clip = painter.clip_rect().intersect(dest);
             let below = sr.left_bottom() + Vec2::new(0.0, 8.0);
-            let min = if below.y + size.y <= painter.clip_rect().max.y { below } else { sr.left_bottom() - Vec2::new(-8.0, size.y + 8.0) };
+            let mut min = if below.y + size.y <= clip.max.y { below } else { sr.left_bottom() - Vec2::new(-8.0, size.y + 8.0) };
+            min.x = min.x.min(clip.max.x - size.x - 4.0).max(clip.min.x + 4.0);
+            min.y = min.y.min(clip.max.y - size.y - 4.0).max(clip.min.y + 4.0);
             let bg = Rect::from_min_size(min, size);
             painter.rect_filled(bg, 4.0, Color32::from_black_alpha(170));
             painter.galley(bg.min + pad, galley, Color32::WHITE);

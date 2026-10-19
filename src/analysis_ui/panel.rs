@@ -131,7 +131,7 @@ impl AnalysisPanel {
             self.drawing = true;
             self.use_roi = true;
         }
-        let esc = self.drawing || self.roi.rect().is_some();
+        let esc = (self.drawing || self.roi.rect().is_some()) && !egui::Popup::is_any_open(ctx);
         if esc && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             if self.drawing {
                 self.drawing = false;
@@ -159,7 +159,7 @@ impl AnalysisPanel {
             #[cfg(feature = "ai")]
             {
                 let roi = self.roi_pixels();
-                let metrics = core.metrics.metric_context();
+                let metrics = core.metrics.metric_context(subject, roi);
                 self.ai.run(core, subject, roi, metrics);
             }
         }
@@ -198,7 +198,7 @@ impl AnalysisPanel {
                 #[cfg(feature = "ai")]
                 Tab::Ai => {
                     let roi = self.roi_pixels();
-                    let metrics = core.metrics.metric_context();
+                    let metrics = core.metrics.metric_context(subject, roi);
                     self.ai.ui(ui, core, subject, roi, metrics, out);
                 }
             }
@@ -249,6 +249,7 @@ impl AnalysisPanel {
             core.metrics.request_run();
         }
         core.metrics.ui(ui, &ctx);
+        super::export_bundle_requested(core, Some(subject));
         match core.metrics.min_roi_size() {
             Some((min, note)) => self.roi.set_min_size(Some(min), note),
             None => self.roi.set_min_size(None, ""),
@@ -303,7 +304,7 @@ impl AnalysisPanel {
     /// The Metrics tab's heatmap on every pane (B panes in A's pixels, like
     /// the ROI), with a value and A/B pixel readout under the pointer.
     fn heatmap_overlay(ui: &mut Ui, core: &mut Core, subject: &Subject, panes: &[canvas::Pane]) {
-        if !core.metrics.heatmap().active() {
+        if !core.metrics.overlay_active() {
             return;
         }
         let Some(a_size) = panes.iter().find(|p| p.slot == Slot::A).map(|p| p.xf.size) else { return };
@@ -318,7 +319,7 @@ impl AnalysisPanel {
             let pb = b.as_ref().and_then(|b| super::adapters::pixel_at(b, x * b.width() as f32 / a_size.x, y * b.height() as f32 / a_size.y));
             (pa, pb)
         };
-        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| !crate::ui::pointer_over_overlay(ui.ctx()));
+        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| !crate::ui::pointer_over_overlay(ui.ctx()) && !egui::Popup::is_any_open(ui.ctx()));
         for pane in panes {
             let xf = ImageTransform { dest: pane.xf.dest, size: a_size };
             let painter = ui.painter().with_clip_rect(pane.clip);

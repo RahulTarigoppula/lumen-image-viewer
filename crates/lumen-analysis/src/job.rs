@@ -52,12 +52,17 @@ impl CancelToken {
 pub struct Progress {
     done: AtomicU64,
     total: AtomicU64,
+    /// Estimated work in microseconds (image jobs: each metric's cost
+    /// estimate), so the fraction and ETA follow the slow metrics rather
+    /// than the count; 0 when the units are all alike (video frames).
+    work_done: AtomicU64,
+    work_total: AtomicU64,
     started: Instant,
 }
 
 impl Default for Progress {
     fn default() -> Self {
-        Progress { done: AtomicU64::new(0), total: AtomicU64::new(0), started: Instant::now() }
+        Progress { done: AtomicU64::new(0), total: AtomicU64::new(0), work_done: AtomicU64::new(0), work_total: AtomicU64::new(0), started: Instant::now() }
     }
 }
 
@@ -73,19 +78,32 @@ impl Progress {
     }
 
     pub fn fraction(&self) -> Option<f32> {
-        let t = self.total();
-        (t > 0).then(|| (self.done() as f32 / t as f32).min(1.0))
+        let (d, t) = self.work();
+        (t > 0).then(|| (d as f32 / t as f32).min(1.0))
+    }
+
+    /// (done, total) in the weighted units when there are any, else in units.
+    fn work(&self) -> (u64, u64) {
+        match self.work_total.load(Ordering::Relaxed) {
+            0 => (self.done(), self.total()),
+            t => (self.work_done.load(Ordering::Relaxed), t),
+        }
     }
 
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
 
-    /// Remaining time extrapolated from the rate so far.
+    /// Remaining time extrapolated from the rate so far; before the first
+    /// unit finishes, the cost estimate of weighted jobs.
     pub fn eta(&self) -> Option<Duration> {
-        let (d, t) = (self.done(), self.total());
-        if d == 0 || t == 0 || d >= t {
+        let (d, t) = self.work();
+        if t == 0 || d >= t {
             return None;
+        }
+        if d == 0 {
+            let est = Duration::from_micros(self.work_total.load(Ordering::Relaxed));
+            return est.checked_sub(self.elapsed()).filter(|r| !r.is_zero());
         }
         Some(self.elapsed().mul_f64((t - d) as f64 / d as f64))
     }
@@ -94,8 +112,18 @@ impl Progress {
         self.total.store(t, Ordering::Relaxed);
     }
 
+    /// Weighted units (see `work_total`) of the whole job.
+    fn set_work(&self, t: u64) {
+        self.work_total.store(t, Ordering::Relaxed);
+    }
+
     fn step(&self) {
         self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn step_work(&self, w: u64) {
+        self.work_done.fetch_add(w, Ordering::Relaxed);
+        self.step();
     }
 }
 
@@ -184,7 +212,7 @@ pub struct VideoSpec {
     pub options: MetricOptions,
     /// Bytes for frames in flight plus their derived images (default 1 GB).
     pub memory_budget: u64,
-    /// Upper bound on frames in flight (default: twice the pool size).
+    /// Upper bound on frames in flight (default: the pool size plus 2).
     pub max_in_flight: Option<usize>,
     /// Expected frame count, for progress and ETA.
     pub total_frames: Option<u64>,
@@ -205,18 +233,20 @@ impl Default for VideoSpec {
     }
 }
 
-/// Lowers the calling thread to below-normal priority (Windows; no-op elsewhere),
-/// so decode, thumbnails and the UI stay responsive.
+/// Lowers the calling thread to the lowest normal-class priority (Windows;
+/// no-op elsewhere), so decode, thumbnails and the UI thread win the cores
+/// whenever they need them: with every core busy measuring, below-normal
+/// alone still left UI frames of 30 ms and more.
 pub fn lower_current_thread_priority() {
     #[cfg(windows)]
     // SAFETY: plain Win32 call on the current thread's pseudo handle.
     unsafe {
-        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
     }
 }
 
-/// The dedicated analysis thread pool (cores - 1 threads, below-normal priority).
+/// The dedicated analysis thread pool (cores - 1 threads, lowest priority).
 pub struct AnalysisPool {
     pool: rayon::ThreadPool,
 }
@@ -319,6 +349,9 @@ pub fn run_image(pool: &AnalysisPool, spec: &ImageSpec, a: &FrameView<'_>, b: Op
         builder.note(format!("{}: temporal metrics need a frame sequence; skipped", t.id));
     }
     ctl.progress.set_total(ms.len() as u64);
+    // At least 1 us each, so even metrics of tiny regions count.
+    let work = |m: &dyn Metric| ((m.info().cost_ms(va.width() as u32, va.height() as u32) * 1000.0) as u64).max(1);
+    ctl.progress.set_work(ms.iter().map(|m| work(*m)).sum());
     let cancel = &ctl.cancel;
     let opts = &spec.options;
     let results: Vec<(&'static dyn Metric, Result<MetricResult, MetricError>)> = pool.install(|| {
@@ -354,7 +387,7 @@ pub fn run_image(pool: &AnalysisPool, spec: &ImageSpec, a: &FrameView<'_>, b: Op
                     place_map(r, roi, 1.0);
                     sink(JobEvent::Metric(r.clone()));
                 }
-                ctl.progress.step();
+                ctl.progress.step_work(work(*m));
                 (*m, r)
             })
             .collect()
@@ -435,14 +468,15 @@ where
         inputs.push(InputKind::Luma);
     }
     let (rw, rh) = spec.roi.and_then(|r| r.clamp(w as u32, h as u32)).map(|r| (r.w as usize, r.h as usize)).unwrap_or((w, h));
-    let per_frame = va.byte_size() + FrameCtx::derived_bytes(rw, rh, &inputs) + if spec.options.want_map { rw * rh * 4 * ms.len() } else { 0 } + rw * rh;
+    // Native planes (16-bit samples for 10-bit video), the derived f32
+    // images, about one f32 working image per metric (SSIM windows, MS-SSIM
+    // pyramids), maps when asked and the temporal features.
+    let px = rw * rh;
+    let per_frame = va.byte_size() + FrameCtx::derived_bytes(rw, rh, &inputs) + ms.len() * px * 4 + if spec.options.want_map { px * 4 * ms.len() } else { 0 } + px;
     let per_pair = per_frame * if has_b { 2 } else { 1 };
-    let cap = spec.max_in_flight.unwrap_or(pool.threads() * 2).max(1);
+    let cap = spec.max_in_flight.unwrap_or(pool.threads() + 2).max(1);
     let window = ((spec.memory_budget as usize / per_pair.max(1)).max(1)).min(cap);
     let mut builder = ReportBuilder::new(scope);
-    if window < cap {
-        builder.note(format!("memory budget allows {window} frame(s) in flight"));
-    }
     let mut ta = TemporalStream { metrics: tm.iter().map(|t| (t.make)(&spec.options)).collect(), prev: None, suffix: "" };
     let mut tb = TemporalStream { metrics: tm.iter().map(|t| (t.make)(&spec.options)).collect(), prev: None, suffix: "_b" };
     let want_temporal = !tm.is_empty();
@@ -472,7 +506,12 @@ where
                 seq += 1;
                 in_flight += 1;
                 s.spawn(move |_| {
-                    let out = frame_task(my, idx, &fa, fb.as_ref(), &ms, roi, &opts, &cancel, want_temporal);
+                    // Always answer: the loop below waits for every frame it
+                    // sent out, so a panicking metric must not leave it
+                    // waiting forever (the scope would only rethrow the
+                    // panic once every task is done).
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame_task(my, idx, &fa, fb.as_ref(), &ms, roi, &opts, &cancel, want_temporal)))
+                        .unwrap_or_else(|_| Done { seq: my, idx, results: ms.iter().map(|m| (m.id(), Err(MetricError::NotApplicable("internal error".into())))).collect(), ta: None, tb: None });
                     let _ = tx.send(out);
                 });
             }
@@ -505,12 +544,16 @@ where
                         }
                     }
                 }
-                if let Some(t) = d.ta {
-                    ta.push(d.idx, t, &mut values);
-                }
-                if let Some(t) = d.tb {
-                    tb.push(d.idx, t, &mut values);
-                }
+                // Temporal metrics use rayon too: in the analysis pool, not
+                // the process-wide one (this is the caller's thread).
+                pool.install(|| {
+                    if let Some(t) = d.ta {
+                        ta.push(d.idx, t, &mut values);
+                    }
+                    if let Some(t) = d.tb {
+                        tb.push(d.idx, t, &mut values);
+                    }
+                });
                 builder.add_row(d.idx, &values);
                 ctl.progress.step();
                 sink(JobEvent::Row(FrameResult { idx: d.idx, values }));
@@ -604,8 +647,19 @@ impl JobHandle {
     }
 
     /// Blocks until the job ends; returns the report or the reason it did not finish.
-    pub fn wait(mut self) -> Result<AnalysisReport, String> {
-        while let Ok(e) = self.rx.recv() {
+    pub fn wait(self) -> Result<AnalysisReport, String> {
+        self.wait_timeout(Duration::MAX)
+    }
+
+    /// [`JobHandle::wait`] for at most `limit` without any event; the job is
+    /// cancelled when it runs out ("timed out").
+    pub fn wait_timeout(mut self, limit: Duration) -> Result<AnalysisReport, String> {
+        loop {
+            let e = match self.rx.recv_timeout(limit) {
+                Ok(e) => e,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Err("timed out".into()),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            };
             match e {
                 JobEvent::Done(r) => {
                     self.finished = true;

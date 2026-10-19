@@ -36,6 +36,7 @@ static BANDING: MetricInfo = MetricInfo {
     heavy: false,
     has_map: true,
     direction: Direction::LowerIsBetter,
+    headline: &["score"],
     description: "Share of smooth area made of one-level step contours between flat runs, with a contour mask",
 };
 
@@ -144,7 +145,7 @@ impl Metric for Banding {
         r.push("smooth_pct", pct(smooth_n, (w * h) as u64), Unit::Percent, Direction::Neutral);
         r.push("contour_pct", pct(contours, (w * h) as u64), Unit::Percent, Direction::LowerIsBetter);
         if o.want_map {
-            r.map = Some(Heatmap::new(w, h, mask, "Banding contours").with_unit(Unit::Score).with_range(0.0, 1.0).with_style(Colormap::Magma, false, Pool::Max));
+            r.map = Some(Heatmap::new(w, h, mask, "Banding contours").with_unit(Unit::Score).with_range(0.0, 1.0).with_min_span(1.0).with_style(Colormap::Magma, false, Pool::Max));
         }
         Ok(r)
     }

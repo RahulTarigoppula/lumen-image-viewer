@@ -302,6 +302,33 @@ impl CmpMode {
     }
 }
 
+/// Toolbar parts that move into the "..." menu when the toolbar is too
+/// narrow (the Analysis panel open, a large UI scale), first to go first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BarPart {
+    Help,
+    Views,
+    Basis,
+    Extras,
+    Cull,
+    Swap,
+    Sync,
+}
+
+impl BarPart {
+    const ALL: [BarPart; 7] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync];
+}
+
+/// What the toolbar shows at its width (see `Compare::bar_plan`).
+#[derive(Debug)]
+struct BarPlan {
+    count: bool,
+    title: bool,
+    /// Mode buttons with their names (else icons, names in the tooltips).
+    labels: bool,
+    hidden: Vec<BarPart>,
+}
+
 struct Pane {
     path: PathBuf,
     loaded: Option<Arc<LoadedImage>>,
@@ -381,6 +408,10 @@ pub struct Compare {
     confirm_delete: Option<usize>,
     /// Files moved to the Recycle Bin from compare mode (the app refreshes views).
     deleted: Vec<PathBuf>,
+    /// "Analyze..." was chosen in a pane's context menu.
+    analyze: bool,
+    /// A menu or list was open when this frame started.
+    popup_open: bool,
 }
 
 fn name_of(p: &std::path::Path) -> String {
@@ -430,6 +461,8 @@ impl Compare {
             show_exif: false,
             confirm_delete: None,
             deleted: Vec::new(),
+            analyze: false,
+            popup_open: false,
         }
     }
 
@@ -771,10 +804,11 @@ impl Compare {
         if self.confirm_delete.is_some() || ui.ctx().egui_wants_keyboard_input() {
             return; // the confirmation modal (or a text field) owns the keyboard
         }
-        if take(Key::Escape) {
+        // Esc with a menu or a list open only closes it (egui does).
+        if !self.popup_open && !egui::Popup::is_any_open(ui.ctx()) && take(Key::Escape) {
             if self.help {
                 self.help = false;
-            } else if !egui::Popup::is_any_open(ui.ctx()) {
+            } else {
                 self.exit = true;
             }
         }
@@ -860,6 +894,8 @@ impl Compare {
         self.update_loading(core);
         self.update_diff(ui.ctx());
         let ppp = ui.ctx().pixels_per_point();
+        // Before the toolbar runs: its menus close themselves on Esc.
+        self.popup_open = egui::Popup::is_any_open(ui.ctx());
 
         egui::Panel::top("compare-toolbar")
             .resizable(false)
@@ -898,6 +934,9 @@ impl Compare {
             self.help_overlay(ui, area);
         }
         self.delete_dialog(ui.ctx(), core);
+        if std::mem::take(&mut self.analyze) {
+            core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
+        }
         !self.exit
     }
 
@@ -965,6 +1004,40 @@ impl Compare {
         }
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        resp.context_menu(|ui| self.pane_menu(ui));
+    }
+
+    /// Right-click menu of the panes.
+    fn pane_menu(&mut self, ui: &mut Ui) {
+        ui.set_min_width(220.0);
+        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| {
+            let r = ui.add(egui::Button::new(format!("{icon}   {label}")).shortcut_text(key)).clicked();
+            if r {
+                ui.close();
+            }
+            r
+        };
+        let analysis = crate::ui::commands::Command::ToggleAnalysis;
+        if item(ui, analysis.icon(), "Analyze...", &analysis.shortcut()) {
+            self.analyze = true;
+        }
+        ui.separator();
+        if item(ui, I::ARROWS_IN, "Fit", "0") {
+            self.fit_all();
+        }
+        if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
+            self.swap_ab();
+        }
+        if item(ui, if self.sync { I::LINK } else { I::LINK_BREAK }, if self.sync { "Unlink zoom & pan" } else { "Link zoom & pan" }, "L") {
+            self.toggle_sync();
+        }
+        if item(ui, I::CHART_BAR, if self.show_hist { "Hide histograms" } else { "Show histograms" }, "G") {
+            self.show_hist = !self.show_hist;
+        }
+        ui.separator();
+        if item(ui, I::ARROW_LEFT, "Back", "Esc") {
+            self.exit = true;
         }
     }
 
@@ -1265,6 +1338,9 @@ impl Compare {
                 let mut zshow = None;
                 if let (Some((z, c, d)), Some((_, g))) = (self.effective(0, rects, ppp, fit_ref), &mut self.diff.gpu) {
                     let dest = dest_rect(area, ppp, d, z, c);
+                    // The difference is drawn in A's geometry: the Analysis
+                    // overlays (ROI, heatmap, AI boxes) line up with it as A.
+                    crate::analysis_ui::canvas::publish(ui.ctx(), crate::analysis_ui::canvas::Slot::A, dest, d, area);
                     let painter = ui.painter().with_clip_rect(area);
                     // The diff may be computed at a reduced level: scale the zoom accordingly.
                     let scale = d.0 as f32 / g.width.max(1) as f32;
@@ -1303,49 +1379,123 @@ impl Compare {
         }
     }
 
+    /// What fits in a toolbar of `avail` points: labels go first, then
+    /// parts move into the "..." menu in [`BarPart`] order (back, the mode
+    /// buttons, zoom and the Analysis button always stay).
+    fn bar_plan(&self, ui: &Ui, avail: f32) -> BarPlan {
+        let s = ui.spacing().item_spacing.x;
+        let pad = ui.spacing().button_padding.x * 2.0;
+        let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_string(), f, Color32::WHITE).size().x;
+        let body = egui::TextStyle::Button.resolve(ui.style());
+        let icon = 30.0 + s;
+        let sep = 9.0 + s;
+        let pair = self.panes.len() == 2;
+        let modes_full: f32 = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference].iter().map(|m| text_w(&format!("{}  {}", m.icon(), m.label()), body.clone()) + pad + s).sum();
+        let modes_compact = 4.0 * (text_w(I::COLUMNS, body.clone()) + pad + s);
+        let title = text_w("Compare", super::theme::semibold(14.0)) + s;
+        let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(12.0)) + s;
+        let part = |b: BarPart| -> f32 {
+            match b {
+                BarPart::Help => icon,
+                BarPart::Views => sep + 2.0 * icon,
+                BarPart::Basis => 126.0 + s,
+                BarPart::Sync => sep + icon,
+                BarPart::Cull => {
+                    let keep = if self.panes.len() >= 2 { text_w(&format!("{}  Keep A", I::CHECK_CIRCLE), FontId::proportional(12.5)) + pad + s } else { 0.0 };
+                    sep + keep + if self.panes.is_empty() { 0.0 } else { 2.0 * icon }
+                }
+                BarPart::Swap => {
+                    if pair {
+                        icon
+                    } else {
+                        0.0
+                    }
+                }
+                BarPart::Extras => match self.mode {
+                    CmpMode::Flicker if pair => sep + text_w("Auto", body.clone()) + pad + s + if self.flicker_auto { 150.0 + s } else { 0.0 },
+                    CmpMode::Difference if pair => sep + text_w("Amplify", FontId::proportional(12.0)) + s + 170.0 + s,
+                    CmpMode::Split if pair => sep + text_w("Divider 100%", FontId::proportional(12.0)) + s,
+                    _ => 0.0,
+                },
+            }
+        };
+        // Back, the modes, zoom (out, percent, in, fit), Analysis and "...".
+        let fixed = icon + 4.0 + sep + sep + 3.0 * icon + 52.0 + s + sep + icon + icon;
+        let mut plan = BarPlan { count: true, title: true, labels: true, hidden: Vec::new() };
+        let width = |p: &BarPlan| -> f32 {
+            let mut w = fixed + if p.labels { modes_full } else { modes_compact };
+            w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
+            w + BarPart::ALL.iter().filter(|b| !p.hidden.contains(b)).map(|b| part(*b)).sum::<f32>()
+        };
+        for step in 0..3 + BarPart::ALL.len() {
+            if width(&plan) <= avail {
+                break;
+            }
+            match step {
+                0 => plan.count = false,
+                1 => plan.labels = false,
+                2 => plan.title = false,
+                n => plan.hidden.push(BarPart::ALL[n - 3]),
+            }
+        }
+        plan
+    }
+
+    fn toggle_sync(&mut self) {
+        self.sync = !self.sync;
+        if self.sync {
+            let v = self.views[self.selected.min(self.views.len() - 1)];
+            for w in &mut self.views {
+                *w = v;
+            }
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let plan = self.bar_plan(ui, ui.available_width());
+            let shown = |b: BarPart| !plan.hidden.contains(&b);
             if widgets::icon_button(ui, I::ARROW_LEFT, "Back  (Esc)", false).clicked() {
                 self.exit = true;
             }
             ui.add_space(4.0);
-            ui.label(RichText::new("Compare").font(super::theme::semibold(14.0)).color(p.text));
-            ui.label(RichText::new(format!("{} images", self.panes.len())).size(12.0).color(p.muted));
+            if plan.title {
+                ui.label(RichText::new("Compare").font(super::theme::semibold(14.0)).color(p.text));
+            }
+            if plan.count {
+                ui.label(RichText::new(format!("{} images", self.panes.len())).size(12.0).color(p.muted));
+            }
             widgets::separator_v(ui);
             let pair = self.panes.len() == 2;
             for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
                 let enabled = m == CmpMode::SideBySide || pair;
                 let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} - needs exactly 2 images", m.label()) };
-                let r = ui.add_enabled(enabled, egui::Button::new(format!("{}  {}", m.icon(), m.label())).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
+                let text = if plan.labels { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() };
+                let r = ui.add_enabled(enabled, egui::Button::new(text).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
                 if r.on_hover_text(tip).clicked() {
                     self.set_mode(m);
                 }
             }
-            widgets::separator_v(ui);
-            let (icon, tip) = if self.sync { (I::LINK, "Zoom & pan synchronized  (L)") } else { (I::LINK_BREAK, "Zoom & pan independent  (L)") };
-            if widgets::icon_button(ui, icon, tip, self.sync).clicked() {
-                self.sync = !self.sync;
-                if self.sync {
-                    let v = self.views[self.selected.min(self.views.len() - 1)];
-                    for w in &mut self.views {
-                        *w = v;
-                    }
+            if shown(BarPart::Sync) {
+                widgets::separator_v(ui);
+                let (icon, tip) = if self.sync { (I::LINK, "Zoom & pan synchronized  (L)") } else { (I::LINK_BREAK, "Zoom & pan independent  (L)") };
+                if widgets::icon_button(ui, icon, tip, self.sync).clicked() {
+                    self.toggle_sync();
                 }
             }
-            let mut basis = self.basis;
-            egui::ComboBox::from_id_salt("cmp-basis")
-                .width(118.0)
-                .selected_text(match basis {
-                    Basis::Relative => "Match framing",
-                    Basis::Pixel => "Match pixels",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut basis, Basis::Relative, "Match framing").on_hover_text("Same relative position/zoom: images of different sizes stay aligned");
-                    ui.selectable_value(&mut basis, Basis::Pixel, "Match pixels").on_hover_text("Same pixel scale: 100% in one pane is 100% in all");
-                });
-            self.set_basis(basis);
+            if shown(BarPart::Basis) {
+                let mut basis = self.basis;
+                egui::ComboBox::from_id_salt("cmp-basis")
+                    .width(118.0)
+                    .selected_text(match basis {
+                        Basis::Relative => "Match framing",
+                        Basis::Pixel => "Match pixels",
+                    })
+                    .show_ui(ui, |ui| Self::basis_choices(ui, &mut basis));
+                self.set_basis(basis);
+            }
             widgets::separator_v(ui);
             let rects = self.layout(self.last_area);
             let ppp = ui.ctx().pixels_per_point();
@@ -1365,63 +1515,147 @@ impl Compare {
             if widgets::icon_button(ui, I::ARROWS_IN, "Fit  (0 / double-click)", fitted).clicked() {
                 self.fit_all();
             }
-            widgets::separator_v(ui);
-            if widgets::icon_button(ui, I::CHART_BAR, "Histograms  (G)", self.show_hist).clicked() {
-                self.show_hist = !self.show_hist;
+            if shown(BarPart::Views) {
+                widgets::separator_v(ui);
+                if widgets::icon_button(ui, I::CHART_BAR, "Histograms  (G)", self.show_hist).clicked() {
+                    self.show_hist = !self.show_hist;
+                }
+                if widgets::icon_button(ui, I::CAMERA, "Camera info strip  (H)", self.show_exif).clicked() {
+                    self.show_exif = !self.show_exif;
+                }
             }
-            if widgets::icon_button(ui, I::CAMERA, "Camera info strip  (H)", self.show_exif).clicked() {
-                self.show_exif = !self.show_exif;
-            }
-            widgets::separator_v(ui);
             // Culling on the selected pane (keys act on the pane under the pointer).
             let sel = self.selected.min(self.panes.len().saturating_sub(1));
             let letter = LETTERS[sel.min(3)];
-            if self.panes.len() >= 2 {
-                let b = egui::Button::new(RichText::new(format!("{}  Keep {letter}", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5)).fill(Color32::from_rgb(39, 150, 90)).corner_radius(CornerRadius::same(6));
-                if ui.add(b).on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
-                    self.keep_only(core, sel);
+            if shown(BarPart::Cull) {
+                widgets::separator_v(ui);
+                if self.panes.len() >= 2 {
+                    let b = egui::Button::new(RichText::new(format!("{}  Keep {letter}", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5)).fill(Color32::from_rgb(39, 150, 90)).corner_radius(CornerRadius::same(6));
+                    if ui.add(b).on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
+                        self.keep_only(core, sel);
+                    }
+                }
+                if !self.panes.is_empty() {
+                    let flagged = core.tags.get(&self.panes[sel].path).flagged;
+                    if widgets::icon_button(ui, I::FLAG, &format!("Flag {letter}  (Q or `)"), flagged).clicked() {
+                        self.toggle_flag(core, sel);
+                    }
+                    if widgets::icon_button(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin  (Del)"), false).clicked() {
+                        self.confirm_delete = Some(sel);
+                    }
                 }
             }
-            if !self.panes.is_empty() {
-                let flagged = core.tags.get(&self.panes[sel].path).flagged;
-                if widgets::icon_button(ui, I::FLAG, &format!("Flag {letter}  (Q or `)"), flagged).clicked() {
-                    self.toggle_flag(core, sel);
-                }
-                if widgets::icon_button(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin  (Del)"), false).clicked() {
-                    self.confirm_delete = Some(sel);
-                }
-            }
-            if pair && widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B  (X)", false).clicked() {
+            if shown(BarPart::Swap) && pair && widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B  (X)", false).clicked() {
                 self.swap_ab();
             }
             // Mode-specific controls.
-            match self.mode {
-                CmpMode::Flicker if pair => {
-                    widgets::separator_v(ui);
-                    ui.toggle_value(&mut self.flicker_auto, "Auto");
-                    if self.flicker_auto {
-                        ui.spacing_mut().slider_width = 90.0;
-                        ui.add(egui::Slider::new(&mut self.flicker_secs, 0.2..=2.0).suffix(" s").fixed_decimals(1));
+            if shown(BarPart::Extras) && pair && self.mode != CmpMode::SideBySide {
+                widgets::separator_v(ui);
+                self.mode_controls(ui, &p);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
+                    self.help = !self.help;
+                }
+                if !plan.hidden.is_empty() {
+                    ui.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| self.overflow_menu(ui, core, &plan, sel));
+                }
+                crate::analysis_ui::toolbar_button(ui, core);
+                widgets::separator_v(ui);
+            });
+        });
+    }
+
+    fn basis_choices(ui: &mut Ui, basis: &mut Basis) {
+        ui.selectable_value(basis, Basis::Relative, "Match framing").on_hover_text("Same relative position/zoom: images of different sizes stay aligned");
+        ui.selectable_value(basis, Basis::Pixel, "Match pixels").on_hover_text("Same pixel scale: 100% in one pane is 100% in all");
+    }
+
+    /// The flicker timer, the difference gain or the divider position.
+    fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
+        match self.mode {
+            CmpMode::Flicker => {
+                ui.toggle_value(&mut self.flicker_auto, "Auto");
+                if self.flicker_auto {
+                    ui.spacing_mut().slider_width = 90.0;
+                    ui.add(egui::Slider::new(&mut self.flicker_secs, 0.2..=2.0).suffix(" s").fixed_decimals(1));
+                }
+            }
+            CmpMode::Difference => {
+                ui.label(RichText::new("Amplify").size(12.0).color(p.muted));
+                ui.spacing_mut().slider_width = 110.0;
+                ui.add(egui::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0));
+            }
+            CmpMode::Split => {
+                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(12.0).color(p.muted));
+            }
+            CmpMode::SideBySide => {}
+        }
+    }
+
+    /// The toolbar parts that did not fit, as menu entries.
+    fn overflow_menu(&mut self, ui: &mut Ui, core: &mut Core, plan: &BarPlan, sel: usize) {
+        ui.set_min_width(220.0);
+        let p = core.pal;
+        let pair = self.panes.len() == 2;
+        let letter = LETTERS[sel.min(3)];
+        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| ui.add(egui::Button::new(format!("{icon}   {label}")).selected(on).shortcut_text(key)).clicked();
+        for (n, part) in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)).enumerate() {
+            let sep = |ui: &mut Ui| {
+                if n > 0 {
+                    ui.separator();
+                }
+            };
+            match part {
+                BarPart::Sync => {
+                    if item(ui, I::LINK, "Link zoom & pan", "L", self.sync) {
+                        self.toggle_sync();
                     }
                 }
-                CmpMode::Difference if pair => {
-                    widgets::separator_v(ui);
-                    ui.label(RichText::new("Amplify").size(12.0).color(p.muted));
-                    ui.spacing_mut().slider_width = 110.0;
-                    ui.add(egui::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0));
+                BarPart::Basis => {
+                    let mut basis = self.basis;
+                    ui.menu_button(format!("{}   Framing", I::FRAME_CORNERS), |ui| Self::basis_choices(ui, &mut basis));
+                    self.set_basis(basis);
                 }
-                CmpMode::Split if pair => {
-                    widgets::separator_v(ui);
-                    ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(12.0).color(p.muted));
+                BarPart::Views => {
+                    if item(ui, I::CHART_BAR, "Histograms", "G", self.show_hist) {
+                        self.show_hist = !self.show_hist;
+                    }
+                    if item(ui, I::CAMERA, "Camera info strip", "H", self.show_exif) {
+                        self.show_exif = !self.show_exif;
+                    }
+                }
+                BarPart::Cull if !self.panes.is_empty() => {
+                    sep(ui);
+                    if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K", false) {
+                        self.keep_only(core, sel);
+                    }
+                    let flagged = core.tags.get(&self.panes[sel].path).flagged;
+                    if item(ui, I::FLAG, &format!("Flag {letter}"), "Q", flagged) {
+                        self.toggle_flag(core, sel);
+                    }
+                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del", false) {
+                        self.confirm_delete = Some(sel);
+                        ui.close();
+                    }
+                }
+                BarPart::Swap if pair => {
+                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X", false) {
+                        self.swap_ab();
+                    }
+                }
+                BarPart::Extras if pair && self.mode != CmpMode::SideBySide => {
+                    sep(ui);
+                    ui.horizontal(|ui| self.mode_controls(ui, &p));
+                }
+                BarPart::Help => {
+                    if item(ui, I::QUESTION, "Shortcuts", "?", self.help) {
+                        self.help = !self.help;
+                    }
                 }
                 _ => {}
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
-                    self.help = !self.help;
-                }
-            });
-        });
+        }
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {

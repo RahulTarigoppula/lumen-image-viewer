@@ -233,6 +233,7 @@ static PSNR: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::HigherIsBetter,
+    headline: &["y", "avg"],
     description: "Peak signal-to-noise ratio per plane and the FFmpeg-style weighted average",
 };
 
@@ -282,6 +283,7 @@ static PSNR_RGB: MetricInfo = MetricInfo {
     heavy: false,
     has_map: false,
     direction: Direction::HigherIsBetter,
+    headline: &["avg"],
     description: "PSNR on R, G and B (converted from YUV when needed)",
 };
 

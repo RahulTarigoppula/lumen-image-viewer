@@ -48,6 +48,7 @@ mod ssimulacra2 {
         heavy: true,
         has_map: false,
         direction: Direction::HigherIsBetter,
+        headline: &["score"],
         description: "SSIMULACRA2 perceptual score (100 = identical, 90 very high, 70 high, 50 medium quality)",
     };
 
@@ -91,6 +92,7 @@ mod butter {
         heavy: true,
         has_map: true,
         direction: Direction::LowerIsBetter,
+        headline: &["score"],
         description: "Butteraugli (libjxl) max-norm distance (below 1 good, above 2 bad) and 3-norm, with a diffmap",
     };
 
@@ -112,7 +114,7 @@ mod butter {
             r.push("pnorm3", res.pnorm_3, Unit::Score, Direction::LowerIsBetter);
             if let Some(m) = res.diffmap {
                 let data: Vec<f32> = m.rows().flat_map(|row| row.iter().copied()).collect();
-                r.map = Some(Heatmap::new(m.width(), m.height(), data, "Butteraugli").with_unit(Unit::Score).with_range(0.0, 3.0).with_style(Colormap::Magma, false, Pool::Max));
+                r.map = Some(Heatmap::new(m.width(), m.height(), data, "Butteraugli").with_unit(Unit::Score).with_range(0.0, 3.0).with_min_span(2.0).with_style(Colormap::Magma, false, Pool::Max));
             }
             Ok(r)
         }
@@ -140,6 +142,7 @@ mod flip {
         heavy: true,
         has_map: true,
         direction: Direction::LowerIsBetter,
+        headline: &["mean"],
         description: "NVIDIA FLIP (LDR, 67 pixels per degree) mean error 0..1, with the error map",
     };
 
@@ -168,7 +171,7 @@ mod flip {
             r.push("median", st.weighted_median as f64, Unit::Score, Direction::LowerIsBetter);
             r.push("max", st.max as f64, Unit::Score, Direction::LowerIsBetter);
             if o.want_map {
-                r.map = Some(Heatmap::new(w, h, map.into_pixels(), "FLIP").with_unit(Unit::Score).with_range(0.0, 1.0).with_style(Colormap::Magma, false, Pool::Max));
+                r.map = Some(Heatmap::new(w, h, map.into_pixels(), "FLIP").with_unit(Unit::Score).with_range(0.0, 1.0).with_min_span(0.25).with_style(Colormap::Magma, false, Pool::Max));
             }
             Ok(r)
         }

@@ -1164,6 +1164,13 @@ impl Viewer {
         let _ = Key::Escape;
         resp.context_menu(|ui| {
             ui.set_min_width(230.0);
+            // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
+            let analysis = Command::ToggleAnalysis;
+            if ui.add(egui::Button::new(format!("{}   Analyze...", analysis.icon())).shortcut_text(analysis.shortcut())).clicked() {
+                core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
+                ui.close();
+            }
+            ui.separator();
             for c in [Command::ZoomFit, Command::ZoomActual, Command::ToggleFullscreen] {
                 menu_item(ui, c, ev);
             }
@@ -1494,6 +1501,7 @@ impl Viewer {
         child.add_space(8.0);
         child.spacing_mut().item_spacing.x = 1.0;
         let dirty = self.is_dirty();
+        let analysis_open = core.analysis_open;
         for item in items {
             let cmd = self.bar_command(item, dirty);
             match item {
@@ -1518,6 +1526,7 @@ impl Viewer {
                 _ => {
                     let Some(cmd) = cmd else { continue };
                     let (icon, tip, sel) = self.bar_button(item, cmd, dirty);
+                    let sel = sel || (item == B::Analysis && analysis_open);
                     if widgets::icon_button(&mut child, icon, &tip, sel).clicked() {
                         if item == B::Lock {
                             self.toggle_lock_zoom();
@@ -1555,6 +1564,7 @@ impl Viewer {
             }
             B::Delete => Command::Delete,
             B::Info => Command::ToggleInfo,
+            B::Analysis => Command::ToggleAnalysis,
             B::Film => Command::ToggleFilmstrip,
             B::Slideshow => Command::Slideshow,
             B::Fullscreen => Command::ToggleFullscreen,
@@ -1594,6 +1604,7 @@ impl Viewer {
             }
             B::Delete => plain(I::TRASH, "Delete"),
             B::Info => (I::INFO, "Info panel (I)".into(), self.show_info),
+            B::Analysis => plain(I::CHART_LINE, "Analysis: metrics and AI"),
             B::Film => (I::FILM_STRIP, "Filmstrip (F)".into(), self.show_filmstrip),
             B::Slideshow => plain(I::PLAY_CIRCLE, "Slideshow"),
             B::Fullscreen => plain(I::CORNERS_OUT, "Full screen"),
@@ -2200,6 +2211,7 @@ enum BarItem {
     Save,
     Delete,
     Info,
+    Analysis,
     Film,
     Slideshow,
     Fullscreen,
@@ -2223,7 +2235,7 @@ fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     use BarItem as B;
     let full = [
         B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Lock, B::Sep, B::RotL, B::RotR, B::Crop, B::Adjust, B::Resize, B::Sep,
-        B::Save, B::Delete, B::Sep, B::Info, B::Film, B::Slideshow, B::Fullscreen,
+        B::Save, B::Delete, B::Sep, B::Info, B::Analysis, B::Film, B::Slideshow, B::Fullscreen,
     ];
     let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
     if width(&full) <= avail {
@@ -2234,7 +2246,7 @@ fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
         return (items, Vec::new());
     }
     // Least important first; Prev / Next / zoom / fit always stay.
-    let drop_order = [B::Fullscreen, B::Slideshow, B::Lock, B::Film, B::Resize, B::Adjust, B::Delete, B::RotR, B::Info, B::RotL, B::Browser, B::ZoomOut, B::ZoomIn, B::Crop, B::Save];
+    let drop_order = [B::Fullscreen, B::Slideshow, B::Lock, B::Film, B::Resize, B::Adjust, B::Delete, B::RotR, B::Info, B::RotL, B::Browser, B::ZoomOut, B::ZoomIn, B::Analysis, B::Crop, B::Save];
     let mut hidden = Vec::new();
     for d in drop_order {
         if width(&items) + B::More.width() <= avail {

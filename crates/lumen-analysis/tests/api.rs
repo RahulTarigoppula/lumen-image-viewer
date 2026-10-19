@@ -31,7 +31,7 @@ fn image_flow_from_guide() {
 
     let repaints = Arc::new(AtomicUsize::new(0));
     let r2 = repaints.clone();
-    let analyzer = Analyzer::new(None, Some(Arc::new(move || {
+    let analyzer = Analyzer::new(Some(2), Some(Arc::new(move || {
         r2.fetch_add(1, Ordering::Relaxed);
     })));
     let a: SharedFrame = Arc::new(OwnedFrame::rgba8(w, h, bytes.clone()));
@@ -46,8 +46,10 @@ fn image_flow_from_guide() {
     assert_eq!(job.generation, analyzer.latest_generation());
     let mut report = None;
     let mut metrics_seen = Vec::new();
-    // The UI polls each frame; here we poll with a short sleep.
-    for _ in 0..3000 {
+    // The UI polls each frame; here we poll with a short sleep, for at most
+    // 5 minutes (a loaded machine is slow; a hang must still end the test).
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
         while let Some(ev) = job.try_recv() {
             match ev {
                 JobEvent::Metric(r) => metrics_seen.push(r.id),
@@ -156,7 +158,7 @@ fn video_flow_from_guide() {
     let mut job = analyzer.submit_video(spec, rx);
     let mut rows = Vec::new();
     let report = loop {
-        match job.recv_timeout(Duration::from_secs(30)).expect("event") {
+        match job.recv_timeout(Duration::from_secs(300)).expect("event") {
             JobEvent::Row(r) => rows.push(r.idx),
             JobEvent::Done(r) => break *r,
             e => panic!("unexpected {e:?}"),
