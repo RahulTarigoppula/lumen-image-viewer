@@ -501,6 +501,9 @@ impl EditTool for DrawBoard {
         let (styles, maxw, maxf, init) = (self.styles.clone(), self.max_width, self.max_font, self.init);
         *self = DrawBoard { styles, max_width: maxw, max_font: maxf, init, ..Default::default() };
     }
+    fn can_apply(&self) -> bool {
+        !self.objs.is_empty()
+    }
     fn wants_canvas(&self) -> bool {
         true
     }
