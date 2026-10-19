@@ -313,10 +313,12 @@ enum BarPart {
     Cull,
     Swap,
     Sync,
+    /// Zoom out, the zoom percentage and zoom in (Fit stays).
+    Zoom,
 }
 
 impl BarPart {
-    const ALL: [BarPart; 7] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync];
+    const ALL: [BarPart; 8] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync, BarPart::Zoom];
 }
 
 /// What the toolbar shows at its width (see `Compare::bar_plan`).
@@ -326,6 +328,8 @@ struct BarPlan {
     title: bool,
     /// Mode buttons with their names (else icons, names in the tooltips).
     labels: bool,
+    /// The last resort: the mode buttons become one menu.
+    modes_menu: bool,
     hidden: Vec<BarPart>,
 }
 
@@ -1411,6 +1415,7 @@ impl Compare {
                         0.0
                     }
                 }
+                BarPart::Zoom => 2.0 * icon + 52.0 + s,
                 BarPart::Extras => match self.mode {
                     CmpMode::Flicker if pair => sep + text_w("Auto", body.clone()) + pad + s + if self.flicker_auto { 150.0 + s } else { 0.0 },
                     CmpMode::Difference if pair => sep + text_w("Amplify", FontId::proportional(12.0)) + s + 170.0 + s,
@@ -1419,15 +1424,16 @@ impl Compare {
                 },
             }
         };
-        // Back, the modes, zoom (out, percent, in, fit), Analysis and "...".
-        let fixed = icon + 4.0 + sep + sep + 3.0 * icon + 52.0 + s + sep + icon + icon;
-        let mut plan = BarPlan { count: true, title: true, labels: true, hidden: Vec::new() };
+        // Back, Fit, Analysis and "..." always stay.
+        let fixed = icon + 4.0 + sep + sep + icon + sep + icon + icon;
+        let modes_menu = text_w(&format!("{}  {}", I::COLUMNS, I::CARET_DOWN), body.clone()) + pad + s;
+        let mut plan = BarPlan { count: true, title: true, labels: true, modes_menu: false, hidden: Vec::new() };
         let width = |p: &BarPlan| -> f32 {
-            let mut w = fixed + if p.labels { modes_full } else { modes_compact };
+            let mut w = fixed + if p.modes_menu { modes_menu } else if p.labels { modes_full } else { modes_compact };
             w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
             w + BarPart::ALL.iter().filter(|b| !p.hidden.contains(b)).map(|b| part(*b)).sum::<f32>()
         };
-        for step in 0..3 + BarPart::ALL.len() {
+        for step in 0..4 + BarPart::ALL.len() {
             if width(&plan) <= avail {
                 break;
             }
@@ -1435,7 +1441,8 @@ impl Compare {
                 0 => plan.count = false,
                 1 => plan.labels = false,
                 2 => plan.title = false,
-                n => plan.hidden.push(BarPart::ALL[n - 3]),
+                n if n - 3 < BarPart::ALL.len() => plan.hidden.push(BarPart::ALL[n - 3]),
+                _ => plan.modes_menu = true,
             }
         }
         plan
@@ -1469,13 +1476,26 @@ impl Compare {
             }
             widgets::separator_v(ui);
             let pair = self.panes.len() == 2;
-            for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
-                let enabled = m == CmpMode::SideBySide || pair;
-                let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} - needs exactly 2 images", m.label()) };
-                let text = if plan.labels { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() };
-                let r = ui.add_enabled(enabled, egui::Button::new(text).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
-                if r.on_hover_text(tip).clicked() {
-                    self.set_mode(m);
+            if plan.modes_menu {
+                let r = ui.menu_button(format!("{}  {}", self.mode.icon(), I::CARET_DOWN), |ui| {
+                    for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
+                        let b = egui::Button::new(format!("{}   {}", m.icon(), m.label())).selected(self.mode == m).shortcut_text(m.key());
+                        if ui.add_enabled(m == CmpMode::SideBySide || pair, b).clicked() {
+                            self.set_mode(m);
+                            ui.close();
+                        }
+                    }
+                });
+                r.response.on_hover_text(format!("View: {}", self.mode.label()));
+            } else {
+                for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
+                    let enabled = m == CmpMode::SideBySide || pair;
+                    let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} - needs exactly 2 images", m.label()) };
+                    let text = if plan.labels { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() };
+                    let r = ui.add_enabled(enabled, egui::Button::new(text).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
+                    if r.on_hover_text(tip).clicked() {
+                        self.set_mode(m);
+                    }
                 }
             }
             if shown(BarPart::Sync) {
@@ -1500,16 +1520,18 @@ impl Compare {
             let rects = self.layout(self.last_area);
             let ppp = ui.ctx().pixels_per_point();
             let src = self.selected.min(self.panes.len().saturating_sub(1));
-            if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out  (-)", false).clicked() && !rects.is_empty() {
-                self.zoom_step(src, &rects, ppp, 0.8, None);
-            }
-            let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
-            let zl = ui.add_sized([52.0, 26.0], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
-            if zl.on_hover_text("Click: 100%  (1)").clicked() && !rects.is_empty() {
-                self.actual_size(&rects, ppp);
-            }
-            if widgets::icon_button(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in  (+)", false).clicked() && !rects.is_empty() {
-                self.zoom_step(src, &rects, ppp, 1.25, None);
+            if shown(BarPart::Zoom) {
+                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out  (-)", false).clicked() && !rects.is_empty() {
+                    self.zoom_step(src, &rects, ppp, 0.8, None);
+                }
+                let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
+                let zl = ui.add_sized([52.0, 26.0], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
+                if zl.on_hover_text("Click: 100%  (1)").clicked() && !rects.is_empty() {
+                    self.actual_size(&rects, ppp);
+                }
+                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in  (+)", false).clicked() && !rects.is_empty() {
+                    self.zoom_step(src, &rects, ppp, 1.25, None);
+                }
             }
             let fitted = self.views.iter().all(|v| v.fit);
             if widgets::icon_button(ui, I::ARROWS_IN, "Fit  (0 / double-click)", fitted).clicked() {
@@ -1651,6 +1673,22 @@ impl Compare {
                 BarPart::Help => {
                     if item(ui, I::QUESTION, "Shortcuts", "?", self.help) {
                         self.help = !self.help;
+                    }
+                }
+                BarPart::Zoom => {
+                    let rects = self.layout(self.last_area);
+                    let ppp = ui.ctx().pixels_per_point();
+                    let src = self.selected.min(self.panes.len().saturating_sub(1));
+                    if !rects.is_empty() {
+                        if item(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in", "+", false) {
+                            self.zoom_step(src, &rects, ppp, 1.25, None);
+                        }
+                        if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", "-", false) {
+                            self.zoom_step(src, &rects, ppp, 0.8, None);
+                        }
+                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "1", false) {
+                            self.actual_size(&rects, ppp);
+                        }
                     }
                 }
                 _ => {}

@@ -257,6 +257,10 @@ impl AnalysisPool {
         let n = threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(1)).max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
+            // A worker waiting inside a metric runs other queued tasks on top
+            // of its stack (work stealing), so frame tasks can nest several
+            // deep; debug builds have big frames. 8 MB instead of 2.
+            .stack_size(8 << 20)
             .thread_name(|i| format!("lumen-analysis-{i}"))
             .start_handler(|_| lower_current_thread_priority())
             .build()
@@ -725,6 +729,7 @@ impl Analyzer {
         let c2 = ctl.clone();
         std::thread::Builder::new()
             .name("lumen-analysis-job".into())
+            .stack_size(8 << 20)
             .spawn(move || {
                 lower_current_thread_priority();
                 let send = |e: JobEvent| {

@@ -2192,18 +2192,55 @@ mod tests {
     fn video_summary_rows() {
         use lumen_analysis::metrics::Value;
         let mut b = lumen_analysis::report::ReportBuilder::new(Default::default());
-        for (i, y) in [42.0, 31.0, 38.0].into_iter().enumerate() {
-            b.add_row(i as u64, &[Value::new("psnr.y", y, Unit::Db, Direction::HigherIsBetter), Value::new("psnr.mse_avg", 1.0, Unit::CodeSq, Direction::LowerIsBetter), Value::new("temporal.scene.score", 3.0, Unit::Score, Direction::Neutral)]);
+        for (i, y) in [42.0, 31.0, 38.0, 100.0].into_iter().enumerate() {
+            let dup = (i == 3) as u8 as f64;
+            b.add_row(
+                i as u64,
+                &[
+                    Value::new("psnr.y", y, Unit::Db, Direction::HigherIsBetter),
+                    Value::new("psnr.mse_avg", 1.0, Unit::CodeSq, Direction::LowerIsBetter),
+                    Value::new("temporal.scene.score", 3.0 * i as f64, Unit::Score, Direction::Neutral),
+                    Value::new("temporal.scene.cut", (i == 2) as u8 as f64, Unit::Count, Direction::Neutral),
+                    Value::new("temporal.freeze.duplicate", dup, Unit::Count, Direction::LowerIsBetter),
+                    Value::new("temporal.freeze.run", dup, Unit::Count, Direction::LowerIsBetter),
+                ],
+            );
         }
         let r = b.finish(Some(255.0));
         let rows = rows_of_report(&r);
-        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["psnr", "temporal.scene"]);
-        let y = &rows[0].cells[0];
-        assert_eq!(y.key, "psnr.y");
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["psnr", "temporal.freeze", "temporal.scene"]);
+        // The headline is the PSNR of the mean MSE, not a mean pulled up by
+        // an identical (100 dB) frame.
+        assert_eq!(rows[0].cells[0].key, "psnr.global");
+        let y = rows[0].cells.iter().find(|c| c.key == "psnr.y").unwrap();
         assert_eq!(y.worst, Some(1));
-        assert!((y.value.unwrap() - 37.0).abs() < 1e-9);
-        assert!(rows[0].cells.iter().any(|c| c.key == "psnr.global"));
+        assert!((y.value.unwrap() - 52.75).abs() < 1e-9);
+        // Temporal rows count instead of averaging flags.
+        let dups = &rows[1].cells[0];
+        assert_eq!((dups.key.as_str(), dups.value), ("temporal.freeze.duplicates", Some(1.0)));
+        assert!(rows[1].cells.iter().any(|c| c.key == "temporal.freeze.longest_freeze" && c.value == Some(2.0)));
+        let cuts = &rows[2].cells[0];
+        assert_eq!((cuts.key.as_str(), cuts.value, cuts.worst), ("temporal.scene.cuts", Some(1.0), Some(2)));
+        assert_eq!(key_label("temporal.freeze", "duplicates_b"), "B: Duplicate frames");
+        assert_eq!(key_label("psnr", "mse_avg"), "MSE average");
         assert!(scope_label(&r).starts_with("Image"));
+    }
+
+    #[test]
+    fn report_bundle_holds_the_ai_cards() {
+        let dir = std::env::temp_dir().join(format!("lumen-bundle-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tab = MetricsTab::new();
+        tab.report = Some(lumen_analysis::report::ReportBuilder::new(Default::default()).finish(None));
+        tab.export_bundle(Some(dir.clone()), vec!["## Quality critique\n\nSharp.".into()]);
+        let res = tab.bg.pop().expect("export started").recv_timeout(Duration::from_secs(60)).expect("export finished");
+        assert!(res.is_ok(), "{res:?}");
+        let bundle = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let md = std::fs::read_to_string(bundle.join("ai_cards.md")).unwrap();
+        assert!(md.contains("Quality critique") && md.contains("Sharp."));
+        assert!(bundle.join("report.csv").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
