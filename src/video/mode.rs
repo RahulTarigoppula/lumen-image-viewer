@@ -6,6 +6,7 @@ use super::engine::{self, Cmd, Event, IndexEntry, MediaInfo, Player, VFrame};
 use super::metrics::{self, FrameMetrics, YuvFrame};
 use super::scopes::{self, Scope};
 use crate::app::Core;
+use crate::ui::commands::Command;
 use crate::ui::icons as I;
 use crate::ui::theme::{self, size, Palette};
 use crate::ui::widgets;
@@ -414,6 +415,10 @@ fn shorten(name: &str, max: usize) -> String {
 /// Playback speeds offered in the transport bar.
 const SPEEDS: [f64; 7] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0];
 
+/// Names of the top bar's Save frame, Scopes and Info buttons (shown when
+/// there is room).
+const RIGHT_LABELS: [&str; 3] = ["Save frame", "Scopes", "Info"];
+
 /// A monospace readout of the transport bar, centered on its digits: a
 /// label centers its line box, which leaves digits above the icons'
 /// middle. With a click sense it highlights on hover like a flat button.
@@ -721,6 +726,25 @@ impl VideoMode {
         } else {
             self.play();
         }
+    }
+
+    /// Run a command from the command layer (palette, menus, keymap, dev
+    /// hook) in video mode. Returns false for commands video mode does not
+    /// handle, which the app then runs as usual.
+    pub fn run_command(&mut self, cmd: Command) -> bool {
+        match cmd {
+            Command::PlayPause => self.toggle_play(),
+            Command::NextFrame => self.step(1),
+            Command::PrevFrame => self.step(-1),
+            Command::ToggleInfo => self.show_info = !self.show_info,
+            Command::ZoomFit => self.auto_fit = true,
+            Command::ZoomActual => {
+                self.auto_fit = false;
+                self.zoom = 1.0;
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn seek_all(&mut self, t: f64, exact: bool) {
@@ -1053,6 +1077,11 @@ impl VideoMode {
             let controls = if pair { self.compare_controls_width(ui, labels) } else { 0.0 };
             let compact = pair && room < controls;
             let controls = if compact { 50.0 } else { controls };
+            // Save frame, Scopes and Info show their names while the file
+            // names keep room for about 24 characters each.
+            let label_extra = RIGHT_LABELS.iter().map(|l| widgets::labeled_icon_button_width(ui, l) + 4.0).sum::<f32>() - 3.0 * 34.0;
+            let icon_labels = !narrow && avail - fixed - controls - label_extra >= 2.0 * 24.0 * 7.5;
+            let fixed = fixed + if icon_labels { label_extra } else { 0.0 };
             let name_chars = ((avail - fixed - controls) / 2.0 / 7.5).clamp(8.0, 48.0) as usize;
             for (i, label) in ["A", "B"].iter().enumerate() {
                 let name = self.sources.get(i).map(|s| shorten(&crate::ui::viewer::file_name(&s.path), name_chars));
@@ -1121,14 +1150,17 @@ impl VideoMode {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = |ui: &mut Ui, icon: &str, label: &str, tip: &str, on: bool| {
+                    if icon_labels { widgets::labeled_icon_button(ui, icon, label, tip, on) } else { widgets::icon_button(ui, icon, tip, on) }
+                };
                 crate::analysis_ui::toolbar_button(ui, core);
-                if widgets::icon_button(ui, I::INFO, "Info & metrics (I)", self.show_info).clicked() {
+                if button(ui, I::INFO, RIGHT_LABELS[2], "Info & metrics (I)", self.show_info).clicked() {
                     self.show_info = !self.show_info;
                 }
-                if !(tiny && pair) && widgets::icon_button(ui, I::WAVEFORM, "Scopes (F2)", self.show_scopes).clicked() {
+                if !(tiny && pair) && button(ui, I::WAVEFORM, RIGHT_LABELS[1], "Scopes (F2)", self.show_scopes).clicked() {
                     self.show_scopes = !self.show_scopes;
                 }
-                if !(tiny && pair) && widgets::icon_button(ui, I::CAMERA, "Save frame as PNG (Ctrl+S)", false).clicked() {
+                if !(tiny && pair) && button(ui, I::CAMERA, RIGHT_LABELS[0], "Save frame as PNG (Ctrl+S)", false).clicked() {
                     self.snapshot(false, core);
                 }
             });
@@ -1553,8 +1585,8 @@ impl VideoMode {
     fn canvas_menu(&mut self, ui: &mut Ui, core: &mut Core) {
         ui.set_min_width(230.0);
         let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| widgets::menu_item(ui, icon, label, key).clicked();
-        // On / off rows show a check mark instead of an icon while on.
-        let check = |ui: &mut Ui, _icon: &str, label: &str, key: &str, on: bool| widgets::menu_toggle(ui, on, label, key).clicked();
+        // On / off rows show a check mark instead of their icon while on.
+        let check = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| widgets::menu_check(ui, on, icon, label, key).clicked();
         let (icon, label) = if self.playing { (I::PAUSE, "Pause") } else { (I::PLAY, "Play") };
         if item(ui, icon, label, "Space") {
             self.toggle_play();
@@ -1600,7 +1632,7 @@ impl VideoMode {
         }
         ui.separator();
         // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
-        let analysis = crate::ui::commands::Command::ToggleAnalysis;
+        let analysis = Command::ToggleAnalysis;
         if item(ui, analysis.icon(), "Analyze...", &analysis.shortcut()) {
             core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
             ui.close();
@@ -1869,11 +1901,15 @@ impl VideoMode {
 
     /// The time and frame counter of the transport bar (`duration`: with
     /// the total time, `word`: "frame 12 / 300" rather than "12 / 300").
+    /// The counter is padded on the left to its width on the last frame, so
+    /// in the monospace readout nothing after it moves while the video plays.
     fn position_text(&self, duration: bool, word: bool) -> (String, String) {
         let a = &self.sources[0];
         let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "...".into());
         let time = if duration { format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())) } else { fmt_time(a.pts()) };
-        let frame = format!("{}{} / {total}", if word { "frame " } else { "" }, a.frame_of(a.pts()));
+        let word = if word { "frame " } else { "" };
+        let widest = format!("{word}{total} / {total}").chars().count();
+        let frame = format!("{:>widest$}", format!("{word}{} / {total}", a.frame_of(a.pts())));
         (time, frame)
     }
 
@@ -1974,7 +2010,11 @@ impl VideoMode {
         painter.rect_filled(rect, CornerRadius::same(theme::radius::CONTROL), ui.visuals().extreme_bg_color);
         let a = &self.sources[0];
         let dur = a.duration().max(0.001);
-        let x_of = |t: f64| rect.min.x + (t / dur) as f32 * rect.width();
+        // The time axis is inset so the playhead's 10 pt head stays whole at
+        // either end.
+        let track = rect.shrink2(Vec2::new(6.0, 0.0));
+        let x_of = |t: f64| track.min.x + (t / dur) as f32 * track.width();
+        let t_of = |x: f32| (((x - track.min.x) / track.width()) as f64 * dur).clamp(0.0, dur);
         // A time ruler along the top, the frame-size bars in the middle and a
         // strip at the bottom with the frame types (I ticks; P and B dots once
         // frames are far enough apart to tell them apart).
@@ -1987,7 +2027,7 @@ impl VideoMode {
             let lb = lb.unwrap_or(a.pts());
             painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(la), rect.min.y), Pos2::new(x_of(lb), rect.max.y)), 0.0, p.accent.gamma_multiply(0.18));
         }
-        let step = tick_step(dur, rect.width(), 84.0);
+        let step = tick_step(dur, track.width(), 84.0);
         let label_font = FontId::proportional(theme::text::CAPTION);
         for k in 0.. {
             let t = k as f64 * step;
@@ -1997,9 +2037,11 @@ impl VideoMode {
             let x = x_of(t).round() + 0.5;
             painter.line_segment([Pos2::new(x, rect.min.y + ruler_h - 5.0), Pos2::new(x, rect.min.y + ruler_h)], Stroke::new(1.0, p.faint));
             let g = painter.layout_no_wrap(fmt_tick(t, step, dur), label_font.clone(), p.faint);
-            // Skip a label that would run off the right edge.
-            if x + 4.0 + g.size().x <= rect.max.x - 2.0 {
-                painter.galley(Pos2::new(x + 4.0, rect.min.y + ruler_h / 2.0 - g.size().y / 2.0), g, p.faint);
+            // Labels start clear of the playhead's head resting on the tick
+            // (at 0:00 before playing); one that would run off the right
+            // edge is skipped.
+            if x + 7.0 + g.size().x <= rect.max.x - 2.0 {
+                painter.galley(Pos2::new(x + 7.0, rect.min.y + ruler_h / 2.0 - g.size().y / 2.0), g, p.faint);
             }
         }
         painter.line_segment([Pos2::new(rect.min.x, base + 0.5), Pos2::new(rect.max.x, base + 0.5)], Stroke::new(1.0, p.border));
@@ -2007,7 +2049,7 @@ impl VideoMode {
         // keyframes' share of a column is drawn a little lighter.
         let idx_guard = a.index.lock();
         if let Some(idx) = idx_guard.as_ref() {
-            let cols = rect.width().max(1.0) as usize;
+            let cols = track.width().max(1.0) as usize;
             // Aggregating 100k+ index entries is too costly per frame: cache it
             // per (entry count, width) and refresh periodically as frame types are learned.
             let stale = match &self.timeline_cache {
@@ -2023,7 +2065,7 @@ impl VideoMode {
             let mut last_tick = f32::NEG_INFINITY;
             let tick = p.muted.gamma_multiply(0.8);
             for (c, col) in columns.iter().enumerate() {
-                let x = rect.min.x + c as f32;
+                let x = track.min.x + c as f32;
                 // An I tick per column with a keyframe, at least 3 points apart.
                 if col.key && x - last_tick >= 3.0 {
                     mesh.add_colored_rect(Rect::from_min_size(Pos2::new(x, base + 2.0), Vec2::new(1.0, 6.0)), tick);
@@ -2044,7 +2086,7 @@ impl VideoMode {
                 }
             }
             // P and B frames as dots when there are at least 6 points per frame.
-            if !idx.is_empty() && rect.width() / idx.len() as f32 >= 6.0 {
+            if !idx.is_empty() && track.width() / idx.len() as f32 >= 6.0 {
                 for e in idx.iter().filter(|e| !e.key && e.kind != b'I') {
                     let c = Pos2::new(x_of(e.pts), base + 5.0);
                     let r = if e.kind == b'B' { 1.0 } else { 1.5 };
@@ -2067,7 +2109,7 @@ impl VideoMode {
             if rows.len() > 1 {
                 let pts: Vec<Pos2> = rows
                     .iter()
-                    .step_by((rows.len() / rect.width().max(1.0) as usize).max(1))
+                    .step_by((rows.len() / track.width().max(1.0) as usize).max(1))
                     .map(|(i, m)| {
                         let t = a.pts_of(*i);
                         let v = ((m.psnr_y.min(60.0) - 20.0) / 40.0).clamp(0.0, 1.0) as f32;
@@ -2083,7 +2125,7 @@ impl VideoMode {
         painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y + 5.0), Pos2::new(x, rect.min.y + 10.0), Pos2::new(x - 5.0, rect.min.y + 5.0)], p.accent, Stroke::NONE));
         // Hover tooltip + scrubbing.
         if let Some(pos) = resp.hover_pos() {
-            let t = (((pos.x - rect.min.x) / rect.width()) as f64 * dur).clamp(0.0, dur);
+            let t = t_of(pos.x);
             let f = a.frame_of(t);
             let e = a.entry(f);
             painter.line_segment([Pos2::new(pos.x, rect.min.y), Pos2::new(pos.x, rect.max.y)], Stroke::new(1.0, p.muted.gamma_multiply(0.7)));
@@ -2100,7 +2142,7 @@ impl VideoMode {
         }
         if resp.dragged() || resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let t = (((pos.x - rect.min.x) / rect.width()) as f64 * dur).clamp(0.0, dur);
+                let t = t_of(pos.x);
                 self.scrubbing = resp.dragged();
                 // Keyframe seeks while dragging (fast), exact on release / click.
                 self.seek_all(t, !resp.dragged());
@@ -2108,7 +2150,7 @@ impl VideoMode {
         }
         if resp.drag_stopped() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let t = (((pos.x - rect.min.x) / rect.width()) as f64 * dur).clamp(0.0, dur);
+                let t = t_of(pos.x);
                 self.seek_all(t, true);
             }
             self.scrubbing = false;
@@ -2404,9 +2446,9 @@ impl VideoMode {
                 // Esc with a menu or a list open only closes it (egui does).
                 Key::Escape if egui::Popup::is_any_open(ctx) => {}
                 Key::Escape => keep = false,
-                Key::Space | Key::K if !m.ctrl => self.toggle_play(),
-                Key::Period => self.step(1),
-                Key::Comma => self.step(-1),
+                Key::Space | Key::K if !m.ctrl => _ = self.run_command(Command::PlayPause),
+                Key::Period => _ = self.run_command(Command::NextFrame),
+                Key::Comma => _ = self.run_command(Command::PrevFrame),
                 Key::ArrowRight if m.ctrl => {
                     let t = self.sources[0].pts() + 10.0;
                     self.seek_all(t, true)
@@ -2441,7 +2483,7 @@ impl VideoMode {
                 }
                 Key::PageDown | Key::PageUp => self.jump_keyframe(k == Key::PageDown),
                 Key::G => self.goto = Some(String::new()),
-                Key::I => self.show_info = !self.show_info,
+                Key::I => _ = self.run_command(Command::ToggleInfo),
                 Key::F2 => self.show_scopes = !self.show_scopes,
                 Key::M => self.toggle_mute(),
                 Key::L if m.ctrl => self.toggle_loop(),
@@ -2450,11 +2492,8 @@ impl VideoMode {
                 Key::OpenBracket => self.set_speed((self.speed / 2.0).max(0.1)),
                 Key::CloseBracket => self.set_speed((self.speed * 2.0).min(4.0)),
                 Key::Backspace => self.set_speed(1.0),
-                Key::Num0 => self.auto_fit = true,
-                Key::Num1 => {
-                    self.auto_fit = false;
-                    self.zoom = 1.0;
-                }
+                Key::Num0 => _ = self.run_command(Command::ZoomFit),
+                Key::Num1 => _ = self.run_command(Command::ZoomActual),
                 Key::S if compare => self.mode = CompareMode::SideBySide,
                 Key::W if compare => self.mode = CompareMode::Wipe,
                 Key::D if compare => self.mode = CompareMode::Difference,

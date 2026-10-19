@@ -84,6 +84,9 @@ impl EditTool for Sharpen {
     fn reset(&mut self) {
         *self = Sharpen::default();
     }
+    fn can_apply(&self) -> bool {
+        self.amount > 0.0
+    }
 }
 
 // ---------------------------------------------------------------- Blur

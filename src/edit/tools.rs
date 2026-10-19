@@ -165,8 +165,7 @@ pub fn section(ui: &mut egui::Ui, cx: &ToolUiCtx, text: &str) {
 /// Colour swatch button (straight-alpha RGBA).
 pub fn color_button(ui: &mut egui::Ui, rgba: &mut [u8; 4], alpha: bool) -> bool {
     let mut c = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
-    let mode = if alpha { egui::color_picker::Alpha::OnlyBlend } else { egui::color_picker::Alpha::Opaque };
-    if egui::color_picker::color_edit_button_srgba(ui, &mut c, mode).changed() {
+    if widgets::color_button_rgba(ui, &mut c, alpha).changed() {
         let n = c.to_srgba_unmultiplied();
         if n != *rgba {
             *rgba = if alpha { n } else { [n[0], n[1], n[2], 255] };
@@ -174,6 +173,42 @@ pub fn color_button(ui: &mut egui::Ui, rgba: &mut [u8; 4], alpha: bool) -> bool 
         }
     }
     false
+}
+
+/// One-click colour choices next to a [`color_button`] (White, Black, None):
+/// 22 pt swatches with the colour's name in the tooltip, a checkerboard for
+/// transparent, and an accent ring on the one in use.
+pub fn color_presets(ui: &mut egui::Ui, rgba: &mut [u8; 4], presets: &[(&str, [u8; 4])]) -> bool {
+    let p = theme::palette(ui.ctx());
+    let mut changed = false;
+    for (name, col) in presets {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+        let r = rect.shrink(1.0);
+        let painter = ui.painter();
+        if col[3] == 0 {
+            // Checkerboard: 4 x 4 cells.
+            let cell = r.width() / 4.0;
+            painter.rect_filled(r, 4.0, Color32::WHITE);
+            for i in 0..4 {
+                for j in 0..4 {
+                    if (i + j) % 2 == 1 {
+                        let c = Rect::from_min_size(r.min + Vec2::new(i as f32 * cell, j as f32 * cell), Vec2::splat(cell));
+                        painter.rect_filled(c, 0.0, Color32::from_gray(200));
+                    }
+                }
+            }
+        } else {
+            painter.rect_filled(r, 4.0, Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]));
+        }
+        let on = rgba == col;
+        let stroke = if on { egui::Stroke::new(2.0, p.accent) } else if resp.hovered() { egui::Stroke::new(1.0, p.text) } else { egui::Stroke::new(1.0, p.border) };
+        painter.rect_stroke(if on { rect.expand(1.0) } else { r }, 4.0, stroke, egui::StrokeKind::Inside);
+        if resp.on_hover_text(*name).clicked() && !on {
+            *rgba = *col;
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub fn color_row(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4], alpha: bool) -> bool {
@@ -324,7 +359,7 @@ pub fn mp(w: u32, h: u32) -> String {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct AdjustColors {
     pub brightness: f32,
     pub contrast: f32,
@@ -357,7 +392,8 @@ impl EditTool for AdjustColors {
         c |= slider_ex(ui, "Exposure", &mut self.exposure, -3.0..=3.0, 0.0, " EV", 0.01, 2, false);
         c |= slider(ui, "Brightness", &mut self.brightness, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Contrast", &mut self.contrast, -100.0..=100.0, 0.0, "");
-        c |= slider_ex(ui, "Gamma", &mut self.gamma, 0.2..=3.0, 1.0, "", 0.01, 2, false);
+        // Log scale over 1/4..4 so the neutral 1.00 sits in the middle, filled from there.
+        c |= slider_row(ui, "Gamma", &mut self.gamma, 0.25..=4.0, 1.0, |s| s.origin(1.0).logarithmic(true).fixed_decimals(2));
         section(ui, cx, "Tone");
         c |= slider(ui, "Shadows", &mut self.shadows, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Highlights", &mut self.highlights, -100.0..=100.0, 0.0, "");
@@ -434,6 +470,9 @@ impl EditTool for AdjustColors {
     fn reset(&mut self) {
         *self = Self::default();
     }
+    fn can_apply(&self) -> bool {
+        *self != Self::default()
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +534,21 @@ mod tests {
             t2.reset();
             assert!(!t2.title().is_empty());
         }
+    }
+
+    /// Apply stays disabled until a tool would change the image: tools whose
+    /// defaults leave it as it is start disabled, as Effects does with nothing
+    /// picked.
+    #[test]
+    fn apply_needs_a_change() {
+        for cmd in [Command::AdjustColors, Command::Resize, Command::CanvasSize, Command::FreeRotate, Command::Levels, Command::Curves, Command::Effects] {
+            assert!(!make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
+        }
+        for cmd in [Command::Sharpen, Command::Blur, Command::AddBorder, Command::AddText, Command::Watermark] {
+            assert!(make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
+        }
+        let changed = AdjustColors { gamma: 1.2, ..Default::default() };
+        assert!(changed.can_apply());
     }
 
     #[test]

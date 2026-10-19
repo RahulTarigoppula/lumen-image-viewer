@@ -209,6 +209,9 @@ impl EditTool for AddText {
     fn reset(&mut self) {
         *self = AddText::default();
     }
+    fn can_apply(&self) -> bool {
+        !self.text.trim().is_empty()
+    }
 }
 
 // ---------------------------------------------------------------- Watermark
@@ -376,6 +379,9 @@ impl EditTool for Watermark {
     fn reset(&mut self) {
         let (logo, logo_name) = (self.logo.take(), std::mem::take(&mut self.logo_name));
         *self = Watermark { logo, logo_name, ..Watermark::default() };
+    }
+    fn can_apply(&self) -> bool {
+        if self.kind == 1 { self.logo.is_some() } else { !self.text.trim().is_empty() }
     }
 }
 
