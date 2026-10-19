@@ -198,6 +198,7 @@ impl Client {
     fn conn(&self) -> Arc<Conn> {
         Arc::new(Conn {
             policy: self.cfg.policy,
+            host: self.endpoint.host.clone(),
             https: self.endpoint.https,
             connect: self.cfg.connect,
             sockets: Mutex::new(Vec::new()),
@@ -256,9 +257,15 @@ impl Client {
         addrs.sort_by_key(|a| a.is_ipv6());
         let mut last = None;
         for a in &addrs {
-            match TcpStream::connect_timeout(a, self.cfg.connect) {
+            let t = Instant::now();
+            match tcp_connect(a, self.cfg.connect) {
                 Ok(_) => return Ok(*a),
-                Err(e) => last = Some(connect_error(&self.endpoint, *a, &e, self.cfg.connect)),
+                // Report how long it really waited (the SYN limit can end it
+                // before the connect timeout).
+                Err(e) => {
+                    let waited = Duration::from_secs(t.elapsed().as_secs_f64().round().max(1.0) as u64).min(self.cfg.connect);
+                    last = Some(connect_error(&self.endpoint, *a, &e, waited))
+                }
             }
         }
         Err(last.unwrap_or_else(|| AiError::Dns { host: self.endpoint.host.clone(), detail: "no addresses".into() }))
@@ -549,6 +556,9 @@ impl Client {
                 if watch.fired.load(Ordering::SeqCst) == FIRED_NONE && e.kind() == io::ErrorKind::TimedOut {
                     return AiError::Timeout(TimeoutKind::Total, self.cfg.total);
                 }
+                if self.endpoint.https && is_plain_http_reply(&e.to_string()) {
+                    return AiError::PlainHttpServer(e.to_string());
+                }
                 AiError::Unreachable { target: self.endpoint.display(), detail: format!("connection lost: {e}") }
             }
         }
@@ -571,14 +581,17 @@ impl Client {
                     _ => AiError::Timeout(TimeoutKind::Total, self.cfg.total),
                 }
             }
+            E::Io(io) if self.endpoint.https && is_plain_http_reply(&io.to_string()) => AiError::PlainHttpServer(io.to_string()),
             E::Io(io) => match io.kind() {
                 io::ErrorKind::TimedOut => AiError::Timeout(TimeoutKind::Connect, self.cfg.connect),
                 io::ErrorKind::ConnectionRefused => AiError::Unreachable { target, detail: REFUSED_HINT.into() },
                 _ => AiError::Unreachable { target, detail: io.to_string() },
             },
             E::ConnectionFailed => AiError::Unreachable { target, detail: "connection failed".into() },
-            E::Tls(m) => AiError::Tls(tls_hint(m, self.endpoint.https)),
-            E::Rustls(r) => AiError::Tls(tls_hint(&r.to_string(), self.endpoint.https)),
+            E::Tls(m) if self.endpoint.https && is_plain_http_reply(m) => AiError::PlainHttpServer(m.to_string()),
+            E::Tls(m) => AiError::Tls(tls_hint(m)),
+            E::Rustls(r) if self.endpoint.https && is_plain_http_reply(&r.to_string()) => AiError::PlainHttpServer(r.to_string()),
+            E::Rustls(r) => AiError::Tls(tls_hint(&r.to_string())),
             E::Pem(p) => AiError::Tls(format!("bad custom CA: {p}")),
             E::Protocol(p) if !self.endpoint.https => {
                 AiError::Protocol(format!("{p}; the server did not answer plain HTTP (does it need HTTPS?)"))
@@ -592,15 +605,123 @@ impl Client {
 
 const REFUSED_HINT: &str = "connection refused: is vllm serve running there, listening on 0.0.0.0 (--host 0.0.0.0) and on this port?";
 
-fn tls_hint(m: &str, https: bool) -> String {
+fn tls_hint(m: &str) -> String {
     let low = m.to_ascii_lowercase();
     if low.contains("unknownissuer") || low.contains("unknown issuer") || low.contains("self signed") || low.contains("selfsigned") {
         format!("{m}; the certificate is not trusted: add the server's CA in Settings > AI")
-    } else if https && (low.contains("corrupt") || low.contains("invalidcontenttype") || low.contains("invalid content type")) {
-        format!("{m}; the server may not use HTTPS: turn HTTPS off")
     } else {
         m.to_string()
     }
+}
+
+/// The TLS library's complaint when the server answers a TLS hello with
+/// plain HTTP ("received corrupt message of type InvalidContentType").
+fn is_plain_http_reply(m: &str) -> bool {
+    let low = m.to_ascii_lowercase();
+    low.contains("invalidcontenttype") || low.contains("invalid content type") || (low.contains("corrupt message") && low.contains("content"))
+}
+
+/// TCP connect with a timeout. On Windows a refused connection normally
+/// takes about 2 s, because the SYN is retried twice after each reset; with
+/// one retry it fails in about 0.5 s (a dropped SYN still gets a second
+/// try), so "server down" and "wrong port" are reported almost at once.
+#[cfg(windows)]
+fn tcp_connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    use std::os::windows::io::FromRawSocket;
+    use windows::Win32::Networking::WinSock::{
+        connect, select, WSAGetLastError, WSAIoctl, WSASocketW, WSAStartup, AF_INET, AF_INET6, FD_SET, IN6_ADDR, IN6_ADDR_0,
+        IN_ADDR, IN_ADDR_0, IPPROTO_TCP, SIO_TCP_INITIAL_RTO, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCK_STREAM,
+        TCP_INITIAL_RTO_PARAMETERS, TIMEVAL, WSADATA, WSAEWOULDBLOCK, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    };
+    static INIT: std::sync::Once = std::sync::Once::new();
+    // SAFETY: WSAStartup only fills `data`; the reference it takes is
+    // never released, as std does for its own sockets.
+    INIT.call_once(|| unsafe {
+        let mut data = WSADATA::default();
+        WSAStartup(0x202, &mut data);
+    });
+    let family = if addr.is_ipv4() { AF_INET.0 } else { AF_INET6.0 } as i32;
+    // SAFETY: plain socket creation; the handle is owned by `stream` below.
+    let sock = unsafe { WSASocketW(family, SOCK_STREAM.0, IPPROTO_TCP.0, None, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT) }
+        .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+    // SAFETY: `sock` is a fresh, valid socket nobody else owns.
+    let stream = unsafe { TcpStream::from_raw_socket(sock.0 as u64) };
+    // 0xFFFF keeps the system's initial RTT; only the SYN retries change.
+    let rto = TCP_INITIAL_RTO_PARAMETERS { Rtt: 0xFFFF, MaxSynRetransmissions: 1 };
+    let mut returned = 0u32;
+    // SAFETY: the input buffer is a live TCP_INITIAL_RTO_PARAMETERS; failure
+    // (older Windows) just keeps the default behaviour.
+    unsafe {
+        WSAIoctl(
+            sock,
+            SIO_TCP_INITIAL_RTO,
+            Some(&rto as *const _ as *const _),
+            std::mem::size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32,
+            None,
+            0,
+            &mut returned,
+            None,
+            None,
+        )
+    };
+    stream.set_nonblocking(true)?;
+    let r = match addr {
+        SocketAddr::V4(a) => {
+            let sa = SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: a.port().to_be(),
+                sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(a.ip().octets()) } },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: `sa` is a valid SOCKADDR_IN for the call's duration.
+            unsafe { connect(sock, &sa as *const _ as *const SOCKADDR, std::mem::size_of::<SOCKADDR_IN>() as i32) }
+        }
+        SocketAddr::V6(a) => {
+            let sa = SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: a.ip().octets() } },
+                Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: a.scope_id() },
+            };
+            // SAFETY: `sa` is a valid SOCKADDR_IN6 for the call's duration.
+            unsafe { connect(sock, &sa as *const _ as *const SOCKADDR, std::mem::size_of::<SOCKADDR_IN6>() as i32) }
+        }
+    };
+    if r != 0 {
+        // SAFETY: reads this thread's last WinSock error.
+        let err = unsafe { WSAGetLastError() };
+        if err != WSAEWOULDBLOCK {
+            return Err(io::Error::from_raw_os_error(err.0));
+        }
+        // Writable means connected; a failed connect shows in the except set.
+        let mut write = FD_SET { fd_count: 1, ..Default::default() };
+        write.fd_array[0] = sock;
+        let mut except = write;
+        let tv = TIMEVAL { tv_sec: timeout.as_secs().min(i32::MAX as u64) as i32, tv_usec: timeout.subsec_micros() as i32 };
+        // SAFETY: both sets hold one valid socket; `tv` outlives the call.
+        let n = unsafe { select(0, None, Some(&mut write), Some(&mut except), Some(&tv)) };
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out"));
+        }
+        if n < 0 {
+            // SAFETY: as above.
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0));
+        }
+        if let Some(e) = stream.take_error()? {
+            return Err(e);
+        }
+        if except.fd_count > 0 {
+            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "connection failed"));
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[cfg(not(windows))]
+fn tcp_connect(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    TcpStream::connect_timeout(addr, timeout)
 }
 
 fn connect_error(ep: &Endpoint, a: SocketAddr, e: &io::Error, timeout: Duration) -> AiError {
@@ -774,7 +895,7 @@ pub fn classify(status: u16, body: &str, key_sent: bool, retry_after: Option<Dur
                 AiError::NotMultimodal(message)
             } else if has(&["response_format", "json_schema", "structured output", "guided_decoding", "guided_json", "xgrammar", "outlines", "grammar"]) {
                 AiError::ResponseFormatRejected(message)
-            } else if has(&["chat_template_kwargs", "extra inputs are not permitted", "extra_forbidden", "unrecognized request argument", "unknown field", "top_k", "continue_final_message", "add_generation_prompt"]) {
+            } else if has(&["chat_template_kwargs", "continuous_usage_stats", "extra inputs are not permitted", "extra_forbidden", "unrecognized request argument", "unknown field", "top_k", "continue_final_message", "add_generation_prompt"]) {
                 AiError::UnsupportedParameter(message)
             } else {
                 AiError::Http { status, message }
@@ -983,6 +1104,7 @@ struct Watch {
 /// Sockets opened for one request, so the watchdog can stop them.
 struct Conn {
     policy: NetPolicy,
+    host: String,
     https: bool,
     connect: Duration,
     sockets: Mutex<Vec<TcpStream>>,
@@ -1017,13 +1139,13 @@ impl Connector<()> for GuardedConnector {
         let conn = &self.0;
         let mut addrs: Vec<SocketAddr> = details.addrs.to_vec();
         // Re-check what DNS returned this time, right before connecting.
-        conn.policy.check_all(&addrs, conn.https).map_err(|e| ureq::Error::Other(Box::new(e)))?;
+        conn.policy.check_host(&conn.host, &addrs, conn.https).map_err(|e| ureq::Error::Other(Box::new(e)))?;
         // IPv4 first: `vllm serve --host 0.0.0.0` listens on IPv4 only, and a
         // refused IPv6 attempt costs about 2 s on Windows.
         addrs.sort_by_key(|a| a.is_ipv6());
         let mut last: Option<io::Error> = None;
         for a in &addrs {
-            match TcpStream::connect_timeout(a, conn.connect) {
+            match tcp_connect(a, conn.connect) {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
                     if let Ok(clone) = stream.try_clone() {
@@ -1200,7 +1322,7 @@ mod tests {
         ));
         assert!(matches!(classify(400, &b("Unrecognized request argument supplied: chat_template_kwargs"), true, None), AiError::UnsupportedParameter(_)));
         assert!(matches!(classify(401, &b("Unauthorized"), true, None), AiError::Unauthorized { key_sent: true, .. }));
-        assert_eq!(classify(401, "", false, None).to_string(), "Server requires an API key (401)");
+        assert!(classify(401, "", false, None).to_string().starts_with("Server requires an API key (401)"));
         assert!(matches!(classify(404, &b("The model `x` does not exist."), true, None), AiError::ModelNotFound(_)));
         assert!(matches!(classify(413, "", true, None), AiError::PayloadTooLarge(_)));
         let busy = classify(503, "", true, Some(Duration::from_secs(3)));

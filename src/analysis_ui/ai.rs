@@ -59,6 +59,8 @@ pub struct Live {
     pub text: String,
     pub reasoning: String,
     pub usage: Option<Usage>,
+    /// Stream chunks so far (about one token each).
+    pub chunks: u64,
     pub status: Option<String>,
     pub connected: bool,
     pub pass: Option<(u8, u8)>,
@@ -118,6 +120,8 @@ pub struct AiState {
     /// Settings > AI edit buffers.
     pub host_edit: String,
     pub host_error: Option<String>,
+    /// A key typed but not saved: used for this session (Test, Run) and
+    /// kept only in memory until Save.
     pub key_edit: String,
     pub model_edit: String,
     test: Option<Task>,
@@ -134,6 +138,10 @@ pub struct AiState {
     history: HashMap<String, Vec<RunRecord>>,
     /// The result shown in the panel and on the image: (file key, index).
     pub shown: Option<(String, usize)>,
+    /// Whether the server answered last time: Test connection, or a run
+    /// (a finished run proves the connection; an unreachable one disproves
+    /// it). With the message for the status dot.
+    reach: Option<(bool, String)>,
     /// `settings` changed and must be copied into `Settings::ai`.
     pub dirty: bool,
     /// The copy in `Settings::ai` was written (a settings reset clears it).
@@ -171,6 +179,7 @@ impl AiState {
             error: None,
             history: HashMap::new(),
             shown: None,
+            reach: None,
             dirty: false,
             written: !settings.ai.is_null(),
             repaint,
@@ -180,8 +189,8 @@ impl AiState {
         st
     }
 
-    /// The host field as the user should see it: the host, with the port
-    /// only when it differs from the port field's default.
+    /// The host field as the user should see it (the port and scheme are
+    /// in their own fields).
     fn host_text(&self) -> String {
         self.settings.host.clone()
     }
@@ -191,8 +200,32 @@ impl AiState {
         self.host_edit = self.host_text();
         self.model_edit = self.settings.model.clone().unwrap_or_default();
         self.key = None;
-        self.key_target = None;
+        self.server_changed();
         self.written = false;
+    }
+
+    /// Port, HTTPS or address changed: earlier results say nothing about
+    /// the new server, and its key is looked up again.
+    fn server_changed(&mut self) {
+        self.key_target = None;
+        self.report = None;
+        self.reach = None;
+        self.steps.clear();
+        self.models.clear();
+    }
+
+    /// The Port field was edited by hand: a bare host keeps it from now on.
+    pub fn port_edited(&mut self) {
+        self.settings.port_by_user = true;
+        self.dirty = true;
+        self.server_changed();
+    }
+
+    /// The HTTPS toggle was flipped by hand.
+    pub fn https_edited(&mut self) {
+        self.settings.https_by_user = true;
+        self.dirty = true;
+        self.server_changed();
     }
 
     pub fn endpoint(&self) -> Option<Endpoint> {
@@ -206,20 +239,24 @@ impl AiState {
             if !self.settings.host.is_empty() {
                 self.settings.host.clear();
                 self.dirty = true;
+                self.server_changed();
             }
             return false;
+        }
+        // Unchanged text: keep the port and scheme it was folded with (a
+        // pasted URL's), rather than resetting them as for a new bare host.
+        if self.host_edit.trim() == self.host_text() && self.settings.endpoint().is_ok() {
+            self.host_error = None;
+            return true;
         }
         let before = (self.settings.host.clone(), self.settings.port, self.settings.https, self.settings.path_prefix.clone());
         match self.settings.apply_server_input(&self.host_edit.clone()) {
             Ok(_) => {
                 self.host_error = None;
                 self.host_edit = self.host_text();
+                self.dirty = true;
                 if before != (self.settings.host.clone(), self.settings.port, self.settings.https, self.settings.path_prefix.clone()) {
-                    // Another server: the last test says nothing about it.
-                    self.dirty = true;
-                    self.key_target = None;
-                    self.report = None;
-                    self.steps.clear();
+                    self.server_changed();
                 }
                 true
             }
@@ -230,8 +267,22 @@ impl AiState {
         }
     }
 
-    /// The API key for the current server, read from the store once.
+    /// The key to send: the one typed in Settings > AI if any (not saved
+    /// yet), else the saved key for the current server.
     pub fn api_key(&mut self) -> Result<Option<ApiKey>, AiError> {
+        if let Some(k) = ApiKey::new(&self.key_edit) {
+            return Ok(Some(k));
+        }
+        self.saved_key()
+    }
+
+    /// A key is typed in the API key field (and not saved).
+    pub fn typed_key(&self) -> bool {
+        !self.key_edit.trim().is_empty()
+    }
+
+    /// The saved API key for the current server, read from the store once.
+    fn saved_key(&mut self) -> Result<Option<ApiKey>, AiError> {
         let Ok(ep) = self.settings.endpoint() else { return Ok(None) };
         let target = ep.credential_target();
         if self.key_target.as_deref() != Some(target.as_str()) {
@@ -244,8 +295,9 @@ impl AiState {
         Ok(self.key.clone())
     }
 
+    /// A key is saved for the current server.
     pub fn has_key(&mut self) -> bool {
-        matches!(self.api_key(), Ok(Some(_)))
+        matches!(self.saved_key(), Ok(Some(_)))
     }
 
     /// Saves the typed key in Credential Manager (or the DPAPI file).
@@ -365,9 +417,10 @@ impl AiState {
         }
     }
 
-    /// The server can be reached and lists models (after Test connection).
-    pub fn connected(&self) -> Option<bool> {
-        self.report.as_ref().map(|r| r.ok())
+    /// The server answered last time (Test connection or a run), with what
+    /// to show on hover; `None` before anything was tried.
+    pub fn connected(&self) -> Option<(bool, &str)> {
+        self.reach.as_ref().map(|(ok, m)| (*ok, m.as_str()))
     }
 
     // ------------------------------------------------------------ runs
@@ -438,12 +491,11 @@ impl AiState {
                 // "Do not ask again for this server": the plan's rule is that
                 // the first request to a server is confirmed, and every one
                 // while Always confirm is on.
-                if !self.settings.is_trusted(&req.server_key) {
-                    self.settings.trusted_servers.push(req.server_key.clone());
-                }
-                self.settings.always_confirm = false;
+                self.notes.push((false, format!("No send preview for {} from now on (Settings > AI to undo)", req.server)));
+            }
+            // Only this server is trusted; "Always confirm" stays as it is.
+            if self.settings.confirmed(&req.server_key, trust) {
                 self.dirty = true;
-                self.notes.push((false, format!("No send preview for {} from now on (Settings > AI to turn it back on)", req.server)));
             }
             self.send(*req, meta);
         }
@@ -536,10 +588,18 @@ impl AiState {
     }
 
     fn finish_test(&mut self, r: ConnectionReport) {
-        self.models = r.models.clone();
+        // A failed test keeps the list it had (the server is the same).
+        if !r.models.is_empty() {
+            self.models = r.models.clone();
+        }
         if let (Some(v), Some(m)) = (r.vision.clone(), r.picked_model.clone()) {
             self.remember_verdict(&m, v);
         }
+        self.reach = Some(if r.ok() {
+            (true, "Connected (last Test connection succeeded)".to_string())
+        } else {
+            (false, r.failure().unwrap_or("Test connection failed").to_string())
+        });
         // Keep the user's model while the server still serves it; otherwise
         // take the one Test picked (the best vision candidate).
         let served = self.settings.model.as_ref().is_some_and(|m| self.card(m).is_some());
@@ -586,11 +646,14 @@ impl AiState {
                         AiEvent::Pass { index, total } => {
                             self.live.text.clear();
                             self.live.reasoning.clear();
+                            self.live.usage = None;
+                            self.live.chunks = 0;
                             self.live.pass = Some((index, total));
                         }
                         AiEvent::Reasoning(s) => self.live.reasoning.push_str(&s),
                         AiEvent::Delta(s) => self.live.text.push_str(&s),
                         AiEvent::Usage(u) => self.live.usage = Some(u),
+                        AiEvent::Chunks(n) => self.live.chunks = n,
                         AiEvent::Status(s) => self.live.status = Some(s),
                         AiEvent::ImageLimitLearned { server_key, model, limit } => {
                             self.settings.remember_image_limit(&server_key, &model, limit);
@@ -605,10 +668,17 @@ impl AiState {
                     let outcome = match r {
                         Ok(res) => {
                             self.live.status = None;
+                            self.reach = Some((true, format!("Connected (last run: {} on {})", res.model, res.server)));
                             Outcome::Done(Box::new(res))
                         }
                         Err(AiError::Cancelled) => Outcome::Cancelled { partial: std::mem::take(&mut self.live.text) },
                         Err(e) => {
+                            self.reach = Some(if reached(&e) {
+                                // The server answered (another HTTP error): it is reachable.
+                                (true, format!("Connected; the last run failed: {e}"))
+                            } else {
+                                (false, e.to_string())
+                            });
                             self.live.status = Some(e.to_string());
                             Outcome::Failed { message: e.to_string(), detail: e.detail().map(str::to_string), partial: self.live.text.clone() }
                         }
@@ -710,6 +780,24 @@ pub fn tick(core: &mut Core) {
             core.ai.written = true;
         }
     }
+}
+
+/// False when a failed run shows the server cannot be used as set up: no
+/// answer (address, policy, connection or TLS failures) or a refused key.
+fn reached(e: &AiError) -> bool {
+    !matches!(
+        e,
+        AiError::Address(_)
+            | AiError::Dns { .. }
+            | AiError::NotLocal { .. }
+            | AiError::PublicNeedsHttps { .. }
+            | AiError::HostNotLocal { .. }
+            | AiError::Unreachable { .. }
+            | AiError::Tls(_)
+            | AiError::PlainHttpServer(_)
+            | AiError::Timeout(lumen_ai::TimeoutKind::Connect, _)
+            | AiError::Unauthorized { .. }
+    )
 }
 
 /// Clears a secret typed into a text field before dropping it.

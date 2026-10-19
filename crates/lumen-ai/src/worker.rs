@@ -5,8 +5,9 @@
 //! vanish; `Task::cancel` stops the request and closes its socket.
 //!
 //! A run applies the plan's recovery rules in order:
-//! - connect failures, 429, 502, 503 and 504 are retried twice (1 s, then
-//!   4 s, or the server's Retry-After), only before the first token;
+//! - 429, 502, 503 and 504 are retried twice (1 s, then 4 s, or the
+//!   server's Retry-After), a refused or lost connection once after 0.5 s,
+//!   only before the first token;
 //! - "At most N image(s)" rebuilds the request for N images (a composite
 //!   when N is 1) and reports the learned limit;
 //! - a rejected `response_format` resends with the schema in the prompt;
@@ -56,6 +57,9 @@ pub enum AiEvent {
     Reasoning(String),
     /// Answer text.
     Delta(String),
+    /// Stream chunks (about one token each) received so far, for a live
+    /// count while the server does not report usage per chunk.
+    Chunks(u64),
     Usage(Usage),
     /// Ends a run task (and any task that failed internally).
     Done(Result<RunResult, AiError>),
@@ -124,10 +128,15 @@ impl Task {
     }
 }
 
+#[derive(Default)]
 struct Pending {
     delta: String,
     reasoning: String,
-    last: Instant,
+    /// Latest usage not sent yet (vLLM reports it with every chunk).
+    usage: Option<Usage>,
+    chunks: u64,
+    chunks_sent: u64,
+    last: Option<Instant>,
 }
 
 struct Emitter {
@@ -147,7 +156,16 @@ impl Emitter {
             let _ = self.tx.send(AiEvent::Delta(std::mem::take(&mut p.delta)));
             sent = true;
         }
-        p.last = Instant::now();
+        if p.chunks != p.chunks_sent {
+            let _ = self.tx.send(AiEvent::Chunks(p.chunks));
+            p.chunks_sent = p.chunks;
+            sent = true;
+        }
+        if let Some(u) = p.usage.take() {
+            let _ = self.tx.send(AiEvent::Usage(u));
+            sent = true;
+        }
+        p.last = Some(Instant::now());
         sent
     }
 
@@ -156,6 +174,11 @@ impl Emitter {
         {
             let mut p = self.pending.lock().unwrap();
             self.flush_locked(&mut p);
+            if matches!(ev, AiEvent::Pass { .. }) {
+                // A new pass counts its own tokens.
+                p.chunks = 0;
+                p.chunks_sent = 0;
+            }
             let _ = self.tx.send(ev);
         }
         (self.repaint)();
@@ -165,7 +188,7 @@ impl Emitter {
     fn tick(&self) {
         let sent = {
             let mut p = self.pending.lock().unwrap();
-            p.last.elapsed() >= FLUSH_EVERY && self.flush_locked(&mut p)
+            p.last.is_none_or(|t| t.elapsed() >= FLUSH_EVERY) && self.flush_locked(&mut p)
         };
         if sent {
             (self.repaint)();
@@ -174,11 +197,16 @@ impl Emitter {
 
     fn push(&self, reasoning: bool, text: &str) {
         let mut p = self.pending.lock().unwrap();
+        p.chunks += 1;
         if reasoning {
             p.reasoning.push_str(text);
         } else {
             p.delta.push_str(text);
         }
+    }
+
+    fn set_usage(&self, usage: &Usage) {
+        self.pending.lock().unwrap().usage = Some(usage.clone());
     }
 }
 
@@ -200,7 +228,7 @@ impl ChatSink for Sink<'_> {
         self.em.push(true, text);
     }
     fn usage(&self, usage: &Usage) {
-        self.em.send(AiEvent::Usage(usage.clone()));
+        self.em.set_usage(usage);
     }
     fn tick(&self) {
         self.em.tick();
@@ -211,7 +239,7 @@ fn spawn(name: &str, repaint: Repaint, f: impl FnOnce(&Emitter, &CancelToken) + 
     let (tx, rx) = unbounded();
     let cancel = CancelToken::new();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let em = Emitter { tx, repaint, pending: Mutex::new(Pending { delta: String::new(), reasoning: String::new(), last: Instant::now() }) };
+    let em = Emitter { tx, repaint, pending: Mutex::new(Pending::default()) };
     let c = cancel.clone();
     let spawned = std::thread::Builder::new().name(format!("lumen-ai-{name}")).spawn(move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&em, &c)));
@@ -264,7 +292,7 @@ pub fn spawn_run(client: Client, prepared: PreparedRequest, repaint: Repaint) ->
 /// Quick score over video frames). Events are not reported.
 pub fn run_blocking(client: &Client, prepared: PreparedRequest, cancel: &CancelToken) -> Result<RunResult, AiError> {
     let (tx, _rx) = unbounded();
-    let em = Emitter { tx, repaint: Arc::new(|| {}), pending: Mutex::new(Pending { delta: String::new(), reasoning: String::new(), last: Instant::now() }) };
+    let em = Emitter { tx, repaint: Arc::new(|| {}), pending: Mutex::new(Pending::default()) };
     run(client, prepared, &em, cancel)
 }
 
@@ -285,19 +313,33 @@ fn sleep_cancellable(d: Duration, cancel: &CancelToken) -> Result<(), AiError> {
     Ok(())
 }
 
+/// How long to wait before retry `attempt` (0-based) after `e`, or `None`
+/// when it is not retried. A busy server gets two retries (1 s, then 4 s,
+/// or its Retry-After); a refused or lost connection gets one quick retry
+/// (a restarting server), so a server that is down fails within about a
+/// second; a connect timeout already waited and is not retried.
+fn retry_delay(e: &AiError, attempt: usize) -> Option<Duration> {
+    const BUSY_BACKOFF: [u64; 2] = [1, 4];
+    match e {
+        AiError::Busy { retry_after, .. } => {
+            let base = Duration::from_secs(*BUSY_BACKOFF.get(attempt)?);
+            Some(retry_after.map(|d| d.clamp(Duration::from_secs(1), Duration::from_secs(30))).unwrap_or(base))
+        }
+        AiError::Unreachable { .. } if attempt == 0 => Some(Duration::from_millis(500)),
+        _ => None,
+    }
+}
+
 fn send_with_retries(client: &Client, body: &[u8], stream: bool, em: &Emitter, cancel: &CancelToken) -> Result<ChatOutput, AiError> {
-    const BACKOFF: [u64; 2] = [1, 4];
     let mut attempt = 0;
     loop {
         let sink = Sink { em, got_token: AtomicBool::new(false) };
         match client.chat(body, stream, cancel, &sink) {
             Ok(o) => return Ok(o),
-            Err(e) if e.is_retryable() && attempt < BACKOFF.len() && !sink.got_token.load(Ordering::SeqCst) => {
-                let wait = match &e {
-                    AiError::Busy { retry_after: Some(d), .. } => (*d).clamp(Duration::from_secs(1), Duration::from_secs(30)),
-                    _ => Duration::from_secs(BACKOFF[attempt]),
-                };
-                em.send(AiEvent::Status(format!("{e}; retrying in {} s", wait.as_secs())));
+            Err(e) if e.is_retryable() && !sink.got_token.load(Ordering::SeqCst) => {
+                let Some(wait) = retry_delay(&e, attempt) else { return Err(e) };
+                let after = if wait < Duration::from_secs(1) { format!("{} ms", wait.as_millis()) } else { format!("{} s", wait.as_secs()) };
+                em.send(AiEvent::Status(format!("{e}; retrying in {after}")));
                 sleep_cancellable(wait, cancel)?;
                 attempt += 1;
             }

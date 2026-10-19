@@ -149,6 +149,11 @@ pub struct App {
     fullscreen: bool,
     viewer_from_browser: bool,
     last_save: Instant,
+    /// Debounced settings autosave: the JSON last written (or loaded), the
+    /// JSON seen at the previous check, and when that check ran.
+    settings_saved: String,
+    settings_seen: String,
+    settings_check: Instant,
     last_title: String,
     effective_dark: bool,
     dev: crate::devhook::DevHook,
@@ -284,6 +289,9 @@ impl App {
             fullscreen: false,
             viewer_from_browser: false,
             last_save: Instant::now(),
+            settings_saved: String::new(),
+            settings_seen: String::new(),
+            settings_check: Instant::now(),
             last_title: String::new(),
             effective_dark: dark,
             dev: crate::devhook::DevHook::new(),
@@ -2464,6 +2472,10 @@ impl eframe::App for App {
             self.core.tags.save_if_dirty();
             self.last_save = Instant::now();
         }
+        if self.settings_check.elapsed() >= std::time::Duration::from_secs(1) {
+            self.settings_check = Instant::now();
+            self.autosave_settings();
+        }
         let _ = ctx;
     }
 
@@ -2769,6 +2781,21 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Writes settings.json shortly after a change (once it has been stable
+    /// for a check interval, so a slider drag is one write), so a crash or
+    /// a killed process does not lose what was set.
+    fn autosave_settings(&mut self) {
+        let Ok(now) = serde_json::to_string(&self.core.settings) else { return };
+        if self.settings_saved.is_empty() {
+            // First check: this is what was loaded.
+            self.settings_saved = now.clone();
+        } else if now != self.settings_saved && now == self.settings_seen {
+            self.core.settings.save();
+            self.settings_saved = now.clone();
+        }
+        self.settings_seen = now;
     }
 
     fn persist(&mut self) {
