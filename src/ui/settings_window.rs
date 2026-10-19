@@ -11,7 +11,7 @@ use crate::settings::{ExternalEditor, FitMode, Settings, SortKey, ThemeChoice, T
 use crate::ui::commands::Command;
 use crate::ui::keymap::{self, KeyMode, Keymap, Preset};
 use egui::KeyboardShortcut;
-use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
@@ -104,6 +104,8 @@ struct State {
     conflict: Option<PendingConflict>,
     confirm_reset_keys: bool,
     confirm_preset: Option<Preset>,
+    /// egui pass in which the window last drew; a gap means it was just opened.
+    last_pass: u64,
 }
 
 const ACCENTS: [(&str, [u8; 3]); 9] = [
@@ -128,54 +130,66 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     let mut st: State = ctx.data_mut(|d| d.get_temp(state_id)).unwrap_or_else(initial_state);
     let mut changed = false;
 
+    // Each opening starts with an empty shortcut search.
+    let pass = ctx.cumulative_pass_nr();
+    if st.last_pass + 1 < pass {
+        st.kb_search.clear();
+        st.capture = None;
+        st.conflict = None;
+    }
+    st.last_pass = pass;
+
     // Esc closes Settings unless a text field is being edited (or a key is being captured).
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.text_edit_focused() && st.capture.is_none() {
         *open = false;
     }
-    // Always fit inside the app window, even at 150% scale on a small screen.
+    // Size and position come from the app window every frame (nothing remembered),
+    // so the window always fits, at any interface size and after maximize / restore,
+    // and keeps the same width on every page.
     let screen = ctx.content_rect();
-    let max_w = (screen.width() - 24.0).max(320.0);
-    let max_h = (screen.height() - 24.0).max(260.0);
+    let size = Vec2::new((screen.width() - 24.0).min(860.0), (screen.height() - 24.0).min(620.0)).max(Vec2::new(120.0, 120.0)).min(screen.size());
     egui::Window::new("Settings")
         .id(egui::Id::unique("settings-window"))
         .open(open)
-        .default_size([760.0f32.min(max_w), 560.0f32.min(max_h)])
-        .pivot(Align2::CENTER_CENTER)
-        .default_pos(screen.center())
-        .min_size([520.0f32.min(max_w), 320.0f32.min(max_h)])
-        .max_size([max_w, max_h])
-        .constrain(true)
-        .resizable(true)
+        .fixed_size(size)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .resizable(false)
         .collapsible(false)
         .scroll(false)
         .frame(egui::Frame::window(&ctx.global_style()).inner_margin(Margin::ZERO).fill(p.bg))
         .show(ctx, |ui| {
-            let h = ui.available_height().max(300.0);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                navigation(ui, &p, &mut st, h);
-                let (line, _) = ui.allocate_exact_size(Vec2::new(1.0, h), Sense::hover());
-                ui.painter().rect_filled(line, 0.0, p.border);
-                ui.vertical(|ui| {
-                    ui.set_min_height(h);
-                    egui::ScrollArea::vertical().id_salt(("settings-page", st.page)).auto_shrink([false, false]).show(ui, |ui| {
-                        egui::Frame::new().inner_margin(Margin { left: 22, right: 22, top: 16, bottom: 22 }).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-                            page_header(ui, &p, st.page);
-                            changed |= match st.page {
-                                Page::Appearance => appearance(ui, &p, &mut core.settings, &mut st),
-                                Page::Viewer => viewer(ui, &p, &mut core.settings),
-                                Page::Browser => browser(ui, &p, &mut core.settings),
-                                Page::Editing => editing(ui, &p, &mut core.settings),
-                                Page::Keyboard => keyboard(ui, &p, core, &mut st),
-                                Page::Performance => performance(ui, &p, core, &mut st),
-                                Page::Editors => editors(ui, &p, core),
-                                Page::Integration => integration(ui, &p, core, &mut st),
-                                Page::Privacy => privacy(ui, &p, &mut st),
-                                Page::About => about(ui, &p),
-                            };
-                        });
-                    });
+            let full = ui.available_rect_before_wrap();
+            // Narrow window (large interface size): the category list shows icons only.
+            let compact = full.width() < 600.0;
+            let nav_w = if compact { 52.0 } else { 204.0 };
+            let nav_rect = Rect::from_min_size(full.min, Vec2::new(nav_w, full.height()));
+            let page_rect = Rect::from_min_max(egui::pos2(nav_rect.right() + 1.0, full.top()), full.max);
+            let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect).layout(Layout::top_down(Align::Min)));
+            nav_ui.set_clip_rect(nav_rect.intersect(ui.clip_rect()));
+            navigation(&mut nav_ui, &p, &mut st, compact);
+            ui.painter().rect_filled(Rect::from_min_max(nav_rect.right_top(), egui::pos2(nav_rect.right() + 1.0, nav_rect.bottom())), 0.0, p.border);
+            let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page_rect).layout(Layout::top_down(Align::Min)));
+            page_ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
+            ui.advance_cursor_after_rect(full);
+            let ui = &mut page_ui;
+            let side = if page_rect.width() < 420.0 { 12 } else { 22 };
+            egui::ScrollArea::vertical().id_salt(("settings-page", st.page)).auto_shrink([false, false]).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin { left: side, right: side, top: 16, bottom: 22 }).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                    page_header(ui, &p, st.page);
+                    changed |= match st.page {
+                        Page::Appearance => appearance(ui, &p, &mut core.settings, &mut st),
+                        Page::Viewer => viewer(ui, &p, &mut core.settings),
+                        Page::Browser => browser(ui, &p, &mut core.settings),
+                        Page::Editing => editing(ui, &p, &mut core.settings),
+                        Page::Keyboard => keyboard(ui, &p, core, &mut st),
+                        Page::Performance => performance(ui, &p, core, &mut st),
+                        Page::Editors => editors(ui, &p, core),
+                        Page::Integration => integration(ui, &p, core, &mut st),
+                        Page::Privacy => privacy(ui, &p, &mut st),
+                        Page::About => about(ui, &p),
+                    };
                 });
             });
         });
@@ -267,31 +281,43 @@ fn initial_state() -> State {
 
 // ====================================================================== chrome
 
-fn navigation(ui: &mut Ui, p: &Palette, st: &mut State, h: f32) {
-    egui::Frame::new().fill(p.panel).inner_margin(Margin::symmetric(8, 12)).show(ui, |ui| {
-        ui.set_width(188.0);
-        ui.set_min_height(h - 24.0);
-        ui.vertical(|ui| {
-            ui.set_width(188.0);
-            ui.set_min_height(h - 24.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
+/// The category list fills `ui`'s rect. It scrolls when the window is too short for
+/// every entry; `compact` shows icons only (names in tooltips).
+fn navigation(ui: &mut Ui, p: &Palette, st: &mut State, compact: bool) {
+    let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0.0, p.panel);
+    const ITEM_H: f32 = 32.0;
+    const GAP: f32 = 2.0;
+    let list_h = Page::ALL.len() as f32 * (ITEM_H + GAP) + 6.0;
+    let footer_h = 26.0;
+    let show_footer = !compact && rect.height() >= list_h + 24.0 + footer_h;
+    let list_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - if show_footer { footer_h } else { 0.0 }));
+    let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(Layout::top_down(Align::Min)));
+    egui::ScrollArea::vertical().id_salt("settings-nav").auto_shrink([false, false]).show(&mut list_ui, |ui| {
+        egui::Frame::new().inner_margin(Margin::symmetric(if compact { 6 } else { 8 }, 12)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = GAP;
             for page in Page::ALL {
                 if page == Page::Privacy {
                     ui.add_space(6.0);
                 }
-                if nav_item(ui, p, page.icon(), page.label(), st.page == page).clicked() {
+                let mut resp = nav_item(ui, p, page.icon(), page.label(), st.page == page, compact);
+                if compact {
+                    resp = resp.on_hover_text(page.label());
+                }
+                if resp.clicked() {
                     st.page = page;
                 }
             }
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Changes apply instantly").size(11.0).color(p.faint));
-            });
         });
     });
+    if show_footer {
+        let pos = egui::pos2(rect.min.x + 12.0, rect.max.y - footer_h / 2.0 - 2.0);
+        ui.painter().with_clip_rect(rect).text(pos, Align2::LEFT_CENTER, "Changes apply instantly", FontId::proportional(11.0), p.faint);
+    }
+    ui.advance_cursor_after_rect(rect);
 }
 
-fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, label: &str, selected: bool) -> Response {
+fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, label: &str, selected: bool, compact: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let bg = if selected {
@@ -308,9 +334,14 @@ fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, label: &str, selected: bool) -
             painter.rect_filled(bar, CornerRadius::same(2), p.accent);
         }
         let icon_color = if selected { p.accent } else { p.muted };
-        painter.text(egui::pos2(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
-        let font = if selected { semibold(13.5) } else { FontId::proportional(13.5) };
-        painter.text(egui::pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, label, font, p.text);
+        if compact {
+            painter.text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(17.0), icon_color);
+        } else {
+            painter.text(egui::pos2(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
+            let font = if selected { semibold(13.5) } else { FontId::proportional(13.5) };
+            let text_clip = Rect::from_min_max(egui::pos2(rect.left() + 38.0, rect.top()), egui::pos2(rect.right() - 4.0, rect.bottom()));
+            painter.with_clip_rect(text_clip.intersect(ui.clip_rect())).text(egui::pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, label, font, p.text);
+        }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -320,8 +351,8 @@ fn page_header(ui: &mut Ui, p: &Palette, page: Page) {
         ui.label(RichText::new(page.icon()).size(22.0).color(p.accent));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(RichText::new(page.label()).font(semibold(19.0)).color(p.text));
-            ui.label(RichText::new(page.subtitle()).size(12.0).color(p.muted));
+            ui.add(egui::Label::new(RichText::new(page.label()).font(semibold(19.0)).color(p.text)).truncate());
+            ui.add(egui::Label::new(RichText::new(page.subtitle()).size(12.0).color(p.muted)).wrap());
         });
     });
     ui.add_space(8.0);
@@ -358,23 +389,52 @@ fn row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&
         ui.painter().hline(r.left()..=r.right(), y, Stroke::new(1.0, p.border.gamma_multiply(0.7)));
     }
     let w = ui.available_width();
-    let text_w = (w - 250.0).max(w * 0.4).max(120.0);
+    // The control's width is measured each frame. When it leaves too little room for
+    // the text, the control goes below the text (and wraps) instead of overlapping it.
+    let width_id = ui.scope_id().with(("settings-row-control", title));
+    let control_w: Option<f32> = ui.data(|d| d.get_temp(width_id));
+    let min_text = 160.0f32.min(w * 0.45);
+    let side_by_side = match control_w {
+        Some(cw) => cw + 16.0 + min_text <= w,
+        None => w >= 520.0,
+    };
+    let text = |ui: &mut Ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add(egui::Label::new(RichText::new(title).color(p.text)).wrap());
+        if !desc.is_empty() {
+            ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(p.muted)).wrap());
+        }
+    };
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
-            ui.set_width(text_w);
-            ui.add_space(8.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new(title).color(p.text));
-            if !desc.is_empty() {
-                ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(p.muted)).wrap());
-            }
-            ui.add_space(8.0);
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    let measured = if side_by_side {
+        let text_w = (w - control_w.unwrap_or(250.0) - 16.0).max(min_text);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(text_w);
+                ui.add_space(8.0);
+                text(ui);
+                ui.add_space(8.0);
+            });
+            let r = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                changed = control(ui);
+            });
+            r.response.rect.width()
+        })
+        .inner
+    } else {
+        ui.add_space(8.0);
+        text(ui);
+        ui.add_space(4.0);
+        let r = ui.with_layout(Layout::right_to_left(Align::Min).with_main_wrap(true), |ui| {
             changed = control(ui);
         });
-    });
+        ui.add_space(8.0);
+        r.response.rect.width()
+    };
+    if control_w.is_none_or(|cw| (cw - measured).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(width_id, measured));
+        ui.ctx().request_repaint();
+    }
     changed
 }
 
@@ -405,18 +465,16 @@ fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
 }
 
 /// Fixed-width left-to-right box for sliders inside a right-to-left row.
-fn slider_box(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> bool) -> bool {
-    ui.allocate_ui_with_layout(Vec2::new(240.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().slider_width = 160.0;
-        add(ui)
-    })
-    .inner
+/// The box is 240 points wide, or the room left when that is less.
+fn slider_box_resp(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
+    slider_box(ui, |ui| ui.add(slider))
 }
 
-fn slider_box_resp(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
-    ui.allocate_ui_with_layout(Vec2::new(240.0, 24.0), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().slider_width = 160.0;
-        ui.add(slider)
+fn slider_box<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let w = 240.0f32.min(ui.available_width()).max(140.0);
+    ui.allocate_ui_with_layout(Vec2::new(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().slider_width = w - 80.0;
+        add(ui)
     })
     .inner
 }
@@ -494,12 +552,12 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
         changed |= row(ui, p, "Interface size", "Scales all text and controls.", |ui| {
             let mut c = false;
             let mut v = st.scale_edit.unwrap_or(s.ui_scale);
-            let resp = slider_box_resp(ui, egui::Slider::new(&mut v, 0.8..=2.0).step_by(0.05).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)));
+            let resp = slider_box_resp(ui, egui::Slider::new(&mut v, 0.75..=2.0).step_by(0.05).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)));
             if resp.changed() {
                 st.scale_edit = Some(v);
             }
             if st.scale_edit.is_some() && !resp.dragged() {
-                s.ui_scale = v.clamp(0.8, 2.0);
+                s.ui_scale = v.clamp(0.75, 2.0);
                 st.scale_edit = None;
                 c = true;
             }
@@ -942,9 +1000,9 @@ fn about(ui: &mut Ui, p: &Palette) -> bool {
         ui.horizontal(|ui| {
             ui.add(egui::Image::new(egui::include_image!("../../assets/lumen-256.png")).fit_to_exact_size(Vec2::splat(56.0)));
             ui.vertical(|ui| {
-                ui.label(RichText::new("Lumen").font(semibold(22.0)).color(p.text));
-                ui.label(RichText::new(format!("Version {}  ·  MIT License", env!("CARGO_PKG_VERSION"))).color(p.muted));
-                ui.hyperlink_to(RichText::new("github.com/RahulTarigoppula/lumen-image-viewer").size(12.0), env!("CARGO_PKG_REPOSITORY"));
+                ui.add(egui::Label::new(RichText::new("Lumen").font(semibold(22.0)).color(p.text)).truncate());
+                ui.add(egui::Label::new(RichText::new(format!("Version {}  ·  MIT License", env!("CARGO_PKG_VERSION"))).color(p.muted)).wrap());
+                ui.add(egui::Hyperlink::from_label_and_url(RichText::new("github.com/RahulTarigoppula/lumen-image-viewer").size(12.0), env!("CARGO_PKG_REPOSITORY")));
             });
         });
         ui.add_space(6.0);
@@ -955,14 +1013,23 @@ fn about(ui: &mut Ui, p: &Palette) -> bool {
     section_title(ui, p, "Open-source credits");
     card(ui, p, |ui| {
         ui.add_space(6.0);
-        egui::Grid::new("credits").num_columns(3).spacing([16.0, 5.0]).striped(false).show(ui, |ui| {
+        if ui.available_width() >= 480.0 {
+            egui::Grid::new("credits").num_columns(3).spacing([16.0, 5.0]).striped(false).show(ui, |ui| {
+                for (name, what, license) in CREDITS {
+                    ui.label(RichText::new(*name).color(p.text));
+                    ui.label(RichText::new(*what).size(12.0).color(p.muted));
+                    ui.label(RichText::new(*license).size(12.0).color(p.faint));
+                    ui.end_row();
+                }
+            });
+        } else {
+            // Narrow: one entry per block, so nothing runs past the card.
             for (name, what, license) in CREDITS {
-                ui.label(RichText::new(*name).color(p.text));
-                ui.label(RichText::new(*what).size(12.0).color(p.muted));
-                ui.label(RichText::new(*license).size(12.0).color(p.faint));
-                ui.end_row();
+                ui.add(egui::Label::new(RichText::new(*name).color(p.text)).wrap());
+                ui.add(egui::Label::new(RichText::new(format!("{what}  ·  {license}")).size(12.0).color(p.muted)).wrap());
+                ui.add_space(4.0);
             }
-        });
+        }
         ui.add_space(6.0);
     });
     hint(ui, p, "Thank you to everyone who builds and maintains these projects. FFmpeg is used as separately linked libraries under the LGPL; you may replace them with your own build.");
@@ -1281,8 +1348,8 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
         let names: Vec<String> = c.others.iter().map(|(m, cmd)| format!("'{}' ({})", cmd.label(), m.label())).collect();
         egui::Frame::new().fill(p.warn.gamma_multiply(0.12)).stroke(Stroke::new(1.0, p.warn)).corner_radius(CornerRadius::same(8)).inner_margin(Margin::same(10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(format!("{}  {} is already used by {}.", I::WARNING, keymap::format_shortcut(&c.sc), names.join(", "))).color(p.text));
-            ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(format!("{}  {} is already used by {}.", I::WARNING, keymap::format_shortcut(&c.sc), names.join(", "))).color(p.text)).wrap());
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(format!("Use for '{}' only", c.cap.cmd.label())).clicked() {
                     apply_capture(core, c.cap, c.sc, &c.others);
                     st.conflict = None;
@@ -1302,6 +1369,13 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     }
 
     // ---- mode tabs + search
+    // Narrow window: the search box goes on its own line.
+    let wide = ui.available_width() >= 560.0;
+    let search = |ui: &mut Ui, text: &mut String| {
+        ui.label(RichText::new(I::MAGNIFYING_GLASS).color(p.muted));
+        let w = 220.0f32.min(ui.available_width() - 8.0).max(80.0);
+        ui.add(egui::TextEdit::singleline(text).hint_text("Search commands or keys").desired_width(w));
+    };
     ui.horizontal(|ui| {
         for m in KeyMode::ALL {
             if ui.selectable_label(st.kb_mode == m, m.label()).clicked() {
@@ -1309,10 +1383,14 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                 st.capture = None;
             }
         }
-        ui.add_space(12.0);
-        ui.label(RichText::new(I::MAGNIFYING_GLASS).color(p.muted));
-        ui.add(egui::TextEdit::singleline(&mut st.kb_search).hint_text("Search commands or keys").desired_width(220.0));
+        if wide {
+            ui.add_space(12.0);
+            search(ui, &mut st.kb_search);
+        }
     });
+    if !wide {
+        ui.horizontal(|ui| search(ui, &mut st.kb_search));
+    }
     hint(
         ui,
         p,
@@ -1342,44 +1420,55 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                 ui.painter().hline(r.left()..=r.right(), y, Stroke::new(1.0, p.border.gamma_multiply(0.7)));
             }
             first = false;
+            // Name column, then the keys (wrapping onto more lines when narrow), then
+            // the restore button at the far right.
+            let w = ui.available_width();
+            let name_w = 250.0f32.min(w * 0.42);
+            let customized = keys != base.keys_for(mode, cmd);
+            let restore_w = if customized { 30.0 } else { 0.0 };
             ui.horizontal(|ui| {
                 ui.set_min_height(30.0);
-                ui.allocate_ui_with_layout(Vec2::new(250.0, 26.0), Layout::left_to_right(Align::Center), |ui| {
-                    ui.set_width(250.0);
-                    ui.label(RichText::new(format!("{}  {}", cmd.icon(), cmd.label())).color(p.text));
+                ui.allocate_ui_with_layout(Vec2::new(name_w, 26.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_width(name_w);
+                    ui.add(egui::Label::new(RichText::new(format!("{}  {}", cmd.icon(), cmd.label())).color(p.text)).truncate());
                 });
-                for (k, text) in keys.iter().zip(&key_text) {
-                    let capturing_this = st.capture == Some(Capture { mode, cmd, replace: Some(*k) });
-                    let conflicts = km.conflicts(mode, *k, cmd);
-                    let label = if capturing_this { "Press a key...".to_string() } else { text.clone() };
-                    let mut rt = RichText::new(label).monospace().size(12.0);
-                    if !conflicts.is_empty() {
-                        rt = rt.color(p.warn);
+                let keys_w = (ui.available_width() - restore_w).max(60.0);
+                ui.allocate_ui_with_layout(Vec2::new(keys_w, 26.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                    ui.set_width(keys_w);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    for (k, text) in keys.iter().zip(&key_text) {
+                        let capturing_this = st.capture == Some(Capture { mode, cmd, replace: Some(*k) });
+                        let conflicts = km.conflicts(mode, *k, cmd);
+                        let label = if capturing_this { "Press a key...".to_string() } else { text.clone() };
+                        let mut rt = RichText::new(label).monospace().size(12.0);
+                        if !conflicts.is_empty() {
+                            rt = rt.color(p.warn);
+                        }
+                        let mut b = ui.add(egui::Button::new(rt).selected(capturing_this));
+                        if !conflicts.is_empty() {
+                            let names: Vec<String> = conflicts.iter().map(|(m, c)| format!("{} ({})", c.label(), m.label())).collect();
+                            b = b.on_hover_text(format!("Also bound to {}", names.join(", ")));
+                        } else {
+                            b = b.on_hover_text("Click, then press the new key");
+                        }
+                        if b.clicked() {
+                            st.capture = Some(Capture { mode, cmd, replace: Some(*k) });
+                            st.conflict = None;
+                        }
+                        if ui.small_button(I::X).on_hover_text("Remove this shortcut").clicked() {
+                            let rest: Vec<KeyboardShortcut> = keys.iter().copied().filter(|x| x != k).collect();
+                            set_command_keys(core, mode, cmd, rest);
+                            changed = true;
+                        }
                     }
-                    let mut b = ui.add(egui::Button::new(rt).selected(capturing_this));
-                    if !conflicts.is_empty() {
-                        let names: Vec<String> = conflicts.iter().map(|(m, c)| format!("{} ({})", c.label(), m.label())).collect();
-                        b = b.on_hover_text(format!("Also bound to {}", names.join(", ")));
-                    } else {
-                        b = b.on_hover_text("Click, then press the new key");
-                    }
-                    if b.clicked() {
-                        st.capture = Some(Capture { mode, cmd, replace: Some(*k) });
+                    let adding = st.capture == Some(Capture { mode, cmd, replace: None });
+                    let add_label = if adding { "Press a key...".to_string() } else { I::PLUS.to_string() };
+                    if ui.add(egui::Button::new(add_label).selected(adding)).on_hover_text("Add a shortcut").clicked() {
+                        st.capture = Some(Capture { mode, cmd, replace: None });
                         st.conflict = None;
                     }
-                    if ui.small_button(I::X).on_hover_text("Remove this shortcut").clicked() {
-                        let rest: Vec<KeyboardShortcut> = keys.iter().copied().filter(|x| x != k).collect();
-                        set_command_keys(core, mode, cmd, rest);
-                        changed = true;
-                    }
-                }
-                let adding = st.capture == Some(Capture { mode, cmd, replace: None });
-                let add_label = if adding { "Press a key...".to_string() } else { I::PLUS.to_string() };
-                if ui.add(egui::Button::new(add_label).selected(adding)).on_hover_text("Add a shortcut").clicked() {
-                    st.capture = Some(Capture { mode, cmd, replace: None });
-                    st.conflict = None;
-                }
-                if keys != base.keys_for(mode, cmd) {
+                });
+                if customized {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button(I::ARROW_COUNTER_CLOCKWISE).on_hover_text("Restore the preset shortcuts for this command").clicked() {
                             set_command_keys(core, mode, cmd, base.keys_for(mode, cmd));

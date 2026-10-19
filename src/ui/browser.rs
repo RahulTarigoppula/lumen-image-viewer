@@ -27,6 +27,13 @@ pub enum BrowserEvent {
     RemoveFavorite(PathBuf),
 }
 
+/// Width range of the folder sidebar: never more than 40% of the window, so the
+/// grid keeps most of the space at any interface size.
+pub fn sidebar_range(ctx: &egui::Context) -> std::ops::RangeInclusive<f32> {
+    let hi = (ctx.content_rect().width() * 0.4).min(560.0);
+    200.0f32.min(hi)..=hi
+}
+
 pub struct Browser {
     pub folder: PathBuf,
     pub entries: Vec<Entry>,
@@ -57,6 +64,9 @@ pub struct Browser {
     right_w: f32,
     /// Set by the app while a modal dialog or tool window owns the keyboard.
     pub suppress_keys: bool,
+    /// Grid tooltips are held back after an in-app file drag until the pointer moves,
+    /// so the drop target's name does not pop up like a leftover drag label.
+    tips_after_drag: bool,
 }
 
 impl Browser {
@@ -88,6 +98,7 @@ impl Browser {
             resort_needed: false,
             right_w: 600.0,
             suppress_keys: false,
+            tips_after_drag: true,
         }
     }
 
@@ -292,6 +303,8 @@ impl Browser {
         let p = core.pal;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            // Very narrow (large interface size in a small window): Refresh stays on F5.
+            let narrow = ui.available_width() < 470.0;
             if widgets::icon_button(ui, I::ARROW_LEFT, "Back (Alt+←)", false).clicked() {
                 ev.push(BrowserEvent::Command(Command::GoBack));
             }
@@ -301,22 +314,30 @@ impl Browser {
             if widgets::icon_button(ui, I::ARROW_UP, "Parent folder (Backspace)", false).clicked() {
                 ev.push(BrowserEvent::Command(Command::GoUp));
             }
-            if widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Refresh (F5)", false).clicked() {
+            if !narrow && widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Refresh (F5)", false).clicked() {
                 ev.push(BrowserEvent::Command(Command::Refresh));
             }
-            ui.add_space(6.0);
+            ui.add_space(if narrow { 2.0 } else { 6.0 });
 
             // Adapt to the room left (points, so UI scale is included): first drop
             // the size slider, then shrink the filter box, then fold the mode
             // buttons into a "..." menu and the sort label into its icon.
             let room = ui.available_width();
             let show_slider = room >= 1050.0;
-            let filter_w = if room >= 860.0 { 150.0 } else if room >= 700.0 { 110.0 } else { 80.0 };
+            let filter_w = if room >= 860.0 {
+                150.0
+            } else if room >= 700.0 {
+                110.0
+            } else if room >= 440.0 {
+                80.0
+            } else {
+                56.0
+            };
             let overflow = room < 800.0;
             let sort_icon_only = room < 640.0;
 
             // Address bar: breadcrumbs, click to edit.
-            let addr_w = (ui.available_width() - self.right_w - 14.0).max(120.0);
+            let addr_w = (ui.available_width() - self.right_w - 14.0).max(if room >= 440.0 { 120.0 } else { 64.0 });
             self.address_bar(ui, addr_w, &p, ev);
             ui.add_space(6.0);
             let right_start = ui.cursor().min.x;
@@ -403,10 +424,15 @@ impl Browser {
             }
 
             let details = core.settings.browser_view == BrowserView::Details;
-            if widgets::icon_button(ui, if details { I::SQUARES_FOUR } else { I::LIST_DASHES }, if details { "Thumbnails view" } else { "Details view" }, false).clicked() {
-                ev.push(BrowserEvent::Command(Command::ToggleDetails));
+            let (view_icon, view_tip) = if details { (I::SQUARES_FOUR, "Thumbnails view") } else { (I::LIST_DASHES, "Details view") };
+            // Narrowest: the view toggle joins the "..." menu as well.
+            let view_in_menu = room < 440.0;
+            if !view_in_menu {
+                if widgets::icon_button(ui, view_icon, view_tip, false).clicked() {
+                    ev.push(BrowserEvent::Command(Command::ToggleDetails));
+                }
+                widgets::separator_v(ui);
             }
-            widgets::separator_v(ui);
             let modes = [
                 (I::PLAY_CIRCLE, "Slideshow (S)", Command::Slideshow),
                 (I::COLUMNS, "Compare selected (P)", Command::Compare),
@@ -415,6 +441,10 @@ impl Browser {
             ];
             if overflow {
                 ui.menu_button(I::DOTS_THREE, |ui| {
+                    if view_in_menu && ui.button(format!("{view_icon}  {view_tip}")).clicked() {
+                        ev.push(BrowserEvent::Command(Command::ToggleDetails));
+                        ui.close();
+                    }
                     for (icon, tip, cmd) in modes {
                         if ui.button(format!("{icon}  {tip}")).clicked() {
                             ev.push(BrowserEvent::Command(cmd));
@@ -504,22 +534,27 @@ impl Browser {
     pub fn sidebar(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
         let favs = core.settings.favorites.clone();
-        let show_preview = core.settings.show_preview_pane;
+        // A short sidebar (large interface size, small window) keeps the tree only.
+        let show_preview = core.settings.show_preview_pane && ui.available_height() >= 300.0;
         let mut tree_bottom: Option<f32> = None;
         if show_preview {
             // Never let the preview take more than ~60% of a short sidebar.
-            let max_h = (ui.available_height() * 0.6).clamp(140.0, 640.0);
-            let preview_h = core.settings.preview_height.clamp(140.0, max_h);
+            let max_h = (ui.available_height() * 0.6).clamp(180.0, 640.0);
+            // Tall enough for a small picture above the file details.
+            let min_h = 190.0f32.min(max_h);
+            let preview_h = core.settings.preview_height.clamp(min_h, max_h);
             let r = egui::Panel::bottom("preview-pane")
                 .resizable(true)
                 .default_size(preview_h)
-                .size_range(140.0..=max_h)
+                .size_range(min_h..=max_h)
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| {
                     // Content must never ask for more than the panel has, or a
                     // resizable panel grows a little every frame.
                     let h = ui.available_height();
                     ui.set_max_height(h);
+                    // Nothing may draw above the panel onto the tree.
+                    ui.set_clip_rect(ui.max_rect().expand2(Vec2::new(10.0, 8.0)).intersect(ui.clip_rect()));
                     self.preview_pane(ui, core);
                 });
             tree_bottom = Some(r.response.rect.min.y);
@@ -554,35 +589,14 @@ impl Browser {
             return;
         };
         let avail = ui.available_size();
-        let img_h = (avail.y - 118.0).max(60.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(avail.x, img_h), Sense::hover());
-        ui.painter().rect_filled(rect, CornerRadius::same(8), ui.visuals().extreme_bg_color);
+        // The text block below the picture is about 118 points tall; the picture
+        // gets what is left and is dropped when that is too little.
+        let img_h = avail.y - 118.0;
         let mut dims = core.meta.get(&entry.path).and_then(|m| m.dims);
-        if entry.is_media() {
-            let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
-            match core.thumbs.get(&key) {
-                Thumb::Ready(t) => {
-                    let ts = t.tex.size_vec2();
-                    let s = cap_upscale(((rect.width() - 12.0) / ts.x).min((rect.height() - 12.0) / ts.y).min(2.0), ts, t.source_dims);
-                    let r = Rect::from_center_size(rect.center(), ts * s);
-                    if dims.is_none() {
-                        dims = t.source_dims;
-                    }
-                    let mut mesh = egui::Mesh::with_texture(t.tex.id());
-                    mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                    ui.painter().add(egui::Shape::mesh(mesh));
-                }
-                Thumb::Pending => {
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::HOURGLASS, FontId::proportional(22.0), p.faint);
-                }
-                Thumb::Failed => {
-                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(28.0), p.faint);
-                }
-            }
-        } else {
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::FOLDER, super::theme::icon_fill(54.0), p.accent.gamma_multiply(0.8));
+        if img_h >= 40.0 {
+            self.preview_image(ui, core, &entry, Vec2::new(avail.x, img_h), &mut dims);
+            ui.add_space(6.0);
         }
-        ui.add_space(6.0);
         ui.add(egui::Label::new(RichText::new(&entry.name).strong()).truncate());
         let mut line = Vec::new();
         if let Some((w, h)) = dims {
@@ -592,8 +606,8 @@ impl Browser {
             line.push(catalog::human_size(entry.size));
         }
         line.push(crate::formats::type_name(&entry.ext));
-        ui.label(RichText::new(line.join("  ·  ")).color(p.muted).size(12.0));
-        ui.label(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(11.5));
+        ui.add(egui::Label::new(RichText::new(line.join("  ·  ")).color(p.muted).size(12.0)).truncate());
+        ui.add(egui::Label::new(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(11.5)).truncate());
         if entry.is_media() {
             let tag = core.tags.get(&entry.path);
             ui.horizontal(|ui| {
@@ -609,6 +623,36 @@ impl Browser {
                     core.tags.update(&entry.path, |t| t.flagged = !t.flagged);
                 }
             });
+        }
+    }
+
+    fn preview_image(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, size: Vec2, dims: &mut Option<(u32, u32)>) {
+        let p = core.pal;
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        ui.painter().rect_filled(rect, CornerRadius::same(8), ui.visuals().extreme_bg_color);
+        if entry.is_media() {
+            let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
+            match core.thumbs.get(&key) {
+                Thumb::Ready(t) => {
+                    let ts = t.tex.size_vec2();
+                    let s = cap_upscale(((rect.width() - 12.0) / ts.x).min((rect.height() - 12.0) / ts.y).min(2.0), ts, t.source_dims);
+                    let r = Rect::from_center_size(rect.center(), ts * s);
+                    if dims.is_none() {
+                        *dims = t.source_dims;
+                    }
+                    let mut mesh = egui::Mesh::with_texture(t.tex.id());
+                    mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    ui.painter().add(egui::Shape::mesh(mesh));
+                }
+                Thumb::Pending => {
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::HOURGLASS, FontId::proportional(22.0), p.faint);
+                }
+                Thumb::Failed => {
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(28.0), p.faint);
+                }
+            }
+        } else {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::FOLDER, super::theme::icon_fill(54.0), p.accent.gamma_multiply(0.8));
         }
     }
 
@@ -687,6 +731,16 @@ impl Browser {
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut double: Option<usize> = None;
         let mut ctx_menu_for: Option<usize> = None;
+        // Near a window edge egui can still report a cell under the window as hovered.
+        let pointer_here = super::pointer_on_layer(ui);
+        if egui::DragAndDrop::has_payload_of_type::<DragFiles>(ui.ctx()) {
+            self.tips_after_drag = false;
+        } else if ui.input(|i| i.pointer.delta() != Vec2::ZERO) {
+            self.tips_after_drag = true;
+        }
+        // No grid tooltips at all while a window is open: one that was already showing
+        // when the window opened would otherwise stay on top of it.
+        let tips = pointer_here && self.tips_after_drag && !super::overlay_open(ui.ctx());
         // Registered before the cells so cells take precedence for clicks.
         let bg = ui.interact(ui.available_rect_before_wrap(), ui.id().with("grid-bg"), Sense::click());
         scroll.show_rows(ui, cell.y, rows, |ui, range| {
@@ -703,7 +757,10 @@ impl Browser {
                         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
                         let selected = self.selected.contains(&entry.path);
                         let focused = self.focus == Some(i);
-                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, resp.hovered(), &p);
+                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, resp.hovered() && pointer_here, &p);
+                        if entry.is_folder() && resp.dnd_hover_payload::<DragFiles>().is_some() {
+                            ui.painter().rect_stroke(rect.shrink(3.0), CornerRadius::same(8), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                        }
                         if resp.clicked() {
                             clicked = Some((i, ui.input(|inp| inp.modifiers)));
                         }
@@ -722,6 +779,13 @@ impl Browser {
                                 let copy = ui.input(|inp| inp.modifiers.ctrl);
                                 ev.push(BrowserEvent::DropFiles { target: entry.path.clone(), files: files.0.clone(), copy });
                             }
+                        }
+                        // A folder's tooltip would only repeat its caption.
+                        let folder_tip_redundant = entry.is_folder()
+                            && captions != ThumbCaption::None
+                            && ui.painter().layout_no_wrap(entry.name.clone(), FontId::proportional(12.0), p.text).size().x <= cell.x - 16.0;
+                        if !tips || folder_tip_redundant {
+                            continue;
                         }
                         let dims = core.meta.get(&entry.path).and_then(|m| m.dims);
                         let tip_entry = entry;

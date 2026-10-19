@@ -215,7 +215,7 @@ pub fn apply(ctx: &egui::Context, p: &Palette, scale: f32) {
         style.text_styles.insert(TextStyle::Small, FontId::proportional(11.5));
         style.text_styles.insert(TextStyle::Monospace, FontId::monospace(12.5));
         style.text_styles.insert(TextStyle::Heading, semibold(17.0));
-        style.interaction.tooltip_delay = 0.35;
+        style.interaction.tooltip_delay = super::TOOLTIP_DELAY;
         style.animation_time = 0.12;
     });
     ctx.set_zoom_factor(scale.clamp(0.6, 2.5));

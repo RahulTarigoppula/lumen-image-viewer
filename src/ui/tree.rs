@@ -42,9 +42,26 @@ pub struct FolderTree {
     rows: Vec<Row>,
     rows_dirty: bool,
     rows_favs: Vec<PathBuf>,
+    /// Deepest row in `rows`, for the indent step.
+    max_depth: usize,
+    /// Indent per level this frame (narrower than `INDENT` when deep folders
+    /// would otherwise push names off the right edge).
+    indent: f32,
+    /// Path tooltips this frame: off while a window is open (they would draw on top of it).
+    tips: bool,
 }
 
 const ROW_H: f32 = 26.0;
+/// Indent per tree level when there is room.
+const INDENT: f32 = 14.0;
+
+/// Indent per level so the deepest row keeps at least ~60% of `width` for its name.
+fn indent_step(width: f32, max_depth: usize) -> f32 {
+    if max_depth == 0 {
+        return INDENT;
+    }
+    (((width - 46.0) * 0.4).max(0.0) / max_depth as f32).clamp(4.0, INDENT)
+}
 
 enum Row {
     Header(&'static str),
@@ -210,6 +227,14 @@ impl FolderTree {
         for (d, label) in self.drives.clone() {
             self.flatten(&mut rows, &d, label, I::HARD_DRIVES, 0, ctx);
         }
+        self.max_depth = rows
+            .iter()
+            .map(|r| match r {
+                Row::Item { depth, .. } | Row::Loading { depth } => *depth,
+                Row::Header(_) => 0,
+            })
+            .max()
+            .unwrap_or(0);
         self.rows = rows;
         self.rows_favs = favorites.to_vec();
         self.rows_dirty = false;
@@ -256,6 +281,8 @@ impl FolderTree {
             self.rebuild_rows(favorites, &ctx);
         }
         let row_h = ROW_H;
+        self.indent = indent_step(ui.available_width(), self.max_depth);
+        self.tips = !super::overlay_open(&ctx);
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("folder-tree");
         if let Some(target) = self.scroll_to.clone() {
             // Look in the drive tree (after the "This PC" header), not in favorites / quick access.
@@ -290,7 +317,7 @@ impl FolderTree {
                     Row::Loading { depth } => {
                         let depth = *depth;
                         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
-                        let x = rect.min.x + 12.0 + depth as f32 * 14.0 + 22.0;
+                        let x = rect.min.x + 12.0 + depth as f32 * self.indent + 22.0;
                         ui.painter().text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, "Loading...", FontId::proportional(12.0), p.faint);
                     }
                     Row::Item { path, name, icon, depth, expandable, favorite } => {
@@ -326,12 +353,13 @@ impl FolderTree {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
         let selected = path == current;
         let hovered_drop = resp.dnd_hover_payload::<DragFiles>().is_some();
+        let hovered = resp.hovered() && super::pointer_on_layer(ui);
         if ui.is_rect_visible(rect) {
             let bg = if hovered_drop {
                 p.accent.gamma_multiply(0.45)
             } else if selected {
                 p.accent_soft
-            } else if resp.hovered() {
+            } else if hovered {
                 p.hover
             } else {
                 Color32::TRANSPARENT
@@ -345,7 +373,7 @@ impl FolderTree {
                     p.accent,
                 );
             }
-            let x0 = rect.min.x + 12.0 + depth as f32 * 14.0;
+            let x0 = rect.min.x + 12.0 + depth as f32 * self.indent;
             let cy = rect.center().y;
             if expandable {
                 let caret = if self.expanded.contains(path) { I::CARET_DOWN } else { I::CARET_RIGHT };
@@ -381,7 +409,7 @@ impl FolderTree {
         }
         if resp.clicked() {
             // Click on the caret toggles, elsewhere navigates (and expands).
-            let caret_zone = rect.min.x + 12.0 + depth as f32 * 14.0 + 12.0;
+            let caret_zone = rect.min.x + 12.0 + depth as f32 * self.indent + 12.0;
             let on_caret = resp.interact_pointer_pos().map(|pos| pos.x < caret_zone).unwrap_or(false);
             if expandable && on_caret {
                 self.toggle(path);
@@ -395,7 +423,7 @@ impl FolderTree {
         if resp.double_clicked() && expandable {
             self.toggle(path);
         }
-        let resp = if resp.hovered() { resp.on_hover_text(path.display().to_string()) } else { resp };
+        let resp = if hovered && self.tips { resp.on_hover_text(path.display().to_string()) } else { resp };
         resp.context_menu(|ui| {
             if ui.button(format!("{}  Open", I::FOLDER_OPEN)).clicked() {
                 action = Some(TreeAction::Navigate(path.to_path_buf()));
