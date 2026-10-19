@@ -1,6 +1,11 @@
 //! Sharpness: variance of the 3x3 Laplacian (Pech-Pacheco 2000) and
 //! Tenengrad, the mean squared Sobel gradient magnitude above a threshold
 //! (Krotkov 1987), both on luma in 8-bit levels with per-tile maps.
+//!
+//! The Laplacian's headline is the 90th percentile of its tile variances:
+//! the sharpest parts of the picture, so a crisp subject before a smooth
+//! sky or wall is not called soft. The whole-frame variance is kept as
+//! `var`.
 
 use super::{sobel, tile_stencil};
 use crate::frame::{FrameCtx, InputKind};
@@ -14,15 +19,15 @@ static LAPLACIAN: MetricInfo = MetricInfo {
     id: "sharpness.laplacian",
     name: "Sharpness (Laplacian variance)",
     kind: MetricKind::NoReference,
-    version: 1,
+    version: 2,
     inputs: &[InputKind::Luma],
     min_size: (3, 3),
     cost_ms_4k: 5.0,
     heavy: false,
     has_map: true,
     direction: Direction::HigherIsBetter,
-    headline: &["var"],
-    description: "Variance of the 3x3 Laplacian of luma (8-bit levels squared), with a tile map",
+    headline: &["p90", "var"],
+    description: "Variance of the 3x3 Laplacian of luma (8-bit levels squared) in the sharpest tiles (90th percentile) and overall, with a tile map",
 };
 
 impl Metric for LaplacianVar {
@@ -41,12 +46,21 @@ impl Metric for LaplacianVar {
         });
         cancel.check()?;
         let mut r = MetricResult::new(&LAPLACIAN);
-        r.push("var", tiles.total().var(), Unit::Levels8Sq, Direction::HigherIsBetter);
+        let total = tiles.total().var();
+        r.push("p90", sharpest(&tiles).unwrap_or(total), Unit::Levels8Sq, Direction::HigherIsBetter);
+        r.push("var", total, Unit::Levels8Sq, Direction::HigherIsBetter);
         if o.want_map {
             r.map = Some(tiles.map(|t| t.var(), "Laplacian variance", Unit::Levels8Sq));
         }
         Ok(r)
     }
+}
+
+/// 90th percentile of the tile variances (tiles with values only).
+fn sharpest(tiles: &super::Tiles) -> Option<f64> {
+    let mut v: Vec<f64> = tiles.acc.iter().map(|t| t.var()).filter(|x| x.is_finite()).collect();
+    let i = (v.len() * 9 / 10).min(v.len().checked_sub(1)?);
+    Some(*v.select_nth_unstable_by(i, f64::total_cmp).1)
 }
 
 /// `sharpness.tenengrad`

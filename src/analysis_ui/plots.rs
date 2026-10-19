@@ -195,6 +195,19 @@ pub trait FrameThumbs {
     fn get(&mut self, ctx: &egui::Context, idx: u64) -> Option<(egui::TextureId, Vec2)>;
 }
 
+/// Length of a legend's line swatch.
+const SWATCH_W: f32 = 12.0;
+
+/// Line color of series `n` of a graph; B's sequence (`_b`) is dimmer.
+fn series_color(key: &str, n: usize) -> Color32 {
+    let c = SERIES_COLORS[n % SERIES_COLORS.len()];
+    if key.ends_with("_b") {
+        c.gamma_multiply(0.55)
+    } else {
+        c
+    }
+}
+
 const SERIES_COLORS: [Color32; 6] = [
     Color32::from_rgb(86, 156, 240),
     Color32::from_rgb(240, 160, 60),
@@ -299,33 +312,51 @@ impl Plots {
     pub fn ui(&mut self, ui: &mut Ui, p: &Palette, s: &Series, span: (u64, u64), current: Option<u64>, plot_height: f32) -> Option<PlotAction> {
         let mut action = None;
         let span = (span.0, span.1.max(span.0 + 1));
-        // The graphs cover the measured range, not the whole timeline above.
-        ui.label(RichText::new(format!("Measured range: frames {}-{}", span.0, span.1)).size(11.0).color(p.muted));
-        for fam in s.families() {
-            if let Some(a) = self.family_plot(ui, p, s, &fam, span, current, plot_height) {
+        // Compact: two graphs fit the space video mode gives them.
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let fams = s.families();
+        // One value column for every graph, wide enough for the widest label.
+        let gutter = fams
+            .iter()
+            .filter_map(|f| y_range(s, &f.cols, f.unit, None).map(|(lo, hi)| [lo, hi].map(|v| ui.painter().layout_no_wrap(fmt_axis(v, f.unit), FontId::proportional(10.0), p.faint).size().x)))
+            .flatten()
+            .fold(0.0f32, f32::max)
+            .max(18.0)
+            + 6.0;
+        let n = fams.len();
+        for (i, fam) in fams.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(4.0);
+            }
+            if let Some(a) = self.family_plot(ui, p, s, fam, span, current, plot_height, gutter, i + 1 == n) {
                 action = Some(a);
             }
-            ui.add_space(4.0);
         }
         action
     }
 
+    /// One family's graph: a header with the series legend and threshold,
+    /// values in a left column `gutter` wide, frame numbers under the last
+    /// graph (`axis`) with the measured range.
     #[allow(clippy::too_many_arguments)]
-    fn family_plot(&mut self, ui: &mut Ui, p: &Palette, s: &Series, fam: &Family, span: (u64, u64), current: Option<u64>, height: f32) -> Option<PlotAction> {
+    fn family_plot(&mut self, ui: &mut Ui, p: &Palette, s: &Series, fam: &Family, span: (u64, u64), current: Option<u64>, height: f32, gutter: f32, axis: bool) -> Option<PlotAction> {
         let thr = self.threshold_for(fam, s);
         // Header: name, series legend, threshold field, in exactly the
         // width of the graph (nested layouts here would grow the row in a
         // scroll area and push the video transport bar off screen).
         let width = ui.available_width();
         let left = ui.cursor().min.x;
-        ui.allocate_ui_with_layout(Vec2::new(width, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.allocate_ui_with_layout(Vec2::new(width, crate::ui::theme::size::COMPACT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_max_width(width);
             let mut on = thr.is_some();
             let sp = ui.spacing();
             let check_w = sp.icon_width + sp.icon_spacing + ui.painter().layout_no_wrap("Threshold".into(), FontId::proportional(11.0), p.text).size().x;
-            let need = check_w + if on { sp.item_spacing.x + sp.interact_size.x.max(48.0) } else { 0.0 } + 2.0;
+            let need = check_w + if on { sp.item_spacing.x + crate::ui::theme::size::VALUE_W } else { 0.0 } + 2.0;
+            ui.add_space(gutter);
             ui.label(RichText::new(&fam.name).size(12.0).strong().color(p.text));
-            // As many series names as fit; the rest are counted (Exposure has 20).
+            ui.add_space(6.0);
+            // As many series names as fit, each with its line color; the rest
+            // are counted (Exposure has 20).
             let names: Vec<String> = fam
                 .cols
                 .iter()
@@ -335,28 +366,33 @@ impl Plots {
                 })
                 .collect();
             for (n, name) in names.iter().enumerate() {
-                let text = format!("- {name}");
-                let w = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(11.0), p.text).size().x + ui.spacing().item_spacing.x;
+                let g = ui.painter().layout_no_wrap(name.clone(), FontId::proportional(11.0), p.muted);
+                let w = SWATCH_W + 4.0 + g.size().x + 10.0;
                 let room = width - (ui.cursor().min.x - left) - need - 40.0;
                 if w > room && n + 1 < names.len() {
                     ui.label(RichText::new(format!("+{}", names.len() - n)).size(11.0).color(p.muted)).on_hover_text(names[n..].join(", "));
                     break;
                 }
-                ui.label(RichText::new(text).size(11.0).color(SERIES_COLORS[n % SERIES_COLORS.len()]));
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, 16.0), Sense::hover());
+                let y = r.center().y;
+                ui.painter().line_segment([Pos2::new(r.min.x, y), Pos2::new(r.min.x + SWATCH_W, y)], Stroke::new(2.0, series_color(&s.cols[fam.cols[n]].key, n)));
+                ui.painter().galley(Pos2::new(r.min.x + SWATCH_W + 4.0, y - g.size().y / 2.0), g, p.muted);
             }
             // Threshold controls at the right edge.
             let mut v = thr.unwrap_or_else(|| s.data[fam.cols[0]].iter().map(|p| p.1).sum::<f64>() / s.data[fam.cols[0]].len().max(1) as f64);
             ui.add_space((width - (ui.cursor().min.x - left) - need).max(0.0));
             let mut changed = crate::ui::widgets::checkbox(ui, &mut on, RichText::new("Threshold").size(crate::ui::theme::text::SMALL)).changed();
             if on {
-                changed |= ui.add(egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
+                changed |= crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
             }
             if changed {
                 self.thresholds.insert(fam.id.clone(), on.then_some(v));
             }
         });
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
-        let painter = ui.painter_at(rect.expand(1.0));
+        let (full, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        // The values sit in the column left of the graph, never over the lines.
+        let rect = Rect::from_min_max(Pos2::new(full.min.x + gutter, full.min.y), full.max);
+        let painter = ui.painter_at(full.expand(1.0));
         painter.rect_filled(rect, 3.0, p.raised);
         painter.rect_stroke(rect, 3.0, Stroke::new(1.0, p.border), StrokeKind::Inside);
         let Some((lo, hi)) = y_range(s, &fam.cols, fam.unit, thr) else {
@@ -365,15 +401,16 @@ impl Plots {
         };
         let inner = rect.shrink2(Vec2::new(4.0, 6.0));
         let to_y = |v: f64| inner.max.y - ((v - lo) / (hi - lo).max(1e-12)) as f32 * inner.height();
-        // Grid: a middle line; max and min labels in the corners (the middle
-        // value too when the plot is tall enough).
+        // Grid: a middle line; the top and bottom values beside the graph
+        // (the middle one too when it is tall enough).
         let mid = (lo + hi) / 2.0;
         painter.line_segment([Pos2::new(inner.min.x, to_y(mid)), Pos2::new(inner.max.x, to_y(mid))], Stroke::new(1.0, p.border));
         let font = FontId::proportional(10.0);
-        painter.text(Pos2::new(inner.min.x + 2.0, rect.min.y + 1.0), egui::Align2::LEFT_TOP, fmt_axis(hi, fam.unit), font.clone(), p.faint);
-        painter.text(Pos2::new(inner.min.x + 2.0, rect.max.y - 1.0), egui::Align2::LEFT_BOTTOM, fmt_axis(lo, fam.unit), font.clone(), p.faint);
+        let lx = rect.min.x - 5.0;
+        painter.text(Pos2::new(lx, inner.min.y), egui::Align2::RIGHT_CENTER, fmt_axis(hi, fam.unit), font.clone(), p.faint);
+        painter.text(Pos2::new(lx, inner.max.y), egui::Align2::RIGHT_CENTER, fmt_axis(lo, fam.unit), font.clone(), p.faint);
         if inner.height() >= 60.0 {
-            painter.text(Pos2::new(inner.min.x + 2.0, to_y(mid)), egui::Align2::LEFT_CENTER, fmt_axis(mid, fam.unit), font, p.faint);
+            painter.text(Pos2::new(lx, to_y(mid)), egui::Align2::RIGHT_CENTER, fmt_axis(mid, fam.unit), font, p.faint);
         }
         // Selection being dragged.
         if let Some((f, start)) = &self.drag {
@@ -400,10 +437,7 @@ impl Plots {
             }
         }
         for (n, &i) in fam.cols.iter().enumerate() {
-            let mut color = SERIES_COLORS[n % SERIES_COLORS.len()];
-            if s.cols[i].key.ends_with("_b") {
-                color = color.gamma_multiply(0.55);
-            }
+            let color = series_color(&s.cols[i].key, n);
             let pts = decimate(&s.data[i], inner, span, &to_y);
             if pts.len() == 1 {
                 painter.circle_filled(pts[0], 2.0, color);
@@ -415,14 +449,16 @@ impl Plots {
             let x = x_of_frame(inner, span, c as f64);
             painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(1.0, p.text));
         }
-        // Frame numbers along the x axis: the ends and the middle.
-        let (axis, _) = ui.allocate_exact_size(Vec2::new(width, 12.0), Sense::hover());
-        let ap = ui.painter_at(axis);
-        let font = FontId::proportional(10.0);
-        let midf = (span.0 + span.1) / 2;
-        ap.text(Pos2::new(inner.min.x, axis.min.y), egui::Align2::LEFT_TOP, span.0.to_string(), font.clone(), p.faint);
-        ap.text(Pos2::new(x_of_frame(inner, span, midf as f64), axis.min.y), egui::Align2::CENTER_TOP, midf.to_string(), font.clone(), p.faint);
-        ap.text(Pos2::new(inner.max.x, axis.min.y), egui::Align2::RIGHT_TOP, span.1.to_string(), font, p.faint);
+        // Frame numbers under the last graph: the ends and the middle, and
+        // that the graphs cover the measured range, not the whole timeline.
+        if axis {
+            let (row, _) = ui.allocate_exact_size(Vec2::new(width, 13.0), Sense::hover());
+            let ap = ui.painter_at(row);
+            let font = FontId::proportional(10.0);
+            ap.text(Pos2::new(inner.min.x, row.min.y), egui::Align2::LEFT_TOP, span.0.to_string(), font.clone(), p.faint);
+            ap.text(Pos2::new(inner.center().x, row.min.y), egui::Align2::CENTER_TOP, format!("Measured range, frames {}-{}", span.0, span.1), font.clone(), p.faint);
+            ap.text(Pos2::new(inner.max.x, row.min.y), egui::Align2::RIGHT_TOP, span.1.to_string(), font, p.faint);
+        }
         // Hover readout.
         if let Some(pos) = resp.hover_pos() {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);

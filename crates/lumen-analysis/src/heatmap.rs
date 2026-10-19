@@ -1,5 +1,5 @@
 //! Heatmaps: one scalar map type for every metric that has a map (diff,
-//! SSIM, Delta-E, banding mask, no-reference tile maps), colormap LUTs,
+//! SSIM, Delta-E, clipping, no-reference tile maps), colormap LUTs,
 //! range modes, worst-value-preserving downsampling and PNG / float TIFF export.
 
 use crate::colormaps;

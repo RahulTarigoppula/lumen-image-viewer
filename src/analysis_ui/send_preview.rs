@@ -78,7 +78,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
                             let ts = tex.size_vec2();
                             let k = (128.0 / ts.x).min(90.0 / ts.y).min(1.0);
                             ui.add(egui::Image::new((tex.id(), ts * k)));
-                            ui.label(RichText::new(format!("{}x{} {}, {}", im.width, im.height, mime_name(im.mime), fmt_bytes(im.bytes))).size(11.0).color(p.text));
+                            ui.label(RichText::new(format!("{} × {} {}, {}", im.width, im.height, mime_name(im.mime), fmt_bytes(im.bytes))).size(11.0).color(p.text));
                             ui.add(egui::Label::new(RichText::new(&im.description).size(10.5).color(p.muted)).wrap());
                         });
                     });

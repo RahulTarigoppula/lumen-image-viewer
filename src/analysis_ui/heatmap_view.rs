@@ -76,6 +76,8 @@ pub struct HeatmapView {
     /// Video frames are measured in native pixels and shown turned (and
     /// maybe scaled): the display rotation in degrees and the native size.
     native: Option<(i32, (f32, f32))>,
+    /// What the readout calls the compared image ("B"; "C" or "D" in a 4-image compare).
+    pub other: &'static str,
 }
 
 impl Default for HeatmapView {
@@ -99,6 +101,7 @@ impl Default for HeatmapView {
             drawn: None,
             pending: None,
             native: None,
+            other: "B",
         }
     }
 }
@@ -380,7 +383,7 @@ impl HeatmapView {
         }];
         let px = |p: [u8; 4]| format!("{} {} {}", p[0], p[1], p[2]);
         match (pa, pb) {
-            (Some(a), Some(b)) => lines.push(format!("A {}   B {}", px(a), px(b))),
+            (Some(a), Some(b)) => lines.push(format!("A {}   {} {}", px(a), self.other, px(b))),
             (Some(a), None) => lines.push(format!("RGB {}", px(a))),
             _ => {}
         }

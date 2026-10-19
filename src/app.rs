@@ -1042,11 +1042,17 @@ impl App {
                 }
             }
             ToggleAnalysis | RunMetrics | RunAi => {
+                // In the browser: open the focused image or video, with the panel.
+                let from_browser = self.mode == Mode::Browser;
+                if let Some(i) = self.browser.focus.filter(|&i| from_browser && self.browser.item(i).is_some_and(|e| e.kind != EntryKind::Folder)) {
+                    self.open_viewer_at(i);
+                }
                 if !matches!(self.mode, Mode::Viewer | Mode::Compare | Mode::Video) {
-                    self.core.toasts.info("The analysis panel works on an open image, a comparison or a video");
+                    self.core.toasts.info(if from_browser { "Select an image or a video to analyze" } else { "The analysis panel works on an open image, a comparison or a video" });
                     return;
                 }
                 match cmd {
+                    ToggleAnalysis if from_browser => self.analysis.open = true,
                     ToggleAnalysis => self.analysis.toggle(),
                     RunMetrics => self.analysis.request_metrics_run(),
                     _ => self.analysis.request_ai_run(),
@@ -2576,6 +2582,11 @@ impl eframe::App for App {
             // frames it holds) elsewhere.
             self.core.metrics.set_video(None);
         }
+        // A 3 or 4 image compare measures C and D against A too.
+        self.core.metrics.set_compare_panes(match (&self.compare, self.mode) {
+            (Some(c), Mode::Compare) => c.paths.clone(),
+            _ => Vec::new(),
+        });
         self.core.analysis_open = self.analysis.open;
         let subject = self.analysis_subject();
         let t_panel = Instant::now();

@@ -228,17 +228,17 @@ impl AnalysisPanel {
     fn scope_row(&mut self, ui: &mut Ui, core: &Core, subject: &Subject) {
         let p = core.pal;
         let whole = match subject.kind {
-            k if k.is_video() => "Whole frame",
-            k if k.is_pair() => "Whole image, B against A",
-            _ => "Whole image",
+            k if k.is_video() => "Whole frame".to_string(),
+            k if k.is_pair() => format!("Whole image, {} against A", core.metrics.pair_letter()),
+            _ => "Whole image".to_string(),
         };
         let rect = self.roi.pixel_rect().filter(|_| self.use_roi && !self.drawing);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let (text, color) = match rect {
                 _ if self.drawing => ("Drag on the image to select a region".to_string(), p.accent),
-                Some((_, _, w, h)) => (format!("Region {w} x {h} px"), p.text),
-                None => (whole.to_string(), p.muted),
+                Some((_, _, w, h)) => (format!("Region {w} × {h} px"), p.text),
+                None => (whole, p.muted),
             };
             ui.label(RichText::new(I::SELECTION).size(13.0).color(color));
             let l = ui.add(egui::Label::new(RichText::new(text).size(crate::ui::theme::text::SMALL).color(color)).truncate());
@@ -277,7 +277,10 @@ impl AnalysisPanel {
         let bits = subject.a.as_ref().and_then(|a| core.loader.get_ready(&a.path)).map(|l| l.decoded.bit_depth).unwrap_or(8);
         let pal = core.pal;
         let roi = self.roi_pixels().map(|(x, y, w, h)| lumen_analysis::Roi::new(x, y, w, h));
-        let ctx = MetricsCtx { pal: &pal, subject: core.metrics.subject_of(subject, bits), roi };
+        // A 3 or 4 image compare measures C and D against A too.
+        let panes: Vec<(std::path::PathBuf, Option<std::sync::Arc<image::RgbaImage>>)> =
+            if core.metrics.compare_panes().len() > 2 { core.metrics.compare_panes().iter().map(|p| (p.clone(), core.loader.get_ready(p).map(|l| l.decoded.image.clone()))).collect() } else { Vec::new() };
+        let ctx = MetricsCtx { pal: &pal, subject: core.metrics.subject_of(subject, bits, &panes), roi };
         if std::mem::take(&mut self.run_metrics) {
             core.metrics.request_run();
         }
@@ -345,7 +348,11 @@ impl AnalysisPanel {
             Some(super::Pixels::Ready(img)) => Some(img.clone()),
             _ => None,
         };
-        let (a, b) = (img(&subject.a), img(&subject.b));
+        // Pane B shows B: in a 3 or 4 image compare with C or D picked, the
+        // map (C against A) is drawn over A only, and the readout reads C.
+        let other = core.metrics.pair_letter();
+        let a = img(&subject.a);
+        let b = if other == "B" { img(&subject.b) } else { core.metrics.compare_panes().get(if other == "C" { 2 } else { 3 }).and_then(|p| core.loader.get_ready(p)).map(|l| l.decoded.image.clone()) };
         // B may have its own size: look its pixel up proportionally.
         let pixels = |x: f32, y: f32| {
             let pa = a.as_ref().and_then(|a| super::adapters::pixel_at(a, x, y));
@@ -353,11 +360,14 @@ impl AnalysisPanel {
             (pa, pb)
         };
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| !crate::ui::pointer_over_overlay(ui.ctx()) && !egui::Popup::is_any_open(ui.ctx()));
-        for pane in panes {
+        for pane in panes.iter().filter(|p| p.slot == Slot::A || other == "B") {
             let xf = ImageTransform { dest: pane.xf.dest, size: a_size };
-            let painter = ui.painter().with_clip_rect(pane.clip);
-            let h = hover.filter(|p| pane.clip.contains(*p));
-            core.metrics.paint_heatmap(ui, &painter, &xf, h, &pixels);
+            // Not over the viewer's floating toolbar.
+            for clip in canvas::uncovered(ui.ctx(), pane.clip) {
+                let painter = ui.painter().with_clip_rect(clip);
+                let h = hover.filter(|p| clip.contains(*p));
+                core.metrics.paint_heatmap(ui, &painter, &xf, h, &pixels);
+            }
         }
     }
 
