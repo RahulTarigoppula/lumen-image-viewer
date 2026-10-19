@@ -4,18 +4,19 @@
 //! exports.
 //!
 //! Hosts describe what is on screen with a [`MetricsCtx`] every frame and
-//! call [`MetricsTab::ui`]. Over the image they call
-//! [`MetricsTab::paint_overlay`] (heatmap and region of interest); video
-//! mode also draws [`MetricsTab::video_plots`] under its timeline and seeks
-//! to [`MetricsTab::take_seek`].
+//! call [`MetricsTab::ui`]. The region of interest belongs to the panel
+//! (shared with the AI tab) and comes in with the context. Over each image
+//! the host calls [`MetricsTab::paint_heatmap`]; video mode also draws
+//! [`MetricsTab::video_plots`] under its timeline and seeks to
+//! [`MetricsTab::take_seek`].
 
 use super::adapters;
 use super::heatmap_view::HeatmapView;
 use super::plots::{self, PlotAction, Plots, Series};
 use crate::ui::icons as I;
-use crate::ui::roi::{ImageTransform, RoiEditor, RoiOptions};
+use crate::ui::roi::ImageTransform;
 use crate::ui::theme::Palette;
-use egui::{Color32, CursorIcon, Painter, Response, RichText, Sense, Ui, Vec2};
+use egui::{CursorIcon, Painter, RichText, Sense, Ui, Vec2};
 use image::RgbaImage;
 use lumen_analysis::cache::{CacheKey, DiskCache, DEFAULT_MAX_BYTES};
 use lumen_analysis::metrics::{self, Direction, MetricKind, Unit};
@@ -180,22 +181,27 @@ pub fn range_frames(r: RangeSel, total: usize) -> usize {
 
 /// One video file as video mode shows it.
 #[cfg(feature = "video")]
-pub struct VideoSideCtx<'a> {
-    pub path: &'a Path,
-    pub info: &'a MediaInfo,
-    pub index: &'a SharedIndex,
+#[derive(Clone)]
+pub struct VideoSideCtx {
+    pub path: PathBuf,
+    /// Native size.
+    pub size: (u32, u32),
+    pub fps: f64,
+    pub color: adapters::VideoColor,
+    pub index: SharedIndex,
     /// Native planes of the frame on screen (when paused and enabled).
     pub native: Option<Arc<YuvFrame>>,
 }
 
 #[cfg(feature = "video")]
-impl VideoSideCtx<'_> {
-    fn fps(&self) -> f64 {
-        [self.info.avg_fps, self.info.fps].into_iter().find(|f| *f > 0.0).unwrap_or(25.0)
+impl VideoSideCtx {
+    pub fn new(path: &Path, info: &MediaInfo, index: &SharedIndex, native: Option<Arc<YuvFrame>>) -> VideoSideCtx {
+        let fps = [info.avg_fps, info.fps].into_iter().find(|f| *f > 0.0).unwrap_or(25.0);
+        VideoSideCtx { path: path.to_path_buf(), size: (info.width, info.height), fps, color: adapters::VideoColor::of_info(info), index: index.clone(), native }
     }
 
     fn side(&self) -> adapters::VideoSide {
-        adapters::VideoSide { path: self.path.to_path_buf(), index: self.index.lock().as_ref().map(|v| Arc::new(v.clone())), fps: self.fps() }
+        adapters::VideoSide { path: self.path.clone(), index: self.index.lock().as_ref().map(|v| Arc::new(v.clone())), fps: self.fps }
     }
 
     fn frames(&self) -> Option<usize> {
@@ -205,9 +211,10 @@ impl VideoSideCtx<'_> {
 
 /// Video mode's state: A, optional B shifted by `offset` frames.
 #[cfg(feature = "video")]
-pub struct VideoSubject<'a> {
-    pub a: VideoSideCtx<'a>,
-    pub b: Option<VideoSideCtx<'a>>,
+#[derive(Clone)]
+pub struct VideoSubject {
+    pub a: VideoSideCtx,
+    pub b: Option<VideoSideCtx>,
     /// B frame = A frame + offset.
     pub offset: i64,
     /// A's frame on screen.
@@ -217,19 +224,22 @@ pub struct VideoSubject<'a> {
 }
 
 /// What the host shows.
-pub enum Subject<'a> {
+#[derive(Clone)]
+pub enum Subject {
     None,
     /// The viewer's image: display pixels and the file's bits per channel.
-    Image { path: &'a Path, image: Arc<RgbaImage>, source_bits: u8 },
+    Image { path: PathBuf, image: Arc<RgbaImage>, source_bits: u8 },
     /// Compare A and B (other panes are not measured).
-    Compare { a: &'a Path, image_a: Arc<RgbaImage>, b: &'a Path, image_b: Arc<RgbaImage>, source_bits: u8 },
+    Compare { a: PathBuf, image_a: Arc<RgbaImage>, b: PathBuf, image_b: Arc<RgbaImage>, source_bits: u8 },
     #[cfg(feature = "video")]
-    Video(VideoSubject<'a>),
+    Video(VideoSubject),
 }
 
 pub struct MetricsCtx<'a> {
     pub pal: &'a Palette,
-    pub subject: Subject<'a>,
+    pub subject: Subject,
+    /// The panel's region of interest in A's pixels (`None`: the whole picture).
+    pub roi: Option<Roi>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +251,7 @@ enum Kind {
     VideoPair,
 }
 
-impl Subject<'_> {
+impl Subject {
     fn kind(&self) -> Kind {
         match self {
             Subject::None => Kind::None,
@@ -261,10 +271,10 @@ impl Subject<'_> {
     fn files(&self) -> (Option<&Path>, Option<&Path>) {
         match self {
             Subject::None => (None, None),
-            Subject::Image { path, .. } => (Some(path), None),
-            Subject::Compare { a, b, .. } => (Some(a), Some(b)),
+            Subject::Image { path, .. } => (Some(path.as_path()), None),
+            Subject::Compare { a, b, .. } => (Some(a.as_path()), Some(b.as_path())),
             #[cfg(feature = "video")]
-            Subject::Video(v) => (Some(v.a.path), v.b.as_ref().map(|b| b.path)),
+            Subject::Video(v) => (Some(v.a.path.as_path()), v.b.as_ref().map(|b| b.path.as_path())),
         }
     }
 
@@ -275,7 +285,7 @@ impl Subject<'_> {
             Subject::Image { image, .. } => Some(image.dimensions()),
             Subject::Compare { image_a, .. } => Some(image_a.dimensions()),
             #[cfg(feature = "video")]
-            Subject::Video(v) => Some((v.a.info.width, v.a.info.height)),
+            Subject::Video(v) => Some(v.a.size),
         }
     }
 
@@ -295,7 +305,7 @@ impl Subject<'_> {
     fn fps(&self) -> f64 {
         match self {
             #[cfg(feature = "video")]
-            Subject::Video(v) => v.a.fps(),
+            Subject::Video(v) => v.a.fps,
             _ => 25.0,
         }
     }
@@ -551,12 +561,6 @@ fn rows_of_report(r: &AnalysisReport) -> Vec<Row> {
 // ------------------------------------------------------------------ the tab
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Spatial {
-    Whole,
-    Roi,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Temporal {
     Frame,
     Range,
@@ -587,7 +591,6 @@ pub struct MetricsTab {
     subject_id: String,
     kind: Kind,
     file_a: Option<PathBuf>,
-    spatial: Spatial,
     temporal: Temporal,
     range_text: [String; 3],
     selected: BTreeSet<String>,
@@ -602,13 +605,19 @@ pub struct MetricsTab {
     history: Vec<HistoryEntry>,
     show_history: bool,
     status: Option<(String, bool)>,
-    roi: RoiEditor,
     seek: Option<u64>,
     bg: Vec<crossbeam_channel::Receiver<Result<String, String>>>,
     #[cfg(feature = "video")]
     video_run: Option<VideoRun>,
     #[cfg(feature = "video")]
     thumbs: Option<adapters::VideoThumbs>,
+    /// Video mode's state, set by video mode every frame.
+    #[cfg(feature = "video")]
+    video: Option<VideoSubject>,
+    /// When the tab was last shown (video mode keeps native planes while it is).
+    shown: Option<Instant>,
+    /// Run once the tab next has its context (Shift+Q).
+    run_requested: bool,
 }
 
 impl Default for MetricsTab {
@@ -628,7 +637,6 @@ impl MetricsTab {
             subject_id: String::new(),
             kind: Kind::None,
             file_a: None,
-            spatial: Spatial::Whole,
             temporal: Temporal::Frame,
             range_text: [String::new(), String::new(), stride],
             selected: BTreeSet::new(),
@@ -643,13 +651,16 @@ impl MetricsTab {
             history: Vec::new(),
             show_history: false,
             status: None,
-            roi: RoiEditor::new((1.0, 1.0), RoiOptions::region(Color32::from_rgb(80, 200, 255))),
             seek: None,
             bg: Vec::new(),
             #[cfg(feature = "video")]
             video_run: None,
             #[cfg(feature = "video")]
             thumbs: None,
+            #[cfg(feature = "video")]
+            video: None,
+            shown: None,
+            run_requested: false,
         }
     }
 
@@ -664,6 +675,42 @@ impl MetricsTab {
         })
     }
 
+    /// Video mode's state for the next frames (`None` when it closes).
+    #[cfg(feature = "video")]
+    pub fn set_video(&mut self, v: Option<VideoSubject>) {
+        self.video = v;
+    }
+
+    #[cfg(feature = "video")]
+    pub fn video(&self) -> Option<&VideoSubject> {
+        self.video.as_ref()
+    }
+
+    /// The tab was on screen in the last moment: hosts keep what it needs
+    /// ready (video mode copies native planes of the paused frame).
+    pub fn visible(&self) -> bool {
+        self.shown.is_some_and(|t| t.elapsed() < Duration::from_millis(600))
+    }
+
+    /// Run the selected metrics the next time the tab is drawn (Shift+Q).
+    pub fn request_run(&mut self) {
+        self.run_requested = true;
+    }
+
+    /// Headline results of the shown report as (name, value, unit), for
+    /// the AI tab's context.
+    pub fn metric_context(&self) -> Vec<(String, f64, String)> {
+        let Some(r) = &self.report else { return Vec::new() };
+        rows_of_report(r)
+            .into_iter()
+            .filter_map(|row| {
+                let c = row.cells.into_iter().next()?;
+                let name = if r.metrics.is_empty() { format!("{} (mean)", c.key) } else { format!("{} ({})", row.name, c.key) };
+                Some((name, c.value?, c.unit.label().to_string()))
+            })
+            .collect()
+    }
+
     pub fn is_running(&self) -> bool {
         self.run.is_some()
     }
@@ -673,19 +720,16 @@ impl MetricsTab {
         self.seek.take()
     }
 
-    /// The region scope is selected: drags on the image draw the region.
-    pub fn roi_mode(&self) -> bool {
-        self.spatial == Spatial::Roi
-    }
-
-    /// `R`: switch between the whole picture and the region.
-    pub fn toggle_roi(&mut self) {
-        self.spatial = if self.spatial == Spatial::Roi { Spatial::Whole } else { Spatial::Roi };
-    }
-
-    /// The region in source pixels, when the region scope is selected.
-    pub fn roi(&self) -> Option<Roi> {
-        (self.spatial == Spatial::Roi).then(|| self.roi.pixel_rect()).flatten().map(|(x, y, w, h)| Roi::new(x, y, w, h))
+    /// The largest minimum size among the selected metrics, with a note for
+    /// the region editor's warning (MS-SSIM needs 176 px).
+    pub fn min_roi_size(&self) -> Option<((u32, u32), String)> {
+        self.runnable()
+            .iter()
+            .filter_map(|id| metrics::get(id))
+            .map(|m| m.info())
+            .filter(|i| i.min_size.0 > 8 || i.min_size.1 > 8)
+            .max_by_key(|i| i.min_size.0.max(i.min_size.1))
+            .map(|i| (i.min_size, format!("{} needs {} px", i.name, i.min_size.0)))
     }
 
     /// Whether there are graphs for [`MetricsTab::video_plots`].
@@ -715,12 +759,6 @@ impl MetricsTab {
         self.heat.clear();
         self.status = None;
         self.expanded.clear();
-        if let Some(size) = s.size() {
-            let size = (size.0 as f32, size.1 as f32);
-            if self.roi.image_size() != size {
-                self.roi = RoiEditor::new(size, self.roi.opts);
-            }
-        }
         if !s.is_video() {
             self.temporal = Temporal::Frame;
         }
@@ -771,11 +809,7 @@ impl MetricsTab {
             self.set_status("Choose at least one metric that applies here", true);
             return;
         }
-        let roi = self.roi();
-        if self.spatial == Spatial::Roi && roi.is_none() {
-            self.set_status("Draw a region on the image first (or choose Whole)", true);
-            return;
-        }
+        let roi = ctx.roi;
         let (fa, fb) = ctx.subject.files();
         let Some(fa) = fa.map(Path::to_path_buf) else {
             self.set_status("Nothing to measure", true);
@@ -822,13 +856,12 @@ impl MetricsTab {
                 self.set_status("No frame on screen yet", true);
                 return;
             };
-            let color = |s: &VideoSideCtx| adapters::VideoColor::of_info(s.info);
-            let Some(a) = v.a.native.clone().and_then(|f| adapters::NativeFrame::new(f, color(&v.a))) else {
+            let Some(a) = v.a.native.clone().and_then(|f| adapters::NativeFrame::new(f, v.a.color)) else {
                 self.set_status("Pause on a frame first (native planes are not ready)", true);
                 return;
             };
             let b = match &v.b {
-                Some(sb) => match sb.native.clone().and_then(|f| adapters::NativeFrame::new(f, color(sb))) {
+                Some(sb) => match sb.native.clone().and_then(|f| adapters::NativeFrame::new(f, sb.color)) {
                     Some(f) => Some(f),
                     None => {
                         self.set_status("B's frame is not ready yet", true);
@@ -844,7 +877,7 @@ impl MetricsTab {
             return;
         }
         let total = v.a.frames();
-        let r = match parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], v.a.fps(), total) {
+        let r = match parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], v.a.fps, total) {
             Ok(r) => r,
             Err(e) => {
                 self.set_status(e, true);
@@ -917,6 +950,7 @@ impl MetricsTab {
         };
         let run = self.run.take().expect("running");
         match done {
+            #[cfg_attr(not(feature = "video"), allow(unused_mut))]
             Ok(mut report) => {
                 #[cfg(feature = "video")]
                 if let Some(d) = &run.decode {
@@ -997,30 +1031,12 @@ impl MetricsTab {
 
     // ---------------------------------------------------------------- overlay
 
-    /// Draw the heatmap and the region over an image that `xf` maps to the
-    /// screen (A's pixels; in compare mode call it for every pane with that
-    /// pane's transform and response). `pixels(x, y)` gives the A and B
-    /// pixels for the hover readout. Returns true when this frame's drag on
-    /// `resp` belongs to the region editor (the host must not pan).
-    pub fn paint_overlay(&mut self, ui: &Ui, painter: &Painter, xf: &ImageTransform, resp: &Response, pixels: &dyn Fn(f32, f32) -> (Option<[u8; 4]>, Option<[u8; 4]>)) -> bool {
-        let hover = resp.hover_pos().filter(|_| !self.roi.is_dragging());
+    /// Draw the heatmap over an image that `xf` maps to the screen (in A's
+    /// pixels; B panes use the same size, so the map lines up there too).
+    /// With the pointer at `hover`, `pixels(x, y)` gives the A and B pixels
+    /// for the readout.
+    pub fn paint_heatmap(&mut self, ui: &Ui, painter: &Painter, xf: &ImageTransform, hover: Option<egui::Pos2>, pixels: &dyn Fn(f32, f32) -> (Option<[u8; 4]>, Option<[u8; 4]>)) {
         self.heat.paint(ui, painter, xf, hover, pixels);
-        if self.spatial != Spatial::Roi {
-            return false;
-        }
-        let min = self
-            .runnable()
-            .iter()
-            .filter_map(|id| metrics::get(id))
-            .map(|m| m.info())
-            .filter(|i| i.min_size.0 > 8 || i.min_size.1 > 8)
-            .max_by_key(|i| i.min_size.0.max(i.min_size.1));
-        match min {
-            Some(i) => self.roi.set_min_size(Some(i.min_size), format!("{} needs {} px", i.name, i.min_size.0)),
-            None => self.roi.set_min_size(None, ""),
-        }
-        let r = self.roi.show(ui, painter, xf, resp);
-        r.dragging || self.roi.is_dragging() || resp.dragged() || resp.drag_started()
     }
 
     /// Graphs of the video range (live while it runs) for the host to draw
@@ -1050,8 +1066,12 @@ impl MetricsTab {
 
     pub fn ui(&mut self, ui: &mut Ui, ctx: &MetricsCtx) {
         let p = *ctx.pal;
+        self.shown = Some(Instant::now());
         self.sync(&ctx.subject);
         self.poll(ui.ctx());
+        if std::mem::take(&mut self.run_requested) && self.kind != Kind::None {
+            self.run(ctx, ui.ctx());
+        }
         if self.kind == Kind::None {
             ui.add_space(8.0);
             ui.label(RichText::new("Open an image, compare two images or open a video to measure it.").color(p.muted));
@@ -1059,7 +1079,7 @@ impl MetricsTab {
         }
         self.scope_bar(ui, &p, &ctx.subject);
         ui.add_space(6.0);
-        self.picker(ui, &p, &ctx.subject);
+        self.picker(ui, &p, &ctx.subject, ctx.roi);
         ui.add_space(6.0);
         self.run_row(ui, &p, ctx);
         ui.add_space(6.0);
@@ -1078,32 +1098,15 @@ impl MetricsTab {
     }
 
     fn scope_bar(&mut self, ui: &mut Ui, p: &Palette, s: &Subject) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.selectable_value(&mut self.spatial, Spatial::Whole, "Whole").on_hover_text("Measure the whole picture");
-            ui.selectable_value(&mut self.spatial, Spatial::Roi, "ROI").on_hover_text("Measure a region: drag on the image (R)");
-            if s.is_video() {
-                ui.label(RichText::new("|").color(p.faint));
-                ui.selectable_value(&mut self.temporal, Temporal::Frame, "Current frame").on_hover_text("The paused frame");
-                ui.selectable_value(&mut self.temporal, Temporal::Range, "Range").on_hover_text("A range of frames");
-            }
-        });
-        if self.spatial == Spatial::Roi {
-            ui.horizontal(|ui| {
-                match self.roi.pixel_rect() {
-                    Some((x, y, w, h)) => {
-                        let warn = self.roi.too_small();
-                        ui.label(RichText::new(format!("{w} x {h} px at {x}, {y}")).color(if warn { p.warn } else { p.muted }));
-                        if ui.small_button("Clear").clicked() {
-                            self.roi.clear();
-                        }
-                    }
-                    None => {
-                        ui.label(RichText::new("Drag on the image to draw a region").color(p.muted));
-                    }
-                }
-            });
+        if !s.is_video() {
+            return;
         }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.label(RichText::new("Frames").size(12.0).color(p.muted));
+            ui.selectable_value(&mut self.temporal, Temporal::Frame, "Current frame").on_hover_text("The paused frame");
+            ui.selectable_value(&mut self.temporal, Temporal::Range, "Range").on_hover_text("A range of frames");
+        });
         if s.is_video() && self.temporal == Temporal::Range {
             let total = s.frames();
             ui.horizontal(|ui| {
@@ -1158,7 +1161,7 @@ impl MetricsTab {
         parse_range(&self.range_text[0], &self.range_text[1], &self.range_text[2], s.fps(), s.frames()).map(|r| range_frames(r, total)).unwrap_or(0)
     }
 
-    fn picker(&mut self, ui: &mut Ui, p: &Palette, s: &Subject) {
+    fn picker(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -1175,7 +1178,7 @@ impl MetricsTab {
             }
         });
         let (w, h) = s.size().unwrap_or((1920, 1080));
-        let (w, h) = self.roi().map(|r| (r.w, r.h)).unwrap_or((w, h));
+        let (w, h) = roi.map(|r| (r.w, r.h)).unwrap_or((w, h));
         let frames = self.frames_to_measure(s).max(1) as f32;
         let threads = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1).max(1)).unwrap_or(1) as f32;
         // Frames run in parallel in range jobs.
