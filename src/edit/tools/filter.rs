@@ -1,6 +1,7 @@
 //! Filter tools: Sharpen (unsharp mask), Blur, and the Effects gallery.
 
-use super::{color_row, info, row, section, segmented, slider, slider_ex};
+use super::{color_row, combo, hint, info, row, section, segmented, slider, slider_ex};
+use crate::ui::widgets;
 use crate::edit::{effects as fx, filters, EditTool, ToolUiCtx};
 use egui::{vec2, Color32, Sense, Stroke};
 use image::RgbaImage;
@@ -70,7 +71,7 @@ impl EditTool for Sharpen {
         c |= slider_ex(ui, "Radius", &mut self.radius, 0.1..=100.0, 1.0, " px", 0.1, 1, true);
         c |= slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 2.0, "", 1.0, 0, false);
         ui.add_space(6.0);
-        info(ui, cx, "Tip: judge sharpening at 100% zoom; previews are downscaled.");
+        hint(ui, "Judge sharpening at 100% zoom: the preview is downscaled.");
         fine_detail_note(ui, cx, self.radius);
         c
     }
@@ -124,9 +125,8 @@ impl EditTool for Blur {
             }
         }
         ui.add_space(6.0);
-        info(
+        hint(
             ui,
-            cx,
             match self.mode {
                 1 => "Uniform averaging - fast, slightly boxy.",
                 2 => "Streaks along a direction, like camera shake.",
@@ -309,7 +309,7 @@ impl EditTool for Effects {
                     let sel = self.kind == k;
                     let img_rect = egui::Rect::from_min_size(rect.min, vec2(cw, ch - 16.0));
                     let painter = ui.painter_at(rect);
-                    painter.rect_filled(img_rect, 4.0, pal.raised);
+                    painter.rect_filled(img_rect, 4.0, if sel { pal.selected_bg } else { pal.raised });
                     if let Some(t) = self.thumbs.as_ref().and_then(|t| t.get(k)) {
                         let ts = t.size_vec2();
                         let s = (img_rect.width() / ts.x).max(img_rect.height() / ts.y);
@@ -330,7 +330,7 @@ impl EditTool for Effects {
                         egui::pos2(rect.center().x, rect.max.y - 7.0),
                         egui::Align2::CENTER_CENTER,
                         EFFECTS[k],
-                        egui::FontId::proportional(10.5),
+                        egui::FontId::proportional(crate::ui::theme::text::CAPTION),
                         if sel { pal.text } else { pal.muted },
                     );
                     if resp.clicked() && !sel {
@@ -365,8 +365,8 @@ impl EditTool for Effects {
             10 => {
                 c |= slider_ex(ui, "Grain size", &mut self.grain_size, 1.0..=8.0, 1.5, " px", 0.1, 1, false);
                 c |= row(ui, "Seed", |ui| {
-                    let r = ui.add(egui::DragValue::new(&mut self.grain_seed).range(0..=9999));
-                    let b = ui.small_button("Shuffle").clicked();
+                    let r = widgets::value_box(ui, egui::DragValue::new(&mut self.grain_seed).range(0..=9999));
+                    let b = ui.button("Shuffle").clicked();
                     if b {
                         self.grain_seed = (self.grain_seed.wrapping_mul(1_103_515_245).wrapping_add(12345)) % 10_000;
                     }
@@ -377,7 +377,10 @@ impl EditTool for Effects {
                 c |= row(ui, "Despeckle", |ui| segmented(ui, &mut self.nr_radius, &["3×3", "5×5"]));
                 c |= slider_ex(ui, "Smoothing", &mut self.nr_smooth, 0.0..=6.0, 1.5, " px", 0.1, 1, false);
             }
-            12 => c |= row(ui, "Lens filter", |ui| segmented(ui, &mut self.bw, &BW_FILTERS)),
+            12 => {
+                let names: Vec<String> = BW_FILTERS.iter().map(|s| s.to_string()).collect();
+                c |= combo(ui, "Lens filter", "fx-bw-filter", &mut self.bw, &names);
+            }
             13 => {
                 c |= color_row(ui, "Shadows", &mut self.dark, false);
                 c |= color_row(ui, "Highlights", &mut self.light, false);

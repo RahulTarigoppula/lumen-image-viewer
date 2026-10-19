@@ -1,7 +1,8 @@
 //! Text overlay and watermark tools. All sizes are relative to the image so
 //! the downscaled live preview looks identical to the full-resolution result.
 
-use super::{anchor_grid, color_button, combo, info, row, section, segmented, slider, slider_ex};
+use super::{anchor_grid, color_button, combo, hint, icon_toggle, info, row, section, section_toggle, segmented, slider, slider_ex};
+use crate::ui::widgets;
 use crate::edit::text::{self as txt, Stamp, TextStyle};
 use crate::edit::{geom, EditTool, ToolUiCtx};
 use crate::ui::icons as I;
@@ -17,22 +18,16 @@ fn opacity_color_row(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4], opacit
     ui.horizontal(|ui| {
         super::row_label(ui, label);
         c |= color_button(ui, color, false);
-        ui.spacing_mut().slider_width = (ui.available_width() - 74.0).max(50.0);
-        c |= ui.add(egui::Slider::new(opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0)).on_hover_text("Opacity").changed();
+        ui.spacing_mut().slider_width = f32::INFINITY;
+        c |= ui.add(widgets::Slider::new(opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0).default_value(100.0)).on_hover_text("Opacity").changed();
     });
     c
 }
 
 fn style_toggles(ui: &mut egui::Ui, bold: &mut bool, italic: &mut bool) -> bool {
     let mut c = false;
-    if ui.selectable_label(*bold, egui::RichText::new(I::TEXT_B).size(15.0)).on_hover_text("Bold").clicked() {
-        *bold = !*bold;
-        c = true;
-    }
-    if ui.selectable_label(*italic, egui::RichText::new(I::TEXT_ITALIC).size(15.0)).on_hover_text("Italic").clicked() {
-        *italic = !*italic;
-        c = true;
-    }
+    c |= icon_toggle(ui, bold, I::TEXT_B, "Bold");
+    c |= icon_toggle(ui, italic, I::TEXT_ITALIC, "Italic");
     c
 }
 
@@ -149,15 +144,15 @@ impl EditTool for AddText {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
-        c |= ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(3).desired_width(ui.available_width().min(312.0)).hint_text("Type your text...")).changed();
+        c |= ui.add(egui::TextEdit::multiline(&mut self.text).desired_rows(3).desired_width(ui.available_width()).hint_text("Type your text...")).changed();
         ui.add_space(4.0);
         c |= combo(ui, "Font", "text-font", &mut self.family, &font_names());
         row(ui, "Style", |ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             c |= style_toggles(ui, &mut self.bold, &mut self.italic);
             ui.add_space(6.0);
-            for (i, icon) in [I::TEXT_ALIGN_LEFT, I::TEXT_ALIGN_CENTER, I::TEXT_ALIGN_RIGHT].iter().enumerate() {
-                if ui.selectable_label(self.align == i, egui::RichText::new(*icon).size(15.0)).clicked() && self.align != i {
+            for (i, (icon, tip)) in [(I::TEXT_ALIGN_LEFT, "Align left"), (I::TEXT_ALIGN_CENTER, "Center"), (I::TEXT_ALIGN_RIGHT, "Align right")].iter().enumerate() {
+                if widgets::icon_button_sized(ui, icon, tip, self.align == i, crate::ui::theme::size::COMPACT + 4.0, crate::ui::theme::size::ICON_TOOLBAR).clicked() && self.align != i {
                     self.align = i;
                     c = true;
                 }
@@ -172,29 +167,27 @@ impl EditTool for AddText {
         c |= slider_ex(ui, "Offset X", &mut self.off_x, -50.0..=50.0, 0.0, " %", 0.1, 1, false);
         c |= slider_ex(ui, "Offset Y", &mut self.off_y, -50.0..=50.0, 0.0, " %", 0.1, 1, false);
         c |= slider_ex(ui, "Rotation", &mut self.angle, -180.0..=180.0, 0.0, "°", 0.5, 1, false);
-        section(ui, cx, "Outline");
-        row(ui, "", |ui| c |= ui.checkbox(&mut self.outline, "Outline").changed());
+        c |= section_toggle(ui, &mut self.outline, "Outline");
         if self.outline {
             c |= slider_ex(ui, "Width", &mut self.outline_w, 0.5..=30.0, 5.0, " %", 0.5, 1, false);
             c |= super::color_row(ui, "Outline color", &mut self.outline_color, true);
         }
-        section(ui, cx, "Shadow");
-        row(ui, "", |ui| c |= ui.checkbox(&mut self.shadow, "Drop shadow").changed());
+        c |= section_toggle(ui, &mut self.shadow, "Drop shadow");
         if self.shadow {
             c |= slider_ex(ui, "Distance", &mut self.shadow_dist, 0.0..=50.0, 5.0, " %", 0.5, 1, false);
             c |= slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=60.0, 8.0, " %", 0.5, 1, false);
             c |= super::color_row(ui, "Shadow color", &mut self.shadow_color, true);
         }
-        section(ui, cx, "Background box");
-        row(ui, "", |ui| c |= ui.checkbox(&mut self.bg, "Box behind text").changed());
+        c |= section_toggle(ui, &mut self.bg, "Box behind the text");
         if self.bg {
             c |= super::color_row(ui, "Box color", &mut self.bg_color, true);
             c |= slider_ex(ui, "Padding", &mut self.bg_pad, 0.0..=150.0, 30.0, " %", 1.0, 0, false);
             c |= slider_ex(ui, "Corner radius", &mut self.bg_radius, 0.0..=100.0, 20.0, " %", 1.0, 0, false);
         }
-        ui.add_space(4.0);
+        section(ui, cx, "Result");
         let px = (self.size / 100.0 * cx.image_size.1 as f32).round();
-        info(ui, cx, format!("Font size {px:.0} px on the full image. Sizes are relative to the image."));
+        info(ui, cx, format!("Font size {px:.0} px on the full image"));
+        hint(ui, "Sizes are relative to the image height, so the preview matches the saved result.");
         c
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {
@@ -325,16 +318,13 @@ impl EditTool for Watermark {
         c |= row(ui, "Type", |ui| segmented(ui, &mut self.kind, &["Text", "Image"]));
         ui.add_space(4.0);
         if self.kind == 0 {
-            c |= ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(ui.available_width().min(312.0)).hint_text("© Your Name")).changed();
+            c |= ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(ui.available_width()).hint_text("© Your Name")).changed();
             c |= combo(ui, "Font", "wm-font", &mut self.family, &font_names());
             row(ui, "Style", |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
-                if ui.selectable_label(self.bold, egui::RichText::new(I::TEXT_B).size(15.0)).on_hover_text("Bold").clicked() {
-                    self.bold = !self.bold;
-                    c = true;
-                }
-                ui.add_space(6.0);
-                c |= ui.checkbox(&mut self.shadow, "Shadow").changed();
+                c |= icon_toggle(ui, &mut self.bold, I::TEXT_B, "Bold");
+                ui.add_space(8.0);
+                c |= widgets::checkbox(ui, &mut self.shadow, "Shadow").changed();
             });
             c |= slider_ex(ui, "Size", &mut self.size, 0.5..=30.0, 4.0, " %", 0.1, 1, true);
             c |= opacity_color_row(ui, "Color", &mut self.color, &mut self.opacity);
@@ -347,7 +337,7 @@ impl EditTool for Watermark {
             if !self.logo_name.is_empty() {
                 info(ui, cx, format!("{}  {}", I::IMAGE, self.logo_name));
             } else {
-                info(ui, cx, "PNG with transparency works best.");
+                hint(ui, "A PNG with transparency works best.");
             }
             if let Some(e) = &self.error {
                 ui.colored_label(cx.palette.danger, e);

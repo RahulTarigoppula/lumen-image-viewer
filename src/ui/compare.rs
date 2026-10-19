@@ -10,6 +10,7 @@
 //! cursor and the resulting `View` is copied to every pane.
 
 use super::icons as I;
+use super::theme::{self, size, text};
 use super::widgets;
 use crate::app::Core;
 use crate::edit::{Histogram, HistogramPaint};
@@ -267,6 +268,11 @@ struct DiffState {
 
 // ---------------------------------------------------------------- panes
 
+/// A view mode's segment label: icon and name, or the icon alone when narrow.
+fn mode_label(m: CmpMode, with_name: bool) -> String {
+    if with_name { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpMode {
     SideBySide,
@@ -410,6 +416,8 @@ pub struct Compare {
     last_area: Rect,
     /// Pane under the pointer this frame (culling keys act on it, else on `selected`).
     hover_pane: Option<usize>,
+    /// The pane the open context menu acts on.
+    menu_pane: usize,
     show_exif: bool,
     /// Pane waiting for "move to Recycle Bin" confirmation.
     confirm_delete: Option<usize>,
@@ -465,6 +473,7 @@ impl Compare {
             exit: false,
             last_area: Rect::NOTHING,
             hover_pane: None,
+            menu_pane: 0,
             show_exif: false,
             confirm_delete: None,
             deleted: Vec::new(),
@@ -906,7 +915,7 @@ impl Compare {
 
         egui::Panel::top("compare-toolbar")
             .resizable(false)
-            .exact_size(46.0)
+            .exact_size(size::TOOLBAR)
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 0)))
             .show(ui, |ui| self.toolbar(ui, core));
 
@@ -955,21 +964,21 @@ impl Compare {
         };
         let p = core.pal;
         let mut decision = None;
-        egui::Modal::new(egui::Id::NULL.with("cmp-delete")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.heading("Move to Recycle Bin?");
-            ui.add_space(6.0);
-            ui.label(format!("{}  {}", LETTERS[i.min(3)], name_of(&path)));
-            ui.label(RichText::new("The image is removed from the comparison. You can restore it from the Recycle Bin.").size(12.0).color(p.muted));
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new(format!("{}  Move to Recycle Bin", I::TRASH)).color(Color32::WHITE)).fill(Color32::from_rgb(200, 70, 60))).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                    decision = Some(true);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    decision = Some(false);
-                }
-            });
+        widgets::modal(ctx, egui::Id::NULL.with("cmp-delete"), 400.0, |ui| {
+            widgets::modal_title(ui, "Move to Recycle Bin?");
+            ui.label(RichText::new(format!("{}  {}", LETTERS[i.min(3)], name_of(&path))).color(p.text));
+            ui.add_space(4.0);
+            widgets::modal_body(ui, "The image is removed from the comparison. You can restore it from the Recycle Bin.");
+            if let Some(r) = widgets::dialog_buttons(ui, &p, "Cancel", "Move to Recycle Bin", widgets::ButtonKind::Danger, true) {
+                decision = Some(r);
+            }
+            // The Recycle Bin can undo it, so Enter confirms (as Delete does in Explorer).
+            if ui.input(|i| i.key_pressed(Key::Enter)) {
+                decision = Some(true);
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                decision = Some(false);
+            }
         });
         match decision {
             Some(true) => {
@@ -981,7 +990,7 @@ impl Compare {
         }
     }
 
-    fn view_input(&mut self, ui: &Ui, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32) {
+    fn view_input(&mut self, ui: &Ui, core: &mut Core, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32) {
         if resp.double_clicked() {
             self.fit_all();
         } else if resp.clicked() {
@@ -1012,14 +1021,27 @@ impl Compare {
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
-        resp.context_menu(|ui| self.pane_menu(ui));
+        // The pane the menu was opened on (in Split / Flicker: the one under the
+        // pointer then), kept while the pointer moves into the menu.
+        if resp.secondary_clicked() {
+            self.menu_pane = self.hover_pane.unwrap_or(src);
+        }
+        let menu_pane = self.menu_pane;
+        resp.context_menu(|ui| self.pane_menu(ui, core, menu_pane));
     }
 
     /// Right-click menu of the panes.
-    fn pane_menu(&mut self, ui: &mut Ui) {
-        ui.set_min_width(220.0);
+    fn pane_menu(&mut self, ui: &mut Ui, core: &mut Core, pane: usize) {
+        ui.set_min_width(240.0);
         let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| {
-            let r = ui.add(egui::Button::new(format!("{icon}   {label}")).shortcut_text(key)).clicked();
+            let r = widgets::menu_item(ui, icon, label, key).clicked();
+            if r {
+                ui.close();
+            }
+            r
+        };
+        let toggle = |ui: &mut Ui, on: bool, label: &str, key: &str| {
+            let r = widgets::menu_toggle(ui, on, label, key).clicked();
             if r {
                 ui.close();
             }
@@ -1036,11 +1058,30 @@ impl Compare {
         if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
             self.swap_ab();
         }
-        if item(ui, if self.sync { I::LINK } else { I::LINK_BREAK }, if self.sync { "Unlink zoom & pan" } else { "Link zoom & pan" }, "L") {
+        if toggle(ui, self.sync, "Link zoom & pan", "L") {
             self.toggle_sync();
         }
-        if item(ui, I::CHART_BAR, if self.show_hist { "Hide histograms" } else { "Show histograms" }, "G") {
+        if toggle(ui, self.show_hist, "Histograms", "G") {
             self.show_hist = !self.show_hist;
+        }
+        if toggle(ui, self.show_exif, "Camera info strip", "H") {
+            self.show_exif = !self.show_exif;
+        }
+        // Culling on the pane that was right-clicked.
+        if pane < self.panes.len() {
+            ui.separator();
+            let letter = LETTERS[pane.min(3)];
+            if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K") {
+                self.selected = pane;
+                self.keep_only(core, pane);
+            }
+            let flagged = core.tags.get(&self.panes[pane].path).flagged;
+            if toggle(ui, flagged, &format!("Flag {letter}"), "Q") {
+                self.toggle_flag(core, pane);
+            }
+            if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del") {
+                self.confirm_delete = Some(pane);
+            }
         }
         ui.separator();
         if item(ui, I::ARROW_LEFT, "Back", "Esc") {
@@ -1152,7 +1193,7 @@ impl Compare {
             if zoom.is_none() {
                 self.placeholder(ui, core, i, rect);
             }
-            self.view_input(ui, &resp, i, rects, ppp);
+            self.view_input(ui, core, &resp, i, rects, ppp);
             // Caption pill.
             let text = self.caption_text(i, zoom);
             Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))), rect.width() - 20.0);
@@ -1252,18 +1293,23 @@ impl Compare {
                 x += gw + 14.0;
             }
         }
-        // "Keep this, reject others" on the hovered / selected pane.
-        let active = self.hover_pane == Some(i) || self.selected == i;
-        if active && self.panes.len() >= 2 && rect.width() > 260.0 {
-            let size = Vec2::new(196.0, 28.0);
+        // "Keep, reject others" only on the pane under the pointer: a neutral pill,
+        // so it never competes with the image (the toolbar's Keep is the filled one).
+        if self.hover_pane == Some(i) && self.panes.len() >= 2 && rect.width() > 260.0 && !self.popup_open {
+            let p = core.pal;
+            let font = FontId::proportional(12.5);
+            let g = ui.painter().layout_no_wrap("Keep, reject others".into(), font, p.text);
+            let size = Vec2::new(12.0 + size::ICON + 6.0 + g.size().x + 12.0, size::CONTROL);
             let top = rect.min.y + 42.0; // below the caption pill and the remove button
             let br = Rect::from_min_size(Pos2::new(rect.max.x - size.x - 10.0, top), size);
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
-            let b = egui::Button::new(RichText::new(format!("{}  Keep, reject others", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5))
-                .fill(Color32::from_rgba_unmultiplied(39, 150, 90, 230))
-                .corner_radius(CornerRadius::same(14))
-                .min_size(size);
-            if child.add(b).on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
+            let resp = ui.interact(br, ui.scope_id().with(("cmp-keep", i)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+            let painter = ui.painter().with_clip_rect(rect);
+            let r = CornerRadius::same((size::CONTROL / 2.0) as u8);
+            painter.add(theme::popover_shadow(&p).as_shape(br, r));
+            painter.rect(br, r, if resp.hovered() { theme::mix(p.raised, p.text, 0.08) } else { p.overlay }, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.text(Pos2::new(br.min.x + 12.0 + size::ICON / 2.0, br.center().y), Align2::CENTER_CENTER, I::CHECK_CIRCLE, FontId::proportional(size::ICON), p.ok);
+            painter.galley(Pos2::new(br.min.x + 12.0 + size::ICON + 6.0, br.center().y - g.size().y / 2.0), g, p.text);
+            if resp.on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
                 self.selected = i;
                 self.keep_only(core, i);
             }
@@ -1336,7 +1382,7 @@ impl Compare {
                 self.pane_overlays(ui, core, 0, left);
                 self.pane_overlays(ui, core, 1, right);
                 if !hresp.dragged() {
-                    self.view_input(ui, &resp, 0, rects, ppp);
+                    self.view_input(ui, core, &resp, 0, rects, ppp);
                 }
             }
             CmpMode::Flicker => {
@@ -1362,7 +1408,7 @@ impl Compare {
                     self.paint_hist(ui, core, i, area);
                 }
                 self.pane_overlays(ui, core, i, area);
-                self.view_input(ui, &resp, i, rects, ppp);
+                self.view_input(ui, core, &resp, i, rects, ppp);
             }
             CmpMode::Difference => {
                 let mut zshow = None;
@@ -1403,7 +1449,7 @@ impl Compare {
                     Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None, area.width() - 20.0);
                 }
                 let src = 0;
-                self.view_input(ui, &resp, src, rects, ppp);
+                self.view_input(ui, core, &resp, src, rects, ppp);
             }
             CmpMode::SideBySide => {}
         }
@@ -1420,10 +1466,12 @@ impl Compare {
         let icon = 30.0 + s;
         let sep = 9.0 + s;
         let pair = self.panes.len() == 2;
-        let modes_full: f32 = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference].iter().map(|m| text_w(&format!("{}  {}", m.icon(), m.label()), body.clone()) + pad + s).sum();
-        let modes_compact = 4.0 * (text_w(I::COLUMNS, body.clone()) + pad + s);
-        let title = text_w("Compare", super::theme::semibold(14.0)) + s;
-        let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(12.0)) + s;
+        // One segmented control: equal segments as wide as the widest label.
+        let widest = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference].iter().map(|m| text_w(&mode_label(*m, true), body.clone())).fold(0.0, f32::max);
+        let modes_full = if pair { 4.0 * (widest + 24.0) + 4.0 + s } else { 0.0 };
+        let modes_compact = if pair { 4.0 * (text_w(I::COLUMNS, body.clone()) + 24.0) + 4.0 + s } else { 0.0 };
+        let title = text_w("Compare", text::title()) + s;
+        let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(text::SMALL)) + s;
         let part = |b: BarPart| -> f32 {
             match b {
                 BarPart::Help => icon,
@@ -1431,7 +1479,7 @@ impl Compare {
                 BarPart::Basis => 126.0 + s,
                 BarPart::Sync => sep + icon,
                 BarPart::Cull => {
-                    let keep = if self.panes.len() >= 2 { text_w(&format!("{}  Keep A", I::CHECK_CIRCLE), FontId::proportional(12.5)) + pad + s } else { 0.0 };
+                    let keep = if self.panes.len() >= 2 { text_w(&format!("{}  Keep A", I::CHECK_CIRCLE), body.clone()) + pad + s } else { 0.0 };
                     sep + keep + if self.panes.is_empty() { 0.0 } else { 2.0 * icon }
                 }
                 BarPart::Swap => {
@@ -1495,34 +1543,38 @@ impl Compare {
             }
             ui.add_space(4.0);
             if plan.title {
-                ui.label(RichText::new("Compare").font(super::theme::semibold(14.0)).color(p.text));
+                ui.label(RichText::new("Compare").font(text::title()).color(p.text));
             }
             if plan.count {
-                ui.label(RichText::new(format!("{} images", self.panes.len())).size(12.0).color(p.muted));
+                ui.label(RichText::new(format!("{} images", self.panes.len())).size(text::SMALL).color(p.muted));
             }
-            widgets::separator_v(ui);
             let pair = self.panes.len() == 2;
-            if plan.modes_menu {
+            if pair {
+                widgets::separator_v(ui);
+            }
+            // The view modes need exactly two images; with three or four there is
+            // only side by side, so no control is shown.
+            const MODES: [CmpMode; 4] = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference];
+            if pair && plan.modes_menu {
                 let r = ui.menu_button(format!("{}  {}", self.mode.icon(), I::CARET_DOWN), |ui| {
-                    for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
-                        let b = egui::Button::new(format!("{}   {}", m.icon(), m.label())).selected(self.mode == m).shortcut_text(m.key());
-                        if ui.add_enabled(m == CmpMode::SideBySide || pair, b).clicked() {
+                    for m in MODES {
+                        if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).clicked() {
                             self.set_mode(m);
                             ui.close();
                         }
                     }
                 });
                 r.response.on_hover_text(format!("View: {}", self.mode.label()));
-            } else {
-                for m in [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference] {
-                    let enabled = m == CmpMode::SideBySide || pair;
-                    let tip = if enabled { format!("{}  ({})", m.label(), m.key()) } else { format!("{} - needs exactly 2 images", m.label()) };
-                    let text = if plan.labels { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() };
-                    let r = ui.add_enabled(enabled, egui::Button::new(text).selected(self.mode == m).corner_radius(CornerRadius::same(6)));
-                    if r.on_hover_text(tip).clicked() {
-                        self.set_mode(m);
-                    }
+            } else if pair {
+                let labels: Vec<String> = MODES.iter().map(|m| mode_label(*m, plan.labels)).collect();
+                let labels: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                let mut idx = MODES.iter().position(|m| *m == self.mode).unwrap_or(0);
+                let r = ui.scope(|ui| widgets::segmented(ui, &mut idx, &labels));
+                if r.inner {
+                    self.set_mode(MODES[idx]);
                 }
+                let tips: Vec<String> = MODES.iter().map(|m| format!("{}  ({})", m.label(), m.key())).collect();
+                r.response.on_hover_text(tips.join("\n"));
             }
             if shown(BarPart::Sync) {
                 widgets::separator_v(ui);
@@ -1533,7 +1585,7 @@ impl Compare {
             }
             if shown(BarPart::Basis) {
                 let mut basis = self.basis;
-                egui::ComboBox::from_id_salt("cmp-basis")
+                widgets::combo("cmp-basis")
                     .width(118.0)
                     .selected_text(match basis {
                         Basis::Relative => "Match framing",
@@ -1551,7 +1603,7 @@ impl Compare {
                     self.zoom_step(src, &rects, ppp, 0.8, None);
                 }
                 let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
-                let zl = ui.add_sized([52.0, 26.0], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
+                let zl = ui.add_sized([52.0, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
                 if zl.on_hover_text("Click: 100%  (1)").clicked() && !rects.is_empty() {
                     self.actual_size(&rects, ppp);
                 }
@@ -1578,8 +1630,12 @@ impl Compare {
             if shown(BarPart::Cull) {
                 widgets::separator_v(ui);
                 if self.panes.len() >= 2 {
-                    let b = egui::Button::new(RichText::new(format!("{}  Keep {letter}", I::CHECK_CIRCLE)).color(Color32::WHITE).size(12.5)).fill(Color32::from_rgb(39, 150, 90)).corner_radius(CornerRadius::same(6));
-                    if ui.add(b).on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
+                    // The one filled call to action of the surface.
+                    let r = ui.scope(|ui| {
+                        ui.spacing_mut().button_padding.x = 10.0;
+                        widgets::success_button(ui, &p, &format!("{}  Keep {letter}", I::CHECK_CIRCLE))
+                    });
+                    if r.inner.on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
                         self.keep_only(core, sel);
                     }
                 }
@@ -1623,19 +1679,17 @@ impl Compare {
     fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
         match self.mode {
             CmpMode::Flicker => {
-                ui.toggle_value(&mut self.flicker_auto, "Auto");
+                widgets::checkbox(ui, &mut self.flicker_auto, "Auto").on_hover_text("Switch between A and B on a timer");
                 if self.flicker_auto {
-                    ui.spacing_mut().slider_width = 90.0;
-                    ui.add(egui::Slider::new(&mut self.flicker_secs, 0.2..=2.0).suffix(" s").fixed_decimals(1));
+                    ui.add(widgets::Slider::new(&mut self.flicker_secs, 0.2..=2.0).suffix(" s").fixed_decimals(1).default_value(0.6).width(90.0).value_width(52.0));
                 }
             }
             CmpMode::Difference => {
-                ui.label(RichText::new("Amplify").size(12.0).color(p.muted));
-                ui.spacing_mut().slider_width = 110.0;
-                ui.add(egui::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0));
+                ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted));
+                ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(110.0).value_width(52.0));
             }
             CmpMode::Split => {
-                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(12.0).color(p.muted));
+                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted));
             }
             CmpMode::SideBySide => {}
         }
@@ -1643,11 +1697,15 @@ impl Compare {
 
     /// The toolbar parts that did not fit, as menu entries.
     fn overflow_menu(&mut self, ui: &mut Ui, core: &mut Core, plan: &BarPlan, sel: usize) {
-        ui.set_min_width(220.0);
+        ui.set_min_width(240.0);
         let p = core.pal;
         let pair = self.panes.len() == 2;
         let letter = LETTERS[sel.min(3)];
-        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| ui.add(egui::Button::new(format!("{icon}   {label}")).selected(on).shortcut_text(key)).clicked();
+        // `on`: an on / off setting (check mark); `None`: a plain command.
+        let item = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: Option<bool>| match on {
+            Some(on) => widgets::menu_toggle(ui, on, label, key).clicked(),
+            None => widgets::menu_item(ui, icon, label, key).clicked(),
+        };
         for (n, part) in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)).enumerate() {
             let sep = |ui: &mut Ui| {
                 if n > 0 {
@@ -1656,39 +1714,46 @@ impl Compare {
             };
             match part {
                 BarPart::Sync => {
-                    if item(ui, I::LINK, "Link zoom & pan", "L", self.sync) {
+                    if item(ui, I::LINK, "Link zoom & pan", "L", Some(self.sync)) {
                         self.toggle_sync();
                     }
                 }
                 BarPart::Basis => {
                     let mut basis = self.basis;
-                    ui.menu_button(format!("{}   Framing", I::FRAME_CORNERS), |ui| Self::basis_choices(ui, &mut basis));
+                    widgets::submenu(ui, I::FRAME_CORNERS, "Framing", |ui| {
+                        if widgets::menu_toggle(ui, basis == Basis::Relative, "Match framing", "").on_hover_text("Same relative position/zoom: images of different sizes stay aligned").clicked() {
+                            basis = Basis::Relative;
+                        }
+                        if widgets::menu_toggle(ui, basis == Basis::Pixel, "Match pixels", "").on_hover_text("Same pixel scale: 100% in one pane is 100% in all").clicked() {
+                            basis = Basis::Pixel;
+                        }
+                    });
                     self.set_basis(basis);
                 }
                 BarPart::Views => {
-                    if item(ui, I::CHART_BAR, "Histograms", "G", self.show_hist) {
+                    if item(ui, I::CHART_BAR, "Histograms", "G", Some(self.show_hist)) {
                         self.show_hist = !self.show_hist;
                     }
-                    if item(ui, I::CAMERA, "Camera info strip", "H", self.show_exif) {
+                    if item(ui, I::CAMERA, "Camera info strip", "H", Some(self.show_exif)) {
                         self.show_exif = !self.show_exif;
                     }
                 }
                 BarPart::Cull if !self.panes.is_empty() => {
                     sep(ui);
-                    if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K", false) {
+                    if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K", None) {
                         self.keep_only(core, sel);
                     }
                     let flagged = core.tags.get(&self.panes[sel].path).flagged;
-                    if item(ui, I::FLAG, &format!("Flag {letter}"), "Q", flagged) {
+                    if item(ui, I::FLAG, &format!("Flag {letter}"), "Q", Some(flagged)) {
                         self.toggle_flag(core, sel);
                     }
-                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del", false) {
+                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del", None) {
                         self.confirm_delete = Some(sel);
                         ui.close();
                     }
                 }
                 BarPart::Swap if pair => {
-                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X", false) {
+                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X", None) {
                         self.swap_ab();
                     }
                 }
@@ -1697,7 +1762,7 @@ impl Compare {
                     ui.horizontal(|ui| self.mode_controls(ui, &p));
                 }
                 BarPart::Help => {
-                    if item(ui, I::QUESTION, "Shortcuts", "?", self.help) {
+                    if item(ui, I::QUESTION, "Shortcuts", "?", Some(self.help)) {
                         self.help = !self.help;
                     }
                 }
@@ -1706,13 +1771,13 @@ impl Compare {
                     let ppp = ui.ctx().pixels_per_point();
                     let src = self.selected.min(self.panes.len().saturating_sub(1));
                     if !rects.is_empty() {
-                        if item(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in", "+", false) {
+                        if item(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in", "+", None) {
                             self.zoom_step(src, &rects, ppp, 1.25, None);
                         }
-                        if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", "-", false) {
+                        if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", "-", None) {
                             self.zoom_step(src, &rects, ppp, 0.8, None);
                         }
-                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "1", false) {
+                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "1", None) {
                             self.actual_size(&rects, ppp);
                         }
                     }

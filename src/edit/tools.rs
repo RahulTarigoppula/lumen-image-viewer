@@ -12,6 +12,8 @@ mod tone;
 
 use super::{ops, EditTool, ToolUiCtx};
 use crate::ui::commands::Command;
+use crate::ui::theme::{self, size};
+use crate::ui::widgets;
 use egui::{Color32, Rect, Sense, Vec2};
 use image::RgbaImage;
 
@@ -57,22 +59,34 @@ pub fn make_tool_by_name(name: &str) -> Option<Box<dyn EditTool>> {
     })
 }
 
-/// Width of the label column used by every tool row.
-pub const LABEL_W: f32 = 96.0;
+//// Width of the label column used by every tool row.
+pub const LABEL_W: f32 = size::LABEL_W;
+
+/// Width of a pixel field ("60000 px").
+const PX_W: f32 = 84.0;
 
 fn row_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    // Fixed-width column, text left-aligned (add_sized would centre it).
+    // Fixed-width column, text left-aligned (add_sized would centre it), as tall
+    // as the value boxes so labels and fields share a baseline.
     let layout = egui::Layout::left_to_right(egui::Align::Center);
-    ui.allocate_ui_with_layout(Vec2::new(LABEL_W, 18.0), layout, |ui| {
+    ui.allocate_ui_with_layout(Vec2::new(LABEL_W, size::COMPACT), layout, |ui| {
         ui.set_min_width(LABEL_W);
         ui.add(egui::Label::new(label).truncate().sense(Sense::click()))
     })
     .inner
 }
 
-/// Labeled slider with a double-click-to-reset affordance. Returns true if changed.
-/// Adapts to the available panel width.
-pub fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N, range: std::ops::RangeInclusive<N>, default: N, suffix: &str) -> bool {
+/// A labelled [`widgets::Slider`] row: 96 pt label, the rail, a 64 pt value box.
+/// Double-clicking the label or the rail resets to `default`. Signed ranges
+/// (Exposure, Contrast, Hue...) fill from 0.
+fn slider_row<'a, N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &'a mut N,
+    range: std::ops::RangeInclusive<N>,
+    default: N,
+    build: impl FnOnce(widgets::Slider<'a, N>) -> widgets::Slider<'a, N>,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         let lr = row_label(ui, label);
@@ -81,50 +95,40 @@ pub fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &m
             changed = true;
         }
         lr.on_hover_text("Double-click to reset");
-        ui.spacing_mut().slider_width = (ui.available_width() - 74.0).max(60.0);
-        let r = ui.add(egui::Slider::new(value, range).suffix(suffix).clamping(egui::SliderClamping::Always));
-        if r.changed() {
-            changed = true;
+        let signed = range.start().to_f64() < 0.0 && range.end().to_f64() > 0.0;
+        let mut s = widgets::Slider::new(value, range).default_value(default);
+        if signed {
+            s = s.bipolar();
         }
-        if r.double_clicked() {
-            *value = default;
+        // The rail takes what the label and the value box leave.
+        ui.spacing_mut().slider_width = f32::INFINITY;
+        if ui.add(build(s)).changed() {
             changed = true;
         }
     });
     changed
+}
+
+/// Labeled slider with a double-click-to-reset affordance. Returns true if changed.
+/// Adapts to the available panel width.
+pub fn slider<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N, range: std::ops::RangeInclusive<N>, default: N, suffix: &str) -> bool {
+    // Whole numbers on wide float ranges (Brightness 0, not 0.0).
+    let whole = !N::INTEGRAL && range.end().to_f64() - range.start().to_f64() >= 20.0;
+    slider_row(ui, label, value, range, default, |s| if whole { s.suffix(suffix).fixed_decimals(0) } else { s.suffix(suffix) })
 }
 
 /// Like [`slider`] but with a step size / fixed decimals and optional log scale.
 #[allow(clippy::too_many_arguments)]
 pub fn slider_ex(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32, suffix: &str, step: f64, decimals: usize, log: bool) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        let lr = row_label(ui, label);
-        if lr.double_clicked() {
-            *value = default;
-            changed = true;
-        }
-        lr.on_hover_text("Double-click to reset");
-        ui.spacing_mut().slider_width = (ui.available_width() - 74.0).max(60.0);
-        let mut s = egui::Slider::new(value, range).suffix(suffix).clamping(egui::SliderClamping::Always).fixed_decimals(decimals).logarithmic(log);
-        if step > 0.0 {
-            s = s.step_by(step);
-        }
-        let r = ui.add(s);
-        if r.changed() {
-            changed = true;
-        }
-        if r.double_clicked() {
-            *value = default;
-            changed = true;
-        }
-    });
-    changed
+    slider_row(ui, label, value, range, default, |s| {
+        let s = s.suffix(suffix).fixed_decimals(decimals).logarithmic(log);
+        if step > 0.0 { s.step_by(step) } else { s }
+    })
 }
 
 /// Labeled integer drag value (for pixel sizes). Returns true if changed.
 pub fn drag_px(ui: &mut egui::Ui, label: &str, value: &mut i64, range: std::ops::RangeInclusive<i64>) -> bool {
-    row(ui, label, |ui| ui.add(egui::DragValue::new(value).range(range).suffix(" px").speed(1.0)).changed())
+    row(ui, label, |ui| widgets::value_box_w(ui, PX_W, egui::DragValue::new(value).range(range).suffix(" px").speed(1.0)).changed())
 }
 
 /// A row with the standard label column followed by arbitrary widgets.
@@ -136,11 +140,26 @@ pub fn row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) ->
     .inner
 }
 
-/// Small muted section heading.
+/// A row of controls indented to the value column (checkboxes under sliders).
+pub fn indented<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
+        add(ui)
+    })
+    .inner
+}
+
+/// A section that can be switched on (Outline, Drop shadow): the checkbox heads
+/// it at the label column, its rows follow while it is on.
+pub fn section_toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
+    ui.add_space(8.0);
+    widgets::checkbox(ui, on, label).changed()
+}
+
+/// Section label inside a tool panel (sentence case, 11 pt semibold, muted).
 pub fn section(ui: &mut egui::Ui, cx: &ToolUiCtx, text: &str) {
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(text.to_uppercase()).size(10.5).color(cx.palette.muted).strong());
-    ui.add_space(2.0);
+    widgets::section_title(ui, cx.palette, text);
 }
 
 /// Colour swatch button (straight-alpha RGBA).
@@ -161,19 +180,9 @@ pub fn color_row(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4], alpha: bool
     row(ui, label, |ui| color_button(ui, rgba, alpha))
 }
 
-/// Segmented control (a row of selectable labels). Returns true if changed.
+/// Segmented control (one control, equal segments). Returns true if changed.
 pub fn segmented(ui: &mut egui::Ui, value: &mut usize, labels: &[&str]) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (i, l) in labels.iter().enumerate() {
-            if ui.selectable_label(*value == i, *l).clicked() && *value != i {
-                *value = i;
-                changed = true;
-            }
-        }
-    });
-    changed
+    widgets::segmented(ui, value, labels)
 }
 
 /// Labeled combo box over string options.
@@ -181,7 +190,7 @@ pub fn combo(ui: &mut egui::Ui, label: &str, id: &str, value: &mut usize, option
     let mut changed = false;
     row(ui, label, |ui| {
         let w = (ui.available_width() - 4.0).clamp(80.0, 200.0);
-        egui::ComboBox::from_id_salt(id).width(w).selected_text(options.get(*value).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+        widgets::combo(id).width(w).selected_text(options.get(*value).cloned().unwrap_or_else(|| "Custom".into())).show_ui(ui, |ui| {
             for (i, o) in options.iter().enumerate() {
                 if ui.selectable_label(*value == i, o).clicked() && *value != i {
                     *value = i;
@@ -193,7 +202,16 @@ pub fn combo(ui: &mut egui::Ui, label: &str, id: &str, value: &mut usize, option
     changed
 }
 
-/// 3×3 anchor picker (0 = top-left ... 8 = bottom-right).
+/// Small on / off button with an icon (Bold, Italic): the one selected style.
+pub fn icon_toggle(ui: &mut egui::Ui, on: &mut bool, icon: &str, tip: &str) -> bool {
+    if widgets::icon_button_sized(ui, icon, tip, *on, size::COMPACT + 4.0, size::ICON_TOOLBAR).clicked() {
+        *on = !*on;
+        return true;
+    }
+    false
+}
+
+/// 3x3 anchor picker (0 = top-left ... 8 = bottom-right).
 pub fn anchor_grid(ui: &mut egui::Ui, cx: &ToolUiCtx, anchor: &mut u8) -> bool {
     let p = cx.palette;
     let cell = 20.0;
@@ -207,10 +225,10 @@ pub fn anchor_grid(ui: &mut egui::Ui, cx: &ToolUiCtx, anchor: &mut u8) -> bool {
         let r = Rect::from_min_size(rect.min + Vec2::new(cxi * (cell + gap), cyi * (cell + gap)), Vec2::splat(cell));
         let hovered = resp.hover_pos().is_some_and(|h| r.contains(h));
         let sel = *anchor == i;
-        let fill = if sel { p.accent } else if hovered { p.hover } else { p.raised };
+        let fill = if sel { p.accent_fill } else if hovered { p.hover } else { p.raised };
         painter.rect_filled(r, 4.0, fill);
-        painter.rect_stroke(r, 4.0, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-        painter.circle_filled(r.center(), if sel { 3.5 } else { 2.0 }, if sel { Color32::WHITE } else { p.faint });
+        painter.rect_stroke(r, 4.0, egui::Stroke::new(1.0, if sel { p.accent_fill } else { p.border }), egui::StrokeKind::Inside);
+        painter.circle_filled(r.center(), if sel { 3.5 } else { 2.0 }, if sel { p.on_accent } else { p.faint });
         if resp.clicked() && hovered && !sel {
             *anchor = i;
             changed = true;
@@ -220,27 +238,83 @@ pub fn anchor_grid(ui: &mut egui::Ui, cx: &ToolUiCtx, anchor: &mut u8) -> bool {
     changed
 }
 
-/// Paint one histogram channel into `rect` (sqrt scaled, like `Histogram::paint`).
+/// A histogram channel smoothed with a small [1 2 3 2 1] kernel (JPEG and
+/// gradient images leave every other bin empty, which reads as spikes) and
+/// scaled to 0..1 by the square root, so the shape of a low-key image still reads.
+pub fn smooth_bins(data: &[u32], max: u32) -> Vec<f32> {
+    const K: [f32; 5] = [1.0, 2.0, 3.0, 2.0, 1.0];
+    let n = data.len() as isize;
+    let m = max.max(1) as f32;
+    (0..n)
+        .map(|i| {
+            let (mut sum, mut wsum) = (0.0, 0.0);
+            for (k, w) in K.iter().enumerate() {
+                let j = i + k as isize - 2;
+                if (0..n).contains(&j) {
+                    sum += data[j as usize] as f32 * w;
+                    wsum += w;
+                }
+            }
+            (sum / wsum.max(1.0) / m).sqrt().min(1.0)
+        })
+        .collect()
+}
+
+/// Paint one smoothed histogram channel as a filled area with a 1 pt line on top.
+pub fn paint_area(painter: &egui::Painter, rect: Rect, bins: &[f32], fill: Color32, line: Color32) {
+    let n = bins.len();
+    if n < 2 {
+        return;
+    }
+    let x = |i: usize| rect.min.x + i as f32 / (n - 1) as f32 * rect.width();
+    let y = |v: f32| rect.max.y - v * rect.height();
+    // A strip of quads down to the baseline (any shape, unlike a convex polygon).
+    let mut mesh = egui::Mesh::default();
+    for (i, &v) in bins.iter().enumerate() {
+        mesh.colored_vertex(egui::pos2(x(i), rect.max.y), fill);
+        mesh.colored_vertex(egui::pos2(x(i), y(v)), fill);
+        if i > 0 {
+            let k = i as u32 * 2;
+            mesh.add_triangle(k - 2, k - 1, k + 1);
+            mesh.add_triangle(k - 2, k + 1, k);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    let pts: Vec<egui::Pos2> = bins.iter().enumerate().map(|(i, &v)| egui::pos2(x(i), y(v))).collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, line)));
+}
+
+/// Paint one histogram channel into `rect` (smoothed, sqrt scaled, like `Histogram::paint`).
 pub fn paint_histogram(painter: &egui::Painter, rect: Rect, data: &[u32], max: u32, color: Color32) {
     if data.is_empty() {
         return;
     }
-    let mut mesh = egui::Mesh::default();
-    let w = rect.width() / data.len() as f32;
-    for (i, &v) in data.iter().enumerate() {
-        let hgt = ((v as f32 / max.max(1) as f32).sqrt().min(1.0)) * rect.height();
-        let x = rect.min.x + i as f32 * w;
-        mesh.add_colored_rect(Rect::from_min_max(egui::pos2(x, rect.max.y - hgt), egui::pos2(x + w + 0.3, rect.max.y)), color);
-    }
-    painter.add(egui::Shape::mesh(mesh));
+    let bins = smooth_bins(data, max);
+    paint_area(painter, rect, &bins, color.gamma_multiply(0.45), color.gamma_multiply(0.9));
 }
 
-/// Muted one-line info text.
+/// Muted info text for readouts (original and resulting size, status).
 pub fn info(ui: &mut egui::Ui, cx: &ToolUiCtx, text: impl Into<String>) {
-    ui.label(egui::RichText::new(text.into()).size(11.5).color(cx.palette.muted));
+    ui.add(egui::Label::new(egui::RichText::new(text.into()).size(theme::text::SMALL).color(cx.palette.muted)).wrap());
 }
 
-/// Number of megapixels as a short string.
+fn hints_id() -> egui::Id {
+    egui::Id::unique("lumen-tool-hints")
+}
+
+/// How-to text for the open tool. Not drawn in the body: the tool panel shows it
+/// in the tooltip of the (i) button in its header, so the controls stay compact.
+pub fn hint(ui: &egui::Ui, text: impl Into<String>) {
+    let text = text.into();
+    ui.ctx().data_mut(|d| d.get_temp_mut_or_default::<Vec<String>>(hints_id()).push(text));
+}
+
+/// The hints given since the last call (the tool panel calls this after the tool's `ui`).
+pub fn take_hints(ctx: &egui::Context) -> Vec<String> {
+    ctx.data_mut(|d| d.remove_temp::<Vec<String>>(hints_id())).unwrap_or_default()
+}
+
+// Number of megapixels as a short string.
 pub fn mp(w: u32, h: u32) -> String {
     let m = w as f64 * h as f64 / 1e6;
     if m >= 10.0 {
@@ -277,22 +351,24 @@ impl EditTool for AdjustColors {
     fn title(&self) -> String {
         "Adjust colors".into()
     }
-    fn ui(&mut self, ui: &mut egui::Ui, _cx: &ToolUiCtx) -> bool {
+    fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
-        c |= slider(ui, "Exposure", &mut self.exposure, -3.0..=3.0, 0.0, " EV");
+        section(ui, cx, "Light");
+        c |= slider_ex(ui, "Exposure", &mut self.exposure, -3.0..=3.0, 0.0, " EV", 0.01, 2, false);
         c |= slider(ui, "Brightness", &mut self.brightness, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Contrast", &mut self.contrast, -100.0..=100.0, 0.0, "");
-        c |= slider(ui, "Gamma", &mut self.gamma, 0.2..=3.0, 1.0, "");
-        ui.separator();
+        c |= slider_ex(ui, "Gamma", &mut self.gamma, 0.2..=3.0, 1.0, "", 0.01, 2, false);
+        section(ui, cx, "Tone");
         c |= slider(ui, "Shadows", &mut self.shadows, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Highlights", &mut self.highlights, -100.0..=100.0, 0.0, "");
-        ui.separator();
+        section(ui, cx, "Color");
         c |= slider(ui, "Saturation", &mut self.saturation, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Vibrance", &mut self.vibrance, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Hue", &mut self.hue, -180.0..=180.0, 0.0, "°");
-        ui.separator();
+        section(ui, cx, "White balance");
         c |= slider(ui, "Temperature", &mut self.temperature, -100.0..=100.0, 0.0, "");
         c |= slider(ui, "Tint", &mut self.tint, -100.0..=100.0, 0.0, "");
+        hint(ui, "Double-click a slider or its label to reset it.");
         c
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {
