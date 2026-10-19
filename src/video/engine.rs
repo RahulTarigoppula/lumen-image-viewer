@@ -180,7 +180,7 @@ pub fn build_index(path: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> 
     let start = if vs.start_time() != ff::ffi::AV_NOPTS_VALUE { vs.start_time() as f64 * tb } else { 0.0 };
     let duration = input.duration() as f64 / ff::ffi::AV_TIME_BASE as f64;
     let mut out = Vec::new();
-    let mut pkt = ff::Packet::empty();
+    let mut pkt: ff::Packet;
     let mut n = 0u64;
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -961,7 +961,7 @@ pub fn thumbnail(path: &Path, max_side: u32) -> Result<RgbaImage> {
     }
     let mut frame = ff::frame::Video::empty();
     let mut got = false;
-    let mut pkt = ff::Packet::empty();
+    let mut pkt: ff::Packet;
     let mut reads = 0;
     while !got && reads < 4000 {
         reads += 1;
@@ -1118,7 +1118,7 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
     }
     let mut frame = ff::frame::Video::empty();
     let mut best: Option<ff::frame::Video> = None;
-    let mut pkt = ff::Packet::empty();
+    let mut pkt: ff::Packet;
     let mut eof = false;
     'outer: loop {
         while dec.receive_frame(&mut frame).is_ok() {

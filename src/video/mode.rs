@@ -388,7 +388,6 @@ pub struct VideoMode {
     analysis: Option<Analysis>,
     loop_ab: (Option<f64>, Option<f64>),
     goto: Option<String>,
-    last_activity: Instant,
     pixel: Option<(u32, u32)>,
     volume: f32,
     muted: bool,
@@ -448,7 +447,6 @@ impl VideoMode {
             analysis: None,
             loop_ab: (None, None),
             goto: None,
-            last_activity: Instant::now(),
             pixel: None,
             volume: 1.0,
             muted: false,
@@ -1653,7 +1651,7 @@ impl VideoMode {
     fn goto_dialog(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut target: Option<f64> = None;
-        egui::Modal::new(egui::Id::new("video-goto")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("video-goto")).show(ctx, |ui| {
             ui.set_width(340.0);
             ui.heading("Go to");
             ui.label(RichText::new("Frame number (1234), time (01:02.5 or 62.5s), or relative (+10f, -2s)").size(11.5));
