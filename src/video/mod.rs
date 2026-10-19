@@ -10,7 +10,7 @@ pub use lumen_core::video::{is_video_ext, VIDEO_EXTS};
 pub use lumen_core::video::{metrics, scopes};
 
 #[cfg(feature = "video")]
-mod analyze;
+pub mod analyze;
 #[cfg(feature = "video")]
 mod audio;
 #[cfg(feature = "video")]
