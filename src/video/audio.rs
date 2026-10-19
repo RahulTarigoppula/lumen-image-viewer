@@ -16,6 +16,16 @@ struct Inner {
     latency: f64,
 }
 
+/// Result of [`AudioShared::trim_to`].
+pub enum Trim {
+    /// The queue now starts at the requested time.
+    Done,
+    /// Nothing queued yet.
+    Empty,
+    /// The requested time is not in the queue.
+    Outside,
+}
+
 pub struct AudioShared {
     pub rate: u32,
     pub channels: u16,
@@ -56,6 +66,22 @@ impl AudioShared {
                 *p += secs;
             }
         }
+    }
+    /// Drop queued audio before `pts` so playback starts there.
+    pub fn trim_to(&self, pts: f64) -> Trim {
+        let mut i = self.inner.lock();
+        let Some(start) = i.next_pts else { return Trim::Empty };
+        let ch = self.channels as usize;
+        let end = start + (i.buf.len() / ch) as f64 / self.rate as f64;
+        // Allow one audio packet of slack either side.
+        if pts < start - 0.025 || pts > end + 0.025 {
+            return Trim::Outside;
+        }
+        let n = ((((pts - start).max(0.0)) * self.rate as f64) as usize * ch).min(i.buf.len());
+        i.buf.drain(..n);
+        i.next_pts = Some(start + (n / ch) as f64 / self.rate as f64);
+        i.last = None;
+        Trim::Done
     }
     /// Seconds of audio queued.
     pub fn buffered_secs(&self) -> f64 {

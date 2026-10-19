@@ -72,7 +72,7 @@ struct Source {
     history: VecDeque<VFrame>,
     tex: Option<egui::TextureHandle>,
     tex_key: (u64, u64),
-    index: Arc<Mutex<Option<Vec<IndexEntry>>>>,
+    index: engine::SharedIndex,
     index_progress: Arc<AtomicU32>,
     index_cancel: Arc<AtomicBool>,
     eof: bool,
@@ -83,13 +83,15 @@ struct Source {
     awaiting: bool,
     /// Mirrors the mode's playing state (set every frame by `poll`).
     playing_hint: bool,
+    /// When the pending seek was sent (drives the "Seeking" badge).
+    seek_started: Option<Instant>,
 }
 
 impl Source {
     fn open(path: &Path, audio: Option<Arc<super::audio::AudioShared>>, ctx: &egui::Context) -> anyhow::Result<Source> {
         let info = engine::probe(path)?;
-        let player = Player::open(path, audio, ctx.clone())?;
-        let index = Arc::new(Mutex::new(None));
+        let index: engine::SharedIndex = Arc::new(Mutex::new(None));
+        let player = Player::open(path, audio, index.clone(), ctx.clone())?;
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         {
@@ -123,6 +125,7 @@ impl Source {
             error: None,
             awaiting: true,
             playing_hint: false,
+            seek_started: None,
         })
     }
 
@@ -182,12 +185,13 @@ impl Source {
         self.index.lock().as_ref().and_then(|v| v.get(frame).copied())
     }
 
-    fn seek(&mut self, t: f64, exact: bool, fill_history: bool) {
+    fn seek(&mut self, t: f64, exact: bool) {
         self.gen += 1;
         self.queue.clear();
         self.eof = false;
         self.awaiting = true;
-        self.player.send(Cmd::Seek { t, exact, gen: self.gen, fill_history });
+        self.seek_started = Some(Instant::now());
+        self.player.send(Cmd::Seek { t, exact, gen: self.gen });
     }
 
     fn set_current(&mut self, f: VFrame) {
@@ -217,9 +221,10 @@ impl Source {
         } else {
             self.history.insert(pos, f);
         }
-        // Bound memory (~600 MB worth of display frames).
+        // Bound memory (160 MB of display frames; the decoder keeps its own
+        // cache of decoded frames for stepping further back).
         let bytes_per = self.history.front().map(|h| h.rgba.as_raw().len()).unwrap_or(1).max(1);
-        let cap = ((320usize << 20) / bytes_per).clamp(8, 240);
+        let cap = ((160usize << 20) / bytes_per).clamp(8, 240);
         while self.history.len() > cap {
             // Drop the frame farthest from the current position.
             let cur = self.pts();
@@ -256,23 +261,24 @@ impl Source {
                     if f.gen != self.gen {
                         continue;
                     }
-                    if f.history {
-                        self.remember(f);
-                    } else if playing || !self.awaiting {
-                        self.awaiting = false;
+                    let awaited = self.awaiting;
+                    self.awaiting = false;
+                    self.seek_started = None;
+                    if playing || !awaited {
                         if playing && self.current.is_none() {
                             self.set_current(f);
                         } else {
                             self.queue.push_back(f);
                         }
                     } else {
-                        self.awaiting = false;
                         self.set_current(f);
                     }
                 }
                 Event::Eof { gen } => {
                     if gen == self.gen {
                         self.eof = true;
+                        self.awaiting = false;
+                        self.seek_started = None;
                     }
                 }
                 Event::Error(e) => self.error = Some(e),
@@ -392,10 +398,15 @@ pub struct VideoMode {
     message: Option<String>,
     pending_swap: Option<(PathBuf, PathBuf, f64)>,
     snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
-    /// (index entries, columns, per-column (max size, kind, has key), p98 size, built at)
-    timeline_cache: Option<(usize, usize, Vec<(u32, u8, bool)>, f32, Instant)>,
+    /// (index entries, columns, per-column bars from `timeline_columns`, built at)
+    timeline_cache: Option<(usize, usize, Vec<TimelineColumn>, Instant)>,
     /// Frame number most recently requested by stepping (until it arrives).
     pending_step: Option<usize>,
+    /// Widget id of the B offset field (last frame), so + and - keep
+    /// shifting B while that field has keyboard focus.
+    offset_field: Option<egui::Id>,
+    /// Dev hook only: start time and press count of the current step burst.
+    dev_burst: Option<(Instant, u32)>,
 }
 
 impl VideoMode {
@@ -445,6 +456,8 @@ impl VideoMode {
             snap_rx: None,
             timeline_cache: None,
             pending_step: None,
+            offset_field: None,
+            dev_burst: None,
         };
         for p in paths.into_iter().take(2) {
             vm.add_source(&p, &core.ctx, &mut None);
@@ -464,7 +477,7 @@ impl VideoMode {
                     s.player.send(Cmd::Native(true));
                     self.sources[0].player.send(Cmd::Native(true));
                     let t = self.sources[0].pts() + self.offset_secs_for(&s);
-                    s.seek(t, true, false);
+                    s.seek(t, true);
                 }
                 self.sources.push(s);
                 self.auto_fit = true;
@@ -530,6 +543,7 @@ impl VideoMode {
     }
 
     fn seek_all(&mut self, t: f64, exact: bool) {
+        self.pending_step = None;
         let was = self.playing;
         if was {
             self.pause();
@@ -539,7 +553,7 @@ impl VideoMode {
         let t = t.clamp(0.0, (dur - 0.001).max(0.0));
         for (i, s) in self.sources.iter_mut().enumerate() {
             let target = if i == 0 { t } else { t + off };
-            s.seek(target.max(0.0), exact, false);
+            s.seek(target.max(0.0), exact);
         }
         self.clock.base_pts = t;
         if was && exact {
@@ -561,6 +575,13 @@ impl VideoMode {
         }
         if self.playing {
             self.pause();
+        }
+        if dev_dir().is_some() {
+            if self.dev_burst.is_none() {
+                dev_log(&format!("at={:.1} press", dev_clock()));
+            }
+            let b = self.dev_burst.get_or_insert((Instant::now(), 0));
+            b.1 += 1;
         }
         let cur = self.sources[0].pts();
         // Rapid key presses: step from the frame already requested, not from
@@ -587,10 +608,10 @@ impl VideoMode {
                 // Re-anchor the decoder so the next forward step continues from here.
                 s.gen += 1;
                 s.awaiting = true;
-                s.player.send(Cmd::Seek { t, exact: true, gen: s.gen, fill_history: false });
+                s.player.send(Cmd::Seek { t, exact: true, gen: s.gen });
                 continue;
             }
-            s.seek(t, true, delta < 0);
+            s.seek(t, true);
         }
     }
 
@@ -605,11 +626,17 @@ impl VideoMode {
             let frame = s.frame_of(pts);
             let stem = s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let mut dlg = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{stem}_frame{frame:06}.png"));
-            if let Some(d) = s.path.parent() {
+            // Not the video's own folder: it is often read-only or a media library.
+            if let Some(d) = last_snapshot_dir().or_else(dirs::picture_dir) {
                 dlg = dlg.set_directory(d);
             }
             match dlg.save_file() {
-                Some(p) => Some(p),
+                Some(p) => {
+                    if let Some(d) = p.parent() {
+                        remember_snapshot_dir(d);
+                    }
+                    Some(p)
+                }
                 None => return,
             }
         };
@@ -675,11 +702,7 @@ impl VideoMode {
         let Some(an) = &self.analysis else { return };
         let rows = an.rows.lock().clone();
         let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("lumen_metrics.csv").save_file() else { return };
-        let mut s = String::from("frame,psnr_y,psnr_u,psnr_v,psnr_avg,ssim_y,ssim_db\n");
-        for (i, m) in rows {
-            s += &format!("{i},{:.4},{:.4},{:.4},{:.4},{:.6},{:.4}\n", m.psnr_y, m.psnr_u, m.psnr_v, m.psnr_avg, m.ssim_y, metrics::ssim_db(m.ssim_y));
-        }
-        match std::fs::write(&p, s) {
+        match std::fs::write(&p, metrics::to_csv(&rows)) {
             Ok(()) => core.toasts.success(format!("Exported {}", p.display())),
             Err(e) => core.toasts.error(e.to_string()),
         }
@@ -717,6 +740,7 @@ impl VideoMode {
             }
         }
         self.advance_playback(&ctx);
+        self.dev_report_step();
         if self.flicker_auto && self.flicker_at.elapsed() > Duration::from_millis(500) {
             self.flicker_b = !self.flicker_b;
             self.flicker_at = Instant::now();
@@ -725,10 +749,12 @@ impl VideoMode {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        let mut keep = true;
+        // Keys first, so this frame already shows their effect (B offset,
+        // panels, compare mode) instead of the state before the press.
+        let mut keep = self.keys(&ctx, core);
         egui::Panel::top("video-top")
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(8, 6)))
-            .show(ui, |ui| keep = self.top_bar(ui, core));
+            .show(ui, |ui| keep &= self.top_bar(ui, core));
         egui::Panel::bottom("video-transport")
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 6)))
             .show(ui, |ui| self.transport(ui, core));
@@ -752,9 +778,6 @@ impl VideoMode {
 
         if self.goto.is_some() {
             self.goto_dialog(&ctx);
-        }
-        if !self.keys(&ctx, core) {
-            keep = false;
         }
         if !keep {
             self.pause();
@@ -852,7 +875,9 @@ impl VideoMode {
                 widgets::separator_v(ui);
                 ui.label(RichText::new("B offset").color(p.muted).size(12.0));
                 let mut off = self.offset_frames;
-                if ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)").changed() {
+                let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
+                self.offset_field = Some(r.id);
+                if r.changed() {
                     self.set_offset(off);
                 }
                 if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
@@ -878,7 +903,7 @@ impl VideoMode {
         self.offset_frames = off;
         if self.sources.len() == 2 {
             let t = self.sources[0].pts() + self.offset_secs();
-            self.sources[1].seek(t.max(0.0), true, false);
+            self.sources[1].seek(t.max(0.0), true);
             self.metrics_now = None;
         }
     }
@@ -979,7 +1004,7 @@ impl VideoMode {
                 let off = self.offset_secs();
                 for (i, s) in self.sources.iter_mut().enumerate() {
                     s.history.clear();
-                    s.seek(if i == 0 { t } else { t + off }, true, false);
+                    s.seek(if i == 0 { t } else { t + off }, true);
                 }
             }
         }
@@ -1136,6 +1161,23 @@ impl VideoMode {
         let r = Rect::from_min_size(Pos2::new(view.max.x - g.size().x - 30.0, view.max.y - 36.0), g.size() + Vec2::new(16.0, 8.0));
         painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(150));
         painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+        // A slow seek (long GOP) keeps the last frame on screen with a badge,
+        // so stepping never looks frozen.
+        if let Some(t0) = a.seek_started {
+            let delay = Duration::from_millis(150);
+            if t0.elapsed() >= delay {
+                let txt = match self.pending_step {
+                    Some(f) => format!("Seeking to frame {f}..."),
+                    None => "Seeking...".to_string(),
+                };
+                let g = painter.layout_no_wrap(txt, FontId::proportional(13.0), Color32::WHITE);
+                let r = Rect::from_center_size(Pos2::new(view.center().x, view.min.y + 34.0), g.size() + Vec2::new(24.0, 12.0));
+                painter.rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(190));
+                painter.galley(r.min + Vec2::new(12.0, 6.0), g, Color32::WHITE);
+            } else {
+                ui.ctx().request_repaint_after(delay - t0.elapsed());
+            }
+        }
         if self.audio.is_none() {
             if let Some(e) = &self.audio_error {
                 painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  No audio output: {e}", I::SPEAKER_SLASH), FontId::proportional(11.5), p.muted);
@@ -1345,44 +1387,31 @@ impl VideoMode {
             // Aggregating 100k+ index entries is too costly per frame: cache it
             // per (entry count, width) and refresh periodically as frame types are learned.
             let stale = match &self.timeline_cache {
-                Some((n, c, _, _, at)) => *n != idx.len() || *c != cols || at.elapsed() > Duration::from_secs(2),
+                Some((n, c, _, at)) => *n != idx.len() || *c != cols || at.elapsed() > Duration::from_secs(2),
                 None => true,
             };
             if stale {
-                let mut col_max = vec![(0u32, b'?', false); cols];
-                for e in idx.iter() {
-                    let c = (((e.pts / dur) * cols as f64) as usize).min(cols - 1);
-                    let slot = &mut col_max[c];
-                    slot.2 |= e.key;
-                    if e.size >= slot.0 {
-                        slot.0 = e.size;
-                        slot.1 = if e.kind == b'?' && e.key { b'I' } else { e.kind };
-                    }
-                }
-                let mut sizes: Vec<u32> = idx.iter().map(|e| e.size).collect();
-                let k = sizes.len() * 98 / 100;
-                let last = sizes.len().saturating_sub(1);
-                let p98 = if sizes.is_empty() { 1 } else { *sizes.select_nth_unstable(k.min(last)).1 }.max(1) as f32;
-                self.timeline_cache = Some((idx.len(), cols, col_max, p98, Instant::now()));
+                self.timeline_cache = Some((idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
             }
-            let (_, _, col_max, p98, _) = self.timeline_cache.as_ref().unwrap();
-            let p98 = *p98;
+            let (_, _, columns, _) = self.timeline_cache.as_ref().unwrap();
             let bar_h = h - 18.0;
+            let base = rect.max.y - 4.0;
             let mut mesh = egui::Mesh::default();
-            for (c, (size, kind, key)) in col_max.iter().enumerate() {
-                if *size == 0 {
+            for (c, col) in columns.iter().enumerate() {
+                if col.height <= 0.0 {
                     continue;
                 }
-                let v = (*size as f32 / p98).min(1.0);
-                let _ = key;
-                let color = match (*kind, false) {
-                    (b'I', _) => Color32::from_rgb(235, 90, 80),
-                    (b'P', _) => Color32::from_rgb(80, 150, 255),
-                    (b'B', _) => Color32::from_rgb(80, 200, 120),
-                    _ => Color32::from_rgb(110, 116, 128),
-                };
+                // Stack the frame types bottom-up by their share of the column's bytes.
                 let x = rect.min.x + c as f32;
-                mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, rect.max.y - 4.0 - v * bar_h), Pos2::new(x + 1.0, rect.max.y - 4.0)), color.gamma_multiply(0.85));
+                let mut y = base;
+                for (share, color) in col.shares.iter().zip(TIMELINE_COLORS) {
+                    if *share <= 0.0 {
+                        continue;
+                    }
+                    let top = y - share * col.height * bar_h;
+                    mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + 1.0, y)), color.gamma_multiply(0.85));
+                    y = top;
+                }
             }
             painter.add(egui::Shape::mesh(mesh));
         } else {
@@ -1427,7 +1456,7 @@ impl VideoMode {
             }
             if let Some(an) = &self.analysis {
                 if let Some((_, m)) = an.rows.lock().iter().find(|(i, _)| *i == f) {
-                    tip += &format!("  ·  PSNR {:.2} dB  SSIM {:.4}", m.psnr_y, m.ssim_y);
+                    tip += &format!("  ·  PSNR {:.2} dB  SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y);
                 }
             }
             resp.clone().on_hover_text_at_pointer(tip);
@@ -1448,7 +1477,7 @@ impl VideoMode {
             self.scrubbing = false;
         }
         // Legend
-        let legend = [("I", Color32::from_rgb(235, 90, 80)), ("P", Color32::from_rgb(80, 150, 255)), ("B", Color32::from_rgb(80, 200, 120))];
+        let legend = [("I", TIMELINE_COLORS[0]), ("P", TIMELINE_COLORS[1]), ("B", TIMELINE_COLORS[2])];
         let mut lx = rect.min.x + 8.0;
         for (l, c) in legend {
             painter.rect_filled(Rect::from_min_size(Pos2::new(lx, rect.min.y + 6.0), Vec2::new(8.0, 8.0)), CornerRadius::same(2), c);
@@ -1542,7 +1571,7 @@ impl VideoMode {
                             worst.sort_by(|a, b| a.1.psnr_y.partial_cmp(&b.1.psnr_y).unwrap_or(std::cmp::Ordering::Equal));
                             let mut jump = None;
                             for (i, m) in worst.iter().take(8) {
-                                if ui.add(egui::Button::new(RichText::new(format!("#{i:<7} PSNR {:>6.2} dB   SSIM {:.4}", m.psnr_y, m.ssim_y)).monospace().size(11.5)).frame(false)).clicked() {
+                                if ui.add(egui::Button::new(RichText::new(format!("#{i:<7} PSNR {:>6.2} dB   SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y)).monospace().size(11.5)).frame(false)).clicked() {
                                     jump = Some(*i);
                                 }
                             }
@@ -1565,22 +1594,7 @@ impl VideoMode {
             ui.add_space(8.0);
             widgets::section_title(ui, &p, "Media info");
             let rows = media_rows(&self.sources.iter().map(|s| &s.info).collect::<Vec<_>>());
-            egui::Grid::new("media-info").num_columns(if compare { 3 } else { 2 }).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
-                if compare {
-                    ui.label("");
-                    ui.label(RichText::new("A").strong().color(Color32::from_rgb(255, 170, 60)));
-                    ui.label(RichText::new("B").strong().color(Color32::from_rgb(90, 190, 255)));
-                    ui.end_row();
-                }
-                for (k, vals) in rows {
-                    let mismatch = compare && vals.len() == 2 && vals[0] != vals[1];
-                    ui.label(RichText::new(k).size(11.5).color(if mismatch { p.warn } else { p.muted }));
-                    for v in vals {
-                        ui.add(egui::Label::new(RichText::new(v).size(11.5).color(if mismatch { p.warn } else { p.text })).wrap());
-                    }
-                    ui.end_row();
-                }
-            });
+            media_table(ui, &p, compare, rows);
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Decoder: FFmpeg {}", engine::ffmpeg_version())).size(10.5).color(p.faint));
         });
@@ -1659,6 +1673,34 @@ impl VideoMode {
     // ---------------------------------------------------------------- keys
 
     fn keys(&mut self, ctx: &egui::Context, core: &mut Core) -> bool {
+        // A click on the B offset field starts editing it as text; + and -
+        // still shift B then (typing them would only leave an unparsable
+        // value behind, and the field would keep showing the old offset).
+        if self.sources.len() == 2 && self.offset_field.is_some_and(|id| ctx.memory(|m| m.has_focus(id))) {
+            let steps: Vec<i64> = ctx.input_mut(|i| {
+                let mut steps = Vec::new();
+                i.events.retain(|e| match e {
+                    egui::Event::Key { key: Key::Plus | Key::Equals, pressed, modifiers, .. } => {
+                        if *pressed {
+                            steps.push(if modifiers.ctrl { 10 } else { 1 });
+                        }
+                        false
+                    }
+                    egui::Event::Key { key: Key::Minus, pressed, modifiers, .. } => {
+                        if *pressed {
+                            steps.push(if modifiers.ctrl { -10 } else { -1 });
+                        }
+                        false
+                    }
+                    egui::Event::Text(t) => !matches!(t.as_str(), "+" | "-" | "="),
+                    _ => true,
+                });
+                steps
+            });
+            for d in steps {
+                self.set_offset(self.offset_frames + d);
+            }
+        }
         if self.goto.is_some() || ctx.text_edit_focused() {
             return true;
         }
@@ -1767,6 +1809,25 @@ impl VideoMode {
         keep
     }
 
+    /// Dev hook: log how long a burst of steps took to land, with a hash of
+    /// the landed frame so tests can check frame accuracy.
+    fn dev_report_step(&mut self) {
+        let Some((t0, n)) = self.dev_burst else { return };
+        let Some(a) = self.sources.first() else { return };
+        let Some(cur) = &a.current else { return };
+        let landed = a.frame_of(cur.pts);
+        // Done when the requested frame is on screen (or the decoder settled elsewhere).
+        if a.awaiting && Some(landed) != self.pending_step {
+            return;
+        }
+        self.dev_burst = None;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in cur.rgba.as_raw() {
+            h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+        }
+        dev_log(&format!("at={:.1} steps={n} frame={landed} pts={:.4} ms={:.1} hash={h:016x}", dev_clock(), cur.pts, t0.elapsed().as_secs_f64() * 1000.0));
+    }
+
     fn jump_keyframe(&mut self, forward: bool) {
         let a = &self.sources[0];
         let cur = a.pts();
@@ -1793,6 +1854,42 @@ impl Drop for VideoMode {
         }
         if let Some(a) = self.audio_shared() {
             a.playing.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+fn snapshot_dir_file() -> PathBuf {
+    crate::settings::data_dir().join("video-snapshot-dir.txt")
+}
+
+/// Folder the last frame snapshot was saved to, if it still exists.
+fn last_snapshot_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(snapshot_dir_file()).ok()?;
+    Some(PathBuf::from(text.trim())).filter(|d| d.is_dir())
+}
+
+fn remember_snapshot_dir(dir: &Path) {
+    let _ = std::fs::create_dir_all(crate::settings::data_dir());
+    let _ = std::fs::write(snapshot_dir_file(), dir.to_string_lossy().as_bytes());
+}
+
+pub(super) fn dev_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("LUMEN_DEV_DIR").map(PathBuf::from)).as_ref()
+}
+
+/// Milliseconds since the first dev log call (dev automation only).
+fn dev_clock() -> f64 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Append a line to `video.log` in the dev hook folder (dev automation only).
+pub(super) fn dev_log(line: &str) {
+    use std::io::Write;
+    if let Some(d) = dev_dir() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(d.join("video.log")) {
+            let _ = writeln!(f, "{line}");
         }
     }
 }
@@ -1839,6 +1936,112 @@ fn media_rows(infos: &[&MediaInfo]) -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
+/// Media info as a striped table: a fixed label column and equal value
+/// columns (A and B), so a long value never squeezes the other column.
+/// File names stay on one line, ellipsized, with the full name on hover.
+fn media_table(ui: &mut Ui, p: &Palette, compare: bool, rows: Vec<(&'static str, Vec<String>)>) {
+    const LABEL_W: f32 = 96.0;
+    const GAP: f32 = 8.0;
+    let cols = if compare { 2 } else { 1 };
+    let width = ui.available_width();
+    let value_w = ((width - LABEL_W - GAP * cols as f32) / cols as f32).max(40.0);
+    let cell = |ui: &mut Ui, w: f32, add: &mut dyn FnMut(&mut Ui)| {
+        ui.allocate_ui_with_layout(Vec2::new(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(w);
+            add(ui);
+        });
+    };
+    let row = |ui: &mut Ui, stripe: bool, add: &mut dyn FnMut(&mut Ui)| {
+        let bg = ui.painter().add(egui::Shape::Noop);
+        let r = ui
+            .horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                add(ui);
+            })
+            .response
+            .rect;
+        if stripe {
+            ui.painter().set(bg, egui::Shape::rect_filled(r.expand2(Vec2::new(4.0, 2.0)), CornerRadius::same(3), ui.visuals().faint_bg_color));
+        }
+    };
+    ui.spacing_mut().item_spacing.y = 4.0;
+    if compare {
+        row(ui, false, &mut |ui| {
+            cell(ui, LABEL_W, &mut |_| {});
+            cell(ui, value_w, &mut |ui| {
+                ui.label(RichText::new("A").strong().color(Color32::from_rgb(255, 170, 60)));
+            });
+            cell(ui, value_w, &mut |ui| {
+                ui.label(RichText::new("B").strong().color(Color32::from_rgb(90, 190, 255)));
+            });
+        });
+    }
+    for (n, (k, vals)) in rows.into_iter().enumerate() {
+        let mismatch = compare && vals.len() == 2 && vals[0] != vals[1];
+        let one_line = k == "File";
+        row(ui, n % 2 == 0, &mut |ui| {
+            cell(ui, LABEL_W, &mut |ui| {
+                ui.add(egui::Label::new(RichText::new(k).size(11.5).color(if mismatch { p.warn } else { p.muted })).wrap());
+            });
+            for v in &vals {
+                cell(ui, value_w, &mut |ui| {
+                    let text = RichText::new(v.as_str()).size(11.5).color(if mismatch { p.warn } else { p.text });
+                    // Truncated labels show the full text as a tooltip.
+                    let label = if one_line { egui::Label::new(text).truncate() } else { egui::Label::new(text).wrap() };
+                    ui.add(label);
+                });
+            }
+        });
+    }
+}
+
+/// Timeline colors for I, P, B and not yet known frame types.
+const TIMELINE_COLORS: [Color32; 4] = [Color32::from_rgb(235, 90, 80), Color32::from_rgb(80, 150, 255), Color32::from_rgb(80, 200, 120), Color32::from_rgb(110, 116, 128)];
+
+/// One pixel column of the frame-size timeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TimelineColumn {
+    /// Mean frame size in the column relative to the 98th percentile (0..=1).
+    height: f32,
+    /// Share of the column's bytes in I, P, B and unknown frames.
+    shares: [f32; 4],
+}
+
+/// Aggregate the frame index into `cols` columns. Heights follow the mean
+/// frame size (so one large I-frame does not turn a column of a long film
+/// into a full red bar) and each bar is split by the bytes of each type.
+fn timeline_columns(idx: &[IndexEntry], dur: f64, cols: usize) -> Vec<TimelineColumn> {
+    let cols = cols.max(1);
+    let mut sums = vec![([0u64; 4], 0u32); cols];
+    for e in idx {
+        let c = (((e.pts / dur.max(1e-9)) * cols as f64).max(0.0) as usize).min(cols - 1);
+        let k = match e.kind {
+            b'I' => 0,
+            b'P' => 1,
+            b'B' => 2,
+            _ if e.key => 0,
+            _ => 3,
+        };
+        sums[c].0[k] += e.size as u64;
+        sums[c].1 += 1;
+    }
+    let means: Vec<f64> = sums.iter().map(|(b, n)| if *n == 0 { 0.0 } else { b.iter().sum::<u64>() as f64 / *n as f64 }).collect();
+    let mut sorted: Vec<f64> = means.iter().copied().filter(|m| *m > 0.0).collect();
+    let p98 = if sorted.is_empty() {
+        1.0
+    } else {
+        let k = (sorted.len() * 98 / 100).min(sorted.len() - 1);
+        *sorted.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
+    };
+    sums.iter()
+        .zip(&means)
+        .map(|((bytes, _), mean)| {
+            let total = bytes.iter().sum::<u64>().max(1) as f32;
+            TimelineColumn { height: (mean / p98.max(1.0)).min(1.0) as f32, shares: bytes.map(|b| b as f32 / total) }
+        })
+        .collect()
+}
+
 fn kind_name(k: char) -> &'static str {
     match k {
         'I' => "I-frame",
@@ -1860,13 +2063,14 @@ pub fn fmt_time(t: f64) -> String {
     }
 }
 
+/// dB value for display, capped like the CSV export (see `metrics::PSNR_CAP_DB`).
 fn fmt_db(v: f64) -> String {
-    if v.is_infinite() {
-        "∞ (identical)".into()
-    } else if v.is_nan() {
+    if v.is_nan() {
         " - ".into()
+    } else if v.is_infinite() {
+        format!("{:.2} dB (identical)", metrics::PSNR_CAP_DB)
     } else {
-        format!("{v:.3} dB")
+        format!("{:.3} dB", metrics::cap_db(v))
     }
 }
 
@@ -1914,6 +2118,31 @@ fn _yuv(_: &YuvFrame) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timeline_heights_ignore_lone_iframes() {
+        // A long film: 10 frames per column, one big keyframe in every column.
+        let mut idx = Vec::new();
+        for i in 0..1000 {
+            let key = i % 10 == 0;
+            // Mid-frame times keep the binning clear of rounding at column edges.
+            idx.push(IndexEntry { pts: (i as f64 + 0.5) / 25.0, size: if key { 100_000 } else { 10_000 }, key, kind: if key { b'I' } else { b'?' } });
+        }
+        let cols = timeline_columns(&idx, 40.0, 100);
+        assert_eq!(cols.len(), 100);
+        for c in &cols {
+            assert!((c.height - 1.0).abs() < 1e-6);
+            // The keyframe is about half of the bytes, not the whole bar.
+            assert!((c.shares[0] - 100.0 / 190.0).abs() < 1e-4, "{:?}", c.shares);
+            assert!((c.shares[3] - 90.0 / 190.0).abs() < 1e-4);
+        }
+        // Few frames: one per column, colored by its own type.
+        let small = [IndexEntry { pts: 0.0, size: 50, key: true, kind: b'I' }, IndexEntry { pts: 1.0, size: 10, key: false, kind: b'B' }];
+        let cols = timeline_columns(&small, 2.0, 2);
+        assert_eq!(cols[0].shares, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(cols[1].shares, [0.0, 0.0, 1.0, 0.0]);
+        assert!(cols[1].height < cols[0].height);
+    }
+
     #[test]
     fn time_format() {
         assert_eq!(fmt_time(62.5), "01:02.500");
