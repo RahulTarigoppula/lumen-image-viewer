@@ -106,7 +106,8 @@ fn for_mask_rows(img: &mut RgbaImage, m: &Mask, f: impl Fn(u32, u32, f32, &mut [
 
 /// Healing: clone the source texture, then add a smooth colour offset field
 /// that matches the destination around the stroke's border (a fast membrane /
-/// normalised-convolution approximation of Poisson blending).
+/// normalised-convolution approximation of Poisson blending). The result
+/// keeps the source's detail on the destination's low frequencies.
 fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
     let (iw, ih) = img.dimensions();
     let m = mask::stroke_mask(&s.pts, s.radius, s.hardness, iw, ih);
@@ -114,9 +115,16 @@ fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
         return;
     }
     let [dx, dy] = s.offset;
-    // Work box: the mask grown by a border band whose colours drive the match.
-    let band = (s.radius * 0.6).clamp(2.0, 400.0);
-    let Some(wb) = mask::clip_box([m.x0 as f32 - band, m.y0 as f32 - band, (m.x0 + m.w) as f32 + band, (m.y0 + m.h) as f32 + band], iw, ih) else { return };
+    // The colours that drive the match come from a thin ring just outside the
+    // stroke, like Poisson's boundary: a wide band would pull in colours from
+    // beyond a nearby edge and smear them into a flat area.
+    let band = (s.radius * 0.2).clamp(2.0, 60.0);
+    let ring = mask::stroke_mask(&s.pts, s.radius + band, 1.0, iw, ih);
+    // Work box: the stroke plus its ring (both, as path simplification can
+    // differ slightly between the two masks).
+    let ((ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1)) = (m.bounds(), ring.bounds());
+    let (x0, y0) = (ax0.min(bx0), ay0.min(by0));
+    let wb = (x0, y0, ax1.max(bx1) - x0, ay1.max(by1) - y0);
     let Some(sb) = mask::clip_box([wb.0 as f32 + dx - 2.0, wb.1 as f32 + dy - 2.0, (wb.0 + wb.2) as f32 + dx + 2.0, (wb.1 + wb.3) as f32 + dy + 2.0], iw, ih) else { return };
     let src = patch(img, sb);
     let (ww, wh) = (wb.2 as usize, wb.3 as usize);
@@ -142,7 +150,7 @@ fn heal_stroke(img: &mut RgbaImage, s: &BrushStroke) {
             for ry in cy * f..((cy + 1) * f).min(wh) {
                 for rx in 0..ww {
                     let (x, y) = (wb.0 + rx as u32, wb.1 + ry as u32);
-                    if m.at(x, y) > 0.0 {
+                    if m.at(x, y) > 0.0 || ring.at(x, y) <= 0.0 {
                         continue;
                     }
                     if let Some(sv) = sample_src(x, y) {
@@ -241,21 +249,38 @@ pub fn red_eye(img: &mut RgbaImage, boxes: &[[f32; 4]], scale: f32, sensitivity:
         let (rx, ry) = (((bx1 - bx0) / 2.0).max(0.5), ((by1 - by0) / 2.0).max(0.5));
         let (wu, hu) = (w as usize, h as usize);
         let raw = img.as_raw();
+        let inside = |x: usize, y: usize| {
+            let (nx, ny) = (((x as f32 + 0.5) - cx) / rx, ((y as f32 + 0.5) - cy) / ry);
+            (nx * nx + ny * ny).sqrt()
+        };
+        // How red the pupil itself is (upper quartile of the red pixels in the
+        // ellipse). A strongly red pupil raises the bar, so a brownish iris or
+        // skin next to it (only mildly red) is left alone even when the box is
+        // generous; a faintly red pupil keeps the plain threshold.
+        let mut reds: Vec<f32> = (0..hu)
+            .flat_map(|j| (0..wu).map(move |i| (x0 as usize + i, y0 as usize + j)))
+            .filter(|&(x, y)| inside(x, y) < 0.75)
+            .map(|(x, y)| redness(&raw[(y * iw as usize + x) * 4..]))
+            .filter(|&q| q >= thresh)
+            .collect();
+        let peak = if reds.is_empty() {
+            0.0
+        } else {
+            let k = reds.len() * 3 / 4;
+            *reds.select_nth_unstable_by(k, f32::total_cmp).1
+        };
+        let (lo, hi) = ((thresh * 0.8).max(peak * 0.45), (thresh * 1.1).max(peak * 0.65));
         // Weight map: redness x position inside the ellipse.
         let mut wgt = vec![0f32; wu * hu];
         wgt.par_chunks_mut(wu).enumerate().for_each(|(ry_i, row)| {
             for (rx_i, v) in row.iter_mut().enumerate() {
                 let (x, y) = (x0 as usize + rx_i, y0 as usize + ry_i);
-                let (nx, ny) = (((x as f32 + 0.5) - cx) / rx, ((y as f32 + 0.5) - cy) / ry);
-                let e = 1.0 - smoothstep(0.75, 1.0, (nx * nx + ny * ny).sqrt());
+                let e = 1.0 - smoothstep(0.75, 1.0, inside(x, y));
                 if e <= 0.0 {
                     continue;
                 }
                 let i = (y * iw as usize + x) * 4;
-                let (r, g, bl) = (raw[i] as f32, raw[i + 1] as f32, raw[i + 2] as f32);
-                let gb = (g + bl) / 2.0;
-                let ratio = r / (gb + 10.0);
-                let red = smoothstep(thresh * 0.8, thresh * 1.1, ratio) * smoothstep(40.0, 80.0, r);
+                let red = smoothstep(lo, hi, redness(&raw[i..])) * smoothstep(40.0, 80.0, raw[i] as f32);
                 *v = e * red;
             }
         });
@@ -285,6 +310,74 @@ pub fn red_eye(img: &mut RgbaImage, boxes: &[[f32; 4]], scale: f32, sensitivity:
             }
         });
     }
+}
+
+/// Red / mean(green, blue) ratio of a pixel (the red-eye "redness").
+#[inline]
+fn redness(p: &[u8]) -> f32 {
+    p[0] as f32 / ((p[1] as f32 + p[2] as f32) / 2.0 + 10.0)
+}
+
+/// The box (x0, y0, x1, y1, in `img` pixels) for a red-eye click at `at`:
+/// the red blob around the click, grown 4-connected from the reddest pixel
+/// near it. The box is padded so the corrected ellipse also covers the blob's
+/// anti-aliased rim. None when there is no red there, or when the red reaches
+/// further than `max_radius` from the seed (a red shirt or lips, not a pupil).
+pub fn red_eye_box_at(img: &RgbaImage, at: [f32; 2], max_radius: f32, sensitivity: f32) -> Option<[f32; 4]> {
+    let (iw, ih) = img.dimensions();
+    if iw == 0 || ih == 0 || !at.iter().all(|v| v.is_finite()) || !(max_radius >= 1.0) {
+        return None;
+    }
+    let thresh = 2.1 - 0.9 * sensitivity.clamp(0.0, 1.0);
+    let raw = img.as_raw();
+    let px = |x: u32, y: u32| &raw[(y as usize * iw as usize + x as usize) * 4..][..3];
+    let red_enough = |p: &[u8], min: f32| redness(p) >= min && p[0] >= 50;
+    // Seed: the reddest pixel within a few pixels of the click (clicks land a
+    // little off a small pupil, or on its specular highlight).
+    let (cx, cy) = (at[0].floor().clamp(0.0, (iw - 1) as f32) as i64, at[1].floor().clamp(0.0, (ih - 1) as f32) as i64);
+    let reach = (max_radius * 0.25).clamp(2.0, 40.0) as i64;
+    // (position, redness, squared distance to the click); ties go to the closest.
+    let mut seed: Option<((u32, u32), f32, i64)> = None;
+    for y in (cy - reach).max(0)..=(cy + reach).min(ih as i64 - 1) {
+        for x in (cx - reach).max(0)..=(cx + reach).min(iw as i64 - 1) {
+            let d2 = (x - cx).pow(2) + (y - cy).pow(2);
+            if d2 > reach * reach {
+                continue;
+            }
+            let p = px(x as u32, y as u32);
+            let r = redness(p);
+            if red_enough(p, thresh) && seed.is_none_or(|s| r > s.1 + 1e-3 || (r > s.1 - 1e-3 && d2 < s.2)) {
+                seed = Some(((x as u32, y as u32), r, d2));
+            }
+        }
+    }
+    let ((sx, sy), sr, _) = seed?;
+    // Grow over pixels that are clearly red relative to the seed, so the blob
+    // stops at skin (mildly red) but takes in the pupil's whole red disc.
+    let min = (sr * 0.45).max(thresh * 0.9);
+    let max2 = max_radius * max_radius;
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![(sx, sy)];
+    seen.insert((sx, sy));
+    let (mut x0, mut y0, mut x1, mut y1) = (sx, sy, sx, sy);
+    while let Some((x, y)) = stack.pop() {
+        if (x as f32 - sx as f32).powi(2) + (y as f32 - sy as f32).powi(2) > max2 {
+            return None;
+        }
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        let n = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)];
+        for (nx, ny) in n {
+            if nx < iw && ny < ih && !seen.contains(&(nx, ny)) && red_enough(px(nx, ny), min) {
+                seen.insert((nx, ny));
+                stack.push((nx, ny));
+            }
+        }
+    }
+    // The correction ellipse is inscribed in the box and fades out over its
+    // outer quarter: pad so the whole blob plus a rim pixel gets full weight.
+    let (bcx, bcy) = ((x0 + x1 + 1) as f32 / 2.0, (y0 + y1 + 1) as f32 / 2.0);
+    let (hw, hh) = ((x1 + 1 - x0) as f32 / 2.0 * 1.45 + 2.0, (y1 + 1 - y0) as f32 / 2.0 * 1.45 + 2.0);
+    Some([bcx - hw, bcy - hh, bcx + hw, bcy + hh])
 }
 
 #[inline]
@@ -471,6 +564,71 @@ mod tests {
         assert_eq!(img.get_pixel(12, 30).0, [90, 120, 160, 255]);
         // Degenerate boxes never panic.
         red_eye(&mut img, &[[5.0, 5.0, 5.0, 5.0], [-50.0, -50.0, -10.0, -10.0], [f32::NAN, 0.0, 1.0, 1.0]], 1.0, 1.0, 1.0);
+    }
+
+    /// Skin-coloured image with a 50 px red pupil (anti-aliased rim) in a
+    /// brown iris (radius 40) at (100, 80).
+    fn pupil_image() -> RgbaImage {
+        RgbaImage::from_fn(200, 160, |x, y| {
+            let d = ((x as f32 + 0.5 - 100.0).powi(2) + (y as f32 + 0.5 - 80.0).powi(2)).sqrt();
+            let t = (25.0 - d + 0.5).clamp(0.0, 1.0); // 1 inside, ramp over the rim pixel
+            let outer = if d < 40.0 { [95.0, 62.0, 32.0] } else { [215.0, 165.0, 140.0] };
+            let red = [205.0, 35.0, 45.0];
+            let c: [u8; 3] = std::array::from_fn(|k| (outer[k] + (red[k] - outer[k]) * t).round() as u8);
+            image::Rgba([c[0], c[1], c[2], 255])
+        })
+    }
+
+    #[test]
+    fn red_eye_click_covers_whole_pupil() {
+        let orig = pupil_image();
+        // A click a little off-centre finds the whole blob, not just its middle.
+        let b = red_eye_box_at(&orig, [108.0, 74.0], 40.0, 0.5).expect("pupil found");
+        assert!(b[0] < 75.0 && b[2] > 125.0 && b[1] < 55.0 && b[3] > 105.0, "box {b:?}");
+        let mut img = orig.clone();
+        red_eye(&mut img, &[b], 1.0, 0.5, 0.4);
+        for (x, y, p) in img.enumerate_pixels() {
+            let d = ((x as f32 + 0.5 - 100.0).powi(2) + (y as f32 + 0.5 - 80.0).powi(2)).sqrt();
+            let o = orig.get_pixel(x, y);
+            if d < 25.0 {
+                assert!(redness(&p.0) < 1.3, "red left at ({x}, {y}) d={d:.1}: {p:?}");
+            } else if d > 30.0 {
+                // The brownish iris (mildly red by ratio) and the skin stay.
+                assert!((0..3).all(|k| (p[k] as i32 - o[k] as i32).abs() <= 3), "iris / skin changed at ({x}, {y}): {p:?} was {o:?}");
+            }
+        }
+        // No red under the click, or red that is far too big for a pupil: no box.
+        assert_eq!(red_eye_box_at(&orig, [10.0, 10.0], 40.0, 0.5), None);
+        assert_eq!(red_eye_box_at(&orig, [100.0, 80.0], 12.0, 0.5), None);
+        assert_eq!(red_eye_box_at(&orig, [f32::NAN, 1.0], 40.0, 0.5), None);
+    }
+
+    #[test]
+    fn heal_on_flat_patch_stays_flat() {
+        // A flat red disc on white. The stroke lies inside the disc, close to
+        // its edge, with its source elsewhere in the disc: the result must stay
+        // the disc's flat red (no colour pulled in from the white outside).
+        let red = [200u8, 30, 30, 255];
+        let disc = |x: u32, y: u32| ((x as f32 + 0.5 - 150.0).powi(2) + (y as f32 + 0.5 - 150.0).powi(2)).sqrt() < 80.0;
+        let base = RgbaImage::from_fn(300, 300, |x, y| image::Rgba(if disc(x, y) { red } else { [250, 250, 250, 255] }));
+        let mut img = base.clone();
+        let s = BrushStroke { pts: vec![[200.0, 150.0], [204.0, 140.0], [200.0, 128.0]], radius: 20.0, hardness: 0.5, opacity: 1.0, offset: [-60.0, 0.0], heal: true };
+        apply_strokes(&mut img, &[s.clone()], 1.0);
+        for (x, y, p) in img.enumerate_pixels() {
+            if disc(x, y) {
+                for k in 0..3 {
+                    assert!((p[k] as i32 - red[k] as i32).abs() <= 2, "smear at ({x}, {y}): {p:?}");
+                }
+            } else {
+                assert_eq!(p, base.get_pixel(x, y));
+            }
+        }
+        // Same at preview scale.
+        let mut small = crate::imaging::resize_to_fit(&base, 150, 150);
+        let before = small.clone();
+        apply_strokes(&mut small, &[s], 0.5);
+        let c = small.get_pixel(100, 75);
+        assert_eq!(c, before.get_pixel(100, 75));
     }
 
     #[test]

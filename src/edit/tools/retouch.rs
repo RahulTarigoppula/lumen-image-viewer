@@ -145,10 +145,11 @@ impl EditTool for CloneStamp {
     fn canvas(&mut self, cx: &CanvasCtx, painter: &egui::Painter, resp: &egui::Response) -> bool {
         let pt = Pointer::read(cx, resp);
         let mut changed = false;
-        if pt.hover.is_some() {
-            self.hover = pt.hover;
-        } else if !self.painting {
-            self.hover = None;
+        // While painting, the brush follows the pointer even where egui does
+        // not report a hover (dragging, fast moves past the view edge).
+        let at = pt.hover.or(if self.painting { pt.pos } else { None });
+        if at.is_some() || !self.painting {
+            self.hover = at;
         }
         // Brush size keys.
         if cx.interactive && pt.hover.is_some() && !resp.ctx.egui_wants_keyboard_input() {
@@ -198,7 +199,9 @@ impl EditTool for CloneStamp {
             if cx.interactive {
                 resp.ctx.set_cursor_icon(if pt.alt { egui::CursorIcon::Cell } else { egui::CursorIcon::None });
             }
-            let src = if pt.alt { None } else { self.current_offset(h).map(|o| [h[0] + o[0], h[1] + o[1]]) };
+            // Mid-stroke the source moves with the brush by that stroke's offset.
+            let off = if self.painting { self.strokes.last().map(|s| s.offset) } else { self.current_offset(h) };
+            let src = if pt.alt { None } else { off.map(|o| [h[0] + o[0], h[1] + o[1]]) };
             if let Some(s) = src {
                 canvas::brush_ring(cx, painter, s, self.radius, None);
                 canvas::crosshair(cx, painter, s, Color32::from_rgb(120, 200, 255));
