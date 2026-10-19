@@ -185,26 +185,44 @@ impl FolderTree {
         got
     }
 
-    /// Expand all ancestors of `path` so the current folder is visible.
+    /// Expand all ancestors of `path` so the current folder is visible, and
+    /// re-list any ancestor whose cached listing does not have the next folder
+    /// on the way (it was created after that listing was read).
     pub fn reveal(&mut self, path: &Path) {
-        if self.revealed_for.as_deref() == Some(path) {
-            return;
+        let mut child = path;
+        while let Some(parent) = child.parent() {
+            self.expanded.insert(parent.to_path_buf());
+            if self.children.get(parent).is_some_and(|kids| !kids.iter().any(|k| k == child)) {
+                self.invalidate(parent);
+            }
+            child = parent;
         }
-        self.revealed_for = Some(path.to_path_buf());
-        let mut cur = path.parent();
-        while let Some(p) = cur {
-            self.expanded.insert(p.to_path_buf());
-            cur = p.parent();
-        }
-        self.scroll_to = Some(path.to_path_buf());
         self.rows_dirty = true;
+        if self.revealed_for.as_deref() != Some(path) {
+            self.revealed_for = Some(path.to_path_buf());
+            self.scroll_to = Some(path.to_path_buf());
+        }
     }
 
+    /// Re-read the listing of `dir` the next time it is shown (the old one stays
+    /// on screen until the new one arrives, so nothing flickers).
     pub fn invalidate(&mut self, dir: &Path) {
         if self.children.contains_key(dir) {
             self.stale.insert(dir.to_path_buf());
             self.rows_dirty = true;
         }
+    }
+
+    /// Re-read every listing and the drive list (F5, and when the window gets
+    /// the focus back, since folders may have been created or removed in
+    /// Explorer meanwhile). Only expanded folders are listed again right away;
+    /// collapsed ones are forgotten and listed when expanded.
+    pub fn refresh(&mut self) {
+        let expanded = &self.expanded;
+        self.children.retain(|dir, _| expanded.contains(dir));
+        self.stale.extend(self.children.keys().cloned());
+        self.drives_requested = false;
+        self.rows_dirty = true;
     }
 
     /// Rebuild the flat row list (only when something changed).
@@ -354,6 +372,8 @@ impl FolderTree {
         let selected = path == current;
         let hovered_drop = resp.dnd_hover_payload::<DragFiles>().is_some();
         let hovered = resp.hovered() && super::pointer_on_layer(ui);
+        // The full path shows as a tooltip only when the name does not fit.
+        let mut truncated = false;
         if ui.is_rect_visible(rect) {
             let bg = if hovered_drop {
                 p.accent.gamma_multiply(0.45)
@@ -387,6 +407,7 @@ impl FolderTree {
             let mut galley = ui.painter().layout_no_wrap(name.to_string(), font.clone(), color);
             if galley.size().x > text_rect.width() && text_rect.width() > 20.0 {
                 // Truncate with a plain "..." so long names stay readable (full path in the tooltip).
+                truncated = true;
                 let chars: Vec<char> = name.chars().collect();
                 let (mut lo, mut hi) = (0usize, chars.len());
                 while lo < hi {
@@ -423,7 +444,7 @@ impl FolderTree {
         if resp.double_clicked() && expandable {
             self.toggle(path);
         }
-        let resp = if hovered && self.tips { resp.on_hover_text(path.display().to_string()) } else { resp };
+        let resp = if hovered && self.tips && truncated { resp.on_hover_text(path.display().to_string()) } else { resp };
         resp.context_menu(|ui| {
             if ui.button(format!("{}  Open", I::FOLDER_OPEN)).clicked() {
                 action = Some(TreeAction::Navigate(path.to_path_buf()));

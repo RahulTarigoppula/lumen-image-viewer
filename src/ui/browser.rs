@@ -125,10 +125,13 @@ impl Browser {
         self.tree.reveal(&self.folder.clone());
     }
 
+    /// List the current folder again (files changed). Its sub-folders in the
+    /// tree are listed again too, since folders may have been added or removed.
     pub fn reload(&mut self, ctx: &egui::Context, show_hidden: bool) {
         let keep_focus = self.focused_path();
         self.pending_select = self.pending_select.take().or(keep_focus);
         let f = self.folder.clone();
+        self.tree.invalidate(&f);
         let sel = self.selected.clone();
         self.load(f, ctx, show_hidden);
         self.selected = sel;
@@ -479,7 +482,7 @@ impl Browser {
             if r.lost_focus() {
                 // Consume Enter so the grid does not also open the focused item.
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-                    let path = PathBuf::from(text.trim().trim_matches('"'));
+                    let path = crate::fileops::true_case(Path::new(text.trim().trim_matches('"')));
                     if path.is_dir() {
                         ev.push(BrowserEvent::Navigate(path));
                     } else if path.is_file() {

@@ -126,8 +126,10 @@ impl Toasts {
                 ToastKind::Success => (super::icons::CHECK_CIRCLE, p.ok),
                 ToastKind::Error => (super::icons::WARNING_CIRCLE, p.danger),
             };
+            // Above the panels and the status bar but below floating windows and
+            // dialogs, so a toast never hides a window's buttons.
             let resp = egui::Area::new(egui::Id::unique(("toast", i)))
-                .order(egui::Order::Tooltip)
+                .order(egui::Order::Background)
                 .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, y - screen.max.y))
                 .interactable(true)
                 .show(ctx, |ui| {
