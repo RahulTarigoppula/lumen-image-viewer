@@ -14,6 +14,40 @@ use std::sync::{Arc, Once};
 
 static INIT: Once = Once::new();
 
+/// Frame threads of the decoders that read for analysis and snapshots.
+/// Each frame thread keeps its own decoder state and frames in flight
+/// (tens of MB per thread for 1080p 10-bit HEVC), so these use a few
+/// threads, not FFmpeg's default of one per core; playback keeps the default.
+const SIDE_DECODE_THREADS: usize = 4;
+
+/// [`frame_at`] decodes running at once (worst-frame thumbnails ask for
+/// many frames together; each decode holds a decoder and its frames).
+const FRAME_AT_PARALLEL: usize = 2;
+static FRAME_AT_SLOTS: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// A slot of [`FRAME_AT_SLOTS`], held while one [`frame_at`] decodes.
+struct FrameAtSlot;
+
+impl FrameAtSlot {
+    fn acquire() -> FrameAtSlot {
+        let (busy, cv) = &FRAME_AT_SLOTS;
+        let mut n = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= FRAME_AT_PARALLEL {
+            n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        FrameAtSlot
+    }
+}
+
+impl Drop for FrameAtSlot {
+    fn drop(&mut self) {
+        let (busy, cv) = &FRAME_AT_SLOTS;
+        *busy.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
+}
+
 pub fn init() {
     INIT.call_once(|| {
         let _ = ff::init();
@@ -1392,7 +1426,7 @@ impl SeqDecoder {
         let start = if vs.start_time() != ff::ffi::AV_NOPTS_VALUE { vs.start_time() as f64 * tb } else { 0.0 };
         let fps = [q2f(vs.avg_frame_rate()), q2f(vs.rate())].into_iter().find(|f| *f > 0.0).unwrap_or(25.0);
         let mut ctx = ff::codec::context::Context::from_parameters(vs.parameters())?;
-        ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: 0 });
+        ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: SIDE_DECODE_THREADS });
         let dec = ctx.decoder().video()?;
         Ok(SeqDecoder {
             path: path.to_path_buf(),
@@ -1799,6 +1833,7 @@ impl Iterator for RangeReader {
 /// Runs independently of playback so it never stalls or disturbs the player.
 pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
     init();
+    let _slot = FrameAtSlot::acquire();
     let mut input = ff::format::input(path)?;
     let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
     let vidx = vs.index();
@@ -1806,7 +1841,7 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
     let start = if vs.start_time() != ff::ffi::AV_NOPTS_VALUE { vs.start_time() as f64 * tb } else { 0.0 };
     let rotation = stream_rotation(&vs);
     let mut ctx = ff::codec::context::Context::from_parameters(vs.parameters())?;
-    ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: 0 });
+    ctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: SIDE_DECODE_THREADS });
     let mut dec = ctx.decoder().video()?;
     let ts = ((pts.max(0.0) + start) / tb) as i64;
     unsafe {
@@ -1820,7 +1855,9 @@ pub fn frame_at(path: &Path, pts: f64) -> Result<RgbaImage> {
         while dec.receive_frame(&mut frame).is_ok() {
             let fp = frame.timestamp().or(frame.pts()).unwrap_or(0) as f64 * tb - start;
             let done = fp >= pts - 1e-4;
-            best = Some(frame.clone());
+            // Keep the latest frame by moving it (a clone copies the pixels);
+            // the frame it replaces goes back to the decoder's pool.
+            best = Some(std::mem::replace(&mut frame, ff::frame::Video::empty()));
             if done {
                 break 'outer;
             }
