@@ -3,7 +3,8 @@
 //! and Red-eye removal.
 
 use super::canvas::{self, NewShape, ShapeEditor};
-use super::{color_row, info, row, section, segmented, slider, slider_ex};
+use super::{color_row, hint, indented, info, row, section, segmented, slider, slider_ex};
+use crate::ui::widgets;
 use crate::edit::mask::{self, Shape};
 use crate::edit::retouch::{self, Obscure};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
@@ -21,7 +22,9 @@ fn shape_kind_row(ui: &mut egui::Ui, kind: &mut NewShape, lasso: bool) {
     let ell = format!("{}  Ellipse", I::CIRCLE);
     let las = format!("{}  Lasso", I::LASSO);
     let labels: Vec<&str> = if lasso { vec![&rect, &ell, &las] } else { vec![&rect, &ell] };
-    row(ui, "Shape", |ui| segmented(ui, &mut i, &labels));
+    // Full width (like a mode switch) so the labels fit.
+    segmented(ui, &mut i, &labels);
+    ui.add_space(4.0);
     *kind = match i {
         1 => NewShape::Ellipse,
         2 if lasso => NewShape::Lasso,
@@ -84,9 +87,10 @@ impl EditTool for ObscureRegion {
         section(ui, cx, &format!("Areas ({})", self.ed.shapes.len()));
         c |= canvas::shape_buttons(ui, &mut self.ed);
         ui.add_space(4.0);
-        info(ui, cx, "Drag on the image to cover an area. Click to select, drag to move, drag a corner to resize, Del removes. Shift draws a square / circle. Hold Space to pan.");
+        info(ui, cx, "Drag on the image to cover an area.");
+        hint(ui, "Click an area to select it, drag to move it, drag a corner to resize, Del removes it. Shift draws a square or circle. Hold Space to pan.");
         if self.mode == 1 {
-            info(ui, cx, "Tip: for faces and text that must stay unreadable, Pixelate or Solid is safer than Blur.");
+            hint(ui, "For faces and text that must stay unreadable, Pixelate or Solid is safer than Blur.");
         }
         c
     }
@@ -178,14 +182,16 @@ impl EditTool for Selection {
         let mut c = false;
         shape_kind_row(ui, &mut self.kind, true);
         c |= slider_ex(ui, "Feather", &mut self.feather, 0.0..=(short / 10.0).max(5.0), (short / 200.0).round().max(1.0), " px", 0.5, 1, true);
-        ui.horizontal(|ui| {
-            ui.add_space(super::LABEL_W + 4.0);
-            c |= ui.checkbox(&mut self.invert, "Invert").on_hover_text("Adjust everything outside the selection").changed();
-            ui.checkbox(&mut self.show_outline, "Show outline");
+        indented(ui, |ui| {
+            c |= widgets::checkbox(ui, &mut self.invert, "Invert").on_hover_text("Adjust everything outside the selection").changed();
+            ui.add_space(8.0);
+            widgets::checkbox(ui, &mut self.show_outline, "Show outline");
         });
         section(ui, cx, &format!("Areas ({})", self.ed.shapes.len()));
         c |= canvas::shape_buttons(ui, &mut self.ed);
-        info(ui, cx, "Drag on the image to select. Several areas add up; Shift+drag starts a new area inside another.");
+        ui.add_space(4.0);
+        info(ui, cx, "Drag on the image to select an area.");
+        hint(ui, "Several areas add up; Shift+drag starts a new area inside another.");
         section(ui, cx, "Adjustment");
         let opts: Vec<String> = INNER.iter().map(|s| s.to_string()).collect();
         let before = self.which;
@@ -284,7 +290,8 @@ impl EditTool for RedEye {
         section(ui, cx, &format!("Eyes ({})", self.ed.shapes.len()));
         c |= canvas::shape_buttons(ui, &mut self.ed);
         ui.add_space(4.0);
-        info(ui, cx, "Drag a box around each red pupil, or just click on it. Only strongly red pixels inside the box change. Raise Sensitivity if some red remains.");
+        info(ui, cx, "Click each red pupil, or drag a box around it.");
+        hint(ui, "Only strongly red pixels inside the box change. Raise Sensitivity if some red remains.");
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {

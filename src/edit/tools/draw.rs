@@ -3,7 +3,8 @@
 //! editable until Apply rasterizes them with anti-aliasing.
 
 use super::canvas::{self, Pointer, HANDLE_HIT};
-use super::{color_button, info, row, section, segmented, slider_ex};
+use super::{color_button, hint, icon_toggle, indented, row, section, segmented, slider_ex};
+use crate::ui::widgets;
 use crate::edit::raster::{self, DrawObj, Kind, CALLOUT_BUBBLE, CALLOUT_PLAIN};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
 use crate::ui::icons as I;
@@ -232,7 +233,7 @@ impl DrawBoard {
             ui.horizontal(|ui| {
                 super::row_label(ui, "Fill");
                 let mut on = st.fill.is_some();
-                if ui.checkbox(&mut on, "").changed() {
+                if widgets::checkbox(ui, &mut on, "").changed() {
                     st.fill = if on { Some(if kind == Kind::Text { [255, 255, 255, 255] } else { [st.color[0], st.color[1], st.color[2], 90] }) } else { None };
                 }
                 if let Some(f) = &mut st.fill {
@@ -242,10 +243,7 @@ impl DrawBoard {
         }
         match kind {
             Kind::Arrow => {
-                ui.horizontal(|ui| {
-                    ui.add_space(super::LABEL_W + 4.0);
-                    ui.checkbox(&mut st.both_heads, "Both ends");
-                });
+                indented(ui, |ui| widgets::checkbox(ui, &mut st.both_heads, "Both ends"));
             }
             Kind::Text => {
                 row(ui, "Style", |ui| {
@@ -267,9 +265,7 @@ impl DrawBoard {
                 ui.horizontal(|ui| {
                     super::row_label(ui, "Text color");
                     color_button(ui, &mut st.text_color, false);
-                    if ui.selectable_label(st.bold, egui::RichText::new(I::TEXT_B).size(15.0)).on_hover_text("Bold").clicked() {
-                        st.bold = !st.bold;
-                    }
+                    icon_toggle(ui, &mut st.bold, I::TEXT_B, "Bold");
                 });
             }
             Kind::Number => {
@@ -277,23 +273,22 @@ impl DrawBoard {
                 ui.horizontal(|ui| {
                     super::row_label(ui, "Number");
                     color_button(ui, &mut st.text_color, false);
-                    if let Some(i) = sel {
-                        let _ = i;
-                        ui.add(egui::DragValue::new(&mut st.number).range(0..=9999));
+                    if sel.is_some() {
+                        widgets::value_box(ui, egui::DragValue::new(&mut st.number).range(0..=9999));
                     } else {
-                        ui.add(egui::DragValue::new(&mut self.next_number).range(0..=9999)).on_hover_text("Next number");
+                        widgets::value_box(ui, egui::DragValue::new(&mut self.next_number).range(0..=9999)).on_hover_text("Next number");
                     }
                 });
             }
             _ => {}
         }
         if !matches!(kind, Kind::Highlighter) {
-            ui.horizontal(|ui| {
-                ui.add_space(super::LABEL_W + 4.0);
+            indented(ui, |ui| {
                 if !matches!(kind, Kind::Number | Kind::Text) {
-                    ui.checkbox(&mut st.dashed, "Dashed");
+                    widgets::checkbox(ui, &mut st.dashed, "Dashed");
+                    ui.add_space(8.0);
                 }
-                ui.checkbox(&mut st.shadow, "Shadow");
+                widgets::checkbox(ui, &mut st.shadow, "Shadow");
             });
         }
         if st == before {
@@ -450,8 +445,8 @@ impl EditTool for DrawBoard {
         let mut c = false;
         // Tool palette.
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
-            let b = |ui: &mut egui::Ui, on: bool, icon: &str, tip: &str| ui.add(egui::Button::selectable(on, egui::RichText::new(icon).size(17.0)).min_size(vec2(30.0, 28.0))).on_hover_text(tip).clicked();
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            let b = |ui: &mut egui::Ui, on: bool, icon: &str, tip: &str| widgets::icon_button_sized(ui, icon, tip, on, 32.0, 16.0).clicked();
             if b(ui, self.tool.is_none(), I::CURSOR, "Select and move (click an object, drag to move, Del deletes)") {
                 self.tool = None;
             }
@@ -494,15 +489,15 @@ impl EditTool for DrawBoard {
             }
         });
         ui.add_space(4.0);
-        let hint = match self.tool {
+        let how = match self.tool {
             None => "Click an object to select it; drag to move, drag handles to reshape. Del deletes.",
             Some(Kind::Text) => "Click where the text goes, or drag from the spot a bubble should point at. Type in the box above; drag the tail handle to re-aim it.",
             Some(Kind::Number) => "Click to drop numbered markers; the number counts up.",
             Some(Kind::Pen) | Some(Kind::Highlighter) => "Drag to draw freehand.",
             Some(_) => "Drag on the image to draw. Shift snaps angles / keeps squares and circles.",
         };
-        info(ui, cx, hint);
-        info(ui, cx, "Hold Space to pan, wheel to zoom. Apply renders everything with anti-aliasing.");
+        hint(ui, how);
+        hint(ui, "Hold Space to pan, wheel to zoom. Apply renders everything with anti-aliasing.");
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {

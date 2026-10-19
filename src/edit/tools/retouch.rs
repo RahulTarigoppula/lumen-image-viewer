@@ -1,7 +1,8 @@
 //! Brush retouching: Clone stamp and Healing brush (same tool, two modes).
 
 use super::canvas::{self, Pointer};
-use super::{info, section, slider, slider_ex};
+use super::{hint, indented, info, section, slider, slider_ex};
+use crate::ui::widgets;
 use crate::edit::retouch::{self, BrushStroke};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
 use crate::ui::icons as I;
@@ -80,9 +81,10 @@ impl EditTool for CloneStamp {
         }
         let mut c = false;
         let mut i = self.heal as usize;
-        if super::row(ui, "Mode", |ui| super::segmented(ui, &mut i, &[&format!("{}  Clone", I::STAMP), &format!("{}  Heal", I::BANDAIDS)])) {
+        if super::segmented(ui, &mut i, &[&format!("{}  Clone", I::STAMP), &format!("{}  Heal", I::BANDAIDS)]) {
             self.heal = i == 1;
         }
+        ui.add_space(4.0);
         let mut size = self.radius * 2.0;
         if slider_ex(ui, "Size", &mut size, 2.0..=self.max_radius * 2.0, (short / 30.0).round().max(6.0), " px", 1.0, 0, true) {
             self.radius = (size / 2.0).max(1.0);
@@ -95,9 +97,8 @@ impl EditTool for CloneStamp {
         if slider_ex(ui, "Opacity", &mut op, 1.0..=100.0, 100.0, " %", 1.0, 0, false) {
             self.opacity = op / 100.0;
         }
-        ui.horizontal(|ui| {
-            ui.add_space(super::LABEL_W + 4.0);
-            if ui.checkbox(&mut self.aligned, "Aligned").on_hover_text("Keep the same source offset for every stroke").changed() && !self.aligned {
+        indented(ui, |ui| {
+            if widgets::checkbox(ui, &mut self.aligned, "Aligned").on_hover_text("Keep the same source offset for every stroke").changed() && !self.aligned {
                 self.offset = None;
             }
         });
@@ -124,7 +125,7 @@ impl EditTool for CloneStamp {
             Some(_) => "Paint to copy from the source (the crosshair follows your brush).".into(),
         };
         info(ui, cx, status);
-        info(ui, cx, "[ and ] change the brush size. Hold Space to pan, wheel to zoom.");
+        hint(ui, "[ and ] change the brush size. Hold Space to pan, wheel to zoom.");
         c
     }
     fn apply(&self, img: &RgbaImage, scale: f32) -> RgbaImage {
