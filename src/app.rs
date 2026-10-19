@@ -119,9 +119,16 @@ fn inverse(t: Transform) -> Transform {
     }
 }
 
+/// "1 file", "3 files".
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
 struct TransferDialog {
     files: Vec<PathBuf>,
     do_move: bool,
+    /// The destination field (filled with the most recent target when it opens).
+    dest: Option<String>,
 }
 
 pub struct App {
@@ -548,6 +555,9 @@ impl App {
                 for e in &self.browser.entries {
                     self.core.meta.forget(&e.path);
                 }
+                // F5 retries thumbnails that failed (a file still being written, or
+                // one that was briefly missing during a move).
+                self.core.thumbs.retry_failed_in(&self.browser.folder);
                 self.browser.tree.refresh();
                 self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
             }
@@ -582,7 +592,7 @@ impl App {
             CopyTo | MoveTo => {
                 let files = self.targets();
                 if !files.is_empty() {
-                    self.transfer = Some(TransferDialog { files, do_move: cmd == MoveTo });
+                    self.transfer = Some(TransferDialog { files, do_move: cmd == MoveTo, dest: None });
                 }
             }
             Delete => {
@@ -643,7 +653,7 @@ impl App {
                 let files = self.targets();
                 if !files.is_empty() {
                     match fileops::copy_files_to_clipboard(&files) {
-                        Ok(()) => self.core.toasts.success(format!("{} file(s) copied - paste in Explorer or another folder", files.len())),
+                        Ok(()) => self.core.toasts.success(format!("{} copied - paste in Explorer or another folder", count(files.len(), "file"))),
                         Err(e) => self.core.toasts.error(e.to_string()),
                     }
                 }
@@ -656,7 +666,7 @@ impl App {
                 match fileops::paste_files_from_clipboard() {
                     Ok(files) if !files.is_empty() => {
                         let dest = self.browser.folder.clone();
-                        self.file_jobs.submit(format!("Pasting {} item(s)", files.len()), transfer_job(files, dest, false));
+                        self.file_jobs.submit(format!("Pasting {}", count(files.len(), "item")), transfer_job(files, dest, false));
                     }
                     _ => {
                         // Maybe an image bitmap: save it as a new PNG.
@@ -697,11 +707,8 @@ impl App {
                 self.browser.focus_filter = true;
             }
             BatchConvert => {
-                let mut files = self.media_targets();
-                if files.len() <= 1 && self.mode == Mode::Browser && self.browser.selected.len() <= 1 {
-                    files = self.browser.image_paths();
-                }
-                self.batch_convert = Some(crate::ui::batch::BatchConvert::new(files, self.browser.folder.clone(), &self.core));
+                let selected = if self.mode == Mode::Browser && self.browser.selected.is_empty() { Vec::new() } else { self.media_targets() };
+                self.batch_convert = Some(crate::ui::batch::BatchConvert::new(selected, self.browser.image_paths(), self.browser.folder.clone(), &self.core));
             }
             BatchRename => {
                 let mut files = self.media_targets();
@@ -1172,6 +1179,10 @@ impl App {
         self.viewer.reset_view(fit);
     }
 
+    /// Drop everything cached about the file at `p` (decode, thumbnail, failure
+    /// marks, size / date, metadata). File operations call it for every path they
+    /// touch, the source and the destination, so a file that comes back (undo, a
+    /// move into an open folder) is read again instead of showing stale state.
     fn forget_file(&mut self, p: &Path) {
         self.core.loader.invalidate(p);
         self.core.thumbs.forget(p);
@@ -1195,7 +1206,7 @@ impl App {
             }
         }
         if !errs.is_empty() {
-            self.core.toasts.error(format!("{} file(s) not rotated - {}", errs.len(), errs[0]));
+            self.core.toasts.error(format!("{} not rotated - {}", count(errs.len(), "file"), errs[0]));
         }
         let ok = done.len();
         if ok > 0 {
@@ -1318,7 +1329,7 @@ impl App {
                     self.viewer.remove_path(f);
                     self.browser.selected.remove(f);
                 }
-                self.core.toasts.success(format!("Moved {} item(s) to the Recycle Bin", files.len()));
+                self.core.toasts.success(format!("Moved {} to the Recycle Bin", count(files.len(), "item")));
                 if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
                     self.mode = Mode::Browser;
                 }
@@ -1333,7 +1344,7 @@ impl App {
             self.core.toasts.error(format!("{} failed: {}", errs.len(), errs.first().cloned().unwrap_or_default()));
         }
         if n > 0 {
-            self.core.toasts.success(format!("{} {n} item(s)", if moved { "Moved" } else { "Copied" }));
+            self.core.toasts.success(format!("{} {}", if moved { "Moved" } else { "Copied" }, count(n, "item")));
         }
     }
 
@@ -1354,7 +1365,7 @@ impl App {
         self.core.settings.copy_move_targets.retain(|p| p != &dest);
         self.core.settings.copy_move_targets.insert(0, dest.clone());
         self.core.settings.copy_move_targets.truncate(10);
-        let label = format!("{} {} item(s)", if do_move { "Moving" } else { "Copying" }, files.len());
+        let label = format!("{} {}", if do_move { "Moving" } else { "Copying" }, count(files.len(), "item"));
         self.file_jobs.submit(label, transfer_job(files, dest, do_move));
     }
 
@@ -1367,10 +1378,10 @@ impl App {
                     self.forget_file(p);
                 }
                 if !skipped.is_empty() {
-                    self.core.toasts.info(format!("Skipped {} file(s): {}", skipped.len(), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+                    self.core.toasts.info(format!("Skipped {}: {}", count(skipped.len(), "file"), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
                 }
                 if !errs.is_empty() {
-                    self.core.toasts.error(format!("{} file(s) not changed - {}", errs.len(), errs[0]));
+                    self.core.toasts.error(format!("{} not changed - {}", count(errs.len(), "file"), errs[0]));
                 }
                 let ok = lossless.len() + reencoded.len();
                 if ok > 0 {
@@ -1426,7 +1437,7 @@ impl App {
 
     fn finish_transfer(&mut self, done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool) {
         if do_move && !done.is_empty() {
-            let label = format!("Move {} item(s) to {}", done.len(), dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string()));
+            let label = format!("Move {} to {}", count(done.len(), "item"), dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string()));
             self.push_file_undo(label, done.clone());
         }
         if do_move {
@@ -1434,12 +1445,12 @@ impl App {
         }
         for (from, to) in &done {
             if do_move {
-                self.core.loader.invalidate(from);
-                self.core.thumbs.forget(from);
+                self.forget_file(from);
                 self.viewer.remove_path(from);
             } else {
                 self.core.tags.copied(from, to);
             }
+            self.forget_file(to);
         }
         self.report_transfer(done.len(), errs, do_move);
         self.browser.tree.invalidate(&dest);
@@ -1481,8 +1492,8 @@ impl App {
                         Ok(()) => {
                             ok += 1;
                             self.core.tags.moved(cur, orig);
-                            self.core.loader.invalidate(cur);
-                            self.core.thumbs.forget(cur);
+                            self.forget_file(cur);
+                            self.forget_file(orig);
                             self.viewer.replace_path(cur, orig);
                             for d in [orig.parent(), cur.parent()].into_iter().flatten() {
                                 if !folders.iter().any(|f| f == d) {
@@ -1525,7 +1536,7 @@ impl App {
         }
         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
         if !errs.is_empty() {
-            self.core.toasts.error(format!("Undo: {} item(s) could not be restored - {}", errs.len(), errs[0]));
+            self.core.toasts.error(format!("Undo: {} could not be restored - {}", count(errs.len(), "item"), errs[0]));
         }
         if ok > 0 {
             self.core.toasts.success(format!("Undone: {}", op.label));
@@ -1931,30 +1942,158 @@ impl App {
         }
     }
 
+    /// "Move to folder" / "Copy to folder": a destination field (type, paste or
+    /// Browse) above the recent and favorite folders (click to pick, double-click or
+    /// 1-9 to go at once). A folder that does not exist yet is created.
+    fn transfer_dialog(&mut self, ctx: &egui::Context) {
+        let Some(t) = &mut self.transfer else { return };
+        let p = self.core.pal;
+        let mut close = false;
+        let mut go: Option<PathBuf> = None;
+        let n = t.files.len();
+        let what = if n == 1 { format!("\"{}\"", crate::ui::viewer::file_name(&t.files[0])) } else { format!("{n} items") };
+        let title = format!("{} {what} to folder", if t.do_move { "Move" } else { "Copy" });
+        let mut recents: Vec<PathBuf> = Vec::new();
+        for d in self.core.settings.copy_move_targets.iter().chain(self.core.settings.favorites.iter()) {
+            if d.is_dir() && !recents.iter().any(|r| fileops::same_path(r, d)) {
+                recents.push(d.clone());
+            }
+        }
+        recents.truncate(9);
+        // Start from the most recent target; with none, an empty field to type into.
+        let first_frame = t.dest.is_none();
+        if first_frame {
+            t.dest = Some(recents.first().map(|d| d.display().to_string()).unwrap_or_default());
+        }
+        widgets::modal(ctx, egui::Id::unique("transfer"), 480.0, |ui| {
+            widgets::modal_title(ui, &title);
+            let dest = t.dest.get_or_insert_with(String::new);
+            ui.horizontal(|ui| {
+                let browse_w = 36.0;
+                let field = ui.add(
+                    egui::TextEdit::singleline(dest)
+                        .hint_text("Folder path")
+                        .desired_width(ui.available_width() - browse_w - ui.spacing().item_spacing.x)
+                        .min_size(Vec2::new(0.0, theme::size::CONTROL))
+                        .align(egui::Align2::LEFT_CENTER),
+                );
+                if first_frame && dest.is_empty() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !dest.trim().is_empty() {
+                    go = Some(PathBuf::from(dest.trim()));
+                }
+                let b = ui.add_sized([browse_w, theme::size::CONTROL], egui::Button::new(RichText::new(I::FOLDER_OPEN).size(theme::size::ICON_TOOLBAR))).on_hover_text("Browse for a folder");
+                if b.clicked() {
+                    let start = Some(PathBuf::from(dest.trim())).filter(|d| d.is_dir()).unwrap_or_else(|| self.browser.folder.clone());
+                    if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
+                        *dest = d.display().to_string();
+                    }
+                }
+            });
+            let typed = PathBuf::from(dest.trim());
+            if !dest.trim().is_empty() && !typed.is_dir() {
+                ui.add_space(2.0);
+                ui.label(RichText::new(format!("{}  This folder does not exist yet; it will be created.", I::INFO)).size(theme::text::SMALL).color(p.muted));
+            }
+            if !recents.is_empty() {
+                widgets::section_title(ui, &p, "Recent and favorite folders");
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (i, d) in recents.iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::click());
+                    let selected = fileops::same_path(&typed, d);
+                    if ui.is_rect_visible(rect) {
+                        let painter = ui.painter();
+                        let cr = egui::CornerRadius::same(theme::radius::CONTROL);
+                        if selected {
+                            painter.rect_filled(rect, cr, p.selected_bg);
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, cr, p.hover);
+                        }
+                        let icon_c = if selected { p.accent_text } else { p.muted };
+                        painter.text(egui::pos2(rect.left() + 18.0, rect.center().y), egui::Align2::CENTER_CENTER, I::FOLDER, egui::FontId::proportional(theme::size::ICON), icon_c);
+                        let key_w = widgets::paint_shortcut_keys(painter, &p, egui::pos2(rect.right() - 8.0, rect.center().y), &format!("{}", i + 1));
+                        let name = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| d.display().to_string());
+                        let x = rect.left() + 36.0;
+                        let room = rect.right() - 8.0 - key_w - 12.0 - x;
+                        let name_g = painter.layout_no_wrap(name, theme::text::body(), if selected { p.accent_text } else { p.text });
+                        let name_w = name_g.size().x.min(room);
+                        let clip = egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + room, rect.bottom()));
+                        painter.with_clip_rect(clip.intersect(ui.clip_rect())).galley(egui::pos2(x, rect.center().y - name_g.size().y / 2.0), name_g, p.text);
+                        if let Some(parent) = d.parent() {
+                            let left = room - name_w - 10.0;
+                            if left > 40.0 {
+                                let pt = widgets::elide_start(ui, &parent.display().to_string(), theme::text::small(), left);
+                                let g = painter.layout_no_wrap(pt, theme::text::small(), p.faint);
+                                painter.galley(egui::pos2(x + name_w + 10.0, rect.center().y - g.size().y / 2.0), g, p.faint);
+                            }
+                        }
+                    }
+                    let resp = resp.on_hover_text(d.display().to_string());
+                    if resp.double_clicked() {
+                        go = Some(d.clone());
+                    } else if resp.clicked() {
+                        *dest = d.display().to_string();
+                    }
+                }
+                // 1-9 go straight to a listed folder (while not typing a path).
+                if !ui.ctx().text_edit_focused() {
+                    for (i, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().enumerate() {
+                        if ui.input(|inp| inp.key_pressed(*k)) {
+                            if let Some(d) = recents.get(i) {
+                                go = Some(d.clone());
+                            }
+                        }
+                    }
+                }
+                ui.spacing_mut().item_spacing.y = 4.0;
+            }
+            let ok = !dest.trim().is_empty();
+            match widgets::dialog_buttons(ui, &p, "Cancel", if t.do_move { "Move" } else { "Copy" }, widgets::ButtonKind::Primary, ok) {
+                Some(true) => go = Some(PathBuf::from(dest.trim())),
+                Some(false) => close = true,
+                None => {}
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+        });
+        if let Some(dest) = go {
+            if !dest.is_dir() {
+                if let Err(e) = std::fs::create_dir_all(&dest) {
+                    self.core.toasts.error(format!("Could not create {}: {e}", dest.display()));
+                    return;
+                }
+                if let Some(parent) = dest.parent() {
+                    self.browser.tree.invalidate(parent);
+                }
+            }
+            let t = self.transfer.take().unwrap();
+            self.transfer_files(t.files, dest, t.do_move);
+        } else if close {
+            self.transfer = None;
+        }
+    }
+
     /// "Open this location on openstreetmap.org?" (Ctrl+Alt+M), with "Don't ask again".
     fn gps_confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some((_, dont_ask)) = &mut self.gps_confirm else { return };
+        let p = self.core.pal;
         let mut choice: Option<bool> = None;
-        let resp = egui::Modal::new(egui::Id::unique("gps-confirm")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.heading("Open map in browser?");
-            ui.add_space(4.0);
-            ui.label("Open this location on openstreetmap.org in your browser? This sends the coordinates to that website.");
-            ui.add_space(6.0);
-            ui.checkbox(dont_ask, "Don't ask again");
+        widgets::modal(ctx, egui::Id::unique("gps-confirm"), 420.0, |ui| {
+            widgets::modal_title(ui, "Open map in browser?");
+            widgets::modal_body(ui, "Open this location on openstreetmap.org in your browser? This sends the coordinates to that website.");
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(format!("{}  Open map", I::MAP_PIN)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                    choice = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(false);
-                }
-            });
+            widgets::checkbox(ui, dont_ask, "Don't ask again");
+            if let Some(r) = widgets::dialog_buttons(ui, &p, "Cancel", "Open map", widgets::ButtonKind::Primary, true) {
+                choice = Some(r);
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                choice = Some(false);
+            } else if ui.input(|i| i.key_pressed(Key::Enter)) {
+                choice = Some(true);
+            }
         });
-        if resp.should_close() && choice.is_none() {
-            choice = Some(false);
-        }
         match choice {
             Some(true) => {
                 let (url, dont_ask) = self.gps_confirm.take().unwrap_or_default();
@@ -1985,7 +2124,8 @@ impl App {
                                 Ok(new) => {
                                     self.push_file_undo(format!("Rename to {}", crate::ui::viewer::file_name(&new)), vec![(path.clone(), new.clone())]);
                                     self.core.tags.moved(&path, &new);
-                                    self.core.loader.invalidate(&path);
+                                    self.forget_file(&path);
+                                    self.forget_file(&new);
                                     self.viewer.replace_path(&path, &new);
                                     self.browser.pending_select = Some(new);
                                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -2040,12 +2180,12 @@ impl App {
         if let Some(Confirm::Reencode { files, jpegs, t }) = &self.confirm {
             let (files, jpegs, t) = (files.clone(), jpegs.clone(), *t);
             let mut body = format!(
-                "{} will decode and re-encode {} file(s) in place. Some quality or metadata may be lost. Animated, multi-page and 16-bit images and icons are skipped.",
+                "{} will decode and re-encode {} in place. Some quality or metadata may be lost. Animated, multi-page and 16-bit images and icons are skipped.",
                 t.label(),
-                files.len()
+                count(files.len(), "file")
             );
             if !jpegs.is_empty() {
-                body += &format!("\n\n{} JPEG file(s) in the selection are rotated losslessly.", jpegs.len());
+                body += &format!("\n\n{} in the selection {} rotated losslessly.", count(jpegs.len(), "JPEG file"), if jpegs.len() == 1 { "is" } else { "are" });
             }
             match widgets::show_confirm(ctx, "Re-encode files?", &body, "Re-encode", false, &p) {
                 Some(true) => {
@@ -2057,53 +2197,7 @@ impl App {
                 None => {}
             }
         }
-        if let Some(t) = &self.transfer {
-            let mut close = false;
-            let mut go: Option<PathBuf> = None;
-            let title = if t.do_move { "Move to folder" } else { "Copy to folder" };
-            let n = t.files.len();
-            egui::Modal::new(egui::Id::unique("transfer")).show(ctx, |ui| {
-                ui.set_width(440.0);
-                ui.heading(title);
-                ui.label(RichText::new(format!("{n} item(s)")).color(p.muted));
-                ui.add_space(8.0);
-                if ui.add(egui::Button::new(format!("{}  Browse for a folder...", I::FOLDER_OPEN)).min_size(Vec2::new(ui.available_width(), 30.0))).clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.browser.folder).pick_folder() {
-                        go = Some(d);
-                    }
-                }
-                let recents: Vec<PathBuf> = self.core.settings.copy_move_targets.iter().chain(self.core.settings.favorites.iter()).filter(|p| p.is_dir()).cloned().collect();
-                if !recents.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Recent & favorite folders").color(p.faint).size(11.5));
-                    for (i, d) in recents.iter().enumerate().take(12) {
-                        let label = format!("{}  {}", if i < 9 { format!("{}", i + 1) } else { " ".into() }, d.display());
-                        if ui.add(egui::Button::new(label).frame(false)).clicked() {
-                            go = Some(d.clone());
-                        }
-                    }
-                    for (i, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].iter().enumerate() {
-                        if ui.input(|inp| inp.key_pressed(*k)) {
-                            if let Some(d) = recents.get(i) {
-                                go = Some(d.clone());
-                            }
-                        }
-                    }
-                }
-                ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        close = true;
-                    }
-                });
-            });
-            if let Some(dest) = go {
-                let t = self.transfer.take().unwrap();
-                self.transfer_files(t.files, dest, t.do_move);
-            } else if close {
-                self.transfer = None;
-            }
-        }
+        self.transfer_dialog(ctx);
         if let Some(dlg) = &mut self.save_dialog {
             match dlg.show(ctx, &p) {
                 SaveOutcome::Open => {}
@@ -2187,12 +2281,13 @@ impl App {
             self.core.tags.moved_many(&renamed);
             for (from, to) in &renamed {
                 self.viewer.replace_path(from, to);
-                self.core.loader.invalidate(from);
-                self.core.thumbs.forget(from);
-                self.core.meta.forget(from);
+            }
+            for (from, to) in &renamed {
+                self.forget_file(from);
+                self.forget_file(to);
             }
             if !renamed.is_empty() {
-                self.push_file_undo(format!("Batch rename of {} file(s)", renamed.len()), renamed.clone());
+                self.push_file_undo(format!("Batch rename of {}", count(renamed.len(), "file")), renamed.clone());
             }
             if !renamed.is_empty() {
                 self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
@@ -2296,7 +2391,7 @@ impl App {
                     ui.add(no_wrap(RichText::new(t).font(theme::text::subtitle()).color(p.text)));
                     ui.end_row();
                 };
-                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).show(ui, |ui| {
+                egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).striped(false).show(ui, |ui| {
                     for mode in KeyMode::ALL {
                         title(ui, mode.label());
                         for c in Command::all() {
@@ -2662,8 +2757,7 @@ impl eframe::App for App {
                                 // Moved by the drop target: forget the old paths.
                                 for f in &files {
                                     if !f.exists() {
-                                        self.core.loader.invalidate(f);
-                                        self.core.thumbs.forget(f);
+                                        self.forget_file(f);
                                         self.viewer.remove_path(f);
                                         self.browser.selected.remove(f);
                                     }
@@ -2783,6 +2877,9 @@ impl eframe::App for App {
             self.run(c);
         }
         self.file_job_progress(&ctx, &p);
+        // Above the status bar in the browser; above the floating bottom bar (and
+        // its 12 pt gap) of the viewer, compare and video modes.
+        self.core.toasts.set_bottom(if self.mode == Mode::Browser { 44.0 } else { 84.0 });
         self.core.toasts.show(&ctx, &p);
         self.was_editing = ctx.text_edit_focused();
         crate::devhook::prof("ui_total", frame_start);

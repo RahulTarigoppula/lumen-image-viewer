@@ -13,8 +13,7 @@ use egui::{Color32, CornerRadius, RichText, Ui, Vec2};
 /// Color button for a straight-alpha RGBA value. Returns true when changed.
 pub fn color_rgba(ui: &mut Ui, c: &mut [u8; 4], alpha: bool) -> bool {
     let mut col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], if alpha { c[3] } else { 255 });
-    let mode = if alpha { egui::color_picker::Alpha::OnlyBlend } else { egui::color_picker::Alpha::Opaque };
-    if egui::color_picker::color_edit_button_srgba(ui, &mut col, mode).changed() {
+    if crate::ui::widgets::color_button_rgba(ui, &mut col, alpha).changed() {
         let v = col.to_srgba_unmultiplied();
         *c = [v[0], v[1], v[2], if alpha { v[3] } else { 255 }];
         true
@@ -26,7 +25,7 @@ pub fn color_rgba(ui: &mut Ui, c: &mut [u8; 4], alpha: bool) -> bool {
 /// 3x3 anchor picker (0 = top-left ... 8 = bottom-right).
 pub fn anchor_grid(ui: &mut Ui, p: &Palette, anchor: &mut u8) -> bool {
     let mut changed = false;
-    egui::Grid::new(ui.next_auto_id()).spacing([2.0, 2.0]).show(ui, |ui| {
+    egui::Grid::new(ui.next_auto_id()).spacing([2.0, 2.0]).striped(false).show(ui, |ui| {
         for r in 0..3u8 {
             for c in 0..3u8 {
                 let i = r * 3 + c;
@@ -66,7 +65,7 @@ const TOKEN_HINT: &str = "Tokens: {name} {date} {taken} {taken:%Y} {n} {width} {
 /// Editor for one step's parameters.
 pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
     let gid = |s: &str| format!("adv-{s}-{id}");
-    egui::Grid::new(gid("grid")).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match step {
+    egui::Grid::new(gid("grid")).num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| match step {
         Step::Resize(r) => {
             row(ui, "Mode", |ui| {
                 crate::ui::widgets::combo(gid("rmode")).width(150.0).selected_text(r.spec.mode.label()).show_ui(ui, |ui| {

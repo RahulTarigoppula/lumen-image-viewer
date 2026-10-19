@@ -78,6 +78,12 @@ pub fn is_within(path: &Path, dir: &Path) -> bool {
     p == d || p.starts_with(&format!("{d}\\"))
 }
 
+/// The same path, ignoring case and a trailing separator (as on NTFS).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
+}
+
 /// `path` spelled the way it is stored on disk: drive letter in upper case and
 /// each existing component in its real case ("c:\photos\2024" ->
 /// "C:\Photos\2024"). Windows paths are case-insensitive, but the folder tree,
