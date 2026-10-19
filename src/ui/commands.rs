@@ -240,7 +240,7 @@ impl Command {
             Selection => "Selection...".into(),
             ToggleAnalysis => "Toggle analysis panel".into(),
             RunMetrics => "Run analysis metrics".into(),
-            RunAi => "Run AI analysis".into(),
+            RunAi => "Run AI review".into(),
         }
     }
 

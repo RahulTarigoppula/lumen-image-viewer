@@ -35,38 +35,33 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
     let screen = ctx.content_rect();
     let mut choice = None;
     egui::Modal::new(egui::Id::unique("ai-send-preview")).show(ctx, |ui| {
-        ui.set_width((screen.width() - 80.0).clamp(320.0, 760.0));
+        ui.set_width((screen.width() - 80.0).clamp(320.0, 640.0));
         ui.spacing_mut().item_spacing.y = 6.0;
-        ui.label(RichText::new(format!("{}  Send to your AI server?", I::PAPER_PLANE_TILT)).font(semibold(17.0)).color(p.text));
-        ui.label(RichText::new("Check what leaves this computer. Nothing has been sent yet.").size(12.0).color(p.muted));
+        ui.label(RichText::new(format!("{}  Send to your AI server?", I::PAPER_PLANE_TILT)).font(semibold(15.5)).color(p.text));
+        ui.label(RichText::new("This is exactly what leaves this computer. Nothing has been sent yet.").size(12.0).color(p.muted));
         ui.add_space(4.0);
         let row = |ui: &mut egui::Ui, k: &str, v: RichText| {
             ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(Vec2::new(92.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
-                    ui.set_width(92.0);
+                ui.allocate_ui_with_layout(Vec2::new(80.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_width(80.0);
                     ui.label(RichText::new(k).size(12.0).color(p.muted));
                 });
                 ui.add(egui::Label::new(v).wrap());
             });
         };
-        row(ui, "Destination", RichText::new(&req.destination).monospace().size(12.0).color(p.text));
-        row(ui, "Model", RichText::new(&req.model).size(12.5).color(p.text));
-        row(ui, "Preset", RichText::new(&req.preset_name).size(12.5).color(p.text));
+        row(ui, "To", RichText::new(&req.destination).monospace().size(12.0).color(p.text));
+        row(ui, "Model", RichText::new(format!("{}, {}", req.model, req.preset_name)).size(12.5).color(p.text));
         let b64 = req.total_bytes * 4 / 3;
-        row(
-            ui,
-            "Size",
-            RichText::new(format!(
-                "{} image(s), {} ({} as base64), about {} prompt tokens, up to {} output tokens",
-                req.images.len(),
-                fmt_bytes(req.total_bytes),
-                fmt_bytes(b64),
-                req.estimated_prompt_tokens,
-                req.max_completion_tokens
-            ))
-            .size(12.0)
-            .color(p.text),
-        );
+        let n = req.images.len();
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(80.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(80.0);
+                ui.label(RichText::new("Size").size(12.0).color(p.muted));
+            });
+            let text = format!("{n} image{}, {}, about {} prompt tokens", if n == 1 { "" } else { "s" }, fmt_bytes(req.total_bytes), req.estimated_prompt_tokens);
+            ui.add(egui::Label::new(RichText::new(text).size(12.0).color(p.text)).wrap())
+                .on_hover_text(format!("{} as base64 on the wire; the answer is limited to {} tokens", fmt_bytes(b64), req.max_completion_tokens));
+        });
         if let Some(w) = card.as_ref().and_then(|c| req.context_warning(c)) {
             ui.label(RichText::new(format!("{}  {w}", I::WARNING)).size(12.0).color(p.warn));
         }
@@ -79,10 +74,10 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
                 ui.spacing_mut().item_spacing = Vec2::new(10.0, 10.0);
                 for (im, tex) in req.images.iter().zip(thumbs.iter()) {
                     egui::Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(6)).inner_margin(6).show(ui, |ui| {
-                        ui.set_width(170.0);
+                        ui.set_width(140.0);
                         ui.vertical(|ui| {
                             let ts = tex.size_vec2();
-                            let k = (158.0 / ts.x).min(110.0 / ts.y).min(1.0);
+                            let k = (128.0 / ts.x).min(90.0 / ts.y).min(1.0);
                             ui.add(egui::Image::new((tex.id(), ts * k)));
                             ui.label(RichText::new(format!("{}x{} {}, {}", im.width, im.height, mime_name(im.mime), fmt_bytes(im.bytes))).size(11.0).color(p.text));
                             ui.add(egui::Label::new(RichText::new(&im.description).size(10.5).color(p.muted)).wrap());
@@ -94,7 +89,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
             egui::CollapsingHeader::new(RichText::new("System prompt").size(12.5)).id_salt("ai-preview-system").default_open(false).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.system_prompt).monospace().size(10.5).color(p.muted)).wrap());
             });
-            egui::CollapsingHeader::new(RichText::new("User message").size(12.5)).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Message").size(12.5)).id_salt("ai-preview-user").default_open(true).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&req.user_prompt).monospace().size(10.5).color(p.text)).wrap());
             });
             if let Some(s) = &req.swapped {
@@ -103,7 +98,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
         });
         ui.label(
             RichText::new(format!(
-                "{}  Pixels only: images are re-encoded by Lumen without EXIF, GPS or color profile. File names and capture settings are sent only if turned on in Settings > AI.",
+                "{}  Pixels only: re-encoded without EXIF, GPS or color profile. File names and capture settings only if turned on in Settings > AI review.",
                 I::SHIELD_CHECK
             ))
             .size(11.0)
@@ -117,7 +112,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core) {
             if ui.button("Cancel").clicked() {
                 choice = Some(Choice::Cancel);
             }
-            if ui.button("Do not ask again for this server").on_hover_text(format!("Send now, and skip this preview for {} from now on", req.server)).clicked() {
+            if ui.button("Send, don't ask again").on_hover_text(format!("Send now, and skip this preview for {} from now on (Settings > AI review to undo)", req.server)).clicked() {
                 choice = Some(Choice::Send { trust: true });
             }
         });
