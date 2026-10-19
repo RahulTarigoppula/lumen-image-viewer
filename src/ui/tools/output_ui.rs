@@ -7,7 +7,7 @@ use crate::app::Core;
 use crate::catalog::human_size;
 use crate::formats::SaveFormat;
 use crate::ui::batch::advanced::color_rgba;
-use crate::ui::batch::{card, danger_button, empty_state, file_name, hint, primary_button, window_size};
+use crate::ui::batch::{card, danger_button, empty_state, file_name, hint, primary_button};
 use crate::ui::icons as I;
 use crate::ui::theme::Palette;
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -118,14 +118,14 @@ fn footer(ui: &mut Ui, p: &Palette, id: &'static str, job: &Option<Job>, result:
                     if primary_button(ui, p, can_create, create_label).clicked() {
                         create = true;
                     }
-                    if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                    if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
                         close = true;
                     }
                     if let Some((Ok(_), out)) = result {
-                        if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                        if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
                             crate::fileops::show_in_explorer(out);
                         }
-                        if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                        if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
                             crate::fileops::open_with_default(out);
                         }
                     }
@@ -192,16 +192,8 @@ fn default_name(files: &[PathBuf], fallback: &str) -> String {
     files.first().and_then(|f| f.parent()).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| fallback.to_string())
 }
 
-fn window(title: String, ctx: &egui::Context, w: f32, h: f32) -> egui::Window<'static> {
-    egui::Window::new(title)
-        .default_size(window_size(ctx, w, h))
-        .max_size(window_size(ctx, 4000.0, 4000.0))
-        .constrain(true)
-        .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center())
-        .min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0))
-        .resizable(true)
-        .collapsible(false)
+fn window<'a>(id: &str, title: &str, w: f32, h: f32) -> crate::ui::widgets::AppWindow<'a> {
+    crate::ui::widgets::app_window(id.to_string(), title).default_size(w, h).min_size(520.0, 380.0)
 }
 
 // ============================================================ multi-page
@@ -251,7 +243,7 @@ impl MultiPageWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Create multi-page file", I::FILES), ctx, 760.0, 600.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
+        window("multi-page", "Create multi-page file", 760.0, 600.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let target = {
                 let ext = self.s.format.ext();
                 // Computed inside the card below; peek with the current values here.
@@ -312,37 +304,35 @@ impl MultiPageWindow {
         let s = &mut self.s;
         card(ui, p, I::FILE_PDF, "Format", |ui| {
             for f in MultiFormat::ALL {
-                ui.radio_value(&mut s.format, f, f.label());
+                crate::ui::widgets::radio_value(ui, &mut s.format, f, f.label());
             }
             ui.add_space(4.0);
             egui::Grid::new("mp-opts").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match s.format {
                 MultiFormat::Pdf => {
                     ui.label("Page size");
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut s.pdf_page, PdfPage::A4, "A4");
-                        ui.selectable_value(&mut s.pdf_page, PdfPage::Letter, "Letter");
-                        ui.selectable_value(&mut s.pdf_page, PdfPage::Image, "Image size");
+                        crate::ui::widgets::segmented_value(ui, &mut s.pdf_page, &[(PdfPage::A4, "A4"), (PdfPage::Letter, "Letter"), (PdfPage::Image, "Image size")]);
                     });
                     ui.end_row();
                     if s.pdf_page == PdfPage::Image {
                         ui.label("Resolution");
-                        ui.add(egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
                     } else {
                         ui.label("Margins");
-                        ui.add(egui::DragValue::new(&mut s.margin_mm).range(0.0..=60.0).suffix(" mm"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin_mm).range(0.0..=60.0).suffix(" mm"));
                     }
                     ui.end_row();
                     ui.label("JPEG quality");
-                    ui.add(egui::Slider::new(&mut s.jpeg_quality, 30..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 30..=100));
                     ui.end_row();
                     ui.label("Max image side");
-                    ui.add(egui::DragValue::new(&mut s.pdf_max_side).range(0..=20000).suffix(" px"))
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.pdf_max_side).range(0..=20000).suffix(" px"))
                         .on_hover_text("Large photos are reduced to this size to keep the PDF small (0 = keep the full size)");
                     ui.end_row();
                 }
                 MultiFormat::Tiff => {
                     ui.label("Resolution");
-                    ui.add(egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
                     ui.end_row();
                     ui.label("");
                     hint(ui, p, "Lossless (LZW), one page per image, full size.");
@@ -350,14 +340,14 @@ impl MultiPageWindow {
                 }
                 MultiFormat::Gif | MultiFormat::WebP => {
                     ui.label("Frame time");
-                    ui.add(egui::DragValue::new(&mut s.frame_ms).range(20..=60000).speed(10.0).suffix(" ms"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.frame_ms).range(20..=60000).speed(10.0).suffix(" ms"));
                     ui.end_row();
                     ui.label("Max size");
-                    ui.add(egui::DragValue::new(&mut s.anim_max_side).range(16..=4000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.anim_max_side).range(16..=4000).suffix(" px"));
                     ui.end_row();
                     if s.format == MultiFormat::WebP {
                         ui.label("Quality");
-                        ui.add(egui::Slider::new(&mut s.webp_quality, 1.0..=100.0).fixed_decimals(0));
+                        ui.add(crate::ui::widgets::Slider::new(&mut s.webp_quality, 1.0..=100.0).fixed_decimals(0));
                         ui.end_row();
                     }
                     ui.label("Background");
@@ -534,7 +524,7 @@ impl StripWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Image strip", I::COLUMNS), ctx, 960.0, 640.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
+        window("image-strip", "Image strip", 960.0, 640.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let idle = match &layout {
                 Some(l) => format!("{} images  -  {} x {} px", self.files.len(), l.width, l.height),
                 None => "Reading image sizes...".into(),
@@ -569,7 +559,7 @@ impl StripWindow {
                 egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("PREVIEW").size(11.0).color(p.faint).strong());
+                        ui.label(RichText::new("Preview").font(crate::ui::theme::text::caption()).color(p.muted));
                         if self.preview_version < self.version {
                             ui.spinner();
                         }
@@ -619,12 +609,11 @@ impl StripWindow {
             egui::Grid::new("st-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Direction");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut s.dir, StripDir::Horizontal, "Horizontal");
-                    ui.selectable_value(&mut s.dir, StripDir::Vertical, "Vertical");
+                    crate::ui::widgets::segmented_value(ui, &mut s.dir, &[(StripDir::Horizontal, "Horizontal"), (StripDir::Vertical, "Vertical")]);
                 });
                 ui.end_row();
                 ui.label(if s.dir == StripDir::Horizontal { "Height" } else { "Width" });
-                egui::ComboBox::from_id_salt("st-size")
+                crate::ui::widgets::combo("st-size")
                     .selected_text(match s.size {
                         StripSize::Original => "Keep original sizes",
                         StripSize::Smallest => "Same as smallest",
@@ -632,22 +621,19 @@ impl StripWindow {
                         StripSize::Custom => "Custom",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut s.size, StripSize::Smallest, "Same as smallest");
-                        ui.selectable_value(&mut s.size, StripSize::Largest, "Same as largest");
-                        ui.selectable_value(&mut s.size, StripSize::Custom, "Custom");
-                        ui.selectable_value(&mut s.size, StripSize::Original, "Keep original sizes");
+                        crate::ui::widgets::segmented_value(ui, &mut s.size, &[(StripSize::Smallest, "Same as smallest"), (StripSize::Largest, "Same as largest"), (StripSize::Custom, "Custom"), (StripSize::Original, "Keep original sizes")]);
                     });
                 ui.end_row();
                 if s.size == StripSize::Custom {
                     ui.label("");
-                    ui.add(egui::DragValue::new(&mut s.custom).range(8..=30000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.custom).range(8..=30000).suffix(" px"));
                     ui.end_row();
                 }
                 ui.label("Spacing");
-                ui.add(egui::DragValue::new(&mut s.spacing).range(0..=2000).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.spacing).range(0..=2000).suffix(" px"));
                 ui.end_row();
                 ui.label("Outer margin");
-                ui.add(egui::DragValue::new(&mut s.margin).range(0..=2000).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin).range(0..=2000).suffix(" px"));
                 ui.end_row();
                 ui.label("Background");
                 color_rgba(ui, &mut s.bg, true);
@@ -661,7 +647,7 @@ impl StripWindow {
         card(ui, p, I::FLOPPY_DISK, "Save as", |ui| {
             egui::Grid::new("st-fmt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Format");
-                egui::ComboBox::from_id_salt("st-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
+                crate::ui::widgets::combo("st-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
                     for f in [SaveFormat::Jpeg, SaveFormat::Png, SaveFormat::WebP, SaveFormat::Tiff, SaveFormat::Bmp] {
                         ui.selectable_value(&mut s.format, f, if f == SaveFormat::WebP { "WebP" } else { f.label() });
                     }
@@ -669,7 +655,7 @@ impl StripWindow {
                 ui.end_row();
                 if s.format == SaveFormat::Jpeg {
                     ui.label("Quality");
-                    ui.add(egui::Slider::new(&mut s.jpeg_quality, 40..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 40..=100));
                     ui.end_row();
                 }
             });
@@ -744,7 +730,7 @@ impl ZipWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Create ZIP archive", I::FILE_ZIP), ctx, 640.0, 520.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
+        window("zip", "Create ZIP archive", 640.0, 520.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let target = self.dir.as_ref().filter(|_| !self.name.trim().is_empty()).map(|d| d.join(format!("{}.zip", crate::ui::batch::logic::sanitize_file_stem(self.name.trim()))));
             let n = self.files.len();
             let idle = format!("{n} file{}{}", if n == 1 { "" } else { "s" }, self.total.map(|t| format!(", {}", human_size(t))).unwrap_or_default());
@@ -763,8 +749,8 @@ impl ZipWindow {
                         });
                         ui.add_space(8.0);
                         card(ui, &p, I::FILE_ZIP, "Archive", |ui| {
-                            ui.checkbox(&mut self.s.store_compressed, "Store JPEG, PNG, video... without recompressing (much faster)");
-                            ui.checkbox(&mut self.s.keep_folders, "Keep the folder structure");
+                            crate::ui::widgets::checkbox(ui, &mut self.s.store_compressed, "Store JPEG, PNG, video... without recompressing (much faster)");
+                            crate::ui::widgets::checkbox(ui, &mut self.s.keep_folders, "Keep the folder structure");
                             ui.add_space(4.0);
                             target_ui(ui, &p, &mut self.dir, &mut self.name, "zip");
                         });

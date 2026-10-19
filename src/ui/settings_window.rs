@@ -4,7 +4,7 @@
 //! returns true, and settings are saved to disk when the window closes.
 
 use super::icons as I;
-use super::theme::{semibold, Palette};
+use super::theme::{self, mix, radius, size, text, Palette};
 use super::widgets::{self, section_title};
 use crate::app::Core;
 use crate::settings::{ExternalEditor, FitMode, Settings, SortKey, ThemeChoice, ThumbCaption, WheelAction};
@@ -119,6 +119,9 @@ struct State {
     /// A text field had keyboard focus at the end of the last frame (egui drops
     /// the focus on Esc before the field sees it).
     editing: bool,
+    /// Shortcut row under the pointer (or holding keyboard focus) last frame:
+    /// only that row shows its remove / add buttons.
+    kb_hot: Option<Command>,
 }
 
 const ACCENTS: [(&str, [u8; 3]); 9] = [
@@ -158,41 +161,37 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
     }
     // Size and position come from the app window every frame (nothing remembered),
     // so the window always fits, at any interface size and after maximize / restore,
-    // and keeps the same width on every page. The bottom strip stays free so the
+    // and keeps the same width on every page. 32 pt stay free on every side, so the
     // status bar remains readable.
-    let screen = ctx.content_rect();
-    let status_h = 26.0;
-    let avail = Vec2::new(screen.width(), (screen.height() - status_h).max(120.0));
-    let size = Vec2::new((avail.x - 24.0).min(860.0), (avail.y - 24.0).min(620.0)).max(Vec2::new(120.0, 120.0)).min(avail);
-    egui::Window::new("Settings")
-        .id(egui::Id::unique("settings-window"))
+    let cap = widgets::AppWindow::cap(ctx);
+    let size = Vec2::new(cap.x.min(900.0), cap.y);
+    widgets::app_window("settings", "Settings")
         .open(open)
         .fixed_size(size)
-        .anchor(Align2::CENTER_CENTER, Vec2::new(0.0, -status_h / 2.0))
-        .resizable(false)
-        .collapsible(false)
-        .scroll(false)
-        .frame(egui::Frame::window(&ctx.global_style()).inner_margin(Margin::ZERO).fill(p.bg))
+        .anchored()
+        .fill(p.panel)
+        .body_margin(Margin::ZERO)
         .show(ctx, |ui| {
             let full = ui.available_rect_before_wrap();
             // Narrow window (large interface size): the category list shows icons only.
             let compact = full.width() < 600.0;
-            let nav_w = if compact { 52.0 } else { 204.0 };
+            let nav_w = if compact { 52.0 } else { 200.0 };
             let nav_rect = Rect::from_min_size(full.min, Vec2::new(nav_w, full.height()));
             let page_rect = Rect::from_min_max(egui::pos2(nav_rect.right() + 1.0, full.top()), full.max);
             let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect).layout(Layout::top_down(Align::Min)));
             nav_ui.set_clip_rect(nav_rect.intersect(ui.clip_rect()));
             navigation(&mut nav_ui, &p, &mut st, compact);
-            ui.painter().rect_filled(Rect::from_min_max(nav_rect.right_top(), egui::pos2(nav_rect.right() + 1.0, nav_rect.bottom())), 0.0, p.border);
+            // The page sits on the darker background, rounded where it meets the list
+            // (and at the window's own corner).
+            ui.painter().rect_filled(page_rect, CornerRadius { nw: 8, ne: 0, sw: 0, se: radius::WINDOW - 1 }, p.bg);
             let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page_rect).layout(Layout::top_down(Align::Min)));
             page_ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
             ui.advance_cursor_after_rect(full);
             let ui = &mut page_ui;
-            let side = if page_rect.width() < 420.0 { 12 } else { 22 };
+            let side = if page_rect.width() < 420.0 { 12 } else { 24 };
             egui::ScrollArea::vertical().id_salt(("settings-page", st.page)).auto_shrink([false, false]).show(ui, |ui| {
-                egui::Frame::new().inner_margin(Margin { left: side, right: side, top: 16, bottom: 22 }).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin { left: side, right: side, top: 18, bottom: 24 }).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
                     page_header(ui, &p, st.page);
                     changed |= match st.page {
                         Page::Appearance => appearance(ui, &p, &mut core.settings, &mut st),
@@ -304,16 +303,15 @@ fn initial_state() -> State {
 /// every entry; `compact` shows icons only (names in tooltips).
 fn navigation(ui: &mut Ui, p: &Palette, st: &mut State, compact: bool) {
     let rect = ui.max_rect();
-    ui.painter().rect_filled(rect, 0.0, p.panel);
     const ITEM_H: f32 = 32.0;
     const GAP: f32 = 2.0;
     let list_h = Page::ALL.len() as f32 * (ITEM_H + GAP) + 6.0;
-    let footer_h = 26.0;
+    let footer_h = 28.0;
     let show_footer = !compact && rect.height() >= list_h + 24.0 + footer_h;
     let list_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - if show_footer { footer_h } else { 0.0 }));
     let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(Layout::top_down(Align::Min)));
     egui::ScrollArea::vertical().id_salt("settings-nav").auto_shrink([false, false]).show(&mut list_ui, |ui| {
-        egui::Frame::new().inner_margin(Margin::symmetric(if compact { 6 } else { 8 }, 12)).show(ui, |ui| {
+        egui::Frame::new().inner_margin(Margin { left: if compact { 6 } else { 10 }, right: if compact { 6 } else { 10 }, top: 2, bottom: 12 }).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = GAP;
             for &page in Page::ALL {
                 if page == Page::Privacy {
@@ -330,8 +328,8 @@ fn navigation(ui: &mut Ui, p: &Palette, st: &mut State, compact: bool) {
         });
     });
     if show_footer {
-        let pos = egui::pos2(rect.min.x + 12.0, rect.max.y - footer_h / 2.0 - 2.0);
-        ui.painter().with_clip_rect(rect).text(pos, Align2::LEFT_CENTER, "Changes apply instantly", FontId::proportional(11.0), p.faint);
+        let pos = egui::pos2(rect.min.x + 20.0, rect.max.y - footer_h / 2.0 - 2.0);
+        ui.painter().with_clip_rect(rect).text(pos, Align2::LEFT_CENTER, "Changes apply instantly", text::small(), p.faint);
     }
     ui.advance_cursor_after_rect(rect);
 }
@@ -340,41 +338,36 @@ fn nav_item(ui: &mut Ui, p: &Palette, icon: &str, label: &str, selected: bool, c
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let bg = if selected {
-            p.accent_soft
+            p.selected_bg
         } else if resp.hovered() {
             p.hover
         } else {
             Color32::TRANSPARENT
         };
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(6), bg);
-        if selected {
-            let bar = egui::Rect::from_center_size(egui::pos2(rect.left() + 2.0, rect.center().y), Vec2::new(3.0, 16.0));
-            painter.rect_filled(bar, CornerRadius::same(2), p.accent);
+        painter.rect_filled(rect, CornerRadius::same(radius::CONTROL), bg);
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(radius::CONTROL), Stroke::new(1.5, p.accent), StrokeKind::Inside);
         }
-        let icon_color = if selected { p.accent } else { p.muted };
+        let icon_color = if selected { p.accent_text } else { p.muted };
         if compact {
-            painter.text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(17.0), icon_color);
+            painter.text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
         } else {
-            painter.text(egui::pos2(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
-            let font = if selected { semibold(13.5) } else { FontId::proportional(13.5) };
-            let text_clip = Rect::from_min_max(egui::pos2(rect.left() + 38.0, rect.top()), egui::pos2(rect.right() - 4.0, rect.bottom()));
-            painter.with_clip_rect(text_clip.intersect(ui.clip_rect())).text(egui::pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, label, font, p.text);
+            painter.text(egui::pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
+            let font = if selected { text::body_strong() } else { text::body() };
+            let text_clip = Rect::from_min_max(egui::pos2(rect.left() + 36.0, rect.top()), egui::pos2(rect.right() - 4.0, rect.bottom()));
+            painter.with_clip_rect(text_clip.intersect(ui.clip_rect())).text(egui::pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, label, font, p.text);
         }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn page_header(ui: &mut Ui, p: &Palette, page: Page) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(page.icon()).size(22.0).color(p.accent));
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add(egui::Label::new(RichText::new(page.label()).font(semibold(19.0)).color(p.text)).truncate());
-            ui.add(egui::Label::new(RichText::new(page.subtitle()).size(12.0).color(p.muted)).wrap());
-        });
-    });
-    ui.add_space(8.0);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.add(egui::Label::new(RichText::new(page.label()).font(text::display()).color(p.text)).truncate());
+    ui.add(egui::Label::new(RichText::new(page.subtitle()).color(p.muted)).wrap());
+    ui.spacing_mut().item_spacing.y = 4.0;
+    ui.add_space(10.0);
 }
 
 /// A rounded card grouping related rows.
@@ -382,15 +375,15 @@ fn card<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
     let r = egui::Frame::new()
         .fill(p.raised)
         .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(14, 4))
+        .corner_radius(CornerRadius::same(radius::CARD))
+        .inner_margin(Margin::symmetric(16, 2))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             // Controls on a card need a fill that differs from the card itself.
             let w = &mut ui.visuals_mut().widgets;
             w.inactive.bg_fill = p.hover;
             w.inactive.weak_bg_fill = p.hover;
-            w.hovered.bg_fill = lerp_color(p.hover, p.text, 0.08);
+            w.hovered.bg_fill = mix(p.hover, p.text, 0.08);
             w.hovered.weak_bg_fill = w.hovered.bg_fill;
             add(ui)
         })
@@ -421,7 +414,7 @@ fn row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.add(egui::Label::new(RichText::new(title).color(p.text)).wrap());
         if !desc.is_empty() {
-            ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(p.muted)).wrap());
+            ui.add(egui::Label::new(RichText::new(desc).size(text::SMALL).color(p.muted)).wrap());
         }
     };
     let mut changed = false;
@@ -430,9 +423,9 @@ fn row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(text_w);
-                ui.add_space(8.0);
+                ui.add_space(7.0);
                 text(ui);
-                ui.add_space(8.0);
+                ui.add_space(7.0);
             });
             let r = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 changed = control(ui);
@@ -457,9 +450,10 @@ fn row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, control: impl FnOnce(&
     changed
 }
 
-/// iOS/Windows-style switch.
+/// Windows 11 style switch: off = outlined track with a muted knob, on = accent
+/// track with an `on_accent` knob.
 fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
-    let size = Vec2::new(38.0, 20.0);
+    let size = Vec2::new(40.0, 20.0);
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *on = !*on;
@@ -469,81 +463,151 @@ fn toggle(ui: &mut Ui, p: &Palette, on: &mut bool) -> Response {
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, value, ""));
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(resp.id, *on);
-        let off_bg = if p.dark { Color32::from_rgb(60, 64, 72) } else { Color32::from_rgb(196, 200, 208) };
-        let bg = lerp_color(off_bg, p.accent, t);
-        let radius = rect.height() / 2.0;
+        let r = rect.height() / 2.0;
+        let cr = CornerRadius::same(r as u8);
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(radius as u8), bg);
-        if resp.hovered() {
-            painter.rect_stroke(rect, CornerRadius::same(radius as u8), Stroke::new(1.0, p.text.gamma_multiply(0.35)), StrokeKind::Outside);
+        let hovered = resp.hovered();
+        let off_border = if hovered { p.text } else { p.muted };
+        let on_fill = if hovered { mix(p.accent_fill, theme::text_on(p.accent_fill), 0.1) } else { p.accent_fill };
+        let track = Color32::from_rgba_unmultiplied(on_fill.r(), on_fill.g(), on_fill.b(), (t * 255.0) as u8);
+        painter.rect_filled(rect, cr, track);
+        if t < 1.0 {
+            painter.rect_stroke(rect, cr, Stroke::new(1.0, off_border.gamma_multiply(1.0 - t)), StrokeKind::Inside);
         }
-        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-        painter.circle_filled(egui::pos2(x, rect.center().y), radius - 3.5, Color32::WHITE);
+        if resp.has_focus() {
+            painter.rect_stroke(rect.expand(3.0), CornerRadius::same(r as u8 + 3), Stroke::new(1.5, p.accent), StrokeKind::Inside);
+        }
+        let x = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
+        let knob = mix(off_border, p.on_accent, t);
+        let kr = if resp.is_pointer_button_down_on() { r - 4.0 } else if hovered { r - 4.5 } else { r - 5.0 };
+        painter.circle_filled(egui::pos2(x, rect.center().y), kr, knob);
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// Fixed-width left-to-right box for sliders inside a right-to-left row.
-/// The box is 240 points wide, or the room left when that is less.
-fn slider_box_resp(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
-    slider_box(ui, |ui| ui.add(slider))
-}
-
-fn slider_box<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let w = 240.0f32.min(ui.available_width()).max(140.0);
+/// Fixed-width box for a slider (rail + value box) inside a right-to-left row.
+/// The box is 260 points wide, or the room left when that is less.
+fn slider_box<N: egui::emath::Numeric>(ui: &mut Ui, slider: widgets::Slider<'_, N>) -> Response {
+    let w = 260.0f32.min(ui.available_width()).max(150.0);
     ui.allocate_ui_with_layout(Vec2::new(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().slider_width = w - 80.0;
-        add(ui)
+        let rail = w - size::VALUE_W - 4.0 - ui.spacing().item_spacing.x;
+        ui.add(slider.width(rail))
     })
     .inner
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+/// An `egui::Slider` in the same box (the AI page still uses egui's slider).
+#[cfg(feature = "ai")]
+fn slider_box_resp(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
+    let w = 260.0f32.min(ui.available_width()).max(150.0);
+    ui.allocate_ui_with_layout(Vec2::new(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().slider_width = w - 80.0;
+        ui.add(slider)
+    })
+    .inner
 }
 
 fn toggle_row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, value: &mut bool) -> bool {
     row(ui, p, title, desc, |ui| toggle(ui, p, value).changed())
 }
 
-/// Segmented choice (call inside a right-to-left row: options are added in reverse).
+/// Segmented choice (one control; options in reading order).
 fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
-    let mut changed = false;
-    ui.spacing_mut().item_spacing.x = 2.0;
-    for (v, label) in options.iter().rev() {
-        if ui.selectable_label(*value == *v, *label).clicked() && *value != *v {
-            *value = *v;
-            changed = true;
-        }
-    }
-    changed
+    widgets::segmented_value(ui, value, options)
 }
 
-fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, round: bool, tip: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+/// A round color swatch: 1 pt ring so dark and light colors both show on the card,
+/// and a 2 pt accent ring (2 pt out) when selected.
+fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let c = Color32::from_rgb(color[0], color[1], color[2]);
-        let r = if round { CornerRadius::same(10) } else { CornerRadius::same(5) };
-        let inner = rect.shrink(if selected { 3.0 } else { 1.0 });
-        ui.painter().rect_filled(inner, r, c);
-        ui.painter().rect_stroke(inner, r, Stroke::new(1.0, p.border), StrokeKind::Outside);
+        let center = rect.center();
+        let painter = ui.painter();
+        painter.circle_filled(center, 8.0, c);
+        painter.circle_stroke(center, 8.0, Stroke::new(1.0, swatch_ring(p)));
         if selected {
-            ui.painter().rect_stroke(rect, r, Stroke::new(2.0, p.text), StrokeKind::Inside);
+            painter.circle_stroke(center, 11.0, Stroke::new(2.0, p.accent));
         } else if resp.hovered() {
-            ui.painter().rect_stroke(rect, r, Stroke::new(1.0, p.muted), StrokeKind::Inside);
+            painter.circle_stroke(center, 11.0, Stroke::new(1.0, p.muted));
+        }
+        if resp.has_focus() && !selected {
+            painter.circle_stroke(center, 11.0, Stroke::new(1.5, p.accent));
         }
     }
     resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn hint(ui: &mut Ui, p: &Palette, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(p.muted)).wrap());
+fn swatch_ring(p: &Palette) -> Color32 {
+    if p.dark { Color32::from_white_alpha(70) } else { Color32::from_black_alpha(50) }
+}
+
+/// The "custom color" swatch: a circle with an eyedropper that opens a color picker.
+/// Shows the color itself (and the selected ring) when `value` is not one of `presets`.
+fn custom_swatch(ui: &mut Ui, p: &Palette, value: &mut [u8; 3], presets: &[[u8; 3]]) -> bool {
+    let custom = !presets.contains(value);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let c = rect.center();
+        let painter = ui.painter();
+        let fill = if custom { Color32::from_rgb(value[0], value[1], value[2]) } else { p.faint_bg };
+        painter.circle_filled(c, 8.0, fill);
+        painter.circle_stroke(c, 8.0, Stroke::new(1.0, swatch_ring(p)));
+        let glyph = if custom { theme::text_on(fill) } else if resp.hovered() { p.text } else { p.muted };
+        painter.text(c, Align2::CENTER_CENTER, I::EYEDROPPER, FontId::proportional(size::ICON_CARET), glyph);
+        if custom {
+            painter.circle_stroke(c, 11.0, Stroke::new(2.0, p.accent));
+        } else if resp.hovered() || resp.has_focus() {
+            painter.circle_stroke(c, 11.0, Stroke::new(1.0, p.muted));
+        }
+    }
+    let resp = resp.on_hover_text("Custom color").on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        let mut c = Color32::from_rgb(value[0], value[1], value[2]);
+        if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+            *value = [c.r(), c.g(), c.b()];
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn hint(ui: &mut Ui, p: &Palette, t: &str) {
+    ui.add(egui::Label::new(RichText::new(t).size(text::SMALL).color(p.muted)).wrap());
 }
 
 fn status_chip(ui: &mut Ui, p: &Palette, ok: bool, on: &str, off: &str) {
     let (icon, color, text) = if ok { (I::CHECK_CIRCLE, p.ok, on) } else { (I::MINUS_CIRCLE, p.faint, off) };
-    ui.label(RichText::new(format!("{icon} {text}")).size(12.0).color(color));
+    ui.label(RichText::new(format!("{icon} {text}")).size(text::SMALL).color(color));
+}
+
+/// A shortcut binding shown as keycaps on a clickable, frameless button (`None` =
+/// waiting for a key: "Press a key..." on the selected style). `conflict` adds a
+/// warning ring.
+fn key_button(ui: &mut Ui, p: &Palette, keys: Option<&str>, conflict: bool, size: Vec2) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let cr = CornerRadius::same(radius::CONTROL);
+        match keys {
+            None => {
+                painter.rect(rect, cr, p.selected_bg, Stroke::new(1.0, p.accent), StrokeKind::Inside);
+                painter.text(egui::pos2(rect.left() + 8.0, rect.center().y), Align2::LEFT_CENTER, "Press a key...", text::body(), p.accent_text);
+            }
+            Some(k) => {
+                if resp.hovered() || resp.has_focus() {
+                    painter.rect(rect, cr, p.hover, Stroke::new(1.0, if resp.has_focus() { p.accent } else { p.border }), StrokeKind::Inside);
+                }
+                if conflict {
+                    painter.rect_stroke(rect, cr, Stroke::new(1.0, p.warn), StrokeKind::Inside);
+                }
+                let w = widgets::shortcut_keys_width(painter, k);
+                widgets::paint_shortcut_keys(painter, p, egui::pos2(rect.left() + 6.0 + w, rect.center().y), k);
+            }
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // ====================================================================== pages
@@ -557,11 +621,12 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
         });
         changed |= row(ui, p, "Accent color", "Used for selections, highlights and focus.", |ui| {
             let mut c = false;
-            ui.spacing_mut().item_spacing.x = 3.0;
-            c |= ui.color_edit_button_srgb(&mut s.accent).on_hover_text("Custom color").changed();
-            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let presets: Vec<[u8; 3]> = ACCENTS.iter().map(|(_, rgb)| *rgb).collect();
+            c |= custom_swatch(ui, p, &mut s.accent, &presets);
+            ui.add_space(6.0);
             for (name, rgb) in ACCENTS.iter().rev() {
-                if swatch(ui, p, *rgb, s.accent == *rgb, true, name).clicked() {
+                if swatch(ui, p, *rgb, s.accent == *rgb, name).clicked() {
                     s.accent = *rgb;
                     c = true;
                 }
@@ -571,7 +636,7 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
         changed |= row(ui, p, "Interface size", "Scales all text and controls.", |ui| {
             let mut c = false;
             let mut v = st.scale_edit.unwrap_or(s.ui_scale);
-            let resp = slider_box_resp(ui, egui::Slider::new(&mut v, 0.75..=2.0).step_by(0.05).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)));
+            let resp = slider_box(ui, widgets::Slider::new(&mut v, 0.75..=2.0).step_by(0.05).default_value(1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)));
             if resp.changed() {
                 st.scale_edit = Some(v);
             }
@@ -580,7 +645,7 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
                 st.scale_edit = None;
                 c = true;
             }
-            if (s.ui_scale - 1.0).abs() > 0.001 && ui.small_button("Reset").clicked() {
+            if (s.ui_scale - 1.0).abs() > 0.001 && ui.add(egui::Button::new("Reset").frame_when_inactive(false)).on_hover_text("Back to 100%").clicked() {
                 s.ui_scale = 1.0;
                 st.scale_edit = None;
                 c = true;
@@ -593,11 +658,12 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
     card(ui, p, |ui| {
         changed |= row(ui, p, "Viewer background", "Color behind images in the viewer.", |ui| {
             let mut c = false;
-            ui.spacing_mut().item_spacing.x = 3.0;
-            c |= ui.color_edit_button_srgb(&mut s.viewer_background).on_hover_text("Custom color").changed();
-            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let presets: Vec<[u8; 3]> = BACKGROUNDS.iter().map(|(_, rgb)| *rgb).collect();
+            c |= custom_swatch(ui, p, &mut s.viewer_background, &presets);
+            ui.add_space(6.0);
             for (name, rgb) in BACKGROUNDS.iter().rev() {
-                if swatch(ui, p, *rgb, s.viewer_background == *rgb, false, name).clicked() {
+                if swatch(ui, p, *rgb, s.viewer_background == *rgb, name).clicked() {
                     s.viewer_background = *rgb;
                     c = true;
                 }
@@ -616,7 +682,7 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= row(ui, p, "Mouse wheel", "Hold Ctrl for the other action.", |ui| segmented(ui, &mut s.wheel_action, &[(WheelAction::Navigate, "Next / previous"), (WheelAction::Zoom, "Zoom")]));
         changed |= row(ui, p, "Default fit", "How images are sized when opened.", |ui| {
             let mut c = false;
-            egui::ComboBox::from_id_salt("settings-fit").width(190.0).selected_text(s.fit_mode.label()).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("settings-fit").width(190.0).selected_text(s.fit_mode.label()).show_ui(ui, |ui| {
                 for m in FitMode::ALL {
                     c |= ui.selectable_value(&mut s.fit_mode, m, m.label()).changed();
                 }
@@ -635,10 +701,10 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= toggle_row(ui, p, "Smooth zoom-in filtering", "Off shows crisp pixels when enlarging (good for pixel art).", &mut s.smooth_zoom_in);
         changed |= toggle_row(ui, p, "Animated zoom", "Ease between zoom levels.", &mut s.animate_zoom);
         changed |= row(ui, p, "Magnifier zoom", "Magnification of the loupe.", |ui| {
-            slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.magnifier_zoom, 1.5..=8.0).step_by(0.5).custom_formatter(|x, _| format!("{x:.1}×"))).changed())
+            slider_box(ui, widgets::Slider::new(&mut s.magnifier_zoom, 1.5..=8.0).step_by(0.5).default_value(Settings::default().magnifier_zoom).custom_formatter(|x, _| format!("{x:.1}×"))).changed()
         });
         changed |= row(ui, p, "Magnifier size", "Diameter of the loupe.", |ui| {
-            slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.magnifier_size, 120.0..=600.0).step_by(10.0).suffix(" px")).changed())
+            slider_box(ui, widgets::Slider::new(&mut s.magnifier_size, 120.0..=600.0).step_by(10.0).default_value(Settings::default().magnifier_size).suffix(" px")).changed()
         });
     });
     changed
@@ -649,12 +715,12 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     section_title(ui, p, "Grid");
     card(ui, p, |ui| {
         changed |= row(ui, p, "Thumbnail size", "Also adjustable with Ctrl + mouse wheel in the browser.", |ui| {
-            slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.thumb_size, 80.0..=384.0).step_by(4.0).suffix(" px")).changed())
+            slider_box(ui, widgets::Slider::new(&mut s.thumb_size, 80.0..=384.0).step_by(4.0).default_value(Settings::default().thumb_size).suffix(" px")).changed()
         });
         changed |= row(ui, p, "Thumbnail captions", "Text under thumbnails in the grid. Also in the View menu.", |ui| {
             let mut c = false;
             let cur = s.caption();
-            egui::ComboBox::from_id_salt("settings-captions").width(210.0).selected_text(cur.label()).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("settings-captions").width(210.0).selected_text(cur.label()).show_ui(ui, |ui| {
                 for k in ThumbCaption::ALL {
                     if ui.selectable_label(cur == k, k.label()).clicked() && cur != k {
                         s.set_thumb_caption(k);
@@ -672,11 +738,11 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= row(ui, p, "Default sort", "", |ui| {
             let mut c = false;
             let icon = if s.sort_desc { I::SORT_DESCENDING } else { I::SORT_ASCENDING };
-            if ui.selectable_label(s.sort_desc, icon).on_hover_text(if s.sort_desc { "Descending" } else { "Ascending" }).clicked() {
+            if widgets::icon_button_sized(ui, icon, if s.sort_desc { "Descending" } else { "Ascending" }, false, 28.0, 16.0).clicked() {
                 s.sort_desc = !s.sort_desc;
                 c = true;
             }
-            egui::ComboBox::from_id_salt("settings-sort").width(170.0).selected_text(s.sort_key.label()).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("settings-sort").width(170.0).selected_text(s.sort_key.label()).show_ui(ui, |ui| {
                 for k in SortKey::ALL {
                     c |= ui.selectable_value(&mut s.sort_key, k, k.label()).changed();
                 }
@@ -697,7 +763,7 @@ fn editing(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     section_title(ui, p, "Saving");
     card(ui, p, |ui| {
         changed |= row(ui, p, "JPEG quality", "Default for Save and Save as. 85-95 is visually lossless for most photos.", |ui| {
-            slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.jpeg_quality, 1..=100)).changed())
+            slider_box(ui, widgets::Slider::new(&mut s.jpeg_quality, 1..=100).default_value(Settings::default().jpeg_quality)).changed()
         });
         changed |= toggle_row(ui, p, "Keep EXIF metadata", "Copy camera data, date taken and GPS into saved files.", &mut s.keep_exif_on_save);
         changed |= toggle_row(ui, p, "Lossless JPEG rotation", "Rotate and flip JPEGs without re-encoding when possible.", &mut s.lossless_jpeg_rotate);
@@ -730,7 +796,7 @@ fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             "Decoded images kept in RAM for instant back-and-forth.".to_string()
         };
         changed |= row(ui, p, "Image cache budget", &desc, |ui| {
-            slider_box(ui, |ui| ui.add(egui::Slider::new(&mut s.cache_budget_mb, 256..=8192).logarithmic(true).step_by(64.0).suffix(" MB")).changed())
+            slider_box(ui, widgets::Slider::new(&mut s.cache_budget_mb, 256..=8192).logarithmic(true).step_by(64.0).default_value(Settings::default().cache_budget_mb).suffix(" MB").value_width(80.0)).changed()
         });
         if ram > 0 && (s.cache_budget_mb << 20) > ram / 2 {
             ui.label(RichText::new(format!("{}  More than half of this PC's memory - other programs may slow down.", I::WARNING)).size(11.5).color(p.warn));
@@ -874,7 +940,8 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                 }
             }
             let label = if status.file_types { if status.stale() { "Update" } else { "Re-register" } } else { "Register" };
-            if ui.add(egui::Button::new(RichText::new(label).color(if status.file_types { p.text } else { Color32::WHITE })).fill(if status.file_types { p.raised } else { p.accent })).clicked() {
+            let clicked = if status.file_types { ui.button(label).clicked() } else { widgets::primary_button(ui, p, label).clicked() };
+            if clicked {
                 match crate::shell::register_file_types() {
                     Ok(n) => core.toasts.success(format!("Lumen registered for {n} file types")),
                     Err(e) => core.toasts.error(format!("Could not register file types: {e}")),
@@ -912,7 +979,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                     }
                     refresh = true;
                 }
-            } else if ui.add(egui::Button::new(RichText::new("Add").color(Color32::WHITE)).fill(p.accent)).clicked() {
+            } else if widgets::primary_button(ui, p, "Add").clicked() {
                 match crate::shell::register_context_menu() {
                     Ok(()) => core.toasts.success("'Browse with Lumen' added to Explorer"),
                     Err(e) => core.toasts.error(format!("Could not add the Explorer menu entry: {e}")),
@@ -962,7 +1029,7 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
         ui.horizontal(|ui| {
             ui.label(RichText::new(I::SHIELD_CHECK).size(28.0).color(p.ok));
             ui.vertical(|ui| {
-                ui.label(RichText::new("Lumen never connects to the internet").font(semibold(14.0)).color(p.text));
+                ui.label(RichText::new("Lumen never connects to the internet").font(text::subtitle()).color(p.text));
                 hint(ui, p, "No telemetry, no analytics, no accounts, no update checks and no cloud. Your pictures, tags and ratings never leave this PC.");
                 #[cfg(feature = "ai")]
                 hint(ui, p, "The optional AI analysis (off by default) talks only to the server you set in Settings > AI review, and only when you press Run.");
@@ -1272,9 +1339,9 @@ fn about(ui: &mut Ui, p: &Palette) -> bool {
         ui.horizontal(|ui| {
             ui.add(egui::Image::new(egui::include_image!("../../assets/lumen-256.png")).fit_to_exact_size(Vec2::splat(56.0)));
             ui.vertical(|ui| {
-                ui.add(egui::Label::new(RichText::new("Lumen").font(semibold(22.0)).color(p.text)).truncate());
+                ui.add(egui::Label::new(RichText::new("Lumen").font(text::display()).color(p.text)).truncate());
                 ui.add(egui::Label::new(RichText::new(format!("Version {}  ·  MIT License", env!("CARGO_PKG_VERSION"))).color(p.muted)).wrap());
-                ui.add(egui::Hyperlink::from_label_and_url(RichText::new("github.com/RahulTarigoppula/lumen-image-viewer").size(12.0), env!("CARGO_PKG_REPOSITORY")));
+                ui.add(egui::Hyperlink::from_label_and_url(RichText::new("github.com/RahulTarigoppula/lumen-image-viewer").size(text::SMALL), env!("CARGO_PKG_REPOSITORY")));
             });
         });
         ui.add_space(6.0);
@@ -1289,8 +1356,8 @@ fn about(ui: &mut Ui, p: &Palette) -> bool {
             egui::Grid::new("credits").num_columns(3).spacing([16.0, 5.0]).striped(false).show(ui, |ui| {
                 for (name, what, license) in CREDITS {
                     ui.label(RichText::new(*name).color(p.text));
-                    ui.label(RichText::new(*what).size(12.0).color(p.muted));
-                    ui.label(RichText::new(*license).size(12.0).color(p.faint));
+                    ui.label(RichText::new(*what).size(text::SMALL).color(p.muted));
+                    ui.label(RichText::new(*license).size(text::SMALL).color(p.faint));
                     ui.end_row();
                 }
             });
@@ -1298,7 +1365,7 @@ fn about(ui: &mut Ui, p: &Palette) -> bool {
             // Narrow: one entry per block, so nothing runs past the card.
             for (name, what, license) in CREDITS {
                 ui.add(egui::Label::new(RichText::new(*name).color(p.text)).wrap());
-                ui.add(egui::Label::new(RichText::new(format!("{what}  ·  {license}")).size(12.0).color(p.muted)).wrap());
+                ui.add(egui::Label::new(RichText::new(format!("{what}  ·  {license}")).size(text::SMALL).color(p.muted)).wrap());
                 ui.add_space(4.0);
             }
         }
@@ -1595,7 +1662,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     section_title(ui, p, "Preset");
     card(ui, p, |ui| {
         row(ui, p, "Shortcut preset", "FastStone compatible adds A for actual size and leaves Space and ` free.", |ui| {
-            egui::ComboBox::from_id_salt("settings-keymap-preset").width(200.0).selected_text(preset.label()).show_ui(ui, |ui| {
+            crate::ui::widgets::combo("settings-keymap-preset").width(200.0).selected_text(preset.label()).show_ui(ui, |ui| {
                 for pr in Preset::ALL {
                     if ui.selectable_label(pr == preset, pr.label()).clicked() && pr != preset {
                         if core.settings.key_overrides.is_empty() {
@@ -1659,11 +1726,9 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
         }
     };
     ui.horizontal(|ui| {
-        for m in KeyMode::ALL {
-            if ui.selectable_label(st.kb_mode == m, m.label()).clicked() {
-                st.kb_mode = m;
-                st.capture = None;
-            }
+        let modes: Vec<(KeyMode, &str)> = KeyMode::ALL.iter().map(|m| (*m, m.label())).collect();
+        if widgets::segmented_value(ui, &mut st.kb_mode, &modes) {
+            st.capture = None;
         }
         if wide {
             ui.add_space(12.0);
@@ -1688,13 +1753,13 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     let base = Keymap::preset(preset);
     let mode = st.kb_mode;
     let q = st.kb_search.trim().to_lowercase();
-    // Every shortcut button of this mode has the same width, so the x and +
+    // Every shortcut button of this mode has the same width, so the remove and add
     // buttons line up in columns from row to row.
-    let key_font = egui::FontId::monospace(12.0);
-    let text_w = |t: String| ui.painter().layout_no_wrap(t, key_font.clone(), p.text).size().x;
-    let widest = Command::all().into_iter().flat_map(|c| km.keys_for(mode, c)).map(|k| text_w(keymap::format_shortcut(&k))).fold(text_w("Press a key...".into()), f32::max);
-    let key_w = (widest + 2.0 * ui.spacing().button_padding.x).clamp(64.0, 180.0);
-    let btn_h = 24.0;
+    let widest = Command::all().into_iter().flat_map(|c| km.keys_for(mode, c)).map(|k| widgets::shortcut_keys_width(ui.painter(), &keymap::format_shortcut(&k))).fold(0.0, f32::max);
+    let press_w = ui.painter().layout_no_wrap("Press a key...".into(), text::body(), p.text).size().x;
+    let key_w = (widest.max(press_w) + 16.0).clamp(64.0, 200.0);
+    let btn_h = 26.0;
+    let mut hot = None;
     card(ui, p, |ui| {
         let mut first = true;
         for cmd in Command::all() {
@@ -1715,11 +1780,16 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
             let name_w = 250.0f32.min(w * 0.42);
             let customized = keys != base.keys_for(mode, cmd);
             let restore_w = if customized { 30.0 } else { 0.0 };
-            ui.horizontal(|ui| {
-                ui.set_min_height(30.0);
+            let capturing_row = st.capture.is_some_and(|c| c.mode == mode && c.cmd == cmd);
+            let show_edit = st.kb_hot == Some(cmd) || capturing_row;
+            let mut focused = false;
+            let row = ui.horizontal(|ui| {
+                ui.set_min_height(34.0);
                 ui.allocate_ui_with_layout(Vec2::new(name_w, 26.0), Layout::left_to_right(Align::Center), |ui| {
                     ui.set_width(name_w);
-                    ui.add(egui::Label::new(RichText::new(format!("{}  {}", cmd.icon(), cmd.label())).color(p.text)).truncate());
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(cmd.icon()).size(size::ICON).color(p.muted)));
+                    ui.add(egui::Label::new(RichText::new(cmd.label()).color(p.text)).truncate());
                 });
                 let keys_w = (ui.available_width() - restore_w).max(60.0);
                 ui.allocate_ui_with_layout(Vec2::new(keys_w, 26.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
@@ -1728,46 +1798,58 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                     for (k, text) in keys.iter().zip(&key_text) {
                         let capturing_this = st.capture == Some(Capture { mode, cmd, replace: Some(*k) });
                         let conflicts = km.conflicts(mode, *k, cmd);
-                        let label = if capturing_this { "Press a key...".to_string() } else { text.clone() };
-                        let mut rt = RichText::new(label).monospace().size(12.0);
-                        if !conflicts.is_empty() {
-                            rt = rt.color(p.warn);
-                        }
-                        let mut b = ui.add(egui::Button::new(rt).selected(capturing_this).min_size(Vec2::new(key_w, btn_h)));
-                        if !conflicts.is_empty() {
+                        let b = key_button(ui, p, if capturing_this { None } else { Some(text) }, !conflicts.is_empty(), Vec2::new(key_w, btn_h));
+                        focused |= b.has_focus();
+                        let b = if !conflicts.is_empty() {
                             let names: Vec<String> = conflicts.iter().map(|(m, c)| format!("{} ({})", c.label(), m.label())).collect();
-                            b = b.on_hover_text(format!("Also bound to {}", names.join(", ")));
+                            b.on_hover_text(format!("Also bound to {}", names.join(", ")))
                         } else {
-                            b = b.on_hover_text("Click, then press the new key");
-                        }
+                            b.on_hover_text("Click, then press the new key")
+                        };
                         if b.clicked() {
                             st.capture = Some(Capture { mode, cmd, replace: Some(*k) });
                             st.conflict = None;
                         }
-                        if ui.add(egui::Button::new(RichText::new(I::X).size(12.0)).frame(false).min_size(Vec2::new(20.0, btn_h))).on_hover_text("Remove this shortcut").clicked() {
+                        let x = ui.scope(|ui| {
+                            ui.set_opacity(if show_edit { 1.0 } else { 0.0 });
+                            widgets::icon_button_sized(ui, I::X, "Remove this shortcut", false, 22.0, 12.0)
+                        });
+                        focused |= x.inner.has_focus();
+                        if x.inner.clicked() {
                             let rest: Vec<KeyboardShortcut> = keys.iter().copied().filter(|x| x != k).collect();
                             set_command_keys(core, mode, cmd, rest);
                             changed = true;
                         }
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                     }
                     let adding = st.capture == Some(Capture { mode, cmd, replace: None });
-                    let add_label = if adding { "Press a key...".to_string() } else { I::PLUS.to_string() };
-                    let add_w = if adding { key_w } else { btn_h };
-                    if ui.add(egui::Button::new(add_label).selected(adding).min_size(Vec2::new(add_w, btn_h))).on_hover_text("Add a shortcut").clicked() {
+                    let add = if adding {
+                        key_button(ui, p, None, false, Vec2::new(key_w, btn_h))
+                    } else {
+                        ui.scope(|ui| {
+                            ui.set_opacity(if show_edit || keys.is_empty() { 1.0 } else { 0.0 });
+                            widgets::icon_button_sized(ui, I::PLUS, "Add a shortcut", false, btn_h, 14.0)
+                        })
+                        .inner
+                    };
+                    focused |= add.has_focus();
+                    if add.clicked() {
                         st.capture = Some(Capture { mode, cmd, replace: None });
                         st.conflict = None;
                     }
                 });
                 if customized {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(egui::Button::new(I::ARROW_COUNTER_CLOCKWISE).min_size(Vec2::splat(btn_h))).on_hover_text("Restore the preset shortcuts for this command").clicked() {
+                        if widgets::icon_button_sized(ui, I::ARROW_COUNTER_CLOCKWISE, "Restore the preset shortcuts for this command", false, btn_h, 14.0).clicked() {
                             set_command_keys(core, mode, cmd, base.keys_for(mode, cmd));
                             changed = true;
                         }
                     });
                 }
             });
+            if focused || ui.rect_contains_pointer(row.response.rect) {
+                hot = Some(cmd);
+            }
         }
         if first {
             ui.add_space(8.0);
@@ -1775,6 +1857,10 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
             ui.add_space(8.0);
         }
     });
+    if st.kb_hot != hot {
+        st.kb_hot = hot;
+        ui.ctx().request_repaint();
+    }
 
     if st.confirm_reset_keys {
         match widgets::show_confirm(ui.ctx(), "Reset shortcuts?", "All custom shortcuts are removed and the preset's keys apply again.", "Reset", true, p) {
