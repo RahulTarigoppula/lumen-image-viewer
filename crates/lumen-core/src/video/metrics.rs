@@ -97,6 +97,16 @@ pub fn mse_plane(a: &Plane, b: &Plane) -> f64 {
     rows as f64 / a.len().max(1) as f64
 }
 
+/// Ceiling for reported PSNR (and SSIM in dB). Identical planes have an
+/// infinite PSNR, which spreadsheets cannot read, so summaries, the UI and
+/// CSV exports show this value instead.
+pub const PSNR_CAP_DB: f64 = 100.0;
+
+/// `v` limited to [`PSNR_CAP_DB`] (NaN, meaning "no such plane", is kept).
+pub fn cap_db(v: f64) -> f64 {
+    if v.is_nan() { v } else { v.min(PSNR_CAP_DB) }
+}
+
 pub fn psnr_from_mse(mse: f64, max: f64) -> f64 {
     if mse <= 1e-12 {
         f64::INFINITY
@@ -206,16 +216,29 @@ pub fn summarize(rows: &[FrameMetrics], max: f64) -> Summary {
         return Summary::default();
     }
     let n = rows.len() as f64;
-    let cap = |v: f64| if v.is_finite() { v } else { 100.0 };
+    let cap = cap_db;
     Summary {
         frames: rows.len(),
         mean_psnr_y: rows.iter().map(|r| cap(r.psnr_y)).sum::<f64>() / n,
         mean_psnr_avg: rows.iter().map(|r| cap(r.psnr_avg)).sum::<f64>() / n,
-        global_psnr: psnr_from_mse(rows.iter().map(|r| r.mse_avg).sum::<f64>() / n, max),
+        global_psnr: cap(psnr_from_mse(rows.iter().map(|r| r.mse_avg).sum::<f64>() / n, max)),
         mean_ssim: rows.iter().map(|r| r.ssim_y).sum::<f64>() / n,
         min_psnr_y: rows.iter().map(|r| cap(r.psnr_y)).fold(f64::INFINITY, f64::min),
         min_ssim: rows.iter().map(|r| r.ssim_y).fold(f64::INFINITY, f64::min),
     }
+}
+
+/// Per-frame metrics as CSV (one row per frame, header comment first).
+/// PSNR and SSIM dB values are capped at [`PSNR_CAP_DB`] so identical frames
+/// read as 100.0000 instead of `inf`; a missing plane leaves its cell empty.
+pub fn to_csv(rows: &[(usize, FrameMetrics)]) -> String {
+    let db = |v: f64| if v.is_nan() { String::new() } else { format!("{:.4}", cap_db(v)) };
+    let mut s = format!("# Lumen per-frame metrics (A = reference). PSNR and SSIM dB are capped at {PSNR_CAP_DB:.2} dB; identical frames read {PSNR_CAP_DB:.2}.\n");
+    s += "frame,psnr_y,psnr_u,psnr_v,psnr_avg,ssim_y,ssim_db\n";
+    for (i, m) in rows {
+        s += &format!("{i},{},{},{},{},{:.6},{}\n", db(m.psnr_y), db(m.psnr_u), db(m.psnr_v), db(m.psnr_avg), m.ssim_y, db(ssim_db(m.ssim_y)));
+    }
+    s
 }
 
 /// FFmpeg `scdet`-style scene score from two consecutive luma planes (0..100).
@@ -259,6 +282,27 @@ mod tests {
         let m = compare(&f, &f).unwrap();
         assert!(m.psnr_y.is_infinite());
         assert!((m.ssim_y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn identical_frames_cap_at_100_db() {
+        assert_eq!(cap_db(f64::INFINITY), PSNR_CAP_DB);
+        assert_eq!(cap_db(42.5), 42.5);
+        assert!(cap_db(f64::NAN).is_nan());
+        let m = FrameMetrics { psnr_y: f64::INFINITY, psnr_u: f64::INFINITY, psnr_v: f64::INFINITY, psnr_avg: f64::INFINITY, ssim_y: 1.0, mse_avg: 0.0 };
+        let s = summarize(&[m, m], 255.0);
+        assert_eq!(s.mean_psnr_y, PSNR_CAP_DB);
+        assert_eq!(s.global_psnr, PSNR_CAP_DB);
+        assert_eq!(s.min_psnr_y, PSNR_CAP_DB);
+    }
+
+    #[test]
+    fn csv_has_no_infinities() {
+        let same = FrameMetrics { psnr_y: f64::INFINITY, psnr_u: f64::INFINITY, psnr_v: f64::NAN, psnr_avg: f64::INFINITY, ssim_y: 1.0, mse_avg: 0.0 };
+        let csv = to_csv(&[(7, same)]);
+        assert!(!csv.contains("inf") && !csv.contains("NaN"), "{csv}");
+        assert!(csv.starts_with('#'));
+        assert_eq!(csv.lines().nth(2), Some("7,100.0000,100.0000,,100.0000,1.000000,100.0000"));
     }
 
     #[test]

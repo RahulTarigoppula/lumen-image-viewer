@@ -5,6 +5,7 @@ use super::audio::AudioShared;
 use super::metrics::{Plane, PlaneData, YuvFrame};
 use anyhow::{anyhow, Context as _, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use std::collections::VecDeque;
 use ffmpeg_next as ff;
 use image::RgbaImage;
 use std::path::{Path, PathBuf};
@@ -220,18 +221,15 @@ pub struct VFrame {
     pub gen: u64,
     pub pts: f64,
     pub kind: u8,
-    pub key: bool,
     pub rgba: Arc<RgbaImage>,
     pub native: Option<Arc<YuvFrame>>,
-    /// Only for filling the back-step history; don't display.
-    pub history: bool,
 }
 
 pub enum Cmd {
     Play,
     Pause,
-    Seek { t: f64, exact: bool, gen: u64, fill_history: bool },
-    Step { gen: u64 },
+    /// Show the frame at `t` (exact) or the keyframe before it (fast scrubbing).
+    Seek { t: f64, exact: bool, gen: u64 },
     OutputSize(u32, u32),
     Native(bool),
     Quit,
@@ -248,10 +246,13 @@ pub struct Player {
     pub rx: Receiver<Event>,
 }
 
+/// Shared frame index (filled by the index thread once it finishes).
+pub type SharedIndex = Arc<parking_lot::Mutex<Option<Vec<IndexEntry>>>>;
+
 impl Player {
-    pub fn open(path: &Path, audio: Option<Arc<AudioShared>>, ctx: egui::Context) -> Result<Player> {
+    pub fn open(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> Result<Player> {
         init();
-        let (ctx_tx, ctx_rx) = unbounded::<Cmd>();
+        let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
         let (ev_tx, ev_rx) = bounded::<Event>(6);
         // FFmpeg contexts are not Send: build the worker on its own thread and
         // report whether opening succeeded.
@@ -260,7 +261,7 @@ impl Player {
         std::thread::Builder::new()
             .name("lumen-video".into())
             .spawn(move || {
-                let mut worker = match Worker::new(&path, audio) {
+                let mut worker = match Worker::new(&path, audio, index, cmd_rx, ev_tx.clone(), ctx.clone()) {
                     Ok(w) => {
                         let _ = init_tx.send(Ok(()));
                         w
@@ -270,14 +271,14 @@ impl Player {
                         return;
                     }
                 };
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(ctx_rx, ev_tx.clone(), ctx.clone())));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()));
                 if r.is_err() {
                     let _ = ev_tx.send(Event::Error("The video decoder crashed".into()));
                     ctx.request_repaint();
                 }
             })?;
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Player { tx: ctx_tx, rx: ev_rx }),
+            Ok(Ok(())) => Ok(Player { tx: cmd_tx, rx: ev_rx }),
             Ok(Err(e)) => Err(anyhow!(e)),
             Err(_) => Err(anyhow!("The video decoder failed to start")),
         }
@@ -294,6 +295,55 @@ impl Drop for Player {
     }
 }
 
+/// Memory for decoded frames kept by one worker for instant back-steps.
+const FRAME_CACHE_BYTES: usize = 512 << 20;
+
+/// Decoded frames in presentation order: one contiguous run that ends at the
+/// decoder's latest output. Stepping back inside the run needs no decoding;
+/// the oldest frames are dropped when the memory cap is reached.
+#[derive(Default)]
+struct FrameCache {
+    frames: VecDeque<(f64, ff::frame::Video)>,
+    bytes: usize,
+}
+
+impl FrameCache {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn push(&mut self, pts: f64, f: ff::frame::Video) {
+        self.bytes += frame_bytes(&f);
+        self.frames.push_back((pts, f));
+        while self.bytes > FRAME_CACHE_BYTES && self.frames.len() > 1 {
+            if let Some((_, old)) = self.frames.pop_front() {
+                self.bytes = self.bytes.saturating_sub(frame_bytes(&old));
+            }
+        }
+    }
+
+    /// Index of the frame an exact seek to `t` shows, if the run covers `t`.
+    fn find(&self, t: f64) -> Option<usize> {
+        let (first, last) = (self.frames.front()?.0, self.frames.back()?.0);
+        if t < first - 1e-4 || t > last + 1e-4 {
+            return None;
+        }
+        let i = self.frames.partition_point(|(p, _)| *p < t - 1e-4);
+        (i < self.frames.len()).then_some(i)
+    }
+
+    /// Index of the frame that follows the one at `pts`, if both are cached.
+    fn after(&self, pts: f64) -> Option<usize> {
+        let i = self.find(pts)?;
+        (i + 1 < self.frames.len()).then_some(i + 1)
+    }
+}
+
+fn frame_bytes(f: &ff::frame::Video) -> usize {
+    (0..f.planes()).map(|i| f.stride(i) * f.plane_height(i) as usize).sum::<usize>().max(1)
+}
+
 struct Worker {
     input: ff::format::context::Input,
     vidx: usize,
@@ -305,6 +355,13 @@ struct Worker {
     adec: Option<ff::decoder::Audio>,
     resampler: Option<ff::software::resampling::Context>,
     audio: Option<Arc<AudioShared>>,
+    index: SharedIndex,
+    rx: Receiver<Cmd>,
+    tx: Sender<Event>,
+    ctx: egui::Context,
+    /// Commands received while a seek was decoding, run after it.
+    backlog: VecDeque<Cmd>,
+    quit: bool,
     scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32, u32, u32))>,
     native_scaler: Option<(ff::software::scaling::Context, (ff::format::Pixel, u32, u32))>,
     out_size: (u32, u32),
@@ -314,13 +371,21 @@ struct Worker {
     eof_sent: bool,
     demux_eof: bool,
     vdec_eof: bool,
-    pending_vpkts: std::collections::VecDeque<ff::Packet>,
-    last_frame: Option<ff::frame::Video>,
+    pending_vpkts: VecDeque<ff::Packet>,
+    cache: FrameCache,
+    /// Pts of the last frame sent for display.
+    shown: Option<f64>,
     audio_min_pts: f64,
+    /// While seeking: frames before this pts would not fit in the cache, so
+    /// non-reference ones are not decoded at all and the rest not kept.
+    skip_before: f64,
+    frame_dur: f64,
+    /// Bytes of the latest decoded frame (sizes the skip window).
+    frame_bytes_hint: usize,
 }
 
 impl Worker {
-    fn new(path: &Path, audio: Option<Arc<AudioShared>>) -> Result<Worker> {
+    fn new(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) -> Result<Worker> {
         let input = ff::format::input(path).with_context(|| format!("Cannot open {}", path.display()))?;
         let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
         let vidx = vs.index();
@@ -330,6 +395,7 @@ impl Worker {
         vctx.set_threading(ff::codec::threading::Config { kind: ff::codec::threading::Type::Frame, count: 0 });
         let vdec = vctx.decoder().video()?;
         let (vw, vh) = (vdec.width(), vdec.height());
+        let fps = [q2f(vs.avg_frame_rate()), q2f(vs.rate())].into_iter().find(|f| *f > 0.0).unwrap_or(25.0);
         let mut aidx = None;
         let mut atb = 0.0;
         let mut adec = None;
@@ -355,6 +421,12 @@ impl Worker {
             adec,
             resampler: None,
             audio,
+            index,
+            rx,
+            tx,
+            ctx,
+            backlog: VecDeque::new(),
+            quit: false,
             scaler: None,
             native_scaler: None,
             out_size: (vw, vh),
@@ -365,64 +437,60 @@ impl Worker {
             demux_eof: false,
             vdec_eof: false,
             pending_vpkts: Default::default(),
-            last_frame: None,
+            cache: FrameCache::default(),
+            shown: None,
             audio_min_pts: f64::NEG_INFINITY,
+            skip_before: f64::NEG_INFINITY,
+            frame_dur: 1.0 / fps,
+            frame_bytes_hint: 0,
         })
     }
 
-    fn run(&mut self, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) {
+    fn run(&mut self) {
         // First frame so the UI shows something immediately.
-        self.seek(0.0, false, 0, false, &tx, &ctx);
-        loop {
-            let cmd = if self.playing { rx.try_recv().ok() } else { rx.recv().ok() };
+        self.seek(0.0, false, 0);
+        while !self.quit {
+            let cmd = match self.backlog.pop_front() {
+                Some(c) => Some(c),
+                None if self.playing => self.rx.try_recv().ok(),
+                None => match self.rx.recv() {
+                    Ok(c) => Some(c),
+                    Err(_) => return,
+                },
+            };
             if let Some(cmd) = cmd {
                 match cmd {
                     Cmd::Quit => return,
-                    Cmd::Play => self.playing = true,
+                    Cmd::Play => {
+                        self.sync_audio();
+                        self.playing = true;
+                    }
                     Cmd::Pause => self.playing = false,
-                    Cmd::Seek { t, exact, gen, fill_history } => {
-                        // Coalesce bursts of seeks (scrubbing): only the latest matters.
-                        let mut latest = (t, exact, gen, fill_history);
-                        let mut others = Vec::new();
-                        while let Ok(c) = rx.try_recv() {
-                            match c {
-                                Cmd::Seek { t, exact, gen, fill_history } => latest = (t, exact, gen, fill_history),
-                                other => others.push(other),
-                            }
-                        }
-                        self.seek(latest.0, latest.1, latest.2, latest.3, &tx, &ctx);
-                        for o in others {
-                            if self.handle_simple(o, &tx, &ctx) {
-                                return;
-                            }
-                        }
-                    }
-                    other => {
-                        if self.handle_simple(other, &tx, &ctx) {
-                            return;
-                        }
-                    }
+                    // Bursts of seeks (scrubbing, rapid steps) collapse to the latest.
+                    Cmd::Seek { t, exact, gen } => match self.drain_commands() {
+                        Some((t, exact, gen)) => self.seek(t, exact, gen),
+                        None => self.seek(t, exact, gen),
+                    },
+                    Cmd::OutputSize(w, h) => self.out_size = (w.max(2), h.max(2)),
+                    Cmd::Native(on) => self.want_native = on,
                 }
                 continue;
             }
             if self.playing {
                 // Keep audio fed even when the video queue is full.
                 let audio_low = self.audio.as_ref().map(|a| a.buffered_secs() < 0.4).unwrap_or(false) && self.aidx.is_some() && !self.demux_eof;
-                if tx.len() < 5 {
-                    match self.next_frame() {
-                        Some(f) => {
-                            let vf = self.to_vframe(&f, false);
-                            self.last_frame = Some(f);
-                            if tx.send(Event::Frame(vf)).is_err() {
+                if self.tx.len() < 5 {
+                    match self.next_output() {
+                        Some(i) => {
+                            if !self.send_cached(i) {
                                 return;
                             }
-                            ctx.request_repaint();
                         }
                         None => {
                             if !self.eof_sent {
                                 self.eof_sent = true;
-                                let _ = tx.send(Event::Eof { gen: self.gen });
-                                ctx.request_repaint();
+                                let _ = self.tx.send(Event::Eof { gen: self.gen });
+                                self.ctx.request_repaint();
                             }
                             self.playing = false;
                         }
@@ -438,31 +506,25 @@ impl Worker {
         }
     }
 
-    /// Returns true when the worker should exit.
-    fn handle_simple(&mut self, cmd: Cmd, tx: &Sender<Event>, ctx: &egui::Context) -> bool {
-        match cmd {
-            Cmd::Quit => return true,
-            Cmd::Play => self.playing = true,
-            Cmd::Pause => self.playing = false,
-            Cmd::Seek { t, exact, gen, fill_history } => self.seek(t, exact, gen, fill_history, tx, ctx),
-            Cmd::Step { gen } => {
-                self.gen = gen;
-                match self.next_frame() {
-                    Some(f) => {
-                        let vf = self.to_vframe(&f, false);
-                        self.last_frame = Some(f);
-                        let _ = tx.send(Event::Frame(vf));
-                    }
-                    None => {
-                        let _ = tx.send(Event::Eof { gen });
-                    }
+    /// Take queued commands without blocking: returns the latest seek, applies
+    /// settings at once and keeps play/pause for after the seek.
+    fn drain_commands(&mut self) -> Option<(f64, bool, u64)> {
+        let mut latest = None;
+        loop {
+            match self.rx.try_recv() {
+                Ok(Cmd::Seek { t, exact, gen }) => latest = Some((t, exact, gen)),
+                Ok(Cmd::OutputSize(w, h)) => self.out_size = (w.max(2), h.max(2)),
+                Ok(Cmd::Native(on)) => self.want_native = on,
+                Ok(Cmd::Quit) => self.quit = true,
+                Ok(other) => self.backlog.push_back(other),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.quit = true;
+                    break;
                 }
-                ctx.request_repaint();
             }
-            Cmd::OutputSize(w, h) => self.out_size = (w.max(2), h.max(2)),
-            Cmd::Native(on) => self.want_native = on,
         }
-        false
+        latest
     }
 
     fn frame_pts(&self, f: &ff::frame::Video) -> f64 {
@@ -553,6 +615,12 @@ impl Worker {
                 Err(_) => {}
             }
             if let Some(pkt) = self.pending_vpkts.pop_front() {
+                // Frame threads pick this up per packet.
+                // (A few frames of margin: decode and keep thresholds must not touch.)
+                let skip = pkt.pts().map(|p| (p as f64 * self.vtb - self.vstart) < self.skip_before - 4.0 * self.frame_dur).unwrap_or(false);
+                unsafe {
+                    (*self.vdec.as_mut_ptr()).skip_frame = if skip { ff::ffi::AVDiscard::AVDISCARD_NONREF } else { ff::ffi::AVDiscard::AVDISCARD_DEFAULT };
+                }
                 let _ = self.vdec.send_packet(&pkt);
                 continue;
             }
@@ -568,13 +636,84 @@ impl Worker {
         }
     }
 
-    fn seek(&mut self, t: f64, exact: bool, gen: u64, fill_history: bool, tx: &Sender<Event>, ctx: &egui::Context) {
-        self.gen = gen;
+    /// Decode the next frame into the cache; returns its cache index and,
+    /// while seeking, whether the frame came before the cache window (such
+    /// frames are not kept, so the cached run has no holes).
+    fn decode_into_cache(&mut self) -> Option<(usize, bool)> {
+        let f = self.next_frame()?;
+        let pts = self.frame_pts(&f);
+        self.frame_bytes_hint = frame_bytes(&f);
+        if pts < self.skip_before {
+            // Park it alone so callers can still look at its pts.
+            self.cache.clear();
+            self.cache.push(pts, f);
+            return Some((0, true));
+        }
+        if self.cache.frames.front().is_some_and(|(p, _)| *p < self.skip_before) {
+            // Skipped frames lie between the parked frame and this one.
+            self.cache.clear();
+        }
+        self.cache.push(pts, f);
+        Some((self.cache.frames.len() - 1, false))
+    }
+
+    /// The frame after the one on screen: from the cache when stepping back
+    /// left newer frames there, else freshly decoded.
+    fn next_output(&mut self) -> Option<usize> {
+        if let Some(i) = self.shown.and_then(|s| self.cache.after(s)) {
+            return Some(i);
+        }
+        self.decode_into_cache().map(|(i, _)| i)
+    }
+
+    /// Convert cached frame `i` and send it for display. False when the UI is gone.
+    fn send_cached(&mut self, i: usize) -> bool {
+        // Borrow the frame out of the cache while converting it (no copy).
+        let pts = self.cache.frames[i].0;
+        let f = std::mem::replace(&mut self.cache.frames[i].1, ff::frame::Video::empty());
+        let vf = self.to_vframe(&f);
+        self.cache.frames[i].1 = f;
+        self.shown = Some(pts);
+        let ok = self.tx.send(Event::Frame(vf)).is_ok();
+        self.ctx.request_repaint();
+        ok
+    }
+
+    /// Pts of the keyframe at or before `t`, from the frame index.
+    fn keyframe_before(&self, t: f64) -> Option<f64> {
+        let guard = self.index.lock();
+        let idx = guard.as_ref()?;
+        let i = idx.partition_point(|e| e.pts <= t + 1e-4);
+        idx[..i].iter().rev().find(|e| e.key).map(|e| e.pts)
+    }
+
+    /// Whether decoding on from the decoder's position reaches `t` sooner than
+    /// a demuxer seek: no keyframe to jump to in between, or only a few frames
+    /// before one (a seek costs about as much as decoding those).
+    fn reachable_by_decoding(&self, t: f64) -> bool {
+        let Some(&(pos, _)) = self.cache.frames.back() else { return false };
+        if self.vdec_eof || t <= pos {
+            return false;
+        }
+        match self.keyframe_before(t) {
+            Some(k) => k <= pos + 0.3,
+            None => t - pos < 1.0,
+        }
+    }
+
+    /// Position the demuxer at the keyframe before `t - back`, flushing decoders.
+    fn demux_seek(&mut self, t: f64, exact: bool, back: f64) {
         self.eof_sent = false;
         self.demux_eof = false;
         self.vdec_eof = false;
         self.pending_vpkts.clear();
-        let ts = ((t.max(0.0) + self.vstart) / self.vtb) as i64;
+        // Seek to the keyframe's own time when the index knows it: containers
+        // seek by decode time, which for a keyframe followed by reordered
+        // frames can land on the next keyframe, after the target.
+        let at = (t - back).max(0.0);
+        let at = self.keyframe_before(at).map(|k| k.min(at)).unwrap_or(at);
+        // Round: truncating could land one tick before the keyframe.
+        let ts = ((at + self.vstart) / self.vtb).round() as i64;
         unsafe {
             ff::ffi::av_seek_frame(self.input.as_mut_ptr(), self.vidx as i32, ts, ff::ffi::AVSEEK_FLAG_BACKWARD as i32);
         }
@@ -587,48 +726,106 @@ impl Worker {
             a.flush();
         }
         self.audio_min_pts = if exact { t } else { f64::NEG_INFINITY };
-        let mut history: Vec<ff::frame::Video> = Vec::new();
-        let mut chosen: Option<ff::frame::Video> = None;
-        let mut decoded = 0;
-        while let Some(f) = self.next_frame() {
-            decoded += 1;
-            let pts = self.frame_pts(&f);
-            if !exact || pts >= t - 1e-4 {
-                chosen = Some(f);
-                break;
-            }
-            if fill_history {
-                history.push(f.clone());
-                if history.len() > 90 {
-                    history.remove(0);
-                }
-            }
-            // Keep the latest frame before the target in case the target is past the end.
-            chosen = Some(f);
-            if decoded > 20_000 {
-                break;
-            }
-        }
-        for h in &history {
-            let vf = self.to_vframe(h, true);
-            if tx.send(Event::Frame(vf)).is_err() {
-                return;
-            }
-        }
-        match chosen {
-            Some(f) => {
-                let vf = self.to_vframe(&f, false);
-                self.last_frame = Some(f);
-                let _ = tx.send(Event::Frame(vf));
-            }
-            None => {
-                let _ = tx.send(Event::Eof { gen });
-            }
-        }
-        ctx.request_repaint();
+        self.cache.clear();
     }
 
-    fn to_vframe(&mut self, f: &ff::frame::Video, history: bool) -> VFrame {
+    /// Show the frame at `t`. Frames decoded on the way are cached, and newer
+    /// seeks that arrive meanwhile retarget the same pass instead of queueing.
+    fn seek(&mut self, mut t: f64, mut exact: bool, mut gen: u64) {
+        let mut back_off = 0.0;
+        // For the dev hook's timing log.
+        let started = std::time::Instant::now();
+        let (mut decoded, mut seeks) = (0usize, 0usize);
+        'target: loop {
+            self.gen = gen;
+            self.eof_sent = false;
+            self.skip_before = f64::NEG_INFINITY;
+            if exact {
+                if let Some(i) = self.cache.find(t) {
+                    self.send_cached(i);
+                    return;
+                }
+            }
+            let resume = exact && self.reachable_by_decoding(t);
+            if !resume {
+                self.demux_seek(t, exact, back_off);
+                seeks += 1;
+                // Frames older than what the cache holds are only decoded
+                // when other frames need them.
+                if exact && self.frame_bytes_hint > 0 {
+                    let fit = (FRAME_CACHE_BYTES / self.frame_bytes_hint).saturating_sub(2);
+                    self.skip_before = t - fit as f64 * self.frame_dur;
+                }
+            }
+            let mut first = !resume;
+            loop {
+                if let Some((t2, e2, g2)) = self.drain_commands() {
+                    (t, exact, gen) = (t2, e2, g2);
+                    back_off = 0.0;
+                    continue 'target;
+                }
+                if self.quit {
+                    self.skip_before = f64::NEG_INFINITY;
+                    return;
+                }
+                let Some((i, early)) = self.decode_into_cache() else {
+                    self.skip_before = f64::NEG_INFINITY;
+                    // Past the end: show the last frame there is.
+                    match self.cache.frames.len() {
+                        0 => {
+                            let _ = self.tx.send(Event::Eof { gen });
+                            self.ctx.request_repaint();
+                        }
+                        n => {
+                            self.send_cached(n - 1);
+                        }
+                    }
+                    return;
+                };
+                let pts = self.cache.frames[i].0;
+                decoded += 1;
+                if first && exact && pts > t + 1e-3 && t > 1e-3 && back_off < 30.0 {
+                    // Landed after the target (open-GOP leading frames are
+                    // dropped after a seek): start from an earlier keyframe.
+                    back_off = if back_off == 0.0 { 1.0 } else { back_off * 4.0 };
+                    continue 'target;
+                }
+                first = false;
+                if early {
+                    continue;
+                }
+                if !exact || pts >= t - 1e-4 {
+                    self.skip_before = f64::NEG_INFINITY;
+                    if super::mode::dev_dir().is_some() {
+                        super::mode::dev_log(&format!("  worker: target={t:.4} seeks={seeks} decoded={decoded} cached={} ms={:.1}", self.cache.frames.len(), started.elapsed().as_secs_f64() * 1000.0));
+                    }
+                    self.send_cached(i);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Before playing from a frame that came from the cache, make the queued
+    /// audio start at that frame so sound stays in sync.
+    fn sync_audio(&mut self) {
+        let (Some(audio), Some(shown)) = (self.audio.clone(), self.shown) else { return };
+        if self.aidx.is_none() {
+            return;
+        }
+        match audio.trim_to(shown) {
+            super::audio::Trim::Done => {}
+            super::audio::Trim::Empty if self.audio_min_pts <= shown + 1e-3 => self.audio_min_pts = shown,
+            _ => {
+                // The audio for this frame was already dropped: read it again.
+                let gen = self.gen;
+                self.cache.clear();
+                self.seek(shown, true, gen);
+            }
+        }
+    }
+
+    fn to_vframe(&mut self, f: &ff::frame::Video) -> VFrame {
         let (ow, oh) = self.out_size;
         let rgba = self.convert_rgba(f, ow, oh).unwrap_or_else(|_| RgbaImage::new(ow.max(1), oh.max(1)));
         let native = if self.want_native { self.native_planes(f).ok().map(Arc::new) } else { None };
@@ -638,7 +835,7 @@ impl Worker {
             ff::picture::Type::B | ff::picture::Type::BI => b'B',
             _ => b'?',
         };
-        VFrame { gen: self.gen, pts: self.frame_pts(f), kind, key: f.is_key(), rgba: Arc::new(rgba), native, history }
+        VFrame { gen: self.gen, pts: self.frame_pts(f), kind, rgba: Arc::new(rgba), native }
     }
 
     fn convert_rgba(&mut self, f: &ff::frame::Video, w: u32, h: u32) -> Result<RgbaImage> {
