@@ -4,8 +4,9 @@
 //! The host field accepts whatever a user is likely to paste: `192.168.1.20`,
 //! `192.168.1.20:8000`, `workstation`, `http://192.168.1.20:8000/v1`,
 //! `https://box.lan/v1/chat/completions`, `[fd00::5]:8000` or a bare IPv6
-//! address. A bare host gets the port field (default 8000) and the HTTPS
-//! toggle (default off); a pasted URL brings its own scheme and port.
+//! address. A bare host gets the port field and the HTTPS toggle as the
+//! user set them by hand, else 8000 and plain HTTP; a pasted URL brings its
+//! own scheme and port (which a later bare host does not inherit).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -64,6 +65,11 @@ pub struct AiSettings {
     pub host: String,
     pub port: u16,
     pub https: bool,
+    /// The port field was changed by hand (not taken from a pasted URL), so
+    /// a bare host keeps it.
+    pub port_by_user: bool,
+    /// The HTTPS toggle was changed by hand.
+    pub https_by_user: bool,
     /// Path before `/v1` when the server sits behind a reverse proxy
     /// (`https://box.lan/vllm/v1` gives `/vllm`). Normally empty.
     pub path_prefix: String,
@@ -77,6 +83,8 @@ pub struct AiSettings {
     pub timeout_first_token_s: u32,
     pub timeout_total_s: u32,
     pub max_completion_tokens: u32,
+    /// Stored rounded, so settings.json shows 0.2 and not 0.20000000298.
+    #[serde(serialize_with = "round_f32")]
     pub temperature: f32,
     /// Long side of the downscaled full view.
     pub max_side_overview: u32,
@@ -93,6 +101,8 @@ pub struct AiSettings {
     pub lan_only: bool,
     /// Also treat 100.64.0.0/10 (CGNAT, Tailscale) as local.
     pub allow_cgnat: bool,
+    /// Show the send preview for every request (except to servers in
+    /// `trusted_servers`); off: only for the first request to each server.
     pub always_confirm: bool,
     pub include_filename: bool,
     pub include_exif: bool,
@@ -113,6 +123,8 @@ impl Default for AiSettings {
             host: String::new(),
             port: DEFAULT_PORT,
             https: false,
+            port_by_user: false,
+            https_by_user: false,
             path_prefix: String::new(),
             api_key_ref: None,
             model: None,
@@ -163,22 +175,42 @@ impl AiSettings {
     /// Folds a typed or pasted address into `host`, `port`, `https` and
     /// `path_prefix`, so the fields show what will be used. Call it when the
     /// host field loses focus or before Test connection.
+    ///
+    /// A URL or `host:port` sets the scheme and port it names. A bare host
+    /// gets the port and HTTPS setting the user chose by hand, else vLLM's
+    /// defaults (8000, plain HTTP): a scheme or port that came with an
+    /// earlier pasted URL never sticks to the next server. A bare host also
+    /// drops an earlier URL's path prefix.
     pub fn apply_server_input(&mut self, text: &str) -> Result<Endpoint, AiError> {
-        let saved = self.host.clone();
-        self.host = text.trim().to_string();
-        match self.endpoint() {
-            Ok(ep) => {
-                self.host = ep.host.clone();
-                self.port = ep.port;
-                self.https = ep.https;
-                self.path_prefix = ep.prefix.clone();
-                Ok(ep)
-            }
-            Err(e) => {
-                self.host = saved;
-                Err(e)
-            }
+        let input = parse_server_input(text)?;
+        if input.https.is_some() {
+            self.https_by_user = false;
         }
+        if input.port.is_some() || input.https.is_some() {
+            self.port_by_user = false;
+        }
+        if !self.https_by_user {
+            self.https = input.https.unwrap_or(false);
+        }
+        if !self.port_by_user {
+            self.port = DEFAULT_PORT;
+        }
+        self.host = input.host.clone();
+        self.path_prefix = input.prefix.clone();
+        let ep = Endpoint {
+            https: self.https,
+            port: match (input.port, input.https) {
+                (Some(p), _) => p,
+                // A pasted URL without a port means the scheme's port.
+                (None, Some(true)) => 443,
+                (None, Some(false)) => 80,
+                (None, None) => self.port.max(1),
+            },
+            host: input.host,
+            prefix: input.prefix,
+        };
+        self.port = ep.port;
+        Ok(ep)
     }
 
     pub fn net_policy(&self) -> NetPolicy {
@@ -201,9 +233,23 @@ impl AiSettings {
         self.trusted_servers.iter().any(|s| s == server_key)
     }
 
-    /// Whether the send preview must be shown before this request.
+    /// Whether the send preview must be shown before this request: always,
+    /// unless the user said "Do not ask again" for this server. With
+    /// `always_confirm` off, confirming the first request to a server also
+    /// trusts it (see `confirmed`).
     pub fn needs_confirmation(&self, server_key: &str) -> bool {
-        self.always_confirm || !self.is_trusted(server_key)
+        !self.is_trusted(server_key)
+    }
+
+    /// A previewed request to `server_key` was sent; `dont_ask` is "Do not
+    /// ask again for this server". Returns true when the server is now
+    /// trusted. Never changes `always_confirm`.
+    pub fn confirmed(&mut self, server_key: &str, dont_ask: bool) -> bool {
+        if (dont_ask || !self.always_confirm) && !self.is_trusted(server_key) {
+            self.trusted_servers.push(server_key.to_string());
+            return true;
+        }
+        false
     }
 
     /// Non-fatal problems to show next to the server fields.
@@ -219,6 +265,10 @@ impl AiSettings {
         }
         out
     }
+}
+
+fn round_f32<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((*v as f64 * 1000.0).round() / 1000.0)
 }
 
 fn limit_key(server_key: &str, model: &str) -> String {
@@ -520,6 +570,27 @@ impl NetPolicy {
     pub fn check_all(&self, addrs: &[SocketAddr], https: bool) -> Result<(), AiError> {
         addrs.iter().try_for_each(|a| self.check(a.ip(), https))
     }
+
+    /// `check_all` for the addresses `host` resolved to. When a host name
+    /// fails, the error names it with every address that is not allowed
+    /// (not only the first, which is often an IPv6 address the user never
+    /// sees).
+    pub fn check_host(&self, host: &str, addrs: &[SocketAddr], https: bool) -> Result<(), AiError> {
+        let Err(first) = self.check_all(addrs, https) else { return Ok(()) };
+        if host.parse::<IpAddr>().is_ok() {
+            return Err(first);
+        }
+        let mut bad: Vec<IpAddr> = Vec::new();
+        for a in addrs {
+            if self.check(a.ip(), https).is_err() && !bad.contains(&a.ip()) {
+                bad.push(a.ip());
+            }
+        }
+        // IPv4 first, as people know their addresses.
+        bad.sort_by_key(|ip| ip.is_ipv6());
+        let needs_https = matches!(first, AiError::PublicNeedsHttps { .. });
+        Err(AiError::HostNotLocal { host: host.to_string(), addrs: bad, needs_https })
+    }
 }
 
 /// Resolves the endpoint's host (IP literals skip DNS).
@@ -544,7 +615,7 @@ pub fn resolve(ep: &Endpoint) -> Result<Vec<SocketAddr>, AiError> {
 /// Resolves and checks the endpoint against the policy.
 pub fn resolve_checked(ep: &Endpoint, policy: &NetPolicy) -> Result<Vec<SocketAddr>, AiError> {
     let addrs = resolve(ep)?;
-    policy.check_all(&addrs, ep.https)?;
+    policy.check_host(&ep.host, &addrs, ep.https)?;
     Ok(addrs)
 }
 
@@ -637,10 +708,48 @@ mod tests {
         // A bad input leaves the fields alone.
         assert!(s.apply_server_input("http://").is_err());
         assert_eq!(s.host, "192.168.1.20");
-        // A bare IP keeps the port field.
-        let mut s = AiSettings { port: 8001, ..Default::default() };
+        // A bare IP keeps a port the user set by hand.
+        let mut s = AiSettings { port: 8001, port_by_user: true, ..Default::default() };
         s.apply_server_input("10.0.0.7").unwrap();
         assert_eq!(s.endpoint().unwrap().base_url(), "http://10.0.0.7:8001/v1");
+    }
+
+    #[test]
+    fn earlier_url_scheme_and_port_do_not_stick() {
+        let mut s = AiSettings::default();
+        s.apply_server_input("https://8.8.8.8:8000").unwrap();
+        assert!(s.https);
+        let e = s.apply_server_input("127.0.0.1").unwrap();
+        assert_eq!(e.base_url(), "http://127.0.0.1:8000/v1");
+        assert_eq!(s.endpoint().unwrap(), e);
+        s.apply_server_input("127.0.0.1:8001").unwrap();
+        assert_eq!(s.port, 8001);
+        assert_eq!(s.apply_server_input("192.168.1.250").unwrap().base_url(), "http://192.168.1.250:8000/v1");
+        s.apply_server_input("https://box.lan/vllm/v1").unwrap();
+        assert_eq!(s.apply_server_input("box2").unwrap().base_url(), "http://box2:8000/v1", "no stale prefix");
+        // Choices made by hand stay until a URL says otherwise.
+        let mut s = AiSettings { https: true, https_by_user: true, port: 8443, port_by_user: true, ..Default::default() };
+        assert_eq!(s.apply_server_input("10.0.0.9").unwrap().base_url(), "https://10.0.0.9:8443/v1");
+        assert_eq!(s.apply_server_input("http://10.0.0.9:9000").unwrap().base_url(), "http://10.0.0.9:9000/v1");
+        assert!(!s.https_by_user && !s.port_by_user);
+        assert_eq!(s.apply_server_input("10.0.0.9").unwrap().base_url(), "http://10.0.0.9:8000/v1");
+    }
+
+    #[test]
+    fn temperature_is_stored_rounded() {
+        let j = serde_json::to_value(AiSettings::default()).unwrap();
+        assert_eq!(j["temperature"].to_string(), "0.2");
+    }
+
+    #[test]
+    fn host_names_list_every_rejected_address() {
+        let addrs: Vec<SocketAddr> = ["[2606:2800:21f:cb07:6820:80da:af6b:8b2c]:80".parse().unwrap(), "93.184.215.14:80".parse().unwrap()].to_vec();
+        let e = NetPolicy::default().check_host("example.com", &addrs, false).unwrap_err();
+        let m = e.to_string();
+        assert!(m.starts_with("example.com resolves to 93.184.215.14, 2606:2800:21f:cb07:6820:80da:af6b:8b2c"), "{m}");
+        // IP literals keep the plain message.
+        let ip = [addrs[1]];
+        assert!(matches!(NetPolicy::default().check_host("93.184.215.14", &ip, false), Err(AiError::NotLocal { .. })));
     }
 
     #[test]
@@ -720,10 +829,16 @@ mod tests {
         assert_eq!(s.effective_max_images("k", "m"), 1);
         assert_eq!(s.effective_max_images("k", "other"), 6);
         assert!(s.needs_confirmation("k"));
-        s.always_confirm = false;
+        // Always confirm: a plain Send trusts nothing.
+        assert!(!s.confirmed("k", false));
         assert!(s.needs_confirmation("k"));
-        s.trusted_servers.push("k".into());
-        assert!(!s.needs_confirmation("k"));
+        // "Do not ask again" trusts this server only, and leaves the switch on.
+        assert!(s.confirmed("k", true));
+        assert!(!s.needs_confirmation("k") && s.needs_confirmation("other") && s.always_confirm);
+        // Without Always confirm, the first confirmed request trusts the server.
+        s.always_confirm = false;
+        assert!(s.confirmed("other", false));
+        assert!(!s.needs_confirmation("other"));
     }
 
     #[test]
