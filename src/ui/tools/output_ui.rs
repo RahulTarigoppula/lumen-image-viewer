@@ -86,12 +86,13 @@ fn footer(ui: &mut Ui, p: &Palette, id: &'static str, job: &Option<Job>, result:
             ui.add(egui::ProgressBar::new(j.progress.fraction()).fill(p.accent).desired_height(6.0));
             ui.add_space(4.0);
         }
-        ui.horizontal(|ui| {
-            match (job, result) {
+        crate::ui::batch::footer_row(
+            ui,
+            |ui| match (job, result) {
                 (Some(j), _) => {
                     ui.spinner();
                     let phase = j.progress.phase.lock().clone();
-                    ui.label(RichText::new(format!("{phase}... {:.0}%", j.progress.fraction() * 100.0)).color(p.muted));
+                    ui.add(egui::Label::new(RichText::new(format!("{phase}... {:.0}%", j.progress.fraction() * 100.0)).color(p.muted)).truncate());
                 }
                 (None, Some((Ok(msg), _))) => {
                     ui.label(RichText::new(I::CHECK_CIRCLE).color(p.ok));
@@ -107,8 +108,8 @@ fn footer(ui: &mut Ui, p: &Palette, id: &'static str, job: &Option<Job>, result:
                 (None, None) => {
                     ui.add(egui::Label::new(RichText::new(idle_text).color(p.muted)).truncate());
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            },
+            |ui| {
                 if let Some(j) = job {
                     if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).clicked() {
                         j.progress.cancel.store(true, Ordering::SeqCst);
@@ -129,8 +130,8 @@ fn footer(ui: &mut Ui, p: &Palette, id: &'static str, job: &Option<Job>, result:
                         }
                     }
                 }
-            });
-        });
+            },
+        );
     });
     (close, create)
 }
@@ -192,7 +193,15 @@ fn default_name(files: &[PathBuf], fallback: &str) -> String {
 }
 
 fn window(title: String, ctx: &egui::Context, w: f32, h: f32) -> egui::Window<'static> {
-    egui::Window::new(title).default_size(window_size(ctx, w, h)).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0)).resizable(true).collapsible(false)
+    egui::Window::new(title)
+        .default_size(window_size(ctx, w, h))
+        .max_size(window_size(ctx, 4000.0, 4000.0))
+        .constrain(true)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.content_rect().center())
+        .min_size(crate::ui::batch::window_size(ctx, 520.0, 380.0))
+        .resizable(true)
+        .collapsible(false)
 }
 
 // ============================================================ multi-page
@@ -242,7 +251,7 @@ impl MultiPageWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Create multi-page file", I::FILES), ctx, 760.0, 600.0).open(&mut open).show(ctx, |ui| {
+        window(format!("{}  Create multi-page file", I::FILES), ctx, 760.0, 600.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let target = {
                 let ext = self.s.format.ext();
                 // Computed inside the card below; peek with the current values here.
@@ -258,16 +267,19 @@ impl MultiPageWindow {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("mp-scroll").auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_enabled_ui(self.job.is_none(), |ui| {
-                        ui.columns(2, |cols| {
-                            card(&mut cols[0], &p, I::IMAGES, "Images", |ui| {
-                                file_list(ui, &p, &mut self.files, "mp-files");
-                            });
-                            self.settings(&mut cols[1], &p);
+                        crate::ui::batch::columns_or_stack(ui, |ui, col| {
+                            if col == 0 {
+                                card(ui, &p, I::IMAGES, "Images", |ui| {
+                                    file_list(ui, &p, &mut self.files, "mp-files");
+                                });
+                            } else {
+                                self.settings(ui, &p);
+                            }
                         });
                     });
                 });
             });
-        });
+        }));
         if let Some(out) = create {
             if out.exists() {
                 self.confirm = Some(out);
@@ -522,7 +534,7 @@ impl StripWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Image strip", I::COLUMNS), ctx, 960.0, 640.0).open(&mut open).show(ctx, |ui| {
+        window(format!("{}  Image strip", I::COLUMNS), ctx, 960.0, 640.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let idle = match &layout {
                 Some(l) => format!("{} images  -  {} x {} px", self.files.len(), l.width, l.height),
                 None => "Reading image sizes...".into(),
@@ -533,7 +545,10 @@ impl StripWindow {
             if go {
                 create = target.clone();
             }
-            egui::Panel::left("st-settings").resizable(false).exact_size(330.0).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
+            // Narrow window: settings only (the preview needs room to be useful).
+            let narrow = ui.available_width() < 330.0 + 260.0;
+            let side_w = if narrow { ui.available_width() } else { 330.0 };
+            egui::Panel::left("st-settings").resizable(false).exact_size(side_w).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("st-scroll").auto_shrink([false, false]).show(ui, |ui| {
                     ui.add_enabled_ui(self.job.is_none(), |ui| {
                         card(ui, &p, I::IMAGES, "Images", |ui| {
@@ -547,6 +562,9 @@ impl StripWindow {
                     });
                 });
             });
+            if narrow {
+                return;
+            }
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
@@ -566,7 +584,7 @@ impl StripWindow {
                     }
                 });
             });
-        });
+        }));
         if let Some(out) = create {
             if out.exists() {
                 self.confirm = Some(out);
@@ -726,7 +744,7 @@ impl ZipWindow {
         let mut open = true;
         let mut close = false;
         let mut create = None;
-        window(format!("{}  Create ZIP archive", I::FILE_ZIP), ctx, 640.0, 520.0).open(&mut open).show(ctx, |ui| {
+        window(format!("{}  Create ZIP archive", I::FILE_ZIP), ctx, 640.0, 520.0).open(&mut open).show(ctx, |ui| crate::ui::batch::window_body(ui, |ui| {
             let target = self.dir.as_ref().filter(|_| !self.name.trim().is_empty()).map(|d| d.join(format!("{}.zip", crate::ui::batch::logic::sanitize_file_stem(self.name.trim()))));
             let n = self.files.len();
             let idle = format!("{n} file{}{}", if n == 1 { "" } else { "s" }, self.total.map(|t| format!(", {}", human_size(t))).unwrap_or_default());
@@ -753,7 +771,7 @@ impl ZipWindow {
                     });
                 });
             });
-        });
+        }));
         if let Some(out) = create {
             if out.exists() {
                 self.confirm = Some(out);

@@ -163,7 +163,7 @@ impl PrintWindow {
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                close = self.ui(ui, &p, core);
+                close = crate::ui::batch::window_body(ui, |ui| self.ui(ui, &p, core));
             });
         let still_open = open && !close && !finished_ok;
         if !still_open {
@@ -186,19 +186,22 @@ impl PrintWindow {
                 ui.add(egui::ProgressBar::new(if t == 0 { 0.0 } else { d as f32 / t as f32 }).fill(p.accent).desired_height(6.0));
                 ui.add_space(4.0);
             }
-            ui.horizontal(|ui| {
-                if let Some(job) = &self.job {
-                    ui.spinner();
-                    let (d, t) = (job.progress.pages_done.load(Ordering::Relaxed), job.progress.pages_total.load(Ordering::Relaxed));
-                    ui.label(RichText::new(format!("Printing page {} of {}...", (d + 1).min(t.max(1)), t.max(1))).color(p.muted));
-                } else if let Some(e) = &self.error {
-                    ui.label(RichText::new(I::WARNING_CIRCLE).color(p.danger));
-                    ui.add(egui::Label::new(RichText::new(e).color(p.danger)).truncate());
-                } else {
-                    let n = self.sources.len();
-                    ui.label(RichText::new(format!("{n} image{}  -  {pages} page{}", if n == 1 { "" } else { "s" }, if pages == 1 { "" } else { "s" })).color(p.muted));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::ui::batch::footer_row(
+                ui,
+                |ui| {
+                    if let Some(job) = &self.job {
+                        ui.spinner();
+                        let (d, t) = (job.progress.pages_done.load(Ordering::Relaxed), job.progress.pages_total.load(Ordering::Relaxed));
+                        ui.add(egui::Label::new(RichText::new(format!("Printing page {} of {}...", (d + 1).min(t.max(1)), t.max(1))).color(p.muted)).truncate());
+                    } else if let Some(e) = &self.error {
+                        ui.label(RichText::new(I::WARNING_CIRCLE).color(p.danger));
+                        ui.add(egui::Label::new(RichText::new(e).color(p.danger)).truncate());
+                    } else {
+                        let n = self.sources.len();
+                        ui.add(egui::Label::new(RichText::new(format!("{n} image{}  -  {pages} page{}", if n == 1 { "" } else { "s" }, if pages == 1 { "" } else { "s" })).color(p.muted)).truncate());
+                    }
+                },
+                |ui| {
                     if let Some(job) = &self.job {
                         if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).clicked() {
                             job.progress.cancel.store(true, Ordering::SeqCst);
@@ -211,15 +214,24 @@ impl PrintWindow {
                             close = true;
                         }
                     }
-                });
-            });
+                },
+            );
         });
         let busy = self.job.is_some();
-        egui::Panel::left("pr-settings").resizable(false).exact_size(320.0).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
+        // Narrow window: settings only (the preview needs room to be useful).
+        let narrow = ui.available_width() < 320.0 + 260.0;
+        let side_w = if narrow { ui.available_width() } else { 320.0 };
+        egui::Panel::left("pr-settings").resizable(false).exact_size(side_w).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("pr-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| self.settings(ui, p));
             });
         });
+        if narrow {
+            if start {
+                self.start(ui.ctx());
+            }
+            return close;
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
