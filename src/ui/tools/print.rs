@@ -16,17 +16,6 @@ pub struct Placement {
     pub h: i32,
 }
 
-/// Fit an `iw` × `ih` image inside a `pw` × `ph` printable area with `margin`
-/// device pixels on each side, preserving aspect ratio and centering it.
-pub fn fit_on_page(iw: u32, ih: u32, pw: i32, ph: i32, margin: i32) -> Placement {
-    let aw = (pw - 2 * margin).max(1) as f64;
-    let ah = (ph - 2 * margin).max(1) as f64;
-    let s = (aw / iw.max(1) as f64).min(ah / ih.max(1) as f64);
-    let w = ((iw as f64 * s).round() as i32).max(1);
-    let h = ((ih as f64 * s).round() as i32).max(1);
-    Placement { x: (pw - w) / 2, y: (ph - h) / 2, w, h }
-}
-
 /// Top-down 32-bit BGRA pixels for a DIB (alpha flattened onto white paper).
 pub fn to_bgra(img: &RgbaImage) -> Vec<u8> {
     let mut out = Vec::with_capacity(img.as_raw().len());
@@ -288,36 +277,29 @@ pub fn prepare_for_placement(img: &RgbaImage, p: &Placed, printer_dpi: f32) -> R
 #[derive(Clone)]
 pub enum PrintSource {
     File(PathBuf),
-    Image { img: Arc<RgbaImage>, name: String },
+    Image(Arc<RgbaImage>),
 }
 
 impl PrintSource {
-    pub fn name(&self) -> String {
-        match self {
-            PrintSource::File(p) => crate::ui::batch::file_name(p),
-            PrintSource::Image { name, .. } => name.clone(),
-        }
-    }
-
     /// Pixel size without decoding (when possible).
     pub fn dims(&self) -> Option<(u32, u32)> {
         match self {
             PrintSource::File(p) => crate::decode::probe_dimensions(p),
-            PrintSource::Image { img, .. } => Some(img.dimensions()),
+            PrintSource::Image(img) => Some(img.dimensions()),
         }
     }
 
     pub fn dpi(&self) -> Option<f32> {
         match self {
             PrintSource::File(p) => crate::ui::batch::pipeline::read_dpi_file(p),
-            PrintSource::Image { .. } => None,
+            PrintSource::Image(_) => None,
         }
     }
 
     pub fn load(&self) -> Result<Arc<RgbaImage>, String> {
         match self {
             PrintSource::File(p) => crate::decode::decode_file(p, Default::default()).map(|d| d.image).map_err(|e| format!("{}: {e:#}", crate::ui::batch::file_name(p))),
-            PrintSource::Image { img, .. } => Ok(img.clone()),
+            PrintSource::Image(img) => Ok(img.clone()),
         }
     }
 }
@@ -537,33 +519,9 @@ pub fn run_job(_printer: Printer, _sources: &[PrintSource], _opts: &PrintOptions
     Err(anyhow::anyhow!("Printing is only supported on Windows"))
 }
 
-/// Print one image with default options (shows the Windows print dialog).
-/// Returns Ok(()) when the user cancels. Convenience wrapper; the Print
-/// options window offers layouts and runs the job off the UI thread.
-pub fn print_image(img: &RgbaImage, title: &str) -> anyhow::Result<()> {
-    let (iw, ih) = img.dimensions();
-    if iw == 0 || ih == 0 {
-        return Err(anyhow::anyhow!("Nothing to print"));
-    }
-    let opts = PrintOptions::default();
-    let Some(printer) = choose_printer(iw > ih, 1)? else { return Ok(()) };
-    let src = [PrintSource::Image { img: Arc::new(img.clone()), name: title.to_string() }];
-    run_job(printer, &src, &opts, title, &PrintProgress::default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn placement_centers_and_preserves_aspect() {
-        let p = fit_on_page(4000, 2000, 1000, 1000, 0);
-        assert_eq!((p.w, p.h), (1000, 500));
-        assert_eq!((p.x, p.y), (0, 250));
-        let p = fit_on_page(100, 200, 1000, 1000, 100);
-        assert_eq!((p.w, p.h), (400, 800));
-        assert_eq!((p.x, p.y), (300, 100));
-    }
 
     #[test]
     fn bgra_conversion() {

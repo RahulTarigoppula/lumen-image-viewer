@@ -68,7 +68,7 @@ impl CommandPalette {
             self.selected = items.len().saturating_sub(1);
         }
         let screen = ctx.content_rect();
-        egui::Area::new(egui::Id::new("command-palette"))
+        egui::Area::new(egui::Id::unique("command-palette"))
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, (screen.height() * 0.12).max(40.0)))
             .show(ctx, |ui| {

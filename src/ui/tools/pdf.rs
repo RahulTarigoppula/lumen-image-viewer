@@ -84,10 +84,6 @@ impl<W: Write> PdfWriter<W> {
         Ok(())
     }
 
-    pub fn page_count(&self) -> usize {
-        self.pages.len()
-    }
-
     /// Write the page tree, catalog, cross-reference table and trailer.
     pub fn finish(mut self, title: &str) -> io::Result<W> {
         let kids: Vec<String> = self.pages.iter().map(|p| format!("{p} 0 R")).collect();
@@ -192,7 +188,6 @@ mod tests {
         let r = fit_rect(A4_PT.0, A4_PT.1, 36.0, 40, 30);
         w.add_jpeg_page(&jpeg, 40, 30, false, A4_PT.0, A4_PT.1, r).unwrap();
         w.add_jpeg_page(&jpeg, 40, 30, false, 40.0, 30.0, (0.0, 0.0, 40.0, 30.0)).unwrap();
-        assert_eq!(w.page_count(), 2);
         let pdf = w.finish("Test (1) \\ ok").unwrap();
         // 2 reserved + 3 per page + info, plus the free entry.
         assert_eq!(check_structure(&pdf), 2 + 6 + 1 + 1);
