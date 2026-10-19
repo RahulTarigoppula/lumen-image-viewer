@@ -77,6 +77,53 @@ pub(crate) fn window_size(ctx: &egui::Context, w: f32, h: f32) -> Vec2 {
     Vec2::new(w.min(s.x - 40.0).max(320.0), h.min(s.y - 60.0).max(240.0))
 }
 
+/// Tool window contents laid out in exactly the window's current size: whatever does
+/// not fit is clipped instead of growing the window past the screen edge.
+pub(crate) fn window_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap();
+    let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    body.set_clip_rect(rect.expand(4.0).intersect(ui.clip_rect()));
+    let r = add(&mut body);
+    ui.advance_cursor_after_rect(rect);
+    r
+}
+
+/// Width below which tool windows stack their two columns and footer rows.
+pub(crate) const NARROW: f32 = 600.0;
+
+/// Two side-by-side columns, or one above the other when the window is narrow.
+/// `add` is called for column 0, then column 1.
+pub(crate) fn columns_or_stack(ui: &mut Ui, mut add: impl FnMut(&mut Ui, usize)) {
+    if ui.available_width() >= NARROW {
+        ui.columns(2, |cols| {
+            add(&mut cols[0], 0);
+            add(&mut cols[1], 1);
+        });
+    } else {
+        add(ui, 0);
+        ui.add_space(8.0);
+        add(ui, 1);
+    }
+}
+
+/// Footer: `right` holds the buttons (laid out right to left, so add them in
+/// reverse) and `left` a status line in the room that is left (use truncating
+/// labels). When narrow, the status goes on its own line and the buttons wrap.
+pub(crate) fn footer_row(ui: &mut Ui, left: impl FnOnce(&mut Ui), right: impl FnOnce(&mut Ui)) {
+    use egui::{Align, Layout};
+    if ui.available_width() >= NARROW {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                right(ui);
+                ui.with_layout(Layout::left_to_right(Align::Center), left);
+            });
+        });
+    } else {
+        ui.horizontal(left);
+        ui.with_layout(Layout::right_to_left(Align::Min).with_main_wrap(true), right);
+    }
+}
+
 pub(crate) fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
 }
@@ -356,11 +403,13 @@ impl BatchConvert {
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                if self.job.is_some() {
-                    close = self.job_ui(ui, &p);
-                } else {
-                    close = self.settings_ui(ui, &p);
-                }
+                window_body(ui, |ui| {
+                    if self.job.is_some() {
+                        close = self.job_ui(ui, &p);
+                    } else {
+                        close = self.settings_ui(ui, &p);
+                    }
+                })
             });
         if self.confirm_overwrite {
             match crate::ui::widgets::show_confirm(
@@ -399,9 +448,12 @@ impl BatchConvert {
         let mut close = false;
         let n = self.files.len();
         egui::Panel::bottom("bc-footer").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 10, bottom: 0 })).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}  {} worker threads", I::LIGHTNING, convert::worker_threads())).size(11.5).color(p.faint));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            footer_row(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(format!("{}  {} worker threads", I::LIGHTNING, convert::worker_threads())).size(11.5).color(p.faint)).truncate());
+                },
+                |ui| {
                     let label = format!("{}  Convert {} file{}", I::PLAY, n, if n == 1 { "" } else { "s" });
                     let ok = n > 0 && !(self.s.dest == DestMode::Folder && self.s.out_folder.is_none());
                     if primary_button(ui, p, ok, &label).clicked() {
@@ -414,8 +466,8 @@ impl BatchConvert {
                     if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(80.0, 30.0))).clicked() {
                         close = true;
                     }
-                });
-            });
+                },
+            );
         });
         egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -427,6 +479,17 @@ impl BatchConvert {
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.tab == 1 {
+                if ui.available_width() < NARROW {
+                    // Narrow: steps, presets and preview in one scrolling column.
+                    egui::ScrollArea::vertical().id_salt("bc-adv-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        self.advanced_card(ui, p);
+                        ui.add_space(8.0);
+                        self.presets_card(ui, p);
+                        ui.add_space(8.0);
+                        self.estimate_card(ui, p);
+                    });
+                    return;
+                }
                 // Steps on the left, live before/after preview on the right.
                 ui.columns(2, |cols| {
                     egui::ScrollArea::vertical().id_salt("bc-adv-scroll").auto_shrink([false, false]).show(&mut cols[0], |ui| {
@@ -441,17 +504,20 @@ impl BatchConvert {
                 return;
             }
             egui::ScrollArea::vertical().id_salt("bc-scroll").auto_shrink([false, false]).show(ui, |ui| {
-                ui.columns(2, |cols| {
-                    self.sources_card(&mut cols[0], p);
-                    cols[0].add_space(8.0);
-                    self.destination_card(&mut cols[0], p);
-                    cols[0].add_space(8.0);
-                    self.presets_card(&mut cols[0], p);
-                    self.format_card(&mut cols[1], p);
-                    cols[1].add_space(8.0);
-                    self.resize_card(&mut cols[1], p);
-                    cols[1].add_space(8.0);
-                    self.adjust_card(&mut cols[1], p);
+                columns_or_stack(ui, |ui, col| {
+                    if col == 0 {
+                        self.sources_card(ui, p);
+                        ui.add_space(8.0);
+                        self.destination_card(ui, p);
+                        ui.add_space(8.0);
+                        self.presets_card(ui, p);
+                    } else {
+                        self.format_card(ui, p);
+                        ui.add_space(8.0);
+                        self.resize_card(ui, p);
+                        ui.add_space(8.0);
+                        self.adjust_card(ui, p);
+                    }
                 });
                 ui.add_space(8.0);
                 self.estimate_card(ui, p);
@@ -837,8 +903,10 @@ impl BatchConvert {
         let mut back = false;
         let mut open_folder = None;
         egui::Panel::bottom("bc-job-footer").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 10, bottom: 0 })).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            footer_row(
+                ui,
+                |_| {},
+                |ui| {
                     if finished {
                         if primary_button(ui, p, true, "Done").clicked() {
                             close = true;
@@ -860,8 +928,8 @@ impl BatchConvert {
                         ui.spinner();
                         ui.label("Stopping after the files in progress...");
                     }
-                });
-            });
+                },
+            );
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let title = if !finished {
@@ -882,7 +950,7 @@ impl BatchConvert {
             };
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon).size(22.0).color(color));
-                ui.label(RichText::new(title).font(crate::ui::theme::semibold(17.0)));
+                ui.add(egui::Label::new(RichText::new(title).font(crate::ui::theme::semibold(17.0))).wrap());
             });
             ui.add_space(6.0);
             let frac = if total == 0 { 1.0 } else { done as f32 / total as f32 };
@@ -1308,7 +1376,7 @@ impl BatchRename {
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                close = self.ui(ui, &p);
+                close = window_body(ui, |ui| self.ui(ui, &p));
             });
         let still_open = open && !close;
         if !still_open {
@@ -1334,21 +1402,24 @@ impl BatchRename {
                 ui.add(egui::ProgressBar::new(n as f32 / job.steps.max(1) as f32).fill(p.accent).desired_height(6.0));
                 ui.add_space(4.0);
             }
-            ui.horizontal(|ui| {
-                match &self.status {
+            let n_files = self.files.len();
+            let last_batch = !self.last_batch.is_empty();
+            footer_row(
+                ui,
+                |ui| match &self.status {
                     Some((ok, msg)) => {
                         let (icon, c) = if *ok { (I::CHECK_CIRCLE, p.ok) } else { (I::WARNING_CIRCLE, p.danger) };
                         ui.label(RichText::new(icon).color(c));
                         ui.add(egui::Label::new(RichText::new(msg).color(c)).truncate());
                     }
                     None if conflicts > 0 => {
-                        ui.label(RichText::new(format!("{}  {conflicts} conflict{} - fix them to rename", I::WARNING, if conflicts == 1 { "" } else { "s" })).color(p.danger));
+                        ui.add(egui::Label::new(RichText::new(format!("{}  {conflicts} conflict{} - fix them to rename", I::WARNING, if conflicts == 1 { "" } else { "s" })).color(p.danger)).truncate());
                     }
                     None => {
-                        ui.label(RichText::new(format!("{changes} of {} file{} will be renamed", self.files.len(), if self.files.len() == 1 { "" } else { "s" })).color(p.muted));
+                        ui.add(egui::Label::new(RichText::new(format!("{changes} of {n_files} file{} will be renamed", if n_files == 1 { "" } else { "s" })).color(p.muted)).truncate());
                     }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                },
+                |ui| {
                     let label = format!("{}  Rename {changes} file{}", I::CHECK, if changes == 1 { "" } else { "s" });
                     if primary_button(ui, p, !busy && conflicts == 0 && changes > 0, &label).clicked() {
                         do_rename = true;
@@ -1356,71 +1427,28 @@ impl BatchRename {
                     if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
                         close = true;
                     }
-                    if !self.last_batch.is_empty() && ui.add_enabled(!busy, egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE)).min_size(Vec2::new(0.0, 30.0))).on_hover_text("Restore the names from the last rename").clicked() {
+                    if last_batch && ui.add_enabled(!busy, egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE)).min_size(Vec2::new(0.0, 30.0))).on_hover_text("Restore the names from the last rename").clicked() {
                         do_undo = true;
                     }
-                });
-            });
+                },
+            );
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.columns(2, |cols| {
-                    card(&mut cols[0], p, I::TEXTBOX, "New name", |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"));
-                        token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{taken}", "{width}", "{height}", "{folder}"]);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Start").color(p.muted));
-                            ui.add(egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000));
-                            ui.label(RichText::new("Step").color(p.muted));
-                            ui.add(egui::DragValue::new(&mut self.s.step).range(-1000..=1000));
-                            ui.label(RichText::new("Digits").color(p.muted));
-                            ui.add(egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }));
-                        });
-                        hint(ui, p, "The extension is kept. {date:%Y%m%d} accepts a custom date format.");
-                    });
-                    card(&mut cols[1], p, I::MAGNIFYING_GLASS, "Find, replace & case", |ui| {
-                        egui::Grid::new("br-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                            ui.label("Find");
-                            ui.add(egui::TextEdit::singleline(&mut self.s.find).desired_width(f32::INFINITY));
-                            ui.end_row();
-                            ui.label("Replace");
-                            ui.add(egui::TextEdit::singleline(&mut self.s.replace).desired_width(f32::INFINITY));
-                            ui.end_row();
-                            ui.label("");
-                            ui.checkbox(&mut self.s.ignore_case, "Ignore case");
-                            ui.end_row();
-                            ui.label("Name case");
-                            egui::ComboBox::from_id_salt("br-case").selected_text(self.s.case.label()).show_ui(ui, |ui| {
-                                for c in CaseChange::ALL {
-                                    ui.selectable_value(&mut self.s.case, c, c.label());
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Extension");
-                            egui::ComboBox::from_id_salt("br-ext").selected_text(self.s.ext_case.label()).show_ui(ui, |ui| {
-                                for c in ExtCase::ALL {
-                                    ui.selectable_value(&mut self.s.ext_case, c, c.label());
-                                }
-                            });
-                            ui.end_row();
-                        });
-                    });
+            // Small window (large interface size): everything scrolls, the preview list
+            // gets a fixed height.
+            if ui.available_width() < NARROW || ui.available_height() < 420.0 {
+                egui::ScrollArea::vertical().id_salt("br-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_enabled_ui(!busy, |ui| self.settings_cards(ui, p));
+                    ui.add_space(8.0);
+                    self.preview_header(ui, p);
+                    self.preview_table(ui, p, 240.0);
                 });
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("PREVIEW").size(11.0).color(p.faint).strong());
-                if let Some(m) = &self.meta {
-                    if m.full {
-                        ui.spinner();
-                        ui.label(RichText::new(format!("Reading image details... {} / {}", m.done.load(Ordering::Relaxed), m.total)).size(11.5).color(p.muted));
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.toggle_value(&mut self.only_changed, "Only changed / conflicts");
-                });
-            });
-            self.preview_table(ui, p);
+            } else {
+                ui.add_enabled_ui(!busy, |ui| self.settings_cards(ui, p));
+                ui.add_space(8.0);
+                self.preview_header(ui, p);
+                self.preview_table(ui, p, f32::INFINITY);
+            }
         });
         if do_rename {
             let pairs: Vec<(PathBuf, PathBuf)> = self.files.iter().zip(&self.rows).filter(|(_, r)| r.changed).map(|(f, r)| (f.clone(), r.target.clone())).collect();
@@ -1433,7 +1461,72 @@ impl BatchRename {
         close
     }
 
-    fn preview_table(&mut self, ui: &mut Ui, p: &Palette) {
+    fn settings_cards(&mut self, ui: &mut Ui, p: &Palette) {
+        columns_or_stack(ui, |ui, col| {
+            if col == 0 {
+                card(ui, p, I::TEXTBOX, "New name", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"));
+                    token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{taken}", "{width}", "{height}", "{folder}"]);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Start").color(p.muted));
+                        ui.add(egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000));
+                        ui.label(RichText::new("Step").color(p.muted));
+                        ui.add(egui::DragValue::new(&mut self.s.step).range(-1000..=1000));
+                        ui.label(RichText::new("Digits").color(p.muted));
+                        ui.add(egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }));
+                    });
+                    hint(ui, p, "The extension is kept. {date:%Y%m%d} accepts a custom date format.");
+                });
+            } else {
+                card(ui, p, I::MAGNIFYING_GLASS, "Find, replace & case", |ui| {
+                    egui::Grid::new("br-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("Find");
+                        ui.add(egui::TextEdit::singleline(&mut self.s.find).desired_width(f32::INFINITY));
+                        ui.end_row();
+                        ui.label("Replace");
+                        ui.add(egui::TextEdit::singleline(&mut self.s.replace).desired_width(f32::INFINITY));
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut self.s.ignore_case, "Ignore case");
+                        ui.end_row();
+                        ui.label("Name case");
+                        egui::ComboBox::from_id_salt("br-case").selected_text(self.s.case.label()).show_ui(ui, |ui| {
+                            for c in CaseChange::ALL {
+                                ui.selectable_value(&mut self.s.case, c, c.label());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Extension");
+                        egui::ComboBox::from_id_salt("br-ext").selected_text(self.s.ext_case.label()).show_ui(ui, |ui| {
+                            for c in ExtCase::ALL {
+                                ui.selectable_value(&mut self.s.ext_case, c, c.label());
+                            }
+                        });
+                        ui.end_row();
+                    });
+                });
+            }
+        });
+    }
+
+    fn preview_header(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.toggle_value(&mut self.only_changed, "Only changed / conflicts");
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("PREVIEW").size(11.0).color(p.faint).strong());
+                    if let Some(m) = &self.meta {
+                        if m.full {
+                            ui.spinner();
+                            ui.add(egui::Label::new(RichText::new(format!("Reading image details... {} / {}", m.done.load(Ordering::Relaxed), m.total)).size(11.5).color(p.muted)).truncate());
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    fn preview_table(&mut self, ui: &mut Ui, p: &Palette, max_h: f32) {
         egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if self.files.is_empty() {
@@ -1455,7 +1548,7 @@ impl BatchRename {
             }
             let row_h = 24.0;
             ui.spacing_mut().item_spacing.y = 0.0;
-            egui::ScrollArea::vertical().id_salt("br-preview").auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            egui::ScrollArea::vertical().id_salt("br-preview").max_height(max_h).auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
                 for &i in &rows[range] {
                     let r = &self.rows[i];
                     ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {

@@ -16,7 +16,7 @@ use self::sheet::{SheetItem, SheetSettings};
 use crate::app::Core;
 use crate::catalog::human_size;
 use crate::formats::SaveFormat;
-use crate::ui::batch::{card, danger_button, empty_state, file_name, hint, primary_button, window_size};
+use crate::ui::batch::{card, danger_button, empty_state, file_name, footer_row, hint, primary_button, window_body, window_size};
 use crate::ui::icons as I;
 use crate::ui::theme::Palette;
 use crossbeam_channel::Receiver;
@@ -298,7 +298,7 @@ impl ContactSheet {
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                close = self.ui(ui, &p);
+                close = window_body(ui, |ui| self.ui(ui, &p));
             });
         let still_open = open && !close;
         if !still_open {
@@ -324,8 +324,9 @@ impl ContactSheet {
                     ui.add_space(4.0);
                 }
             }
-            ui.horizontal(|ui| {
-                match self.job.as_ref().and_then(|j| j.result.as_ref()) {
+            footer_row(
+                ui,
+                |ui| match self.job.as_ref().and_then(|j| j.result.as_ref()) {
                     Some(Ok(paths)) if !paths.is_empty() => {
                         ui.label(RichText::new(I::CHECK_CIRCLE).color(p.ok));
                         let dir = paths[0].parent().map(|d| d.display().to_string()).unwrap_or_default();
@@ -341,13 +342,13 @@ impl ContactSheet {
                     None if running => {
                         let job = self.job.as_ref().unwrap();
                         ui.spinner();
-                        ui.label(RichText::new(format!("Rendering... {} / {}", job.progress.done.load(Ordering::Relaxed), n)).color(p.muted));
+                        ui.add(egui::Label::new(RichText::new(format!("Rendering... {} / {}", job.progress.done.load(Ordering::Relaxed), n)).color(p.muted)).truncate());
                     }
                     None => {
-                        ui.label(RichText::new(format!("{n} images  ·  {} page{}  ·  {} × {} px", l.pages, if l.pages == 1 { "" } else { "s" }, l.width, l.height)).color(p.muted));
+                        ui.add(egui::Label::new(RichText::new(format!("{n} images  ·  {} page{}  ·  {} × {} px", l.pages, if l.pages == 1 { "" } else { "s" }, l.width, l.height)).color(p.muted)).truncate());
                     }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                },
+                |ui| {
                     if running {
                         if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).clicked() {
                             if let Some(j) = &self.job {
@@ -374,9 +375,21 @@ impl ContactSheet {
                             }
                         }
                     }
+                },
+            );
+        });
+        // Narrow window: settings only (the preview needs room to be useful).
+        if ui.available_width() < 340.0 + 260.0 {
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("cs-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_enabled_ui(!running, |ui| self.settings(ui, p, &l));
                 });
             });
-        });
+            if start {
+                self.start(ui.ctx());
+            }
+            return close;
+        }
         egui::Panel::left("cs-settings").resizable(false).exact_size(340.0).frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 10, top: 0, bottom: 0 })).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("cs-scroll").auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_enabled_ui(!running, |ui| self.settings(ui, p, &l));
@@ -949,7 +962,7 @@ impl Duplicates {
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                close = self.ui(ui, &p, core, &mut events);
+                close = window_body(ui, |ui| self.ui(ui, &p, core, &mut events));
             });
         if let Some(n) = self.confirm_bulk_similar {
             let body = format!(
@@ -1009,27 +1022,34 @@ impl Duplicates {
         let busy = scanning || self.deleting.is_some();
         let marked_bytes: u64 = self.items.iter().filter(|it| self.marked.contains(&it.path)).map(|it| it.size).sum();
         egui::Panel::bottom("dup-footer").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 10, bottom: 0 })).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if self.deleting.is_some() {
-                    ui.spinner();
-                    ui.label(RichText::new("Moving files to the Recycle Bin...").color(p.muted));
-                } else if !self.marked.is_empty() {
-                    ui.label(RichText::new(format!("{} marked · {}", self.marked.len(), human_size(marked_bytes))).color(p.muted));
-                } else if let Some(e) = &self.error {
-                    ui.label(RichText::new(format!("{}  {e}", I::WARNING_CIRCLE)).color(p.danger));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let n = self.marked.len();
+            let n = self.marked.len();
+            let mut confirm = false;
+            footer_row(
+                ui,
+                |ui| {
+                    if self.deleting.is_some() {
+                        ui.spinner();
+                        ui.add(egui::Label::new(RichText::new("Moving files to the Recycle Bin...").color(p.muted)).truncate());
+                    } else if n > 0 {
+                        ui.add(egui::Label::new(RichText::new(format!("{n} marked · {}", human_size(marked_bytes))).color(p.muted)).truncate());
+                    } else if let Some(e) = &self.error {
+                        ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING_CIRCLE)).color(p.danger)).truncate());
+                    }
+                },
+                |ui| {
                     let enabled = n > 0 && !busy;
                     let fill = if enabled { p.danger } else { p.danger.gamma_multiply(0.4) };
                     if ui.add_enabled(enabled, egui::Button::new(RichText::new(format!("{}  Move {n} marked to Recycle Bin", I::TRASH)).color(Color32::WHITE)).fill(fill).min_size(Vec2::new(0.0, 30.0))).clicked() {
-                        self.confirm_delete = true;
+                        confirm = true;
                     }
                     if ui.add(egui::Button::new("Close").min_size(Vec2::new(80.0, 30.0))).clicked() {
                         close = true;
                     }
-                });
-            });
+                },
+            );
+            if confirm {
+                self.confirm_delete = true;
+            }
         });
         egui::Panel::top("dup-options").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {
             ui.add_enabled_ui(!busy, |ui| {
@@ -1066,7 +1086,7 @@ impl Duplicates {
                     let (d, t) = (job.progress.done.load(Ordering::Relaxed), job.progress.total.load(Ordering::Relaxed));
                     ui.label(RichText::new(if t > 0 { format!("{phase}...  {d} / {t}") } else { format!("{phase}...") }).font(crate::ui::theme::semibold(14.0)));
                     ui.add_space(6.0);
-                    ui.add(egui::ProgressBar::new(job.progress.fraction()).fill(p.accent).desired_width(360.0).desired_height(6.0));
+                    ui.add(egui::ProgressBar::new(job.progress.fraction()).fill(p.accent).desired_width(360.0f32.min(ui.available_width())).desired_height(6.0));
                     ui.add_space(8.0);
                     if ui.button(format!("{}  Cancel", I::STOP)).clicked() {
                         job.progress.cancel.store(true, Ordering::SeqCst);
@@ -1104,51 +1124,44 @@ impl Duplicates {
                 })
                 .sum();
             let mut mark_all = false;
+            let keep_before = self.keep_rule;
             let ng = self.groups.len();
-            ui.label(RichText::new(format!("{ng} group{} · {files_in_groups} files · up to {} reclaimable", if ng == 1 { "" } else { "s" }, human_size(reclaim))).strong());
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!self.marked.is_empty(), egui::Button::new("Clear marks")).clicked() {
-                        self.marked.clear();
-                    }
-                    if ui
-                        .button(format!("{}  Mark all but the best", I::LIST_CHECKS))
-                        .on_hover_text("In every identical group, mark all copies except the one to keep. Similar groups are marked only when allowed, confirmed and the best is clear")
-                        .clicked()
-                    {
-                        mark_all = true;
-                    }
-                    ui.checkbox(&mut self.bulk_similar, "Include similar groups")
-                        .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure. Only groups where the keep rule finds a clearly sharper picture are marked");
-                    let before = self.keep_rule;
-                    egui::ComboBox::from_id_salt("dup-keep").selected_text(self.keep_rule.label()).show_ui(ui, |ui| {
+            let summary = |ui: &mut Ui, keep_rule: &mut KeepRule, bulk_similar: &mut bool, marked: &mut HashSet<PathBuf>, mark_all: &mut bool, bulk_note: &Option<String>| {
+                ui.add(egui::Label::new(RichText::new(format!("{ng} group{} · {files_in_groups} files · up to {} reclaimable", if ng == 1 { "" } else { "s" }, human_size(reclaim))).strong()).wrap());
+                ui.add_space(2.0);
+                // Wraps onto a second line when narrow.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Keep").color(p.muted));
+                    egui::ComboBox::from_id_salt("dup-keep").selected_text(keep_rule.label()).show_ui(ui, |ui| {
                         for r in KeepRule::ALL {
-                            ui.selectable_value(&mut self.keep_rule, r, r.label());
+                            ui.selectable_value(keep_rule, r, r.label());
                         }
                     });
-                    if self.keep_rule != before {
-                        dupes::refresh_representatives(&mut self.groups, &self.items, self.keep_rule);
+                    ui.checkbox(bulk_similar, "Include similar groups")
+                        .on_hover_text("Similar pictures are not copies: review them one group at a time unless you are sure");
+                    if ui.button(format!("{}  Mark all but the best", I::LIST_CHECKS)).on_hover_text("In every identical group (and, if allowed, every similar group), mark all copies except the one to keep").clicked() {
+                        *mark_all = true;
                     }
-                    ui.label(RichText::new("Keep").color(p.muted));
+                    if ui.add_enabled(!marked.is_empty(), egui::Button::new("Clear marks")).clicked() {
+                        marked.clear();
+                    }
                 });
-            });
-            if let Some(note) = &self.bulk_note {
-                ui.label(RichText::new(format!("{}  {note}", I::INFO)).color(p.muted));
-            }
-            if mark_all {
-                // Similar groups are only bulk-marked on explicit opt-in and confirmation.
-                let n = if self.bulk_similar { self.decisive_similar().len() } else { 0 };
-                if n > 0 {
-                    self.confirm_bulk_similar = Some(n);
-                } else {
-                    self.mark_all_but_best(self.bulk_similar);
+                if let Some(note) = bulk_note {
+                    ui.label(RichText::new(format!("{}  {note}", I::INFO)).color(p.muted));
                 }
+                ui.add_space(4.0);
+            };
+            // Short window (large interface size): the summary scrolls with the groups.
+            let summary_in_list = ui.available_height() < 260.0;
+            if !summary_in_list {
+                summary(ui, &mut self.keep_rule, &mut self.bulk_similar, &mut self.marked, &mut mark_all, &self.bulk_note);
             }
-            ui.add_space(4.0);
             let mut mark_group = None;
             let mut unmark_group = None;
             egui::ScrollArea::vertical().id_salt("dup-groups").auto_shrink([false, false]).show(ui, |ui| {
+                if summary_in_list {
+                    summary(ui, &mut self.keep_rule, &mut self.bulk_similar, &mut self.marked, &mut mark_all, &self.bulk_note);
+                }
                 for (gi, g) in self.groups.iter().enumerate() {
                     let choice = dupes::pick(&self.items, &g.members, self.keep_rule);
                     let best = choice.index;
@@ -1159,25 +1172,8 @@ impl Duplicates {
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            // Buttons at the right; badge and size in the room left of them.
                             ui.horizontal(|ui| {
-                                let (badge, color, tip) = match g.kind {
-                                    GroupKind::Identical if g.same_bytes => ("Identical".to_string(), p.accent, "Byte-for-byte copies of the same file"),
-                                    GroupKind::Identical => ("Identical pixels".to_string(), p.accent, "Every pixel is the same; the files differ only in metadata or compression"),
-                                    GroupKind::Similar => (format!("Similar · {}%", g.min_similarity), p.warn, "Pictures that look alike but are not exact copies"),
-                                };
-                                ui.label(RichText::new(format!("Group {}", gi + 1)).strong());
-                                egui::Frame::new().fill(color.gamma_multiply(0.18)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
-                                    ui.label(RichText::new(badge).size(11.5).color(color).strong());
-                                })
-                                .response
-                                .on_hover_text(tip);
-                                let total: u64 = g.members.iter().map(|&i| self.items[i].size).sum();
-                                ui.label(RichText::new(format!("{} files · {}", g.members.len(), human_size(total))).color(p.muted));
-                                let chain = self.keep_rule.chain().iter().map(|c| c.reason().trim_start_matches("Kept: ")).collect::<Vec<_>>().join(", then ");
-                                ui.label(RichText::new(choice.reason.reason()).color(p.ok)).on_hover_text(format!("The crowned file is kept. Order of preference: {chain}."));
-                                if g.kind == GroupKind::Similar && !choice.decisive {
-                                    ui.label(RichText::new(format!("{}  No clear best: review", I::WARNING)).color(p.warn)).on_hover_text("These pictures differ, and the keep rule does not find one clearly sharper picture. Mark all but the best skips this group; choose yourself or use Keep best.");
-                                }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button("Unmark").clicked() {
                                         unmark_group = Some(gi);
@@ -1185,7 +1181,30 @@ impl Duplicates {
                                     if ui.small_button(format!("{}  Keep best", I::CROWN)).on_hover_text("Mark all except the crowned file").clicked() {
                                         mark_group = Some(gi);
                                     }
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        let (badge, color, tip) = match g.kind {
+                                            GroupKind::Identical if g.same_bytes => ("Identical".to_string(), p.accent, "Byte-for-byte copies of the same file"),
+                                            GroupKind::Identical => ("Identical pixels".to_string(), p.accent, "Every pixel is the same; the files differ only in metadata or compression"),
+                                            GroupKind::Similar => (format!("Similar · {}%", g.min_similarity), p.warn, "Pictures that look alike but are not exact copies"),
+                                        };
+                                        ui.label(RichText::new(format!("Group {}", gi + 1)).strong());
+                                        egui::Frame::new().fill(color.gamma_multiply(0.18)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+                                            ui.label(RichText::new(badge).size(11.5).color(color).strong());
+                                        })
+                                        .response
+                                        .on_hover_text(tip);
+                                        let total: u64 = g.members.iter().map(|&i| self.items[i].size).sum();
+                                        ui.add(egui::Label::new(RichText::new(format!("{} files · {}", g.members.len(), human_size(total))).color(p.muted)).truncate());
+                                    });
                                 });
+                            });
+                            // Why the crowned file is kept, on its own row so it never squeezes the buttons.
+                            ui.horizontal_wrapped(|ui| {
+                                let chain = self.keep_rule.chain().iter().map(|c| c.reason().trim_start_matches("Kept: ")).collect::<Vec<_>>().join(", then ");
+                                ui.label(RichText::new(choice.reason.reason()).color(p.ok)).on_hover_text(format!("The crowned file is kept. Order of preference: {chain}."));
+                                if g.kind == GroupKind::Similar && !choice.decisive {
+                                    ui.label(RichText::new(format!("{}  No clear best: review", I::WARNING)).color(p.warn)).on_hover_text("These pictures differ, and the keep rule does not find one clearly sharper picture. Mark all but the best skips this group; choose yourself or use Keep best.");
+                                }
                             });
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
@@ -1209,6 +1228,18 @@ impl Duplicates {
                     ui.add_space(8.0);
                 }
             });
+            if self.keep_rule != keep_before {
+                dupes::refresh_representatives(&mut self.groups, &self.items, self.keep_rule);
+            }
+            if mark_all {
+                // Similar groups are only bulk-marked on explicit opt-in and confirmation.
+                let n = if self.bulk_similar { self.decisive_similar().len() } else { 0 };
+                if n > 0 {
+                    self.confirm_bulk_similar = Some(n);
+                } else {
+                    self.mark_all_but_best(self.bulk_similar);
+                }
+            }
             if let Some(gi) = mark_group {
                 self.mark_best(gi);
             }
