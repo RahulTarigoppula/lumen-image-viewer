@@ -1055,12 +1055,12 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             row(ui, p, "Port", "Used when the address has no port (vLLM's default is 8000)", |ui| {
                 let r = ui.add(egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
                 if r.changed() {
-                    ai.dirty = true;
+                    ai.port_edited();
                 }
                 false
             });
             if toggle_row(ui, p, "Use HTTPS", "For a server behind TLS (a reverse proxy, or vLLM with --ssl-certfile)", &mut ai.settings.https) {
-                ai.dirty = true;
+                ai.https_edited();
             }
             if toggle_row(
                 ui,
@@ -1077,6 +1077,8 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             let has_key = ai.has_key();
             let key_desc = if has_key {
                 "Saved in Windows Credential Manager (or an encrypted file in the data folder), never in settings.json."
+            } else if ai.typed_key() {
+                "Used for Test connection and Run until Lumen closes. Save keeps it in Windows Credential Manager."
             } else {
                 "Optional: only when vllm serve runs with --api-key."
             };
@@ -1087,15 +1089,22 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                     }
                     status_chip(ui, p, true, "Key saved", "");
                 } else {
-                    let save = ui.add_enabled(!ai.key_edit.trim().is_empty(), egui::Button::new("Save"));
+                    let save = ui
+                        .add_enabled(ai.typed_key(), egui::Button::new("Save"))
+                        .on_hover_text("Keep the key in Windows Credential Manager for next time");
                     let resp = ui.add(egui::TextEdit::singleline(&mut ai.key_edit).password(true).hint_text("none").desired_width(170.0));
-                    if save.clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    if save.clicked() {
                         ai.save_key();
+                    }
+                    // Enter tries the key at once; only Save stores it.
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && ai.typed_key() {
+                        ai.test_connection();
                     }
                 }
                 false
             });
-            for w in ai.settings.warnings(has_key) {
+            let key_in_use = has_key || ai.typed_key();
+            for w in ai.settings.warnings(key_in_use) {
                 ui.add(egui::Label::new(RichText::new(format!("{}  {w}", I::WARNING)).size(11.5).color(p.warn)).wrap());
             }
             row(ui, p, "Test connection", "Connects, checks the server, lists its models and picks one that takes images", |ui| {
@@ -1212,7 +1221,13 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             });
             section_title(ui, p, "Privacy");
             card(ui, p, |ui| {
-                changed |= toggle_row(ui, p, "Always confirm before sending", "Show the send preview for every request (otherwise only the first time for each server)", &mut s.always_confirm);
+                changed |= toggle_row(
+                    ui,
+                    p,
+                    "Always confirm before sending",
+                    "Show the send preview for every request, except to servers marked 'Do not ask again' (otherwise only the first time for each server)",
+                    &mut s.always_confirm,
+                );
                 changed |= toggle_row(ui, p, "Include file name", "Send the file name with the image", &mut s.include_filename);
                 changed |= toggle_row(ui, p, "Include capture settings", "Send camera, lens and exposure from EXIF (never GPS)", &mut s.include_exif);
                 if !s.trusted_servers.is_empty() {

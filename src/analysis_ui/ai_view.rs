@@ -133,8 +133,8 @@ impl AiView {
         let (dot, tip) = match (ai.testing(), ai.connected(), &server) {
             (_, _, None) => (p.faint, "No server set".to_string()),
             (true, _, _) => (p.warn, "Testing the connection".to_string()),
-            (false, Some(true), _) => (p.ok, "Connected (last Test connection succeeded)".to_string()),
-            (false, Some(false), _) => (p.danger, ai.report.as_ref().and_then(|r| r.failure()).unwrap_or("Test connection failed").to_string()),
+            (false, Some((true, m)), _) => (p.ok, m.to_string()),
+            (false, Some((false, m)), _) => (p.danger, m.to_string()),
             (false, None, _) => (p.faint, "Not tested yet: press Test".to_string()),
         };
         ui.horizontal(|ui| {
@@ -253,8 +253,9 @@ impl AiView {
         let mut meta = format!("{secs:.0} s");
         if let Some(u) = &live.usage {
             meta.push_str(&format!(", {} prompt + {} output tokens", u.prompt_tokens, u.completion_tokens));
-        } else if !live.text.is_empty() {
-            meta.push_str(&format!(", {} characters", live.text.chars().count()));
+        } else if live.chunks > 0 {
+            // Servers stream about one token per chunk.
+            meta.push_str(&format!(", about {} tokens", live.chunks));
         }
         if let Some((i, n)) = live.pass {
             meta.push_str(&format!(", pass {i} of {n}"));
@@ -518,7 +519,14 @@ impl AiView {
         for pane in panes {
             let label = if pane.slot == Slot::B { ImageLabel::B } else { ImageLabel::A };
             let Some((w, h)) = rec.dims[if pane.slot == Slot::B { 1 } else { 0 }] else { continue };
+            // In a wipe or split view the other image covers the rest of the
+            // same place: its side shows this image's boxes dashed, so a
+            // finding stays visible wherever the divider is, without being
+            // mistaken for one of the other image.
+            let twin = pane.twin(panes);
             let painter = ui.painter().with_clip_rect(pane.clip);
+            let ghost = twin.map(|t| ui.painter().with_clip_rect(t.clip));
+            let whole = twin.map(|t| pane.clip.union(t.clip)).unwrap_or(pane.clip);
             for (i, f) in report.findings.iter().enumerate() {
                 let Some(s) = f.source.filter(|s| s.label == label) else { continue };
                 let k = Vec2::new(pane.xf.size.x / w.max(1) as f32, pane.xf.size.y / h.max(1) as f32);
@@ -530,11 +538,27 @@ impl AiView {
                 }
                 painter.rect_stroke(r, 0.0, Stroke::new(if hot { 4.5 } else { 3.0 }, Color32::from_black_alpha(120)), egui::StrokeKind::Middle);
                 painter.rect_stroke(r, 0.0, Stroke::new(if hot { 2.5 } else { 1.5 }, col), egui::StrokeKind::Middle);
-                // Number tag above the box, or inside it at the top of the view.
-                let tag_min = if r.min.y - 18.0 >= pane.clip.min.y { Pos2::new(r.min.x, r.min.y - 18.0) } else { r.min };
-                let tag = Rect::from_min_size(tag_min, Vec2::new(18.0, 18.0));
-                painter.rect_filled(tag, CornerRadius::same(3), col);
-                painter.text(tag.center(), Align2::CENTER_CENTER, (i + 1).to_string(), semibold(11.0), Color32::BLACK);
+                if let Some(g) = &ghost {
+                    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                    g.add(egui::Shape::line(pts.to_vec(), Stroke::new(3.0, Color32::from_black_alpha(90))));
+                    g.extend(egui::Shape::dashed_line(&pts, Stroke::new(if hot { 2.0 } else { 1.2 }, col), 6.0, 4.0));
+                }
+                // Number tag above the box, or inside it at the top of the view;
+                // with a twin it names the image ("B2") and stays visible on
+                // either side, solid where its own image is shown.
+                let text = if twin.is_some() { format!("{}{}", label.as_str(), i + 1) } else { (i + 1).to_string() };
+                let tag_w = if twin.is_some() { 26.0 } else { 18.0 };
+                let tag_min = if r.min.y - 18.0 >= whole.min.y { Pos2::new(r.min.x, r.min.y - 18.0) } else { r.min };
+                let tag = Rect::from_min_size(tag_min, Vec2::new(tag_w, 18.0));
+                let tags = ui.painter().with_clip_rect(whole);
+                if pane.clip.contains(tag.center()) || twin.is_none() {
+                    tags.rect_filled(tag, CornerRadius::same(3), col);
+                    tags.text(tag.center(), Align2::CENTER_CENTER, text, semibold(11.0), Color32::BLACK);
+                } else {
+                    tags.rect_filled(tag, CornerRadius::same(3), Color32::from_black_alpha(190));
+                    tags.rect_stroke(tag, CornerRadius::same(3), Stroke::new(1.0, col), egui::StrokeKind::Inside);
+                    tags.text(tag.center(), Align2::CENTER_CENTER, text, semibold(11.0), col);
+                }
             }
         }
     }
@@ -633,8 +657,9 @@ pub fn markdown(rec: &RunRecord, res: &RunResult) -> String {
             _ => format!("## {}\n\n{}\n", res.preset_name, res.text.trim()),
         },
     };
-    let frame = rec.frame.map(|f| format!(", frame {} at {}", f.index, lumen_ai::prompts::fmt_timestamp(f.timestamp_s))).unwrap_or_default();
-    md.push_str(&format!("\n_{}{frame}. {}, {} via {}. AI opinion, not a measurement._\n", rec.label, rec.when, res.model, res.server));
+    // The label already names the frame ("clip.mp4, frame 120"): add its time.
+    let at = rec.frame.map(|f| format!(" at {}", lumen_ai::prompts::fmt_timestamp(f.timestamp_s))).unwrap_or_default();
+    md.push_str(&format!("\n_{}{at}. {}, {} via {}. AI opinion, not a measurement._\n", rec.label, rec.when, res.model, res.server));
     md
 }
 

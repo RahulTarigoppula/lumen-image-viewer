@@ -24,6 +24,17 @@ pub struct Pane {
     pub clip: Rect,
 }
 
+impl Pane {
+    /// The other image drawn at the same place, beyond a divider (wipe or
+    /// split view): A and B share the screen, each visible on its side of
+    /// the line, so a point of one image lies on the same point of the
+    /// other.
+    pub fn twin<'a>(&self, panes: &'a [Pane]) -> Option<&'a Pane> {
+        let close = |a: Rect, b: Rect| (a.min - b.min).length() <= 2.0 && (a.max - b.max).length() <= 2.0;
+        panes.iter().find(|o| o.slot != self.slot && close(o.xf.dest, self.xf.dest) && !o.clip.intersect(self.clip).is_positive())
+    }
+}
+
 #[derive(Clone, Default)]
 struct Frame {
     pass: u64,
