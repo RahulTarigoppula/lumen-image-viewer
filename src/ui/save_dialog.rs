@@ -3,7 +3,10 @@
 use crate::encode::{Chroma, SaveOptions};
 use crate::formats::SaveFormat;
 use crossbeam_channel::Receiver;
-use egui::{Color32, RichText};
+use super::icons as I;
+use super::theme::{self, size, text};
+use super::widgets;
+use egui::{RichText, Vec2};
 use image::RgbaImage;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +24,10 @@ pub struct SaveDialog {
     original: PathBuf,
     /// The user was told the target exists; the next Save click replaces it.
     confirm_replace: bool,
+    /// The name field got its first focus (base name selected).
+    focused: bool,
+    /// The name field as typed (`path` follows it while it is not empty).
+    name: String,
 }
 
 pub enum SaveOutcome {
@@ -36,13 +43,47 @@ impl SaveDialog {
         }
         let original = path.clone();
         let path = path.with_extension(opts.format.ext());
-        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false }
+        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false, focused: false, name: String::new() }.with_name()
     }
 
     /// The target is an existing file other than the one being edited.
     fn overwrites_other(&self) -> bool {
         let same = self.path.to_string_lossy().to_lowercase() == self.original.to_string_lossy().to_lowercase();
         !same && self.path.exists()
+    }
+
+    /// Show the file name of `path` in the name field.
+    fn with_name(mut self) -> Self {
+        self.sync_name();
+        self
+    }
+
+    fn sync_name(&mut self) {
+        self.name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    }
+
+    fn folder(&self) -> PathBuf {
+        self.path.parent().map(|d| d.to_path_buf()).unwrap_or_default()
+    }
+
+    /// The system Save dialog, for another folder (or name).
+    fn browse(&mut self) {
+        let mut dlg = rfd::FileDialog::new().add_filter(self.opts.format.label(), &[self.opts.format.ext()]);
+        if let Some(dir) = self.path.parent() {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(n) = self.path.file_name() {
+            dlg = dlg.set_file_name(n.to_string_lossy());
+        }
+        if let Some(p) = dlg.save_file() {
+            self.path = p;
+            self.sync_name();
+            // The system dialog already asked about replacing an existing file.
+            self.confirm_replace = true;
+            if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&self.path)) {
+                self.opts.format = f;
+            }
+        }
     }
 
     pub fn show(&mut self, ctx: &egui::Context, p: &super::theme::Palette) -> SaveOutcome {
@@ -78,24 +119,33 @@ impl SaveDialog {
             self.est_rx = Some(rx);
         }
 
-        egui::Modal::new(egui::Id::unique("save-dialog")).show(ctx, |ui| {
-            // Wide enough for typical paths; the path field takes all the room
-            // the Browse button leaves.
-            let w = (ctx.content_rect().width() * 0.8).clamp(360.0, 640.0);
-            ui.set_width(w);
-            ui.heading("Save as");
-            ui.add_space(8.0);
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                let mut s = self.path.display().to_string();
-                let browse_w = ui.spacing().item_spacing.x + ui.spacing().button_padding.x * 2.0 + 64.0;
-                let field_w = (ui.available_width() - browse_w).max(160.0);
-                let field = ui.add(egui::TextEdit::singleline(&mut s).desired_width(field_w));
-                if field.hovered() {
-                    field.clone().on_hover_text(self.path.display().to_string());
+        let mut changed = false;
+        let mut save_clicked = false;
+        widgets::modal(ctx, egui::Id::unique("save-dialog"), 460.0, |ui| {
+            widgets::modal_title(ui, "Save as");
+            ui.spacing_mut().item_spacing.y = widgets::FORM_ROW_GAP;
+            ui.spacing_mut().combo_width = 200.0;
+            let overwrites = self.overwrites_other();
+            let ctl_w = ui.available_width() - size::LABEL_W - ui.spacing().item_spacing.x;
+
+            // The name is what is usually changed; the folder comes from the open file.
+            widgets::form_row(ui, "Name", |ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(ctl_w).min_size(Vec2::new(0.0, size::CONTROL)).align(egui::Align2::LEFT_CENTER));
+                if !self.focused {
+                    self.focused = true;
+                    field.request_focus();
+                    // Select the base name, as Explorer does.
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field.id) {
+                        let end = self.name.rfind('.').filter(|&i| i > 0).unwrap_or(self.name.len());
+                        let range = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.name[..end].chars().count()));
+                        state.cursor.set_char_range(Some(range));
+                        state.store(ui.ctx(), field.id);
+                    }
                 }
-                if field.changed() {
-                    self.path = PathBuf::from(s);
+                if field.changed() && !self.name.trim().is_empty() {
+                    let typed = PathBuf::from(self.name.trim());
+                    // A full path typed or pasted into the name goes anywhere.
+                    self.path = if typed.is_absolute() { typed } else { self.folder().join(typed) };
                     self.confirm_replace = false;
                     // A typed extension picks the format.
                     if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&self.path)) {
@@ -105,120 +155,123 @@ impl SaveDialog {
                         }
                     }
                 }
-                if ui.button("Browse...").clicked() {
-                    let mut dlg = rfd::FileDialog::new().add_filter(self.opts.format.label(), &[self.opts.format.ext()]);
-                    if let Some(dir) = self.path.parent() {
-                        dlg = dlg.set_directory(dir);
-                    }
-                    if let Some(n) = self.path.file_name() {
-                        dlg = dlg.set_file_name(n.to_string_lossy());
-                    }
-                    if let Some(p) = dlg.save_file() {
-                        self.path = p;
-                        // The system dialog already asked about replacing an existing file.
-                        self.confirm_replace = true;
-                        if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&self.path)) {
-                            self.opts.format = f;
-                            changed = true;
-                        }
-                    }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save_clicked = true;
                 }
             });
-            ui.add_space(6.0);
-            egui::Grid::new("save-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Format");
-                egui::ComboBox::from_id_salt("save-format").selected_text(self.opts.format.label()).show_ui(ui, |ui| {
+            widgets::form_row(ui, "Folder", |ui| {
+                let folder = self.folder().display().to_string();
+                let label = widgets::elide_start(ui, &folder, text::body(), ctl_w - 44.0);
+                let b = egui::Button::new(RichText::new(format!("{}  {label}", I::FOLDER)).font(text::body())).min_size(Vec2::new(ctl_w, size::CONTROL));
+                let r = ui.add(b).on_hover_text(format!("{folder}\nClick to choose another folder or name"));
+                if r.clicked() {
+                    self.browse();
+                    changed = true;
+                }
+            });
+            ui.add_space(4.0);
+            widgets::form_row(ui, "Format", |ui| {
+                widgets::combo("save-format").selected_text(self.opts.format.label()).show_ui(ui, |ui| {
                     for f in SaveFormat::ALL {
                         if ui.selectable_value(&mut self.opts.format, f, f.label()).changed() {
                             self.path = self.path.with_extension(f.ext());
+                            self.sync_name();
                             self.confirm_replace = false;
                             changed = true;
                         }
                     }
                 });
-                ui.end_row();
-                match self.opts.format {
-                    SaveFormat::Jpeg => {
-                        ui.label("Quality");
-                        changed |= ui.add(egui::Slider::new(&mut self.opts.jpeg_quality, 1..=100)).changed();
-                        ui.end_row();
-                        ui.label("Chroma");
-                        egui::ComboBox::from_id_salt("chroma").selected_text(self.opts.jpeg_chroma.label()).show_ui(ui, |ui| {
+            });
+            match self.opts.format {
+                SaveFormat::Jpeg => {
+                    widgets::form_row(ui, "Quality", |ui| {
+                        changed |= ui.add(widgets::Slider::new(&mut self.opts.jpeg_quality, 1..=100).default_value(92)).changed();
+                    });
+                    widgets::form_row(ui, "Chroma", |ui| {
+                        widgets::combo("chroma").selected_text(self.opts.jpeg_chroma.label()).show_ui(ui, |ui| {
                             for c in [Chroma::S444, Chroma::S422, Chroma::S420] {
                                 changed |= ui.selectable_value(&mut self.opts.jpeg_chroma, c, c.label()).changed();
                             }
                         });
-                        ui.end_row();
-                        ui.label("");
-                        changed |= ui.checkbox(&mut self.opts.jpeg_progressive, "Progressive").changed();
-                        ui.end_row();
-                    }
-                    SaveFormat::WebP => {
-                        ui.label("");
-                        changed |= ui.checkbox(&mut self.opts.webp_lossless, "Lossless").changed();
-                        ui.end_row();
-                        if !self.opts.webp_lossless {
-                            ui.label("Quality");
-                            changed |= ui.add(egui::Slider::new(&mut self.opts.webp_quality, 1.0..=100.0)).changed();
-                            ui.end_row();
-                        }
-                    }
-                    SaveFormat::Png => {
-                        ui.label("");
-                        changed |= ui.checkbox(&mut self.opts.png_best_compression, "Best compression (slower)").changed();
-                        ui.end_row();
-                    }
-                    _ => {}
+                    });
+                    widgets::form_row(ui, "", |ui| {
+                        changed |= widgets::checkbox(ui, &mut self.opts.jpeg_progressive, "Progressive").changed();
+                    });
+                    widgets::form_row(ui, "", |ui| {
+                        widgets::checkbox(ui, &mut self.opts.keep_metadata, "Keep EXIF metadata");
+                    });
                 }
-                if self.opts.format == SaveFormat::Jpeg {
-                    ui.label("");
-                    ui.checkbox(&mut self.opts.keep_metadata, "Keep EXIF metadata");
-                    ui.end_row();
+                SaveFormat::WebP => {
+                    if !self.opts.webp_lossless {
+                        widgets::form_row(ui, "Quality", |ui| {
+                            changed |= ui.add(widgets::Slider::new(&mut self.opts.webp_quality, 1.0..=100.0).fixed_decimals(0).default_value(88.0)).changed();
+                        });
+                    }
+                    widgets::form_row(ui, "", |ui| {
+                        changed |= widgets::checkbox(ui, &mut self.opts.webp_lossless, "Lossless").changed();
+                    });
                 }
-                ui.label("Estimated size");
-                match &self.estimate {
-                    _ if self.est_version < self.version => {
-                        ui.spinner();
-                    }
-                    Some(Ok(n)) => {
-                        ui.label(RichText::new(format!("{}  ({} × {})", crate::catalog::human_size(*n as u64), self.image.width(), self.image.height())).strong());
-                    }
-                    Some(Err(e)) => {
-                        ui.label(RichText::new(e).color(p.danger));
-                    }
-                    None => {
-                        ui.spinner();
-                    }
+                SaveFormat::Png => {
+                    widgets::form_row(ui, "", |ui| {
+                        changed |= widgets::checkbox(ui, &mut self.opts.png_best_compression, "Best compression (slower)").changed();
+                    });
                 }
-                ui.end_row();
-            });
-            if changed {
-                self.version += 1;
+                _ => {}
             }
             if let Some(e) = &self.error {
-                ui.add_space(6.0);
-                ui.colored_label(p.danger, e);
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING_CIRCLE)).color(p.danger)).wrap());
             }
-            let overwrites = self.overwrites_other();
             if overwrites && self.confirm_replace {
-                ui.add_space(6.0);
-                ui.colored_label(p.warn, format!("{} already exists. Save again to replace it.", self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+                ui.add_space(4.0);
+                let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                ui.add(egui::Label::new(RichText::new(format!("{}  {name} already exists. Save again to replace it.", I::WARNING)).color(p.warn)).wrap());
             }
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    out = SaveOutcome::Cancel;
-                }
-                let label = if overwrites && self.confirm_replace { "Replace" } else { "Save" };
-                if ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(if overwrites && self.confirm_replace { p.danger } else { p.accent }).min_size(egui::vec2(80.0, 28.0))).clicked() {
-                    if overwrites && !self.confirm_replace {
-                        self.confirm_replace = true;
-                    } else {
-                        out = SaveOutcome::Save(self.path.clone(), self.opts.clone());
+            ui.add_space(theme::space::BUTTONS_GAP - widgets::FORM_ROW_GAP);
+            // Footer: the size estimate on the left, Cancel / Save on the right.
+            let ok = !self.name.trim().is_empty();
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let replace = overwrites && self.confirm_replace;
+                    let r = if replace { ui.add_enabled_ui(ok, |ui| widgets::danger_button(ui, p, "Replace")).inner } else { widgets::primary_button_enabled(ui, p, ok, "Save") };
+                    if r.clicked() {
+                        save_clicked = true;
                     }
-                }
+                    if widgets::secondary_button(ui, "Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        out = SaveOutcome::Cancel;
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new("Estimated size").color(p.muted));
+                        match &self.estimate {
+                            Some(Ok(n)) if self.est_version >= self.version => {
+                                ui.label(RichText::new(crate::catalog::human_size(*n as u64)).color(p.text));
+                                ui.add(egui::Label::new(RichText::new(format!("{} × {}", self.image.width(), self.image.height())).color(p.faint)).truncate());
+                            }
+                            Some(Err(e)) if self.est_version >= self.version => {
+                                ui.add(egui::Label::new(RichText::new(e).color(p.danger)).truncate());
+                            }
+                            _ => {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            }
+                        }
+                    });
+                });
             });
+            if !ok {
+                save_clicked = false;
+            }
         });
+        if changed {
+            self.version += 1;
+        }
+        if save_clicked && !matches!(out, SaveOutcome::Cancel) {
+            if self.overwrites_other() && !self.confirm_replace {
+                self.confirm_replace = true;
+            } else {
+                out = SaveOutcome::Save(self.path.clone(), self.opts.clone());
+            }
+        }
         out
     }
 }
