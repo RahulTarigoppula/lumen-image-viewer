@@ -1776,7 +1776,7 @@ impl MetricsTab {
         }
         if self.kind == Kind::None {
             ui.add_space(10.0);
-            ui.label(RichText::new("Nothing to analyze yet").font(crate::ui::theme::semibold(13.5)).color(p.text));
+            ui.label(RichText::new("Nothing to analyze yet").font(crate::ui::theme::semibold(look::SUBTITLE)).color(p.text));
             look::note(ui, &p, "Open an image, compare two images (select them in the browser and press P) or open a video.");
             return;
         }
@@ -1859,11 +1859,11 @@ impl MetricsTab {
     /// Start, end and stride of a custom range (Details and options).
     fn range_fields(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Frame range").font(crate::ui::theme::semibold(12.5)).color(p.text));
+        ui.label(RichText::new("Frame range").size(look::CAPTION).font(crate::ui::theme::semibold(look::CAPTION)).color(p.muted));
         let mut edited = false;
         ui.horizontal_wrapped(|ui| {
             let field = |ui: &mut Ui, label: &str, text: &mut String, hint: &str, enabled: bool| {
-                ui.label(RichText::new(label).size(12.0).color(p.muted));
+                ui.label(RichText::new(label).size(look::SMALL).color(p.muted));
                 ui.add_enabled(enabled, egui::TextEdit::singleline(text).desired_width(56.0).hint_text(hint)).on_hover_text("Frame number, seconds (4.5s) or minutes:seconds (1:02)").changed()
             };
             edited |= field(ui, "Start", &mut self.range_text[0], "0", true);
@@ -1874,7 +1874,7 @@ impl MetricsTab {
             self.status = None;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Stride").size(12.0).color(p.muted));
+            ui.label(RichText::new("Stride").size(look::SMALL).color(p.muted));
             if self.stride_auto {
                 let auto = self.planned_range(s, roi).map(|r| r.stride.to_string()).unwrap_or_else(|_| "-".into());
                 let mut shown = auto;
@@ -1895,26 +1895,33 @@ impl MetricsTab {
 
     fn picker(&mut self, ui: &mut Ui, p: &Palette, s: &Subject, roi: Option<Roi>) {
         let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let mut presets: Vec<(&str, Vec<String>, &str)> = vec![("Recommended", default_metrics(self.kind), "What the summary uses: quick and covers the basics")];
-            if matches!(self.kind, Kind::Compare | Kind::VideoPair) {
-                presets.push(("Quick", metrics::preset("quick").iter().map(|s| s.to_string()).collect(), "PSNR, fast SSIM and the absolute difference"));
-            }
-            presets.push(("Encode QA", metrics::preset("encode_qa").iter().map(|s| s.to_string()).collect(), "Fidelity, blocking and banding for encodes"));
-            presets.push(("Photo technical", metrics::preset("photo_technical").iter().map(|s| s.to_string()).collect(), "Sharpness, noise, exposure and color cast"));
-            for (name, ids, tip) in presets {
-                let on = self.selected == ids.iter().cloned().collect::<BTreeSet<String>>();
-                if ui.add(egui::Button::selectable(on, name).small()).on_hover_text(tip).clicked() {
-                    self.selected = ids.into_iter().collect();
-                    changed = true;
+        let mut presets: Vec<(&str, Vec<String>, &str)> = vec![("Recommended", default_metrics(self.kind), "What the summary uses: quick, and covers the basics")];
+        if matches!(self.kind, Kind::Compare | Kind::VideoPair) {
+            presets.push(("Quick", metrics::preset("quick").iter().map(|s| s.to_string()).collect(), "PSNR, fast SSIM and the absolute difference"));
+        }
+        presets.push(("Encode QA", metrics::preset("encode_qa").iter().map(|s| s.to_string()).collect(), "Fidelity, blocking and banding for encodes"));
+        presets.push(("Photo technical", metrics::preset("photo_technical").iter().map(|s| s.to_string()).collect(), "Sharpness, noise, exposure and color cast"));
+        let is = |ids: &Vec<String>| self.selected == ids.iter().cloned().collect::<BTreeSet<String>>();
+        let current = presets.iter().find(|x| is(&x.1)).map(|x| x.0).unwrap_or(if self.selected.is_empty() { "None" } else { "Custom" });
+        let mut pick: Option<Vec<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Metric set").size(look::SMALL).color(p.muted));
+            egui::ComboBox::from_id_salt("metrics-preset").selected_text(current).width(ui.available_width()).show_ui(ui, |ui| {
+                for (name, ids, tip) in &presets {
+                    if ui.selectable_label(*name == current, *name).on_hover_text(*tip).clicked() {
+                        pick = Some(ids.clone());
+                    }
                 }
-            }
-            if ui.small_button("None").clicked() {
-                self.selected.clear();
-                changed = true;
-            }
+                ui.separator();
+                if ui.selectable_label(current == "None", "None").on_hover_text("Clear the selection, then tick metrics below").clicked() {
+                    pick = Some(Vec::new());
+                }
+            });
         });
+        if let Some(ids) = pick {
+            self.selected = ids.into_iter().collect();
+            changed = true;
+        }
         let (w, h) = s.size().unwrap_or((1920, 1080));
         let (w, h) = roi.map(|r| (r.w, r.h)).unwrap_or((w, h));
         let frames = self.frames_to_measure(s, roi).max(1) as f32;
@@ -1932,8 +1939,8 @@ impl MetricsTab {
             } else {
                 metrics::all().iter().filter(|m| m.info().kind == kind && self.selected.contains(m.id())).count()
             };
-            let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).size(12.5).color(if blocked.is_some() { p.faint } else { p.text });
-            egui::CollapsingHeader::new(head).id_salt(("metrics-group", title)).default_open(false).show(ui, |ui| {
+            let head = RichText::new(format!("{title}{}", if n_sel > 0 { format!("  ({n_sel})") } else { String::new() })).size(look::BODY).color(if blocked.is_some() { p.faint } else { p.text });
+            look::group(head, p).id_salt(("metrics-group", title)).default_open(false).show(ui, |ui| {
                 if let Some(why) = &blocked {
                     ui.add(egui::Label::new(RichText::new(why).size(11.0).color(p.faint)).wrap());
                 }
@@ -1952,7 +1959,7 @@ impl MetricsTab {
                 for (id, name, desc, cost, heavy) in entries {
                     ui.horizontal(|ui| {
                         let mut on = self.selected.contains(id);
-                        let resp = ui.add_enabled(blocked.is_none(), egui::Checkbox::new(&mut on, RichText::new(name).size(12.5))).on_hover_text(desc);
+                        let resp = ui.add_enabled(blocked.is_none(), egui::Checkbox::new(&mut on, RichText::new(name).size(look::BODY))).on_hover_text(desc);
                         if resp.changed() {
                             if on {
                                 self.selected.insert(id.to_string());
@@ -2089,11 +2096,11 @@ impl MetricsTab {
             if let Some(h) = &s.head {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    look::dot(ui, if stale { p.faint } else { look::level_color(p, h.level) });
+                    look::dot(ui, if stale { p.faint } else { look::level_color(p, h.level) }, if stale { "Out of date: analyze again" } else { look::level_text(h.level) });
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.add(egui::Label::new(RichText::new(&h.title).font(crate::ui::theme::semibold(13.5)).color(if stale { p.faint } else { p.text })).wrap());
-                        ui.add(egui::Label::new(RichText::new(&h.detail).size(12.0).color(p.muted)).wrap());
+                        ui.add(egui::Label::new(RichText::new(&h.title).font(crate::ui::theme::semibold(look::SUBTITLE)).color(if stale { p.faint } else { p.text })).wrap());
+                        ui.add(egui::Label::new(RichText::new(&h.detail).size(look::SMALL).color(p.muted)).wrap());
                     });
                 });
                 if !s.lines.is_empty() {
@@ -2104,7 +2111,7 @@ impl MetricsTab {
                 }
             }
             for l in &s.lines {
-                look::status_row(ui, p, look::level_color(p, l.level), &l.label, &l.value, &l.tip, stale);
+                look::status_row(ui, p, l.level, &l.label, &l.value, &l.tip, stale);
             }
             if !s.cuts.is_empty() {
                 ui.add_space(2.0);
@@ -2114,7 +2121,7 @@ impl MetricsTab {
                     ui.label(RichText::new("Cuts at").size(11.5).color(p.muted));
                     for &c in s.cuts.iter().take(16) {
                         let t = summary::fmt_clock(c as f64 / self.fps.max(1.0));
-                        if ui.add(egui::Button::new(RichText::new(t).size(11.5).color(p.accent)).frame(false)).on_hover_text(format!("Show frame {c}")).clicked() {
+                        if ui.add(egui::Button::new(RichText::new(t).size(look::SMALL).color(p.accent)).frame(false)).on_hover_text(format!("Show frame {c}")).clicked() {
                             seek = Some(c);
                         }
                     }
@@ -2134,7 +2141,7 @@ impl MetricsTab {
                 Some(summary::Action::ShowMap { id, why }) => {
                     let on = self.heat.visible && self.heat.id() == Some(id.as_str());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Biggest difference: {why}")).size(12.0).color(p.muted));
+                        ui.label(RichText::new(format!("Biggest difference: {why}")).size(look::SMALL).color(p.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let text = if on { "Hide" } else { "Show where" };
                             if ui.button(text).on_hover_text("Color the image by how much B differs from A there").clicked() {
@@ -2145,7 +2152,7 @@ impl MetricsTab {
                 }
                 Some(summary::Action::Seek { frame }) => {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Worst: frame {frame}")).size(12.0).color(p.muted));
+                        ui.label(RichText::new(format!("Worst: frame {frame}")).size(look::SMALL).color(p.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Show worst frame").on_hover_text("Pause on the worst frame").clicked() {
                                 seek = Some(frame);
@@ -2177,7 +2184,7 @@ impl MetricsTab {
         // The summary's "Show where" already toggles its own map.
         let from_card = matches!(self.summary.as_ref().and_then(|s| s.action.as_ref()), Some(summary::Action::ShowMap { id, .. }) if self.heat.id() == Some(id.as_str()));
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Heatmap on the image: {name}")).size(12.0).color(p.muted));
+            ui.label(RichText::new(format!("Heatmap on the image: {name}")).size(look::SMALL).color(p.muted));
             if !from_card {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Hide").clicked() {
@@ -2189,15 +2196,18 @@ impl MetricsTab {
         look::section("Heatmap options", p).id_salt("metrics-heatmap").default_open(false).show(ui, |ui| self.heatmap_controls(ui, p));
     }
 
-    fn chip(ui: &mut Ui, p: &Palette, g: Option<Grade>) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-        let c = match g {
-            Some(Grade::Good) => p.ok,
-            Some(Grade::Fair) => p.warn,
-            Some(Grade::Poor) => p.danger,
-            None => return,
+    /// The value's grade as a dot; what it means (and the limits) on hover.
+    fn chip(ui: &mut Ui, p: &Palette, key: &str, value: Option<f64>, stale: bool) {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+        let (Some(t), Some(g)) = (threshold(key), value.filter(|_| !stale).and_then(|v| grade(key, v))) else { return };
+        let (c, what) = match g {
+            Grade::Good => (p.ok, "Good"),
+            Grade::Fair => (p.warn, "Fair"),
+            Grade::Poor => (p.danger, "Poor"),
         };
-        ui.painter().circle_filled(rect.center(), 4.5, c);
+        ui.painter().circle_filled(rect.center(), 3.5, c);
+        let (good, poor) = if t.higher_better { ("at or above", "below") } else { ("below", "above") };
+        resp.on_hover_text(format!("{what}: good {good} {}, poor {poor} {}", t.good, t.poor));
     }
 
     fn arrow(ui: &mut Ui, p: &Palette, d: Direction) {
@@ -2253,7 +2263,7 @@ impl MetricsTab {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.spacing_mut().interact_size.y = 20.0;
-                Self::chip(ui, p, head.value.filter(|_| !stale).and_then(|v| grade(&head.key, v)));
+                Self::chip(ui, p, &head.key, head.value, stale);
                 ui.with_layout(right, |ui| {
                     Self::arrow(ui, p, head.direction);
                     let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
@@ -2289,17 +2299,17 @@ impl MetricsTab {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.spacing_mut().interact_size.y = 18.0;
-                        Self::chip(ui, p, c.value.filter(|_| !stale).and_then(|v| grade(&c.key, v)));
+                        Self::chip(ui, p, &c.key, c.value, stale);
                         ui.with_layout(right, |ui| {
                             Self::arrow(ui, p, c.direction);
-                            let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(12.0));
+                            let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(look::SMALL));
                             if let Some(t) = &c.tip {
                                 v.on_hover_text(t);
                             }
                             ui.with_layout(left, |ui| {
                                 ui.add_space(14.0);
                                 let short = key_label(&row.id, short_key(&row.id, &c.key));
-                                let job = name_job(&short, None, muted, 12.0, ui.available_width());
+                                let job = name_job(&short, None, muted, look::SMALL, ui.available_width());
                                 let lab = ui.add(egui::Label::new(job).sense(Sense::click()));
                                 if c.worst.is_some() && lab.on_hover_text("Click to show the worst frame").clicked() {
                                     seek = c.worst;
@@ -2385,7 +2395,7 @@ impl MetricsTab {
             return;
         }
         let mut load = None;
-        egui::CollapsingHeader::new(RichText::new(format!("{}  History ({})", I::CLOCK_COUNTER_CLOCKWISE, self.history.len())).color(p.text)).id_salt("metrics-history").default_open(self.show_history).show(ui, |ui| {
+        look::group(RichText::new(format!("History ({})", self.history.len())).size(look::BODY).color(p.text), p).id_salt("metrics-history").default_open(self.show_history).show(ui, |ui| {
             for h in &self.history {
                 let r = ui
                     .vertical(|ui| {

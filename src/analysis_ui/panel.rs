@@ -180,7 +180,7 @@ impl AnalysisPanel {
         egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(I::CHART_LINE).size(15.0).color(p.accent));
-                ui.label(RichText::new("Analysis").font(semibold(14.5)).color(p.text));
+                ui.label(RichText::new("Analysis").font(semibold(super::look::TITLE)).color(p.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let tip = format!("Close ({})", crate::ui::commands::Command::ToggleAnalysis.shortcut());
                     if crate::ui::widgets::icon_button_sized(ui, I::X, &tip, false, 24.0, 14.0).clicked() {
@@ -240,13 +240,13 @@ impl AnalysisPanel {
                 None => (whole.to_string(), p.muted),
             };
             ui.label(RichText::new(I::SELECTION).size(13.0).color(color));
-            let l = ui.add(egui::Label::new(RichText::new(text).size(12.0).color(color)).truncate());
+            let l = ui.add(egui::Label::new(RichText::new(text).size(super::look::SMALL).color(color)).truncate());
             if let Some((x, y, _, _)) = rect {
                 l.on_hover_text(format!("At {x}, {y} in A's pixels"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(12.0).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
+                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(super::look::SMALL).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
                 if self.drawing {
                     if link(ui, "Cancel", "Esc") {
                         self.drawing = false;
