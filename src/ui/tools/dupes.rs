@@ -1,5 +1,5 @@
 //! Duplicate detection: exact (size + content hash) and visually similar
-//! (64-bit difference hash compared by Hamming distance).
+//! (128-bit difference hash compared by Hamming distance).
 
 use image::RgbaImage;
 use std::collections::HashMap;
@@ -8,19 +8,26 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// 64-bit difference hash: shrink to 9×8 grayscale and compare horizontal neighbours.
+/// 128-bit difference hash: the high 64 bits compare horizontal neighbours
+/// (a 9x8 grayscale grid), the low 64 bits vertical ones (8x9). Both
+/// directions are needed: a picture whose detail runs top to bottom (a
+/// vertical gradient, a horizon) has almost nothing to compare across.
 #[allow(dead_code)]
-pub fn dhash(img: &RgbaImage) -> u64 {
+pub fn dhash(img: &RgbaImage) -> u128 {
     dhash_detail(img).0
 }
 
-/// Images whose hash grid has less detail than this (mean absolute neighbour
-/// difference, 0..255) are too flat for the hash to mean anything: their bits
-/// are dominated by noise, so they never take part in similarity matching.
+/// Images whose hash grids have less detail than this (mean absolute
+/// neighbour difference, 0..255, in the more detailed direction) are too flat
+/// for the hash to mean anything: their bits are dominated by noise, so they
+/// never take part in similarity matching.
 pub const MIN_DETAIL: f32 = 2.0;
 
+/// Number of bits in the hash.
+pub const HASH_BITS: u32 = 128;
+
 /// Difference hash plus the amount of detail it was computed from.
-pub fn dhash_detail(img: &RgbaImage) -> (u64, f32) {
+pub fn dhash_detail(img: &RgbaImage) -> (u128, f32) {
     if img.width() == 0 || img.height() == 0 {
         return (0, 0.0);
     }
@@ -31,32 +38,37 @@ pub fn dhash_detail(img: &RgbaImage) -> (u64, f32) {
         let l = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
         image::Luma([(l * a + 128.0 * (1.0 - a)).round() as u8])
     });
-    let small = image::imageops::resize(&gray, 9, 8, image::imageops::FilterType::Triangle);
-    let mut h = 0u64;
-    let mut diff = 0u32;
-    for y in 0..8 {
-        for x in 0..8 {
-            let l = small.get_pixel(x, y).0[0];
-            let r = small.get_pixel(x + 1, y).0[0];
-            h = (h << 1) | (l > r) as u64;
-            diff += (l as i32 - r as i32).unsigned_abs();
+    // One direction: a (w x h) grid compared along (dx, dy).
+    let half = |w: u32, h: u32, dx: u32, dy: u32| -> (u64, u32) {
+        let small = image::imageops::resize(&gray, w, h, image::imageops::FilterType::Triangle);
+        let (mut bits, mut diff) = (0u64, 0u32);
+        for y in 0..h - dy {
+            for x in 0..w - dx {
+                let a = small.get_pixel(x, y).0[0];
+                let b = small.get_pixel(x + dx, y + dy).0[0];
+                bits = (bits << 1) | (a > b) as u64;
+                diff += (a as i32 - b as i32).unsigned_abs();
+            }
         }
-    }
-    (h, diff as f32 / 64.0)
+        (bits, diff)
+    };
+    let (row, row_diff) = half(9, 8, 1, 0);
+    let (col, col_diff) = half(8, 9, 0, 1);
+    (((row as u128) << 64) | col as u128, row_diff.max(col_diff) as f32 / 64.0)
 }
 
-pub fn hamming(a: u64, b: u64) -> u32 {
+pub fn hamming(a: u128, b: u128) -> u32 {
     (a ^ b).count_ones()
 }
 
-/// Similarity percentage for a Hamming distance on a 64-bit hash.
+/// Similarity percentage for a Hamming distance between two hashes.
 pub fn similarity_pct(distance: u32) -> u32 {
-    100 - (distance.min(64) * 100 + 32) / 64
+    100 - (distance.min(HASH_BITS) * 100 + HASH_BITS / 2) / HASH_BITS
 }
 
 /// Hamming threshold for a similarity percentage.
 pub fn threshold_for_pct(pct: u32) -> u32 {
-    (100 - pct.min(100)) * 64 / 100
+    (100 - pct.min(100)) * HASH_BITS / 100
 }
 
 /// Fast 64-bit content hash (SipHash over the whole file plus its length).
@@ -98,7 +110,7 @@ pub struct ScanItem {
     pub content: Option<u64>,
     /// Hash of the decoded pixels, computed only for likely matches (see `pixel_hash`).
     pub pixels: Option<u64>,
-    pub dhash: Option<u64>,
+    pub dhash: Option<u128>,
     /// Detail behind the dHash (see `MIN_DETAIL`).
     pub detail: f32,
 }
@@ -296,10 +308,10 @@ pub fn copy_penalty(p: &std::path::Path) -> u8 {
     copyish as u8
 }
 
-/// BK-tree over 64-bit hashes with Hamming distance, for fast radius queries.
+/// BK-tree over hashes with Hamming distance, for fast radius queries.
 pub struct BkTree {
     /// (hash, payload, children as (distance, node index))
-    nodes: Vec<(u64, usize, Vec<(u32, usize)>)>,
+    nodes: Vec<(u128, usize, Vec<(u32, usize)>)>,
 }
 
 impl BkTree {
@@ -307,7 +319,7 @@ impl BkTree {
         BkTree { nodes: Vec::new() }
     }
 
-    pub fn insert(&mut self, hash: u64, payload: usize) {
+    pub fn insert(&mut self, hash: u128, payload: usize) {
         if self.nodes.is_empty() {
             self.nodes.push((hash, payload, Vec::new()));
             return;
@@ -328,7 +340,7 @@ impl BkTree {
     }
 
     /// Payloads of every hash within `radius` of `hash`.
-    pub fn query(&self, hash: u64, radius: u32, out: &mut Vec<usize>) {
+    pub fn query(&self, hash: u128, radius: u32, out: &mut Vec<usize>) {
         if self.nodes.is_empty() {
             return;
         }
@@ -485,7 +497,7 @@ pub fn group(items: &[ScanItem], similar: bool, threshold: u32) -> Vec<Group> {
         .map(|c| {
             let mut shown: Vec<(usize, Option<usize>)> = c.iter().map(|&u| (units[u].iter().copied().min_by(|a, b| path_cmp(a, b)).unwrap_or(reps[u]), group_of_unit[u])).collect();
             shown.sort_by(|a, b| path_cmp(&a.0, &b.0));
-            let hashes: Vec<u64> = c.iter().filter_map(|&u| items[reps[u]].dhash).collect();
+            let hashes: Vec<u128> = c.iter().filter_map(|&u| items[reps[u]].dhash).collect();
             let mut min_similarity = 100;
             for a in 0..hashes.len() {
                 for b in a + 1..hashes.len() {
@@ -544,16 +556,67 @@ mod tests {
         assert_eq!(hamming(dhash(&c), dhash(&blocks(256, 192, 1))), 0);
     }
 
+    /// Top-to-bottom gradient from `top` to `bottom` gray with faint rings,
+    /// like a sky or a studio backdrop: almost no detail from left to right.
+    fn vertical_gradient(w: u32, h: u32, top: f32, bottom: f32, seed: u32) -> RgbaImage {
+        RgbaImage::from_fn(w, h, |x, y| {
+            let (u, v) = (x as f32 / w as f32, y as f32 / h as f32);
+            let mut l = top + (bottom - top) * v;
+            let (cx, cy) = (0.3 + 0.1 * seed as f32, 0.5);
+            let r = ((u - cx).powi(2) + (v - cy).powi(2)).sqrt();
+            if (r * 40.0).fract() < 0.05 {
+                l += 6.0;
+            }
+            let g = l.clamp(0.0, 255.0) as u8;
+            image::Rgba([g, g.saturating_add(10), g / 2, 255])
+        })
+    }
+
+    fn fingerprinted(name: &str, img: &RgbaImage, size: u64) -> ScanItem {
+        let (h, detail) = dhash_detail(img);
+        ScanItem { dims: Some(img.dimensions()), content: Some(size), dhash: Some(h), detail, ..ScanItem::new(PathBuf::from(name), size, None) }
+    }
+
+    #[test]
+    fn vertical_gradients_and_their_resized_copies_match() {
+        let g = vertical_gradient(800, 600, 210.0, 50.0, 0);
+        let half = image::imageops::resize(&g, 400, 300, image::imageops::FilterType::Triangle);
+        let gentle = vertical_gradient(800, 600, 90.0, 150.0, 1);
+        let gentle_small = image::imageops::resize(&gentle, 200, 150, image::imageops::FilterType::Lanczos3);
+        // Nothing to compare across a row, plenty down a column.
+        let (h, detail) = dhash_detail(&g);
+        assert!(detail >= MIN_DETAIL, "{detail}");
+        assert!(dhash_detail(&gentle).1 >= MIN_DETAIL);
+        assert!((h as u64).count_ones() > 48, "{h:032x}");
+        assert!(hamming(h, dhash(&half)) <= 4, "{}", hamming(h, dhash(&half)));
+        assert!(hamming(dhash(&gentle), dhash(&gentle_small)) <= 4);
+        // Opposite directions are different pictures.
+        assert!(hamming(h, dhash(&gentle)) >= 40, "{}", hamming(h, dhash(&gentle)));
+        let items = vec![
+            fingerprinted("g.png", &g, 1000),
+            fingerprinted("g_half.png", &half, 400),
+            fingerprinted("s.png", &gentle, 900),
+            fingerprinted("s_small.png", &gentle_small, 100),
+            fingerprinted("flat.png", &RgbaImage::from_pixel(80, 60, image::Rgba([90, 90, 90, 255])), 50),
+        ];
+        let groups = group(&items, true, threshold_for_pct(90));
+        let mut found: Vec<Vec<usize>> = groups.iter().map(|g| g.members.clone()).collect();
+        found.sort();
+        assert_eq!(found, vec![vec![0, 1], vec![2, 3]], "{groups:?}");
+        assert!(groups.iter().all(|g| g.kind == GroupKind::Similar));
+    }
+
     #[test]
     fn similarity_conversion() {
         assert_eq!(similarity_pct(0), 100);
-        assert_eq!(similarity_pct(64), 0);
+        assert_eq!(similarity_pct(HASH_BITS), 0);
+        assert_eq!(similarity_pct(64), 50);
         assert_eq!(threshold_for_pct(100), 0);
-        assert_eq!(threshold_for_pct(90), 6);
+        assert_eq!(threshold_for_pct(90), 12);
         assert!(similarity_pct(threshold_for_pct(85)) >= 85);
     }
 
-    fn item(name: &str, size: u64, content: Option<u64>, dhash: Option<u64>, dims: (u32, u32)) -> ScanItem {
+    fn item(name: &str, size: u64, content: Option<u64>, dhash: Option<u128>, dims: (u32, u32)) -> ScanItem {
         ScanItem { dims: Some(dims), content, dhash, detail: 20.0, ..ScanItem::new(PathBuf::from(name), size, None) }
     }
 
@@ -566,7 +629,7 @@ mod tests {
         // A burst: each frame differs from the next by 4 bits, so single
         // linkage would chain all of them; complete linkage must not.
         let mut items = Vec::new();
-        let mut h = 0u64;
+        let mut h = 0u128;
         for i in 0..6 {
             items.push(item(&format!("burst{i}.jpg"), 100 + i, Some(i), Some(h), (40, 30)));
             h ^= 0xF << (i * 4);
@@ -598,15 +661,15 @@ mod tests {
     #[test]
     fn bk_tree_matches_brute_force() {
         let mut v = 0x9E37_79B9_7F4A_7C15u64;
-        let hashes: Vec<u64> = (0..300)
+        let hashes: Vec<u128> = (0..300)
             .map(|_| {
                 v ^= v << 13;
                 v ^= v >> 7;
                 v ^= v << 17;
                 if v % 3 == 0 {
-                    v & 0xFFFF
+                    (v & 0xFFFF) as u128
                 } else {
-                    v
+                    ((v as u128) << 64) | v.rotate_left(29) as u128
                 }
             })
             .collect();
@@ -629,7 +692,7 @@ mod tests {
             item("a.jpg", 100, Some(1), Some(0xFF00), (10, 10)),
             item("b.jpg", 100, Some(1), Some(0xFF00), (10, 10)),
             item("c.jpg", 300, Some(2), Some(0xFF01), (40, 40)),
-            item("d.jpg", 100, Some(3), Some(!0xFF00u64), (10, 10)),
+            item("d.jpg", 100, Some(3), Some(!0xFF00u128), (10, 10)),
         ];
         let exact = group(&items, false, 6);
         assert_eq!(exact.len(), 1);

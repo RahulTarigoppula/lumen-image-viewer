@@ -408,6 +408,10 @@ pub struct VideoMode {
     /// Widget id of the B offset field (last frame), so + and - keep
     /// shifting B while that field has keyboard focus.
     offset_field: Option<egui::Id>,
+    /// The B offset field had keyboard focus at the end of the last frame.
+    offset_editing: bool,
+    /// Frames left in which the B offset field's change is ignored (Esc).
+    offset_cancel: u8,
     /// Dev hook only: start time and press count of the current step burst.
     dev_burst: Option<(Instant, u32)>,
 }
@@ -460,6 +464,8 @@ impl VideoMode {
             pending_step: None,
             was_editing: false,
             offset_field: None,
+            offset_editing: false,
+            offset_cancel: 0,
             dev_burst: None,
         };
         for p in paths.into_iter().take(2) {
@@ -879,9 +885,19 @@ impl VideoMode {
                 widgets::separator_v(ui);
                 ui.label(RichText::new("B offset").color(p.muted).size(12.0));
                 let mut off = self.offset_frames;
-                let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
+                // Typed values apply on Enter (or when the field loses focus);
+                // Esc goes back to the offset in use. egui reports the lost
+                // focus for two frames and applies the typed text on the second,
+                // after the Esc press is gone, so that change is dropped here.
+                if self.offset_editing && ui.input(|i| i.key_pressed(Key::Escape)) {
+                    self.offset_cancel = 2;
+                }
+                let r = ui.add(egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
                 self.offset_field = Some(r.id);
-                if r.changed() {
+                self.offset_editing = ui.memory(|m| m.has_focus(r.id));
+                if self.offset_cancel > 0 {
+                    self.offset_cancel -= 1;
+                } else if r.changed() {
                     self.set_offset(off);
                 }
                 if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
@@ -1310,6 +1326,9 @@ impl VideoMode {
             if ui.add(egui::Button::new(RichText::new(format!("{} {lab}", I::REPEAT)).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text("Ctrl+L").clicked() {
                 self.toggle_loop();
             }
+            widgets::separator_v(ui);
+            ui.add_space(6.0);
+            self.timeline_legend(ui, &p);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Volume
                 ui.spacing_mut().slider_width = 90.0;
@@ -1379,10 +1398,29 @@ impl VideoMode {
         let a = &self.sources[0];
         let dur = a.duration().max(0.001);
         let x_of = |t: f64| rect.min.x + (t / dur) as f32 * rect.width();
+        // A time ruler along the top; the bars and the metric graph stay below it.
+        let ruler_h = 14.0;
+        let bar_h = h - ruler_h - 4.0;
+        let base = rect.max.y - 4.0;
         // Loop region
         if let (Some(la), lb) = self.loop_ab {
             let lb = lb.unwrap_or(a.pts());
             painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(la), rect.min.y), Pos2::new(x_of(lb), rect.max.y)), 0.0, p.accent.gamma_multiply(0.18));
+        }
+        let step = tick_step(dur, rect.width(), 84.0);
+        for k in 0.. {
+            let t = k as f64 * step;
+            if t > dur {
+                break;
+            }
+            let x = x_of(t).round() + 0.5;
+            painter.line_segment([Pos2::new(x, rect.min.y + ruler_h), Pos2::new(x, base)], Stroke::new(1.0, Color32::from_white_alpha(14)));
+            painter.line_segment([Pos2::new(x, rect.min.y + ruler_h - 4.0), Pos2::new(x, rect.min.y + ruler_h)], Stroke::new(1.0, p.faint));
+            let label = fmt_tick(t, step, dur);
+            // Skip a label that would run off the right edge.
+            if x + 4.0 + label.len() as f32 * 6.0 <= rect.max.x {
+                painter.text(Pos2::new(x + 3.0, rect.min.y + 7.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), p.muted);
+            }
         }
         // Frame-size bars colored by type (StreamEye-style), aggregated per pixel column.
         let idx_guard = a.index.lock();
@@ -1398,8 +1436,6 @@ impl VideoMode {
                 self.timeline_cache = Some((idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
             }
             let (_, _, columns, _) = self.timeline_cache.as_ref().unwrap();
-            let bar_h = h - 18.0;
-            let base = rect.max.y - 4.0;
             let mut mesh = egui::Mesh::default();
             for (c, col) in columns.iter().enumerate() {
                 if col.height <= 0.0 {
@@ -1438,7 +1474,7 @@ impl VideoMode {
                     .map(|(i, m)| {
                         let t = a.pts_of(*i);
                         let v = ((m.psnr_y.min(60.0) - 20.0) / 40.0).clamp(0.0, 1.0) as f32;
-                        Pos2::new(x_of(t), rect.max.y - 4.0 - v * (h - 10.0))
+                        Pos2::new(x_of(t), base - v * bar_h)
                     })
                     .collect();
                 painter.add(egui::Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(250, 210, 80))));
@@ -1480,18 +1516,29 @@ impl VideoMode {
             }
             self.scrubbing = false;
         }
-        // Legend
-        let legend = [("I", TIMELINE_COLORS[0]), ("P", TIMELINE_COLORS[1]), ("B", TIMELINE_COLORS[2])];
-        let mut lx = rect.min.x + 8.0;
-        for (l, c) in legend {
-            painter.rect_filled(Rect::from_min_size(Pos2::new(lx, rect.min.y + 6.0), Vec2::new(8.0, 8.0)), CornerRadius::same(2), c);
-            painter.text(Pos2::new(lx + 11.0, rect.min.y + 10.0), Align2::LEFT_CENTER, l, FontId::proportional(10.0), p.muted);
-            lx += 26.0;
-        }
-        if self.analysis.is_some() {
-            painter.rect_filled(Rect::from_min_size(Pos2::new(lx, rect.min.y + 9.0), Vec2::new(12.0, 2.0)), 0.0, Color32::from_rgb(250, 210, 80));
-            painter.text(Pos2::new(lx + 15.0, rect.min.y + 10.0), Align2::LEFT_CENTER, "PSNR-Y (20-60 dB)", FontId::proportional(10.0), p.muted);
-        }
+    }
+
+    /// Key to the timeline's colors, shown in the transport row so it never
+    /// covers the bars.
+    fn timeline_legend(&self, ui: &mut Ui, p: &Palette) {
+        let chip = |ui: &mut Ui, color: Color32, size: Vec2, text: &str| {
+            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+            ui.painter().rect_filled(r, CornerRadius::same(2), color);
+            ui.add_space(3.0);
+            ui.label(RichText::new(text).size(11.0).color(p.muted));
+            ui.add_space(8.0);
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (text, color) in [("I", TIMELINE_COLORS[0]), ("P", TIMELINE_COLORS[1]), ("B", TIMELINE_COLORS[2])] {
+                chip(ui, color, Vec2::splat(8.0), text);
+            }
+            if self.analysis.is_some() {
+                chip(ui, Color32::from_rgb(250, 210, 80), Vec2::new(12.0, 2.0), "PSNR-Y (20-60 dB)");
+            }
+        })
+        .response
+        .on_hover_text("Timeline bars: frame sizes by type (I, P and B frames)");
     }
 
     // ---------------------------------------------------------------- panels
@@ -1533,7 +1580,7 @@ impl VideoMode {
                         widgets::kv_row(ui, &p, "PSNR Y", &fmt_db(m.psnr_y));
                         widgets::kv_row(ui, &p, "PSNR U / V", &format!("{} / {}", fmt_db(m.psnr_u), fmt_db(m.psnr_v)));
                         widgets::kv_row(ui, &p, "PSNR avg", &fmt_db(m.psnr_avg));
-                        widgets::kv_row(ui, &p, "SSIM Y", &format!("{:.5}  ({})", m.ssim_y, fmt_db(metrics::ssim_db(m.ssim_y))));
+                        widgets::kv_row(ui, &p, "SSIM Y", &fmt_ssim(m.ssim_y));
                     }
                     None => {
                         let mismatch = self.sources[0].info.width != self.sources[1].info.width || self.sources[0].info.height != self.sources[1].info.height;
@@ -1567,7 +1614,7 @@ impl VideoMode {
                             widgets::kv_row(ui, &p, "Frames", &sum.frames.to_string());
                             widgets::kv_row(ui, &p, "Mean PSNR Y", &fmt_db(sum.mean_psnr_y));
                             widgets::kv_row(ui, &p, "Global PSNR", &fmt_db(sum.global_psnr));
-                            widgets::kv_row(ui, &p, "Mean SSIM", &format!("{:.5}", sum.mean_ssim));
+                            widgets::kv_row(ui, &p, "Mean SSIM", &fmt_ssim(sum.mean_ssim));
                             widgets::kv_row(ui, &p, "Worst PSNR Y", &fmt_db(sum.min_psnr_y));
                             ui.add_space(4.0);
                             ui.label(RichText::new("Worst frames (click to jump)").size(11.5).color(p.faint));
@@ -1597,7 +1644,8 @@ impl VideoMode {
             }
             ui.add_space(8.0);
             widgets::section_title(ui, &p, "Media info");
-            let rows = media_rows(&self.sources.iter().map(|s| &s.info).collect::<Vec<_>>());
+            let durations: Vec<f64> = self.sources.iter().map(|s| s.duration()).collect();
+            let rows = media_rows(&self.sources.iter().map(|s| &s.info).collect::<Vec<_>>(), &durations);
             media_table(ui, &p, compare, rows);
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Decoder: FFmpeg {}", engine::ffmpeg_version())).size(10.5).color(p.faint));
@@ -1917,14 +1965,25 @@ fn rotate_mesh(mesh: &mut egui::Mesh, dest: Rect, rotation: i32) {
     }
 }
 
-fn media_rows(infos: &[&MediaInfo]) -> Vec<(&'static str, Vec<String>)> {
+/// Media info rows. `durations` are the video streams' own lengths (as the
+/// transport bar shows them: the last frame's time plus one frame); the
+/// container's duration, which also covers audio and is often a few
+/// milliseconds longer, gets its own row only when it differs.
+fn media_rows(infos: &[&MediaInfo], durations: &[f64]) -> Vec<(&'static str, Vec<String>)> {
     let f = |g: &dyn Fn(&MediaInfo) -> String| infos.iter().map(|i| g(i)).collect::<Vec<_>>();
     let br = |b: i64| if b > 0 { format!("{:.2} Mb/s", b as f64 / 1e6) } else { " - ".into() };
-    vec![
+    let video_dur = |k: usize| durations.get(k).copied().unwrap_or(infos[k].duration);
+    let file_dur_differs = (0..infos.len()).any(|k| infos[k].duration > 0.0 && (infos[k].duration - video_dur(k)).abs() >= 0.0005);
+    let mut rows = vec![
         ("File", f(&|i| crate::ui::viewer::file_name(&i.path))),
         ("Size", f(&|i| crate::catalog::human_size(i.file_size))),
         ("Container", f(&|i| i.container.clone())),
-        ("Duration", f(&|i| fmt_time(i.duration))),
+        ("Duration", (0..infos.len()).map(|k| fmt_time(video_dur(k))).collect()),
+    ];
+    if file_dur_differs {
+        rows.push(("File duration", f(&|i| if i.duration > 0.0 { fmt_time(i.duration) } else { " - ".into() })));
+    }
+    rows.extend([
         ("Overall bitrate", f(&|i| br(i.bitrate))),
         ("Video codec", f(&|i| if i.profile.is_empty() { i.codec.clone() } else { format!("{} ({})", i.codec, i.profile) })),
         ("Resolution", f(&|i| format!("{} × {}", i.width, i.height))),
@@ -1938,7 +1997,8 @@ fn media_rows(infos: &[&MediaInfo]) -> Vec<(&'static str, Vec<String>)> {
         ("Transfer", f(&|i| format!("{}{}", i.color_transfer, if i.hdr { " · HDR (shown without tone mapping)" } else { "" }))),
         ("Rotation", f(&|i| format!("{}°", i.rotation))),
         ("Audio", f(&|i| if i.has_audio { format!("{} · {} Hz · {} ch · {}", i.audio_codec, i.sample_rate, i.channels, br(i.audio_bitrate)) } else { "none".into() })),
-    ]
+    ]);
+    rows
 }
 
 /// Media info as a striped table: a fixed label column and equal value
@@ -2068,14 +2128,51 @@ pub fn fmt_time(t: f64) -> String {
     }
 }
 
-/// dB value for display, capped like the CSV export (see `metrics::PSNR_CAP_DB`).
+/// Seconds between timeline ticks: the smallest round step that keeps ticks
+/// at least `min_px` apart on a `width` pixel timeline of `dur` seconds.
+fn tick_step(dur: f64, width: f32, min_px: f32) -> f64 {
+    const STEPS: [f64; 22] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0, 21600.0];
+    let per_px = dur.max(1e-6) / width.max(1.0) as f64;
+    STEPS.into_iter().find(|s| s / per_px >= min_px as f64).unwrap_or(STEPS[STEPS.len() - 1])
+}
+
+/// Timeline tick label: as many decimals as the step needs, hours only on
+/// videos of an hour or more.
+fn fmt_tick(t: f64, step: f64, dur: f64) -> String {
+    let decimals = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
+    let scale = 10f64.powi(decimals);
+    let t = (t * scale).round() / scale;
+    let (h, m, s) = ((t / 3600.0) as u64, ((t % 3600.0) / 60.0) as u64, t % 60.0);
+    let w = if decimals == 0 { 2 } else { 3 + decimals as usize };
+    let sec = format!("{s:0w$.prec$}", prec = decimals as usize);
+    if dur >= 3600.0 {
+        format!("{h}:{m:02}:{sec}")
+    } else {
+        format!("{m}:{sec}")
+    }
+}
+
+/// PSNR for display. Identical planes (infinite PSNR, or a mean of values
+/// all at the cap, see `metrics::PSNR_CAP_DB`) read as "Identical".
 fn fmt_db(v: f64) -> String {
     if v.is_nan() {
         " - ".into()
-    } else if v.is_infinite() {
-        format!("{:.2} dB (identical)", metrics::PSNR_CAP_DB)
+    } else if v >= metrics::PSNR_CAP_DB {
+        "Identical".into()
     } else {
-        format!("{:.3} dB", metrics::cap_db(v))
+        format!("{v:.3} dB")
+    }
+}
+
+/// SSIM for display, with its dB equivalent unless the frames are identical.
+fn fmt_ssim(v: f64) -> String {
+    let db = metrics::ssim_db(v);
+    if v.is_nan() {
+        " - ".into()
+    } else if db >= metrics::PSNR_CAP_DB {
+        format!("{v:.4} (identical)")
+    } else {
+        format!("{v:.4} ({db:.2} dB)")
     }
 }
 
@@ -2152,5 +2249,47 @@ mod tests {
     fn time_format() {
         assert_eq!(fmt_time(62.5), "01:02.500");
         assert_eq!(fmt_time(3723.25), "1:02:03.250");
+    }
+
+    #[test]
+    fn timeline_ticks() {
+        // A feature film on a wide timeline: five-minute ticks, with hours.
+        let film = 6324.8;
+        let step = tick_step(film, 1900.0, 84.0);
+        assert_eq!(step, 300.0);
+        assert_eq!(fmt_tick(3000.0, step, film), "0:50:00");
+        // Short clips get finer steps and decimals when needed.
+        assert_eq!(tick_step(30.0, 1900.0, 84.0), 2.0);
+        assert_eq!(fmt_tick(62.0, 2.0, 90.0), "1:02");
+        assert_eq!(tick_step(1.5, 1200.0, 84.0), 0.2);
+        assert_eq!(fmt_tick(0.4, 0.2, 1.5), "0:00.4");
+        assert_eq!(fmt_tick(0.05, 0.05, 0.5), "0:00.05");
+        // Ticks never crowd, however narrow the timeline.
+        for (dur, w) in [(10.0, 300.0), (600.0, 500.0), (86_400.0, 400.0), (0.2, 900.0)] {
+            let s = tick_step(dur, w, 84.0);
+            assert!(s / dur * w as f64 >= 84.0 || s == 21600.0, "{dur} {w} {s}");
+        }
+    }
+
+    #[test]
+    fn metric_format() {
+        assert_eq!(fmt_db(f64::INFINITY), "Identical");
+        assert_eq!(fmt_db(metrics::PSNR_CAP_DB), "Identical");
+        assert_eq!(fmt_db(42.1234), "42.123 dB");
+        assert_eq!(fmt_db(f64::NAN), " - ");
+        assert_eq!(fmt_ssim(1.0), "1.0000 (identical)");
+        assert_eq!(fmt_ssim(0.99), "0.9900 (20.00 dB)");
+    }
+
+    #[test]
+    fn duration_rows() {
+        let info = MediaInfo { duration: 6324.832, ..Default::default() };
+        let rows = media_rows(&[&info], &[6324.818]);
+        let get = |name: &str| rows.iter().find(|r| r.0 == name).map(|r| r.1.clone());
+        // The transport bar's duration first, the container's next to it.
+        assert_eq!(get("Duration"), Some(vec!["1:45:24.818".to_string()]));
+        assert_eq!(get("File duration"), Some(vec!["1:45:24.832".to_string()]));
+        let rows = media_rows(&[&info], &[6324.832]);
+        assert!(!rows.iter().any(|r| r.0 == "File duration"));
     }
 }
