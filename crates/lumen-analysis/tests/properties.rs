@@ -182,7 +182,9 @@ fn roi_equals_crop_then_compute() {
                 assert!(x.value == y.value || (x.value - y.value).abs() <= 1e-9 * x.value.abs().max(1.0), "{id}.{}: {} vs {}", x.key, x.value, y.value);
             }
             if let (Some(p), Some(q)) = (&strided.map, &packed.map) {
-                assert_eq!(p.data, q.data, "{id} map");
+                // Bit for bit: NaN marks "no value" (clipping, banding).
+                let bits = |m: &lumen_analysis::Heatmap| m.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(p), bits(q), "{id} map");
             }
         }
     }
@@ -366,7 +368,12 @@ fn banding_posterized_vs_dithered() {
     assert!(val(&banded, "score") > 1.0, "{:?}", banded.values);
     assert!(val(&dithered, "score") < 0.2 * val(&banded, "score"), "{:?}", dithered.values);
     assert!(val(&textured, "score") < 0.2 * val(&banded, "score"), "{:?}", textured.values);
-    assert!(banded.map.unwrap().data.iter().filter(|v| **v > 0.0).count() > 30 * (h - 6));
+    // The map marks the banded tiles: all of them on the posterized ramp
+    // (one row of 64 px tiles), hardly any when dithered.
+    let m = banded.map.unwrap();
+    assert_eq!((m.width, m.height, m.cell_w), (10, 1, 64.0));
+    assert!(m.data.iter().all(|v| v.is_finite()), "{:?}", m.data);
+    assert!(dithered.map.unwrap().data.iter().filter(|v| v.is_finite()).count() <= 2);
 }
 
 #[test]

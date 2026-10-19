@@ -29,6 +29,10 @@ pub struct Line {
     pub label: String,
     pub value: String,
     pub tip: String,
+    /// The report value the line is about (`"exposure.clip_pct"`; empty for
+    /// counts that are not a table value). The "All numbers" table shows
+    /// that value with the line's dot, so both always agree.
+    pub key: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +61,22 @@ pub struct Summary {
     pub notes: Vec<String>,
     /// Video ranges: frames where a scene cut was found (clickable).
     pub cuts: Vec<u64>,
+    /// Values measured but deliberately not graded, with why (no smooth
+    /// area to judge banding on): the table shows them with a gray dot.
+    pub ungraded: Vec<(String, String)>,
+    /// Pairs: how close B is to A overall.
+    pub closeness: Option<Closeness>,
+}
+
+impl Summary {
+    /// The verdict on report value `key`: the dot of its line (or gray for
+    /// an ungraded value) and what the summary says about it.
+    pub fn verdict(&self, key: &str) -> Option<(Level, String)> {
+        if let Some(l) = self.lines.iter().find(|l| l.key == key) {
+            return Some((l.level, if l.value.is_empty() { l.label.clone() } else { format!("{}: {}", l.label, l.value) }));
+        }
+        self.ungraded.iter().find(|u| u.0 == key).map(|u| (Level::Info, u.1.clone()))
+    }
 }
 
 /// What a report measured, in the terms the summary needs.
@@ -79,9 +99,8 @@ pub struct Facts {
     pub fps: f64,
     /// B was resampled to A's size.
     pub rescaled: bool,
-    /// 90th percentile of the per-tile Laplacian variance (the sharpest
-    /// parts of the picture), when the tile map is there.
-    pub sharp_peak: Option<f64>,
+    /// What the compared image is called (`"B"`; 4-image compare: `"C"`, `"D"`).
+    pub other: String,
     /// Metrics with a heatmap in the report.
     pub maps: Vec<String>,
     /// Video ranges: frames with a scene cut.
@@ -94,7 +113,21 @@ impl Facts {
     }
 
     fn first(&self, keys: &[&str]) -> Option<f64> {
-        keys.iter().find_map(|k| self.get(k))
+        self.first_key(keys).map(|k| k.1)
+    }
+
+    /// The first of `keys` with a value, and the value.
+    fn first_key<'k>(&self, keys: &[&'k str]) -> Option<(&'k str, f64)> {
+        keys.iter().find_map(|k| self.get(k).map(|v| (*k, v)))
+    }
+
+    /// The compared image's letter.
+    fn b(&self) -> &str {
+        if self.other.is_empty() {
+            "B"
+        } else {
+            &self.other
+        }
     }
 }
 
@@ -161,7 +194,18 @@ pub enum Closeness {
 }
 
 impl Closeness {
-    fn level(self) -> Level {
+    /// A few words for lists ("Very close").
+    pub fn short(self) -> &'static str {
+        match self {
+            Closeness::Identical => "Identical",
+            Closeness::VeryClose => "Very close",
+            Closeness::Close => "Close",
+            Closeness::Noticeable => "Differs",
+            Closeness::Different => "Clearly different",
+        }
+    }
+
+    pub fn level(self) -> Level {
         match self {
             Closeness::Identical | Closeness::VeryClose => Level::Good,
             Closeness::Close | Closeness::Noticeable => Level::Fair,
@@ -233,15 +277,11 @@ pub fn every(stride: usize) -> String {
     }
 }
 
-fn small(v: f64) -> String {
-    if v.abs() < 1.0 {
-        format!("{v:.2}")
-    } else {
-        format!("{v:.1}")
-    }
-}
+// Values are written with the decimals the "All numbers" table uses
+// (`metrics_view::fmt_value`), so a number reads the same in both places.
 
-fn pct(v: f64) -> String {
+/// Percent: one decimal, `<0.1%` for traces.
+pub fn pct(v: f64) -> String {
     if v > 0.0 && v < 0.1 {
         "<0.1%".into()
     } else {
@@ -250,7 +290,7 @@ fn pct(v: f64) -> String {
 }
 
 fn db(v: f64) -> String {
-    format!("{v:.1} dB")
+    format!("{v:.2} dB")
 }
 
 // ------------------------------------------------------------------ summaries
@@ -275,9 +315,11 @@ fn single(f: &Facts) -> Summary {
     let range = f.video && f.frames > 1;
     let avg = if range { " (mean over the measured frames)" } else { "" };
     let mut lines = Vec::new();
-    if let Some(v) = f.get("sharpness.laplacian.var") {
-        let peak = f.sharp_peak.filter(|_| !range);
-        let x = peak.unwrap_or(v);
+    let mut ungraded = Vec::new();
+    // The sharpest tiles decide (the table's headline); reports from before
+    // that value existed have the whole-frame variance only.
+    if let Some((key, x)) = f.first_key(&["sharpness.laplacian.p90", "sharpness.laplacian.var"]) {
+        let overall = f.get("sharpness.laplacian.var").filter(|_| key.ends_with("p90"));
         let (level, label) = if x >= SHARP_GOOD {
             (Level::Good, "Sharp detail")
         } else if x >= SHARP_SOFT {
@@ -285,12 +327,16 @@ fn single(f: &Facts) -> Summary {
         } else {
             (Level::Fair, "Soft, little fine detail")
         };
-        let basis = if peak.is_some() { format!("{x:.0} in the sharpest areas, {v:.0} overall") } else { format!("{v:.0}{avg}") };
+        let basis = match overall {
+            Some(v) => format!("{x:.0} in the sharpest areas, {v:.0} over the whole picture{avg}"),
+            None => format!("{x:.0}{avg}"),
+        };
         lines.push(Line {
             level,
             label: label.into(),
             value: format!("{x:.0}"),
             tip: format!("Edge contrast (Laplacian variance): {basis}. Above {SHARP_GOOD:.0} edges are crisp, below {SHARP_SOFT:.0} the picture looks soft. Smooth subjects such as sky or walls also score low, so this does not prove the focus is off."),
+            key: key.into(),
         });
     }
     if let Some(v) = f.get("noise.y") {
@@ -302,8 +348,9 @@ fn single(f: &Facts) -> Summary {
         lines.push(Line {
             level,
             label: label.into(),
-            value: small(v),
-            tip: format!("Estimated luma noise: {} levels{avg} (Immerkaer, edges masked). Below {NOISE_GOOD:.0} grain is hard to see, above {NOISE_POOR:.0} it shows at 100%. Fine texture such as foliage can add to it.", small(v)),
+            value: format!("{v:.2}"),
+            tip: format!("Estimated luma noise: {v:.2} levels{avg} (Immerkaer, edges masked). Below {NOISE_GOOD:.0} grain is hard to see, above {NOISE_POOR:.0} it shows at 100%. Fine texture such as foliage can add to it."),
+            key: "noise.y".into(),
         });
     }
     if let (Some(hi), Some(lo)) = (f.get("exposure.clip_hi_pct"), f.get("exposure.clip_lo_pct")) {
@@ -319,6 +366,7 @@ fn single(f: &Facts) -> Summary {
             label: label.into(),
             value,
             tip: format!("{} of pixels have a channel at full white (blown highlights or saturated color), {} are pure black{avg}. A few light sources or a black background are normal.", pct(hi), pct(lo)),
+            key: "exposure.clip_pct".into(),
         });
     }
     if let Some(de) = f.get("color_cast.delta_e") {
@@ -329,7 +377,8 @@ fn single(f: &Facts) -> Summary {
                 level: Level::Info,
                 label: "Color cast not measurable".into(),
                 value: "few gray areas".into(),
-                tip: format!("Only {} of the picture is near gray, so a cast cannot be told apart from the colors of the subject. The average color leans {hue} (Delta-E {de:.1}).", pct(neutral)),
+                tip: format!("Only {} of the picture is near gray, so a cast cannot be told apart from the colors of the subject. The average color leans {hue} (Delta-E {de:.2}).", pct(neutral)),
+                key: "color_cast.delta_e".into(),
             });
         } else {
             let level = lo_level(de, CAST_GOOD, CAST_POOR);
@@ -341,8 +390,9 @@ fn single(f: &Facts) -> Summary {
             lines.push(Line {
                 level,
                 label,
-                value: format!("dE {de:.1}"),
-                tip: format!("Average color of the near-gray areas ({} of the picture) is {de:.1} Delta-E from neutral{avg}. Below {CAST_GOOD:.0} it is hard to see. Warm evening light or a graded look can be intentional.", pct(neutral)),
+                value: format!("dE {de:.2}"),
+                tip: format!("Average color of the near-gray areas ({} of the picture) is {de:.2} Delta-E from neutral{avg}. Below {CAST_GOOD:.0} it is hard to see. Warm evening light or a graded look can be intentional.", pct(neutral)),
+                key: "color_cast.delta_e".into(),
             });
         }
     }
@@ -358,6 +408,7 @@ fn single(f: &Facts) -> Summary {
             label: label.into(),
             value: format!("{v:.2}"),
             tip: format!("Blockiness {v:.2}{avg}: how much stronger edges are on the 8x8 grid that JPEG and most video codecs leave (0 is none, 0.3 is 30% stronger). Ringing and blur from compression are not measured here."),
+            key: "blockiness.score".into(),
         });
     }
     if let Some(v) = f.get("banding.score") {
@@ -374,7 +425,10 @@ fn single(f: &Facts) -> Summary {
                 label: label.into(),
                 value: pct(v),
                 tip: format!("{} of the smooth areas ({} of the picture) are one-level steps between flat bands{avg}, the stair-step look of a posterized gradient.", pct(v), pct(smooth)),
+                key: "banding.score".into(),
             });
+        } else {
+            ungraded.push(("banding.score".to_string(), format!("Not graded: only {} of the picture is smooth enough to show banding", pct(smooth))));
         }
     }
     if let Some(n) = f.get("temporal.freeze.duplicates") {
@@ -386,6 +440,7 @@ fn single(f: &Facts) -> Summary {
             label: if n < 0.5 { "No repeated frames".into() } else { format!("{n:.0} repeated frames") },
             value: pct(share),
             tip: format!("Frames identical to the one before{longest}. Normal for still content such as screen recordings; in camera footage it means dropped or frozen frames.{sampled}"),
+            key: "temporal.freeze.duplicates".into(),
         });
     }
     if let Some(n) = f.get("temporal.scene.cuts") {
@@ -398,6 +453,7 @@ fn single(f: &Facts) -> Summary {
             },
             value: String::new(),
             tip: "Large picture changes between frames, such as cuts between shots. Click a time below to see the cut.".into(),
+            key: "temporal.scene.cuts".into(),
         });
     }
     let head = if range {
@@ -417,14 +473,15 @@ fn single(f: &Facts) -> Summary {
         }
     };
     let cuts = if range { f.cuts.clone() } else { Vec::new() };
-    Summary { head, lines, cuts, ..Default::default() }
+    Summary { head, lines, cuts, ungraded, ..Default::default() }
 }
 
 /// The aspects of a pair: (closeness, line). `psnr` is the key to read.
 fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, &'static str)>, Vec<Line>) {
     let mut close = Vec::new();
     let mut lines = Vec::new();
-    if let Some(v) = f.first(&["ssim.gauss.y", "ssim.fast.y", "ms_ssim.y"]) {
+    let b = f.b();
+    if let Some((key, v)) = f.first_key(&["ssim.gauss.y", "ssim.fast.y", "ms_ssim.y"]) {
         let c = ssim_closeness(v);
         close.push((c, "ssim"));
         let label = match c {
@@ -436,8 +493,9 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
         lines.push(Line {
             level: c.level(),
             label: label.into(),
-            value: format!("SSIM {v:.3}"),
+            value: format!("SSIM {v:.4}"),
             tip: format!("SSIM{avg} compares local brightness, contrast and structure (1 is identical). Blur, noise, blocking and sharpening all lower it. Above {SSIM_GOOD} differences are usually hard to see, below {SSIM_POOR} they are clear."),
+            key: key.into(),
         });
     }
     if let Some(v) = f.get("deltae.2000.mean") {
@@ -455,9 +513,10 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
             label: label.into(),
             value: format!("dE {v:.2}"),
             tip: format!("Average CIEDE2000 color difference{avg}. Below {DE_GOOD:.0} it is not perceptible, up to {DE_CLOSE:.0} only on close inspection, above that at a glance.{visible}"),
+            key: "deltae.2000.mean".into(),
         });
     }
-    if let Some(v) = psnr_key.and_then(|k| f.get(k)) {
+    if let Some((key, v)) = psnr_key.and_then(|k| f.get(k).map(|v| (k, v))) {
         let c = psnr_closeness(v);
         close.push((c, "psnr"));
         let label = match c {
@@ -470,7 +529,8 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
             level: c.level(),
             label: label.into(),
             value: if c == Closeness::Identical { "PSNR max".into() } else { format!("PSNR {}", db(v)) },
-            tip: format!("Peak signal-to-noise ratio of the pixel differences{avg}. Above {PSNR_GOOD:.0} dB B usually looks the same, {PSNR_POOR:.0} to {PSNR_GOOD:.0} dB good to fair, below {PSNR_POOR:.0} dB visibly degraded."),
+            tip: format!("Peak signal-to-noise ratio of the pixel differences{avg}. Above {PSNR_GOOD:.0} dB {b} usually looks the same, {PSNR_POOR:.0} to {PSNR_GOOD:.0} dB good to fair, below {PSNR_POOR:.0} dB visibly degraded."),
+            key: key.into(),
         });
     }
     if let Some(v) = f.get("ssimulacra2.score") {
@@ -480,7 +540,8 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
             Level::Fair => "Medium perceived quality",
             _ => "Low perceived quality",
         };
-        lines.push(Line { level, label: label.into(), value: format!("SSIMULACRA 2 {v:.0}"), tip: "Perceptual quality of B against A (100 is identical, 70 and up is high quality, below 50 low).".into() });
+        let tip = format!("Perceptual quality of {b} against A (100 is identical, 70 and up is high quality, below 50 low).");
+        lines.push(Line { level, label: label.into(), value: format!("SSIMULACRA 2 {v:.2}"), tip, key: "ssimulacra2.score".into() });
     }
     if let Some(v) = f.get("butteraugli.score") {
         let level = lo_level(v, 1.0, 2.0);
@@ -489,7 +550,8 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
             Level::Fair => "Differences near visibility",
             _ => "Clearly visible differences",
         };
-        lines.push(Line { level, label: label.into(), value: format!("Butteraugli {v:.2}"), tip: "Largest perceptual difference (Butteraugli): below 1 usually invisible, above 2 clearly visible.".into() });
+        let tip = "Largest perceptual difference (Butteraugli): below 1 usually invisible, above 2 clearly visible.".to_string();
+        lines.push(Line { level, label: label.into(), value: format!("Butteraugli {v:.2}"), tip, key: "butteraugli.score".into() });
     }
     (close, lines)
 }
@@ -498,7 +560,7 @@ fn pair_lines(f: &Facts, psnr_key: Option<&str>, avg: &str) -> (Vec<(Closeness, 
 fn numbers(f: &Facts, psnr_key: Option<&str>) -> String {
     let mut v = Vec::new();
     if let Some(s) = f.first(&["ssim.gauss.y", "ssim.fast.y", "ms_ssim.y"]) {
-        v.push(format!("SSIM {s:.3}"));
+        v.push(format!("SSIM {s:.4}"));
     }
     if let Some(p) = psnr_key.and_then(|k| f.get(k)).filter(|p| *p < PSNR_CAP_DB) {
         v.push(format!("PSNR {}", db(p)));
@@ -511,14 +573,16 @@ fn numbers(f: &Facts, psnr_key: Option<&str>) -> String {
     v.join(", ")
 }
 
-fn verdict(c: Closeness) -> (&'static str, &'static str) {
-    match c {
-        Closeness::Identical => ("B is identical to A", "Every measured pixel matches"),
-        Closeness::VeryClose => ("B is very close to A", "Differences barely visible"),
-        Closeness::Close => ("B is close to A", "Small differences, visible on close inspection"),
-        Closeness::Noticeable => ("B differs from A", "Differences are noticeable"),
-        Closeness::Different => ("B is clearly different from A", "Differences are easy to see"),
-    }
+/// Headline and detail for a pair, `b` naming the compared image.
+fn verdict(c: Closeness, b: &str) -> (String, &'static str) {
+    let (title, what) = match c {
+        Closeness::Identical => ("is identical to A", "Every measured pixel matches"),
+        Closeness::VeryClose => ("is very close to A", "Differences barely visible"),
+        Closeness::Close => ("is close to A", "Small differences, visible on close inspection"),
+        Closeness::Noticeable => ("differs from A", "Differences are noticeable"),
+        Closeness::Different => ("is clearly different from A", "Differences are easy to see"),
+    };
+    (format!("{b} {title}"), what)
 }
 
 /// How far a value is past its "very close" limit, in units of the span to
@@ -538,16 +602,16 @@ fn pair(f: &Facts) -> Summary {
     let overall = close.iter().map(|c| c.0).max().unwrap_or(Closeness::Close);
     // Identical only when every measure says so.
     let overall = if overall == Closeness::Identical && close.iter().all(|c| c.0 == Closeness::Identical) { overall } else { overall.max(Closeness::VeryClose) };
-    let (title, what) = verdict(overall);
+    let (title, what) = verdict(overall, f.b());
     let nums = numbers(f, psnr_key);
     let at = f.frame.map(|i| format!("Frame {i}: ")).unwrap_or_default();
     let detail = if nums.is_empty() || overall == Closeness::Identical { format!("{what}.") } else { format!("{what} ({nums}).") };
-    let mut s = Summary { head: Some(Head { level: overall.level(), title: format!("{at}{title}"), detail }), lines, ..Default::default() };
+    let mut s = Summary { head: Some(Head { level: overall.level(), title: format!("{at}{title}"), detail }), lines, closeness: Some(overall), ..Default::default() };
     if overall != Closeness::Identical {
         s.action = show_where(f);
     }
     if f.rescaled {
-        s.notes.push("B was resized to A's size before comparing.".into());
+        s.notes.push(format!("{} was resized to A's size before comparing.", f.b()));
     }
     s
 }
@@ -579,7 +643,7 @@ fn video_pair(f: &Facts) -> Summary {
     let head = match psnr_key.and_then(|k| f.get(k)) {
         Some(p) if p >= PSNR_CAP_DB => Head { level: Level::Good, title: "B is identical to A".into(), detail: format!("Every measured frame matches ({} of them).", f.frames) },
         Some(p) => {
-            let (_, what) = verdict(overall);
+            let (_, what) = verdict(overall, f.b());
             let w = match worst {
                 Some((k, (i, v))) if k.starts_with("psnr") => format!("; worst at {}, {}", at(i), db(v)),
                 Some((_, (i, _))) => format!("; worst at {}", at(i)),
@@ -588,8 +652,8 @@ fn video_pair(f: &Facts) -> Summary {
             Head { level: overall.level(), title: format!("Average quality {}{w}", db(p)), detail: format!("{what} on average.") }
         }
         None => {
-            let (title, what) = verdict(overall);
-            Head { level: overall.level(), title: title.into(), detail: format!("{what} on average.") }
+            let (title, what) = verdict(overall, f.b());
+            Head { level: overall.level(), title, detail: format!("{what} on average.") }
         }
     };
     if f.values.contains_key("psnr.y") || f.values.contains_key("psnr.global") {
@@ -608,9 +672,10 @@ fn video_pair(f: &Facts) -> Summary {
             },
             value: pct(share),
             tip: format!("Frames whose PSNR-Y is under {PSNR_POOR:.0} dB, where encoding damage is usually visible. The graph under the timeline shows where they are."),
+            key: String::new(),
         });
     }
-    let mut s = Summary { head: Some(head), lines, ..Default::default() };
+    let mut s = Summary { head: Some(head), lines, closeness: Some(overall), ..Default::default() };
     if let Some((_, (i, _))) = worst.filter(|_| overall != Closeness::Identical) {
         s.action = Some(Action::Seek { frame: i });
     }
@@ -692,17 +757,34 @@ mod tests {
         let s = summarize(&facts(&[("sharpness.laplacian.var", 12.0)]));
         assert_eq!((line(&s, "Soft").level), Level::Fair);
         // The sharpest tiles decide, not the mean over a smooth background.
-        let mut f = facts(&[("sharpness.laplacian.var", 80.0)]);
-        f.sharp_peak = Some(900.0);
-        assert_eq!(line(&summarize(&f), "Sharp").level, Level::Good);
+        let s = summarize(&facts(&[("sharpness.laplacian.p90", 900.0), ("sharpness.laplacian.var", 80.0)]));
+        let sharp = line(&s, "Sharp");
+        assert_eq!((sharp.level, sharp.value.as_str(), sharp.key.as_str()), (Level::Good, "900", "sharpness.laplacian.p90"));
         // A gray-world estimate on a colorful picture is not called a cast.
         let s = summarize(&facts(&[("color_cast.delta_e", 50.0), ("color_cast.neutral_pct", 0.5), ("color_cast.hue", 10.0)]));
         let c = line(&s, "Color cast");
         assert_eq!((c.level, c.label.as_str()), (Level::Info, "Color cast not measurable"));
         let s = summarize(&facts(&[("color_cast.delta_e", 6.0), ("color_cast.neutral_pct", 20.0), ("color_cast.hue", 270.0)]));
         assert_eq!(line(&s, "cast").label, "Strong blue (cool) cast");
-        // No smooth area: nothing to say about banding.
-        assert!(summarize(&facts(&[("banding.score", 9.0), ("banding.smooth_pct", 0.2)])).lines.is_empty());
+        // No smooth area: nothing to say about banding, and the table says so too.
+        let s = summarize(&facts(&[("banding.score", 9.0), ("banding.smooth_pct", 0.2)]));
+        assert!(s.lines.is_empty());
+        assert_eq!(s.verdict("banding.score").map(|v| v.0), Some(Level::Info));
+    }
+
+    #[test]
+    fn the_table_reads_the_summary_verdicts() {
+        let s = summarize(&facts(&[("sharpness.laplacian.p90", 764.0), ("sharpness.laplacian.var", 229.5), ("color_cast.delta_e", 48.6), ("color_cast.neutral_pct", 0.4), ("exposure.clip_hi_pct", 3.02), ("exposure.clip_lo_pct", 0.0)]));
+        // The headline value the table shows first carries the line's dot.
+        assert_eq!(s.verdict("sharpness.laplacian.p90"), Some((Level::Good, "Sharp detail: 764".into())));
+        assert_eq!(s.verdict("color_cast.delta_e").map(|v| v.0), Some(Level::Info));
+        assert_eq!(s.verdict("exposure.clip_pct"), Some((Level::Poor, "Highlights clipped: 3.0%".into())));
+        assert_eq!(s.verdict("sharpness.laplacian.var"), None);
+        // In a 4-image compare, C and D are named.
+        let mut f = facts(&[("psnr.avg", 25.0), ("ssim.gauss.y", 0.9)]);
+        f.pair = true;
+        f.other = "C".into();
+        assert_eq!(summarize(&f).head.unwrap().title, "C is clearly different from A");
     }
 
     #[test]
@@ -713,7 +795,7 @@ mod tests {
         let s = summarize(&f);
         let h = s.head.clone().unwrap();
         assert_eq!(h.title, "B is very close to A");
-        assert_eq!(h.detail, "Differences barely visible (SSIM 0.991, PSNR 42.3 dB).");
+        assert_eq!(h.detail, "Differences barely visible (SSIM 0.9910, PSNR 42.30 dB).");
         assert_eq!(h.level, Level::Good);
         // JPEG q30 of a photo: the worst measure decides.
         let mut f = facts(&[("psnr.avg", 33.3), ("ssim.gauss.y", 0.976), ("deltae.2000.mean", 1.23)]);
@@ -756,7 +838,7 @@ mod tests {
         f.worst.insert("psnr.y".into(), (2490, 31.4));
         let s = summarize(&f);
         let h = s.head.as_ref().unwrap();
-        assert_eq!(h.title, "Average quality 41.2 dB; worst at 01:23 (frame 2490), 31.4 dB");
+        assert_eq!(h.title, "Average quality 41.20 dB; worst at 01:23 (frame 2490), 31.40 dB");
         assert_eq!(s.action, Some(Action::Seek { frame: 2490 }));
         let low = line(&s, "below");
         assert_eq!((low.label.as_str(), low.level), ("12 frames below 30 dB", Level::Fair));
@@ -792,7 +874,6 @@ mod tests {
         assert_eq!(every(4), "Every 4th frame");
         assert_eq!(pct(0.05), "<0.1%");
         assert_eq!(pct(0.0), "0.0%");
-        assert_eq!(small(0.066), "0.07");
         // No typographic punctuation in any text.
         let mut f = facts(&[("psnr.avg", 33.3), ("ssim.gauss.y", 0.95), ("noise.y", 3.0)]);
         f.pair = true;

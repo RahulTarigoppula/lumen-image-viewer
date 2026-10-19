@@ -103,6 +103,27 @@ fn image_job_errors_and_skips() {
 }
 
 #[test]
+fn image_batches_run_every_pair_until_superseded() {
+    let an = Analyzer::new(Some(2), None);
+    let (w, h) = (160, 120);
+    let a: SharedFrame = Arc::new(gray_rgba(w, h, &quantize(&texture(w, h, 3))));
+    let b: SharedFrame = Arc::new(gray_rgba(w, h, &quantize(&add_noise(&texture(w, h, 3), 2.0, 1))));
+    let c: SharedFrame = Arc::new(gray_rgba(w, h, &quantize(&add_noise(&texture(w, h, 3), 8.0, 2))));
+    let spec = ImageSpec { metrics: vec!["psnr".into()], ..Default::default() };
+    let hs = an.submit_images(vec![(spec.clone(), a.clone(), Some(b)), (spec.clone(), a.clone(), Some(c))]);
+    let psnr: Vec<f64> = hs.into_iter().map(|h| h.wait_timeout(LIMIT).unwrap().value("psnr.avg").unwrap()).collect();
+    // Both pairs are measured, each against A: C is the noisier one.
+    assert!(psnr[0] > psnr[1], "{psnr:?}");
+    // A new image job cancels a batch still running.
+    let big: SharedFrame = Arc::new(gray_rgba(1600, 1200, &quantize(&texture(1600, 1200, 4))));
+    let slow = ImageSpec { metrics: vec!["ssim.gauss".into(), "deltae.2000".into()], ..Default::default() };
+    let hs = an.submit_images(vec![(slow.clone(), big.clone(), Some(big.clone())), (slow, big.clone(), Some(big))]);
+    let last = an.submit_image(spec, a.clone(), Some(a));
+    assert!(last.wait_timeout(LIMIT).is_ok());
+    assert!(hs.into_iter().last().unwrap().wait_timeout(LIMIT).is_err());
+}
+
+#[test]
 fn new_submission_supersedes_previous() {
     let an = Analyzer::new(Some(2), None);
     let (w, h) = (1600, 1200);

@@ -478,7 +478,7 @@ impl AiView {
         let bytes: usize = res.sent.images.iter().map(|i| i.bytes).sum();
         foot.push(format!("{} image(s), {}", res.sent.images.len(), fmt_bytes(bytes)));
         let foot_l = ui.add(egui::Label::new(RichText::new(foot.join("  |  ")).size(10.5).color(p.faint)).wrap());
-        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({}x{}, {} {})", i.description, i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
+        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({} × {}, {} {})", i.description, i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
         foot_l.on_hover_text(format!("Sent to {}:\n{}", res.sent.destination, sent.join("\n")));
         for c in &res.sent.changes {
             ui.label(RichText::new(c).size(10.5).color(p.faint));
@@ -547,7 +547,7 @@ impl AiView {
             ui.label(RichText::new(format!("Findings ({})", r.findings.len())).font(semibold(12.5)).color(p.text));
             let mut hovered = None;
             for (i, f) in r.findings.iter().enumerate() {
-                let resp = finding_row(ui, p, i, f);
+                let resp = finding_row(ui, p, i, f, rec.dims[1].is_some());
                 if resp.hovered() {
                     hovered = Some(i);
                 }
@@ -675,7 +675,9 @@ fn score_bar(ui: &mut Ui, p: &Palette, label: &str, score: Option<u8>, rationale
     }
 }
 
-fn finding_row(ui: &mut Ui, p: &Palette, i: usize, f: &lumen_ai::Finding) -> egui::Response {
+/// One finding: number, severity, category and where (`pair`: name the
+/// image; a single image needs no "image A").
+fn finding_row(ui: &mut Ui, p: &Palette, i: usize, f: &lumen_ai::Finding, pair: bool) -> egui::Response {
     let col = severity_color(f.severity);
     let cat = lumen_ai::prompts::CATEGORIES.iter().find(|c| c.0 == f.category).map(|c| c.1).unwrap_or(&f.category);
     let inner = ui.horizontal_top(|ui| {
@@ -684,8 +686,13 @@ fn finding_row(ui: &mut Ui, p: &Palette, i: usize, f: &lumen_ai::Finding) -> egu
         ui.painter().text(r.center(), Align2::CENTER_CENTER, (i + 1).to_string(), semibold(11.0), Color32::BLACK);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            let place = if f.tile == 0 { format!("image {}", f.image.as_str()) } else { format!("image {}, tile {}", f.image.as_str(), f.tile) };
-            ui.label(RichText::new(format!("{} {}, {place}", f.severity.as_str(), cat.to_lowercase())).size(11.0).color(col));
+            let place = match (pair, f.tile) {
+                (true, 0) => format!(", image {}", f.image.as_str()),
+                (true, t) => format!(", image {}, tile {t}", f.image.as_str()),
+                (false, 0) => String::new(),
+                (false, t) => format!(", tile {t}"),
+            };
+            ui.label(RichText::new(format!("{} {}{place}", f.severity.as_str(), cat.to_lowercase())).size(11.0).color(col));
             ui.add(egui::Label::new(RichText::new(&f.description).size(11.5).color(p.text)).wrap());
         });
     });

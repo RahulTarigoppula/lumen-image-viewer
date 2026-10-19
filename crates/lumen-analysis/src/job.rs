@@ -697,13 +697,17 @@ impl Drop for JobHandle {
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// A job's body, run on a job thread.
+type Body = Box<dyn FnOnce(&AnalysisPool, &JobControl, &(dyn Fn(JobEvent) + Sync)) -> Result<AnalysisReport, JobError> + Send>;
+
 /// The analysis service: one pool, one job thread per running job, and a
 /// generation counter. A new image (or video) job cancels the previous one.
 pub struct Analyzer {
     pool: Arc<AnalysisPool>,
     generation: AtomicU64,
-    image_lane: Mutex<Option<CancelToken>>,
-    video_lane: Mutex<Option<CancelToken>>,
+    /// The running image job(s) (a batch is several) and video job.
+    image_lane: Mutex<Vec<CancelToken>>,
+    video_lane: Mutex<Vec<CancelToken>>,
     notify: Option<Notify>,
 }
 
@@ -711,7 +715,7 @@ impl Analyzer {
     /// `threads`: pool size (`None` for cores - 1). `notify` is called after
     /// every event (e.g. `move || ctx.request_repaint()`).
     pub fn new(threads: Option<usize>, notify: Option<Notify>) -> Self {
-        Analyzer { pool: Arc::new(AnalysisPool::new(threads)), generation: AtomicU64::new(0), image_lane: Mutex::new(None), video_lane: Mutex::new(None), notify }
+        Analyzer { pool: Arc::new(AnalysisPool::new(threads)), generation: AtomicU64::new(0), image_lane: Mutex::new(Vec::new()), video_lane: Mutex::new(Vec::new()), notify }
     }
 
     pub fn pool(&self) -> &Arc<AnalysisPool> {
@@ -723,50 +727,72 @@ impl Analyzer {
         self.generation.load(Ordering::Relaxed)
     }
 
-    fn start(&self, lane: &Mutex<Option<CancelToken>>) -> (JobControl, u64) {
-        let ctl = JobControl::default();
-        if let Some(old) = lane.lock().unwrap_or_else(|e| e.into_inner()).replace(ctl.cancel.clone()) {
+    /// Controls for `n` new jobs of a lane, cancelling the lane's running ones.
+    fn start(&self, lane: &Mutex<Vec<CancelToken>>, n: usize) -> Vec<(JobControl, u64)> {
+        let jobs: Vec<(JobControl, u64)> = (0..n).map(|_| (JobControl::default(), self.generation.fetch_add(1, Ordering::Relaxed) + 1)).collect();
+        let mut lane = lane.lock().unwrap_or_else(|e| e.into_inner());
+        for old in lane.drain(..) {
             old.cancel();
         }
-        (ctl, self.generation.fetch_add(1, Ordering::Relaxed) + 1)
+        lane.extend(jobs.iter().map(|j| j.0.cancel.clone()));
+        jobs
     }
 
-    fn spawn(&self, ctl: JobControl, generation: u64, body: impl FnOnce(&AnalysisPool, &JobControl, &(dyn Fn(JobEvent) + Sync)) -> Result<AnalysisReport, JobError> + Send + 'static) -> JobHandle {
-        let (tx, rx) = crossbeam_channel::unbounded();
+    /// Runs `jobs` one after another on one job thread, each reporting to its own handle.
+    fn spawn(&self, jobs: Vec<(JobControl, u64, Body)>) -> Vec<JobHandle> {
+        let mut handles = Vec::new();
+        let mut runs = Vec::new();
+        for (ctl, generation, body) in jobs {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            handles.push(JobHandle { generation, ctl: ctl.clone(), rx, finished: false });
+            runs.push((ctl, tx, body));
+        }
         let pool = self.pool.clone();
         let notify = self.notify.clone();
-        let c2 = ctl.clone();
         std::thread::Builder::new()
             .name("lumen-analysis-job".into())
             .stack_size(8 << 20)
             .spawn(move || {
                 lower_current_thread_priority();
-                let send = |e: JobEvent| {
-                    let _ = tx.send(e);
-                    if let Some(n) = &notify {
-                        n();
-                    }
-                };
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&pool, &c2, &send)));
-                send(match res {
-                    Ok(Ok(r)) => JobEvent::Done(Box::new(r)),
-                    Ok(Err(JobError::Cancelled)) => JobEvent::Cancelled,
-                    Ok(Err(JobError::Invalid(s))) => JobEvent::Failed(s),
-                    Err(_) => JobEvent::Failed("internal error in analysis".into()),
-                });
+                for (ctl, tx, body) in runs {
+                    let send = |e: JobEvent| {
+                        let _ = tx.send(e);
+                        if let Some(n) = &notify {
+                            n();
+                        }
+                    };
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&pool, &ctl, &send)));
+                    send(match res {
+                        Ok(Ok(r)) => JobEvent::Done(Box::new(r)),
+                        Ok(Err(JobError::Cancelled)) => JobEvent::Cancelled,
+                        Ok(Err(JobError::Invalid(s))) => JobEvent::Failed(s),
+                        Err(_) => JobEvent::Failed("internal error in analysis".into()),
+                    });
+                }
             })
             .expect("analysis job thread");
-        JobHandle { generation, ctl, rx, finished: false }
+        handles
     }
 
-    /// Runs an image job on owned / shared frames.
-    pub fn submit_image(&self, spec: ImageSpec, a: SharedFrame, b: Option<SharedFrame>) -> JobHandle {
-        let (ctl, generation) = self.start(&self.image_lane);
-        self.spawn(ctl, generation, move |pool, ctl, sink| {
+    fn image_body(spec: ImageSpec, a: SharedFrame, b: Option<SharedFrame>) -> Body {
+        Box::new(move |pool, ctl, sink| {
             let va = a.view();
             let vb = b.as_ref().map(|b| b.view());
             run_image(pool, &spec, &va, vb.as_ref(), ctl, sink)
         })
+    }
+
+    /// Runs an image job on owned / shared frames.
+    pub fn submit_image(&self, spec: ImageSpec, a: SharedFrame, b: Option<SharedFrame>) -> JobHandle {
+        self.submit_images(vec![(spec, a, b)]).pop().expect("one job")
+    }
+
+    /// Runs several image jobs one after another (a 4-image compare: B, C
+    /// and D against A), each with its own handle. Together they replace the
+    /// running image job, and the next submission cancels all of them.
+    pub fn submit_images(&self, jobs: Vec<(ImageSpec, SharedFrame, Option<SharedFrame>)>) -> Vec<JobHandle> {
+        let ctl = self.start(&self.image_lane, jobs.len());
+        self.spawn(ctl.into_iter().zip(jobs).map(|((ctl, generation), (spec, a, b))| (ctl, generation, Self::image_body(spec, a, b))).collect())
     }
 
     /// Runs a video job over `frames` (e.g. a channel receiver's `into_iter()`
@@ -775,7 +801,8 @@ impl Analyzer {
     where
         I: IntoIterator<Item = (u64, SharedFrame, Option<SharedFrame>)> + Send + 'static,
     {
-        let (ctl, generation) = self.start(&self.video_lane);
-        self.spawn(ctl, generation, move |pool, ctl, sink| run_video(pool, &spec, frames, ctl, sink))
+        let (ctl, generation) = self.start(&self.video_lane, 1).pop().expect("one job");
+        let body: Body = Box::new(move |pool, ctl, sink| run_video(pool, &spec, frames, ctl, sink));
+        self.spawn(vec![(ctl, generation, body)]).pop().expect("one job")
     }
 }

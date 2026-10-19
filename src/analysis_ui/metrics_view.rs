@@ -235,8 +235,10 @@ pub enum Subject {
     None,
     /// The viewer's image: display pixels and the file's bits per channel.
     Image { path: PathBuf, image: Arc<RgbaImage>, source_bits: u8 },
-    /// Compare A and B (other panes are not measured).
-    Compare { a: PathBuf, image_a: Arc<RgbaImage>, b: PathBuf, image_b: Arc<RgbaImage>, source_bits: u8 },
+    /// Compare A and B. With 3 or 4 panes `b` is the pane picked in the tab
+    /// (`letter` "B", "C" or "D") and `others` the rest, measured against A
+    /// in the same run.
+    Compare { a: PathBuf, image_a: Arc<RgbaImage>, b: PathBuf, image_b: Arc<RgbaImage>, source_bits: u8, letter: &'static str, others: Vec<(&'static str, PathBuf, Arc<RgbaImage>)> },
     #[cfg(feature = "video")]
     Video(VideoSubject),
 }
@@ -297,7 +299,15 @@ impl Subject {
 
     fn id(&self) -> String {
         let (a, b) = self.files();
-        format!("{:?}|{}|{}", self.kind(), a.map(|p| p.display().to_string()).unwrap_or_default(), b.map(|p| p.display().to_string()).unwrap_or_default())
+        subject_id(self.kind(), a, b)
+    }
+
+    /// Compare: the letter of the pane measured against A.
+    fn letter(&self) -> &'static str {
+        match self {
+            Subject::Compare { letter, .. } => letter,
+            _ => "B",
+        }
     }
 
     fn is_video(&self) -> bool {
@@ -320,6 +330,15 @@ impl Subject {
         }
     }
 
+    /// Video: A's frame on screen.
+    fn current(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "video")]
+            Subject::Video(v) => v.current,
+            _ => None,
+        }
+    }
+
     /// The A-B loop in A frames (inclusive).
     fn loop_ab(&self) -> Option<(usize, usize)> {
         match self {
@@ -329,6 +348,14 @@ impl Subject {
         }
     }
 }
+
+/// What results are kept by: the kind of subject and its files.
+fn subject_id(kind: Kind, a: Option<&Path>, b: Option<&Path>) -> String {
+    format!("{kind:?}|{}|{}", a.map(|p| p.display().to_string()).unwrap_or_default(), b.map(|p| p.display().to_string()).unwrap_or_default())
+}
+
+/// Pane letters of compare mode.
+const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
 
 /// A region drawn on a video displayed rotated by `rotation` degrees, in the
 /// stream's native pixels (`size`, unrotated).
@@ -474,7 +501,7 @@ fn scope_label(r: &AnalysisReport) -> String {
         }
     }
     if let Some(r) = s.roi {
-        parts.push(format!("ROI {}x{}", r.w, r.h));
+        parts.push(format!("ROI {} × {}", r.w, r.h));
     }
     parts.join(", ")
 }
@@ -484,12 +511,13 @@ fn fmt_time(unix: u64) -> String {
     chrono::Local.timestamp_opt(unix as i64, 0).single().map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
 }
 
-/// Decimals shown in the results table.
+/// Decimals shown in the results table; the summary writes its values with
+/// the same ones (see `summary::pct`), so a number reads the same in both.
 fn ui_decimals(u: Unit) -> usize {
     match u {
         Unit::Index => 4,
-        Unit::DeltaE | Unit::Score => 3,
-        Unit::Count | Unit::Pixels => 0,
+        Unit::Count | Unit::Pixels | Unit::Levels8Sq => 0,
+        Unit::Percent => 1,
         _ => 2,
     }
 }
@@ -534,6 +562,8 @@ pub fn key_label(id: &str, key: &str) -> String {
         ("color_cast", "delta_e") => "Cast strength",
         ("color_cast", "hue") => "Hue",
         ("color_cast", "neutral_pct") => "Near-neutral pixels",
+        ("sharpness.laplacian", "p90") => "Sharpest areas",
+        ("sharpness.laplacian", "var") => "Whole picture",
         (_, "y" | "u" | "v" | "r" | "g" | "b") if id.starts_with("psnr") || id.starts_with("ssim") || id == "ms_ssim" || id == "noise" => return plane(key),
         (_, "cb") => "Cb",
         (_, "cr") => "Cr",
@@ -620,6 +650,9 @@ pub fn fmt_value(v: f64, u: Unit) -> String {
     // dB values are capped for identical inputs (the CSV keeps the 100).
     if u == Unit::Db && v >= lumen_analysis::PSNR_CAP_DB {
         return "Identical".into();
+    }
+    if u == Unit::Percent {
+        return summary::pct(v);
     }
     let d = ui_decimals(u);
     match unit_text(u) {
@@ -871,6 +904,47 @@ fn report_matches(r: &AnalysisReport, s: &super::Subject) -> bool {
     }
 }
 
+/// The facts the summary of report `r` is written from (`maps`: its
+/// heatmaps, `other`: what the compared image is called).
+fn facts_of(r: &AnalysisReport, maps: &[(String, String, Arc<Heatmap>)], fps: f64, other: &str) -> summary::Facts {
+    let mut f = summary::Facts {
+        pair: r.scope.file_b.is_some(),
+        video: r.scope.kind != ScopeKind::Image,
+        fps,
+        rescaled: r.scope.rescaled,
+        other: other.to_string(),
+        maps: maps.iter().map(|m| m.0.clone()).collect(),
+        ..Default::default()
+    };
+    for row in rows_of_report(r) {
+        for c in row.cells {
+            if let Some(v) = c.value {
+                f.values.insert(c.key, v);
+            }
+        }
+    }
+    match r.scope.kind {
+        ScopeKind::VideoRange => {
+            f.frames = r.frames.len();
+            f.stride = r.scope.frames.map(|x| x.stride.max(1) as usize).unwrap_or(1);
+            for s in &r.summary {
+                let lower = r.columns.iter().find(|c| c.key == s.key).is_some_and(|c| c.direction == Direction::LowerIsBetter);
+                if let (Some(i), Some(lo), Some(hi)) = (s.worst_idx, s.min, s.max) {
+                    f.worst.insert(s.key.clone(), (i, if lower { hi } else { lo }));
+                }
+            }
+            f.low_frames = r.series("psnr.y").iter().filter(|(_, v)| v.is_some_and(|v| v < summary::PSNR_POOR)).count();
+            f.cuts = r.series("temporal.scene.cut").iter().filter(|(_, v)| v.is_some_and(|v| v > 0.5)).map(|x| x.0).collect();
+        }
+        ScopeKind::VideoFrame => {
+            f.frame = r.scope.frames.map(|x| x.start);
+            f.frames = 1;
+        }
+        ScopeKind::Image => {}
+    }
+    f
+}
+
 // ------------------------------------------------------------------ the tab
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -898,6 +972,35 @@ struct Run {
     roi: Option<Roi>,
     #[cfg(feature = "video")]
     decode: Option<Arc<adapters::DecodeInfo>>,
+}
+
+/// A run of another pair of a 3 or 4 image compare (C against A while B is
+/// shown), kept by its subject id.
+struct SideRun {
+    id: String,
+    letter: &'static str,
+    run: Run,
+}
+
+/// The results of a pair that is not shown, ready for when it is picked.
+struct Stashed {
+    report: AnalysisReport,
+    maps: Vec<(String, String, Arc<Heatmap>)>,
+    summary: Option<summary::Summary>,
+    result_roi: Option<Option<Roi>>,
+    status: Option<(String, bool)>,
+}
+
+/// Takes the heatmaps out of `report` (moved, not copied: a 12 MP map is 48 MB).
+fn take_maps(report: &mut AnalysisReport) -> Vec<(String, String, Arc<Heatmap>)> {
+    report
+        .metrics
+        .iter_mut()
+        .filter_map(|m| {
+            let map = m.map.take().filter(|x| !x.data.is_empty())?;
+            Some((m.id.clone(), m.name.clone(), Arc::new(map)))
+        })
+        .collect()
 }
 
 /// The video a range was measured on (for thumbnails and frame exports).
@@ -966,8 +1069,16 @@ pub struct MetricsTab {
     size_mismatch: Option<String>,
     /// The plain-language summary of `report` (built when first shown).
     summary: Option<summary::Summary>,
-    /// Sharpest tiles of the shown sharpness map (see `summary::Facts`).
-    sharp_peak: Option<f64>,
+    /// Compare mode's panes (A, B, C, D), set by the app every frame.
+    compare_panes: Vec<PathBuf>,
+    /// The pane measured against A in a 3 or 4 image compare (1 is B).
+    pair_pick: usize,
+    /// The letter of the image compared with A ("B"; "C" or "D" when picked).
+    letter: &'static str,
+    /// Results of the other pairs of the compare, by subject id.
+    stash: std::collections::HashMap<String, Stashed>,
+    /// Runs of the other pairs, started with the shown one.
+    side_runs: Vec<SideRun>,
     /// Frame rate of the video shown (summary times).
     fps: f64,
     /// Dev hook: open the "All numbers" and "Details and options" sections.
@@ -1027,7 +1138,11 @@ impl MetricsTab {
             dev_scroll: 0.0,
             size_mismatch: None,
             summary: None,
-            sharp_peak: None,
+            compare_panes: Vec::new(),
+            pair_pick: 1,
+            letter: "B",
+            stash: std::collections::HashMap::new(),
+            side_runs: Vec::new(),
             fps: 25.0,
             dev_open: None,
             frame_tries: 0,
@@ -1062,10 +1177,35 @@ impl MetricsTab {
         self.run_requested = true;
     }
 
+    /// Compare mode's panes in order (A first; empty outside compare mode),
+    /// so 3 and 4 image compares measure C and D against A too.
+    pub fn set_compare_panes(&mut self, panes: Vec<PathBuf>) {
+        if panes != self.compare_panes {
+            self.compare_panes = panes;
+            self.pair_pick = 1;
+        }
+    }
+
+    pub fn compare_panes(&self) -> &[PathBuf] {
+        &self.compare_panes
+    }
+
+    /// The letter of the image measured against A ("B", or "C" / "D" when
+    /// picked in a 3 or 4 image compare).
+    pub fn pair_letter(&self) -> &'static str {
+        if self.compare_panes.len() > 2 {
+            LETTERS[self.pair_pick.clamp(1, 3)]
+        } else {
+            "B"
+        }
+    }
+
     /// The tab's subject from the panel's: display pixels of the viewer or
     /// of compare A and B (`source_bits` of A's file), or video mode's state
-    /// (see [`MetricsTab::set_video`]) at the frame on screen.
-    pub fn subject_of(&self, s: &super::Subject, source_bits: u8) -> Subject {
+    /// (see [`MetricsTab::set_video`]) at the frame on screen. `panes`: the
+    /// decoded compare panes (see [`MetricsTab::set_compare_panes`]), when
+    /// there are more than two.
+    pub fn subject_of(&self, s: &super::Subject, source_bits: u8, panes: &[(PathBuf, Option<Arc<RgbaImage>>)]) -> Subject {
         use super::{Pixels, SubjectKind};
         let ready = |i: &Option<super::SubjectImage>| match i.as_ref().map(|i| (&i.pixels, &i.path)) {
             Some((Pixels::Ready(img), path)) => Some((path.clone(), img.clone())),
@@ -1077,7 +1217,14 @@ impl MetricsTab {
                 None => Subject::None,
             },
             SubjectKind::Pair => match (ready(&s.a), ready(&s.b)) {
-                (Some((a, image_a)), Some((b, image_b))) => Subject::Compare { a, image_a, b, image_b, source_bits },
+                // 3 or 4 panes: the picked one against A, the others in the same run.
+                (Some((a, image_a)), Some(_)) if panes.len() > 2 && panes.first().is_some_and(|p| p.0 == a) => {
+                    let pick = self.pair_pick.clamp(1, panes.len() - 1);
+                    let Some(image_b) = panes[pick].1.clone() else { return Subject::None };
+                    let others = panes.iter().enumerate().skip(1).filter(|(i, _)| *i != pick).filter_map(|(i, (p, img))| Some((LETTERS[i.min(3)], p.clone(), img.clone()?))).collect();
+                    Subject::Compare { a, image_a, b: panes[pick].0.clone(), image_b, source_bits, letter: LETTERS[pick.min(3)], others }
+                }
+                (Some((a, image_a)), Some((b, image_b))) => Subject::Compare { a, image_a, b, image_b, source_bits, letter: "B", others: Vec::new() },
                 _ => Subject::None,
             },
             #[cfg(feature = "video")]
@@ -1132,6 +1279,8 @@ impl MetricsTab {
             },
             "recommended" => self.selected = default_metrics(self.kind).into_iter().collect(),
             "where" => self.show_where(),
+            // `pair B|C|D`: the pane of a 3 or 4 image compare measured against A.
+            "pair" => self.pair_pick = LETTERS.iter().position(|l| l.eq_ignore_ascii_case(rest)).unwrap_or(1).max(1),
             // `details [close]`: open (or close) the collapsed sections.
             "details" => self.dev_open = Some(rest != "close"),
             "run" => self.request_run(),
@@ -1179,7 +1328,7 @@ impl MetricsTab {
             v.join("; ")
         });
         format!(
-            "metrics: kind={:?} scope={:?} stride_auto={} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} visible={} notes={} history={} worst={:?} summary=[{}]",
+            "metrics: kind={:?} scope={:?} stride_auto={} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} visible={} notes={} history={} worst={:?} pair={} stashed={} side_runs={} summary=[{}]",
             self.kind,
             self.scope,
             self.stride_auto,
@@ -1194,6 +1343,9 @@ impl MetricsTab {
             self.report.as_ref().map(|r| r.notes.len()).unwrap_or(0),
             self.history.len(),
             self.plots.worst_frames(&self.series),
+            self.letter,
+            self.stash.len(),
+            self.side_runs.len(),
             summary.unwrap_or_default(),
         )
     }
@@ -1281,12 +1433,31 @@ impl MetricsTab {
         if id == self.subject_id {
             return;
         }
-        self.subject_id = id;
-        if let Some(r) = self.run.take() {
-            r.handle.cancel();
+        let old_id = std::mem::replace(&mut self.subject_id, id.clone());
+        let file_a = s.files().0.map(Path::to_path_buf);
+        // Another pair of the same compare: keep this pair's results (or its
+        // run) for when it is picked again.
+        let same_compare = self.kind == Kind::Compare && s.kind() == Kind::Compare && self.file_a == file_a;
+        if same_compare {
+            if let Some(run) = self.run.take() {
+                self.side_runs.push(SideRun { id: old_id.clone(), letter: self.letter, run });
+            }
+            if let Some(report) = self.report.take() {
+                let st = Stashed { report, maps: std::mem::take(&mut self.maps), summary: self.summary.take(), result_roi: self.result_roi, status: self.status.take() };
+                self.stash.insert(old_id, st);
+            }
+        } else {
+            // Dropping the handles cancels the runs.
+            drop_later(std::mem::take(&mut self.stash));
+            self.side_runs.clear();
+            if let Some(r) = self.run.take() {
+                r.handle.cancel();
+            }
         }
+        let shown = self.heat.id().filter(|_| self.heat.visible).map(str::to_string);
         self.kind = s.kind();
-        self.file_a = s.files().0.map(Path::to_path_buf);
+        self.letter = s.letter();
+        self.file_a = file_a;
         self.report = None;
         self.live.clear();
         self.series = Series::default();
@@ -1295,8 +1466,20 @@ impl MetricsTab {
         self.result_roi = None;
         self.status = None;
         self.summary = None;
-        self.sharp_peak = None;
         self.expanded.clear();
+        if same_compare {
+            if let Some(i) = self.side_runs.iter().position(|r| r.id == id) {
+                self.run = Some(self.side_runs.remove(i).run);
+            }
+            if let Some(st) = self.stash.remove(&id) {
+                self.report = Some(st.report);
+                self.maps = st.maps;
+                self.summary = st.summary;
+                self.result_roi = st.result_roi;
+                self.status = st.status;
+                self.pick_overlay(shown);
+            }
+        }
         // A new video starts on the frame on screen; a range typed for the
         // last file may not exist in this one.
         self.set_scope(VideoScope::Frame);
@@ -1390,7 +1573,7 @@ impl MetricsTab {
         self.size_mismatch = match s {
             #[cfg(feature = "video")]
             Subject::Video(VideoSubject { a, b: Some(b), .. }) if a.size != b.size => {
-                Some(format!("A is {}x{} and B {}x{}: full-reference metrics need videos of the same size", a.size.0, a.size.1, b.size.0, b.size.1))
+                Some(format!("A is {} × {} and B {} × {}: full-reference metrics need videos of the same size", a.size.0, a.size.1, b.size.0, b.size.1))
             }
             _ => None,
         };
@@ -1438,9 +1621,21 @@ impl MetricsTab {
                     self.set_status("The image is empty", true);
                     return;
                 };
-                let spec = adapters::image_spec(ids.clone(), roi, Some(&fa), fb.as_deref(), pair.rescaled, *source_bits);
+                let rescaled = pair.rescaled;
+                let spec = adapters::image_spec(ids.clone(), roi, Some(&fa), fb.as_deref(), rescaled, *source_bits);
                 let key = run_key("image", &fa, fb.as_deref(), &ids, roi, None, 0);
-                let handle = self.analyzer(egui_ctx).submit_image(spec, pair.a, pair.b);
+                let mut jobs = vec![(spec, pair.a, pair.b)];
+                // A 3 or 4 image compare: the other panes against A, one after the other.
+                let mut sides = Vec::new();
+                if let Subject::Compare { others, .. } = &ctx.subject {
+                    for (letter, path, img) in others {
+                        let Some(pair) = adapters::image_pair(image, Some(img)) else { continue };
+                        jobs.push((adapters::image_spec(ids.clone(), roi, Some(&fa), Some(path), pair.rescaled, *source_bits), pair.a, pair.b));
+                        sides.push((subject_id(Kind::Compare, Some(&fa), Some(path)), *letter, run_key("image", &fa, Some(path), &ids, roi, None, 0)));
+                    }
+                }
+                let mut handles = self.analyzer(egui_ctx).submit_images(jobs).into_iter();
+                let handle = handles.next().expect("the shown pair");
                 self.start(Run {
                     handle,
                     key,
@@ -1450,8 +1645,22 @@ impl MetricsTab {
                     #[cfg(feature = "video")]
                     decode: None,
                 });
-                if pair.rescaled {
-                    self.set_status("B is resampled to A's size", false);
+                self.side_runs.clear();
+                for ((id, letter, key), handle) in sides.into_iter().zip(handles) {
+                    self.stash.remove(&id);
+                    let run = Run {
+                        handle,
+                        key,
+                        history: None,
+                        started: Instant::now(),
+                        roi,
+                        #[cfg(feature = "video")]
+                        decode: None,
+                    };
+                    self.side_runs.push(SideRun { id, letter, run });
+                }
+                if rescaled {
+                    self.set_status(format!("{} is resampled to A's size", self.letter), false);
                 }
             }
             #[cfg(feature = "video")]
@@ -1542,12 +1751,13 @@ impl MetricsTab {
         drop_later(std::mem::take(&mut self.live));
         self.series = Series::default();
         self.report = None;
+        self.summary = None;
         self.status = None;
         self.run = Some(run);
     }
 
     pub fn cancel(&mut self) {
-        if let Some(r) = &self.run {
+        for r in self.run.iter().chain(self.side_runs.iter().map(|s| &s.run)) {
             r.handle.cancel();
         }
     }
@@ -1568,6 +1778,7 @@ impl MetricsTab {
                 Err(_) => {}
             }
         }
+        self.poll_side_runs();
         let Some(run) = &mut self.run else { return };
         let mut done: Option<Result<AnalysisReport, String>> = None;
         while let Some(ev) = run.handle.try_recv() {
@@ -1618,6 +1829,34 @@ impl MetricsTab {
         }
     }
 
+    /// Results of the other pairs of a compare go to the stash, ready for
+    /// when their pane is picked.
+    fn poll_side_runs(&mut self) {
+        let mut i = 0;
+        while i < self.side_runs.len() {
+            let mut done = None;
+            while let Some(ev) = self.side_runs[i].run.handle.try_recv() {
+                match ev {
+                    JobEvent::Done(r) => done = Some(Some(*r)),
+                    JobEvent::Failed(_) | JobEvent::Cancelled => done = Some(None),
+                    _ => {}
+                }
+            }
+            let Some(done) = done else {
+                i += 1;
+                continue;
+            };
+            let side = self.side_runs.remove(i);
+            if let Some(mut report) = done {
+                let ms = side.run.started.elapsed().as_secs_f32() * 1000.0;
+                let maps = take_maps(&mut report);
+                let summary = Some(summary::summarize(&facts_of(&report, &maps, self.fps, side.letter)));
+                let status = Some((format!("Done in {}", fmt_cost(ms.max(1.0))), false));
+                self.stash.insert(side.id, Stashed { report, maps, summary, result_roi: Some(side.run.roi), status });
+            }
+        }
+    }
+
     /// Remembers how fast a range run went (for the automatic stride),
     /// smoothed over runs; short runs say little.
     #[cfg(feature = "video")]
@@ -1639,15 +1878,7 @@ impl MetricsTab {
     fn finish(&mut self, mut report: AnalysisReport, store: Option<(CacheKey, Option<CacheKey>)>) {
         drop_later(std::mem::take(&mut self.live));
         self.result_roi = None;
-        // Moved, not copied: a 12 MP map is 48 MB.
-        let maps = report
-            .metrics
-            .iter_mut()
-            .filter_map(|m| {
-                let map = m.map.take().filter(|x| !x.data.is_empty())?;
-                Some((m.id.clone(), m.name.clone(), Arc::new(map)))
-            })
-            .collect();
+        let maps = take_maps(&mut report);
         drop_later(std::mem::replace(&mut self.maps, maps));
         if !report.frames.is_empty() {
             self.series = Series::from_report(&report);
@@ -1656,25 +1887,8 @@ impl MetricsTab {
             }
         }
         self.summary = None;
-        self.sharp_peak = self.map_of("sharpness.laplacian").and_then(|m| {
-            let mut v: Vec<f32> = m.data.iter().copied().filter(|x| x.is_finite()).collect();
-            let i = (v.len() * 9 / 10).min(v.len().checked_sub(1)?);
-            Some(*v.select_nth_unstable_by(i, f32::total_cmp).1 as f64)
-        });
-        // Keep the overlay of the same metric on screen; else ready a
-        // difference map, shown when asked ("Show where", the map buttons).
-        // No-reference tile maps only when asked (they cover the photo).
-        let same = self.heat.id().and_then(|id| self.map_of(id).map(|m| (id.to_string(), m)));
-        if same.is_none() {
-            self.heat.visible = false;
-        }
-        let pick = same.or_else(|| {
-            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().find_map(|id| self.map_of(id).map(|m| (id.to_string(), m)))
-        });
-        match pick {
-            Some((id, m)) => self.heat.set_map(&id, m),
-            None => self.heat.clear(),
-        }
+        let shown = self.heat.id().filter(|_| self.heat.visible).map(str::to_string);
+        self.pick_overlay(shown);
         if let Some((key, Some(hkey))) = store {
             let entry = HistoryEntry {
                 key: key.hex(),
@@ -1698,6 +1912,22 @@ impl MetricsTab {
             });
         }
         self.report = Some(report);
+    }
+
+    /// Readies the overlay for the shown maps: `keep` (the map on screen)
+    /// stays on screen when there is one of that metric; else a difference
+    /// map is readied, shown when asked ("Show where", the map buttons).
+    /// No-reference tile maps only when asked (they cover the photo).
+    fn pick_overlay(&mut self, keep: Option<String>) {
+        let same = keep.and_then(|id| self.map_of(&id).map(|m| (id, m)));
+        self.heat.visible = same.is_some();
+        let pick = same.or_else(|| {
+            ["ssim.gauss", "deltae.2000", "diff.abs", "flip", "butteraugli"].iter().find_map(|id| self.map_of(id).map(|m| (id.to_string(), m)))
+        });
+        match pick {
+            Some((id, m)) => self.heat.set_map(&id, m),
+            None => self.heat.clear(),
+        }
     }
 
     fn load_history(&mut self, h: &HistoryEntry) {
@@ -1736,6 +1966,7 @@ impl MetricsTab {
         #[cfg(not(feature = "video"))]
         let native = None;
         self.heat.set_native(native);
+        self.heat.other = self.letter;
         self.heat.paint(ui, painter, xf, hover, pixels);
     }
 
@@ -1787,6 +2018,9 @@ impl MetricsTab {
         ui.spacing_mut().item_spacing.y = 6.0;
         self.scope_bar(ui, &p, &ctx.subject, ctx.roi);
         self.run_row(ui, &p, ctx);
+        if self.kind == Kind::Compare && self.compare_panes.len() > 2 {
+            self.pairs_card(ui, &p);
+        }
         if self.report.is_none() && self.live.is_empty() && self.run.is_none() && self.status.is_none() {
             self.intro(ui, &p);
         }
@@ -1839,16 +2073,22 @@ impl MetricsTab {
             self.set_scope(scopes[idx]);
             self.status = None;
         }
-        if self.scope != VideoScope::Frame {
-            let (text, color) = match self.range_hint(s, roi) {
-                Ok(t) if self.scope == VideoScope::Custom => (format!("Custom range: {t}"), p.muted),
-                Ok(t) => (t, p.muted),
-                Err(e) => (e, p.danger),
-            };
-            let r = ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
-            if self.stride_auto {
-                r.on_hover_text("Long videos are sampled so the run takes about 30 s. Set a fixed stride in Details and options.");
-            }
+        // One line whatever the scope, so Analyze below never moves when the
+        // scope changes (a click aimed at it would miss).
+        let (text, color) = match (self.scope, self.range_hint(s, roi)) {
+            (VideoScope::Frame, _) => match (s.current(), s.frames()) {
+                (Some(f), Some(n)) => (format!("The frame on screen: frame {f} of {n}"), p.muted),
+                _ => ("The frame on screen".to_string(), p.muted),
+            },
+            (VideoScope::Custom, Ok(t)) => (format!("Custom range: {t}"), p.muted),
+            (_, Ok(t)) => (t, p.muted),
+            (_, Err(e)) => (e, p.danger),
+        };
+        let r = ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(color)).truncate());
+        if self.stride_auto && self.scope != VideoScope::Frame {
+            r.on_hover_text(format!("{text}\nLong videos are sampled so the run takes about 30 s. Set a fixed stride in Details and options."));
+        } else {
+            r.on_hover_text(text);
         }
     }
 
@@ -1992,6 +2232,7 @@ impl MetricsTab {
 
     /// Analyze (or Cancel with progress), the export menu and the status line.
     fn run_row(&mut self, ui: &mut Ui, p: &Palette, ctx: &MetricsCtx) {
+        let mut cancel = false;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.spacing_mut().interact_size.y = theme::size::CONTROL;
@@ -2004,7 +2245,7 @@ impl MetricsTab {
                 // row never asks for more than the panel has (a wider row grows the panel).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if widgets::secondary_button(ui, "Cancel").clicked() {
-                        run.handle.cancel();
+                        cancel = true;
                     }
                     let bar_w = ui.available_width().max(40.0);
                     ui.add(egui::ProgressBar::new(frac).fill(p.accent).desired_width(bar_w).desired_height(theme::size::CONTROL).corner_radius(6).text(RichText::new(text).size(11.5)));
@@ -2017,8 +2258,14 @@ impl MetricsTab {
                     (Kind::Video | Kind::VideoPair, _, VideoScope::Custom) => "the range",
                     (_, true, _) => "the region",
                     (Kind::Video | Kind::VideoPair, false, _) => "the frame on screen",
-                    (Kind::Compare, false, _) => "B against A",
+                    (Kind::Compare, false, _) => "",
                     _ => "the whole image",
+                };
+                let what = match self.compare_panes.len() {
+                    _ if !what.is_empty() => what.to_string(),
+                    3 => "B and C against A".to_string(),
+                    4 => "B, C and D against A".to_string(),
+                    _ => "B against A".to_string(),
                 };
                 let tip = format!("Measure {what} with {n} metric{} (Shift+Q)", if n == 1 { "" } else { "s" });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2031,6 +2278,9 @@ impl MetricsTab {
                 });
             }
         });
+        if cancel {
+            self.cancel();
+        }
         if self.stale() && self.run.is_none() && self.report.is_some() {
             ui.label(RichText::new(format!("{}  The region changed: Analyze again to update", I::WARNING)).size(11.5).color(p.warn));
         } else if let Some((msg, err)) = &self.status {
@@ -2040,9 +2290,69 @@ impl MetricsTab {
         }
     }
 
+    /// A 3 or 4 image compare: one row per pane measured against A with its
+    /// verdict; the picked row's details are shown below it.
+    fn pairs_card(&mut self, ui: &mut Ui, p: &Palette) {
+        let Some(a) = self.compare_panes.first().cloned() else { return };
+        let mut pick = None;
+        ui.label(RichText::new("Each image against A").size(theme::text::CAPTION).font(theme::semibold(theme::text::CAPTION)).color(p.muted));
+        look::card(ui, p, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, path) in self.compare_panes.iter().enumerate().skip(1) {
+                let id = subject_id(Kind::Compare, Some(&a), Some(path));
+                let shown = i == self.pair_pick;
+                let running = if shown { self.run.is_some() } else { self.side_runs.iter().any(|r| r.id == id) };
+                let sum = if shown { self.summary.as_ref() } else { self.stash.get(&id).and_then(|s| s.summary.as_ref()) };
+                let head = sum.and_then(|s| s.head.as_ref());
+                let value = sum.and_then(|s| s.closeness).map(|c| c.short().to_string());
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), theme::size::LIST_ROW), Sense::click());
+                let painter = ui.painter();
+                let bg = rect.expand2(Vec2::new(6.0, 0.0));
+                if shown {
+                    painter.rect_filled(bg, egui::CornerRadius::same(theme::radius::CONTROL), p.selected_bg);
+                } else if resp.hovered() {
+                    painter.rect_filled(bg, egui::CornerRadius::same(theme::radius::CONTROL), p.hover);
+                }
+                let c = egui::pos2(rect.min.x + 8.0, rect.center().y);
+                painter.circle_filled(c, 8.0, look::pane_color(p, i));
+                painter.text(c, egui::Align2::CENTER_CENTER, LETTERS[i.min(3)], theme::semibold(10.5), egui::Color32::WHITE);
+                // Right: verdict dot and number (or what is happening).
+                let (dot, right) = match (head, running) {
+                    (_, true) => (None, "Analyzing".to_string()),
+                    (Some(h), _) => (Some(look::level_color(p, h.level)), value.unwrap_or_default()),
+                    (None, _) => (None, "Not analyzed".to_string()),
+                };
+                let rg = painter.layout_no_wrap(right, theme::text::small(), if head.is_some() && !running { p.text } else { p.faint });
+                let rx = rect.max.x - rg.size().x;
+                painter.galley(egui::pos2(rx, rect.center().y - rg.size().y / 2.0), rg, p.text);
+                if let Some(d) = dot {
+                    painter.circle_filled(egui::pos2(rx - 9.0, rect.center().y), 3.5, d);
+                }
+                let name_w = (rx - 20.0 - (rect.min.x + 22.0)).max(20.0);
+                let mut job = egui::text::LayoutJob::simple_singleline(super::file_name(path), theme::text::body(), if shown { p.text } else { p.muted });
+                job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+                let ng = painter.layout_job(job);
+                painter.galley(egui::pos2(rect.min.x + 22.0, rect.center().y - ng.size().y / 2.0), ng, p.text);
+                let tip = match head {
+                    Some(h) => format!("{}\n{}", h.title, h.detail),
+                    None if running => format!("Measuring {} against A", LETTERS[i.min(3)]),
+                    None => "Press Analyze to measure it".to_string(),
+                };
+                let resp = resp.on_hover_text(if shown { tip } else { format!("{tip}\nClick to show its details") });
+                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    pick = Some(i);
+                }
+            }
+        });
+        if let Some(i) = pick {
+            self.pair_pick = i;
+        }
+    }
+
     /// What the tab does, before the first run.
     fn intro(&self, ui: &mut Ui, p: &Palette) {
         let what = match self.kind {
+            Kind::Compare if self.compare_panes.len() > 2 => "Measures each image against A: how close it is, and where they differ.",
             Kind::Compare => "Shows how close B is to A, and where they differ.",
             Kind::Video => "Checks the frame on screen, the A-B loop or the whole video.",
             Kind::VideoPair => "Compares B with A on the frame on screen, the A-B loop or the whole video.",
@@ -2054,43 +2364,7 @@ impl MetricsTab {
 
     /// The facts the summary is written from (the shown report).
     fn facts(&self) -> Option<summary::Facts> {
-        let r = self.report.as_ref()?;
-        let mut f = summary::Facts {
-            pair: r.scope.file_b.is_some(),
-            video: r.scope.kind != ScopeKind::Image,
-            fps: self.fps,
-            rescaled: r.scope.rescaled,
-            sharp_peak: self.sharp_peak,
-            maps: self.maps.iter().map(|m| m.0.clone()).collect(),
-            ..Default::default()
-        };
-        for row in rows_of_report(r) {
-            for c in row.cells {
-                if let Some(v) = c.value {
-                    f.values.insert(c.key, v);
-                }
-            }
-        }
-        match r.scope.kind {
-            ScopeKind::VideoRange => {
-                f.frames = r.frames.len();
-                f.stride = r.scope.frames.map(|x| x.stride.max(1) as usize).unwrap_or(1);
-                for s in &r.summary {
-                    let lower = r.columns.iter().find(|c| c.key == s.key).is_some_and(|c| c.direction == Direction::LowerIsBetter);
-                    if let (Some(i), Some(lo), Some(hi)) = (s.worst_idx, s.min, s.max) {
-                        f.worst.insert(s.key.clone(), (i, if lower { hi } else { lo }));
-                    }
-                }
-                f.low_frames = r.series("psnr.y").iter().filter(|(_, v)| v.is_some_and(|v| v < summary::PSNR_POOR)).count();
-                f.cuts = r.series("temporal.scene.cut").iter().filter(|(_, v)| v.is_some_and(|v| v > 0.5)).map(|x| x.0).collect();
-            }
-            ScopeKind::VideoFrame => {
-                f.frame = r.scope.frames.map(|x| x.start);
-                f.frames = 1;
-            }
-            ScopeKind::Image => {}
-        }
-        Some(f)
+        Some(facts_of(self.report.as_ref()?, &self.maps, self.fps, self.letter))
     }
 
     /// The plain-language result: headline, one line per check, and the
@@ -2102,6 +2376,7 @@ impl MetricsTab {
         }
         let stale = self.stale();
         let mut toggle_map = false;
+        let mut line_map: Option<String> = None;
         let mut seek = None;
         look::card(ui, p, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -2122,8 +2397,13 @@ impl MetricsTab {
                     ui.add_space(5.0);
                 }
             }
+            let links = if stale { Vec::new() } else { self.line_maps() };
             for l in &s.lines {
-                look::status_row(ui, p, l.level, &l.label, &l.value, &l.tip, stale);
+                let map = plots::metric_of(&l.key);
+                let link = links.iter().any(|m| m == map).then(|| if self.heat.visible && self.heat.id() == Some(map) { "Hide" } else { "Show where" });
+                if look::status_row(ui, p, l.level, &l.label, &l.value, &l.tip, stale, link).1 {
+                    line_map = Some(map.to_string());
+                }
             }
             if !s.cuts.is_empty() {
                 ui.add_space(2.0);
@@ -2156,7 +2436,8 @@ impl MetricsTab {
                         ui.label(RichText::new(format!("Biggest difference: {why}")).size(theme::text::SMALL).color(p.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let text = if on { "Hide" } else { "Show where" };
-                            if ui.button(text).on_hover_text("Color the image by how much B differs from A there").clicked() {
+                            let tip = format!("Color the image by how much {} differs from A there", self.letter);
+                            if widgets::secondary_button(ui, text).on_hover_text(tip).clicked() {
                                 toggle_map = true;
                             }
                         });
@@ -2166,7 +2447,7 @@ impl MetricsTab {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("Worst: frame {frame}")).size(theme::text::SMALL).color(p.muted));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Show worst frame").on_hover_text("Pause on the worst frame").clicked() {
+                            if widgets::secondary_button(ui, "Show worst frame").on_hover_text("Pause on the worst frame").clicked() {
                                 seek = Some(frame);
                             }
                         });
@@ -2182,9 +2463,33 @@ impl MetricsTab {
                 self.show_where();
             }
         }
+        if let Some(id) = line_map {
+            if self.heat.visible && self.heat.id() == Some(id.as_str()) {
+                self.heat.visible = false;
+            } else if let Some(m) = self.map_of(&id) {
+                self.heat.set_map(&id, m);
+                self.heat.visible = true;
+            }
+        }
         if seek.is_some() {
             self.seek = seek;
         }
+    }
+
+    /// Metrics whose summary line offers "Show where" (lines worth a look
+    /// that have a map: clipping, banding, blocking, soft detail). Pairs
+    /// have one "Show where" for the biggest difference instead.
+    fn line_maps(&self) -> Vec<String> {
+        let Some(s) = &self.summary else { return Vec::new() };
+        if matches!(s.action, Some(summary::Action::ShowMap { .. })) {
+            return Vec::new();
+        }
+        s.lines
+            .iter()
+            .filter(|l| matches!(l.level, summary::Level::Fair | summary::Level::Poor))
+            .map(|l| plots::metric_of(&l.key).to_string())
+            .filter(|id| self.maps.iter().any(|m| &m.0 == id))
+            .collect()
     }
 
     /// While a heatmap is on the image: its name, Hide, and its options.
@@ -2194,12 +2499,13 @@ impl MetricsTab {
         }
         let name = self.heat.id().and_then(|id| self.maps.iter().find(|m| m.0 == id).map(|m| m.1.clone())).unwrap_or_else(|| "Heatmap".into());
         // The summary's "Show where" already toggles its own map.
-        let from_card = matches!(self.summary.as_ref().and_then(|s| s.action.as_ref()), Some(summary::Action::ShowMap { id, .. }) if self.heat.id() == Some(id.as_str()));
+        let from_card = matches!(self.summary.as_ref().and_then(|s| s.action.as_ref()), Some(summary::Action::ShowMap { id, .. }) if self.heat.id() == Some(id.as_str()))
+            || self.line_maps().iter().any(|m| self.heat.id() == Some(m.as_str()));
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("Heatmap on the image: {name}")).size(theme::text::SMALL).color(p.muted));
             if !from_card {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Hide").clicked() {
+                    if widgets::secondary_button(ui, "Hide").clicked() {
                         self.heat.visible = false;
                     }
                 });
@@ -2209,17 +2515,31 @@ impl MetricsTab {
     }
 
     /// The value's grade as a dot; what it means (and the limits) on hover.
-    fn chip(ui: &mut Ui, p: &Palette, key: &str, value: Option<f64>, stale: bool) {
+    /// A value the summary talks about (`verdict`) has the summary's dot,
+    /// so the summary and the table never disagree.
+    fn chip(ui: &mut Ui, p: &Palette, key: &str, value: Option<f64>, stale: bool, verdict: Option<(summary::Level, String)>) {
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-        let (Some(t), Some(g)) = (threshold(key), value.filter(|_| !stale).and_then(|v| grade(key, v))) else { return };
+        if stale || value.is_none() {
+            return;
+        }
+        let limits = threshold(key).map(|t| {
+            let (good, poor) = if t.higher_better { ("at or above", "below") } else { ("below", "above") };
+            format!("good {good} {}, poor {poor} {}", t.good, t.poor)
+        });
+        if let Some((level, said)) = verdict {
+            ui.painter().circle_filled(rect.center(), 3.5, look::level_color(p, level));
+            let limits = limits.filter(|_| level != summary::Level::Info).map(|l| format!("\nLimits: {l}")).unwrap_or_default();
+            resp.on_hover_text(format!("{}. {said}{limits}", look::level_text(level)));
+            return;
+        }
+        let (Some(limits), Some(g)) = (limits, value.and_then(|v| grade(key, v))) else { return };
         let (c, what) = match g {
             Grade::Good => (p.ok, "Good"),
             Grade::Fair => (p.warn, "Fair"),
             Grade::Poor => (p.danger, "Poor"),
         };
         ui.painter().circle_filled(rect.center(), 3.5, c);
-        let (good, poor) = if t.higher_better { ("at or above", "below") } else { ("below", "above") };
-        resp.on_hover_text(format!("{what}: good {good} {}, poor {poor} {}", t.good, t.poor));
+        resp.on_hover_text(format!("{what}: {limits}"));
     }
 
     fn arrow(ui: &mut Ui, p: &Palette, d: Direction) {
@@ -2247,7 +2567,12 @@ impl MetricsTab {
         // Stale results stay readable, dimmed, until the next run.
         let stale = self.stale() && self.report.is_some();
         let (text, muted) = if stale { (p.faint, p.faint) } else { (p.text, p.muted) };
-        let notes: Vec<String> = self.report.as_ref().map(|r| r.notes.iter().cloned().chain(r.metrics.iter().flat_map(|m| m.notes.iter().map(move |n| format!("{}: {n}", m.name)))).collect()).unwrap_or_default();
+        // Report notes (skipped metrics) are warnings; a metric's own notes explain its value.
+        let notes: Vec<(String, bool)> = self
+            .report
+            .as_ref()
+            .map(|r| r.notes.iter().map(|n| (n.clone(), true)).chain(r.metrics.iter().flat_map(|m| m.notes.iter().map(move |n| (format!("{}: {n}", m.name), false)))).collect())
+            .unwrap_or_default();
         if rows.is_empty() && notes.is_empty() {
             return;
         }
@@ -2267,6 +2592,9 @@ impl MetricsTab {
         };
         let right = egui::Layout::right_to_left(egui::Align::Center);
         let left = egui::Layout::left_to_right(egui::Align::Center);
+        // Live rows (while running) have no summary yet: thresholds only.
+        let summary = self.summary.clone().filter(|_| self.report.is_some());
+        let verdict = |key: &str| summary.as_ref().and_then(|s| s.verdict(key));
         ui.spacing_mut().item_spacing.y = 2.0;
         for row in &rows {
             let Some(head) = row.cells.first() else { continue };
@@ -2275,7 +2603,7 @@ impl MetricsTab {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.spacing_mut().interact_size.y = 20.0;
-                Self::chip(ui, p, &head.key, head.value, stale);
+                Self::chip(ui, p, &head.key, head.value, stale, verdict(&head.key));
                 ui.with_layout(right, |ui| {
                     Self::arrow(ui, p, head.direction);
                     let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
@@ -2297,8 +2625,15 @@ impl MetricsTab {
                         let caret = if many { if open { I::CARET_DOWN } else { I::CARET_RIGHT } } else { " " };
                         // Which value the row shows (PSNR: average, Exposure: clipping).
                         let key = many.then(|| key_label(&row.id, short_key(&row.id, &head.key)));
-                        let job = name_job(&format!("{caret} {}", row.name), key.as_deref(), text, 13.0, ui.available_width());
-                        let name = ui.add(egui::Label::new(job).sense(Sense::click())).on_hover_text(&row.name);
+                        let w = ui.available_width();
+                        let mut job = name_job(&format!("{caret} {}", row.name), key.as_deref(), text, 13.0, w);
+                        // Too long: drop the method in brackets ("Sharpness (Laplacian
+                        // variance)"), so the value's name still shows; the full name is on hover.
+                        if let Some((short, _)) = row.name.split_once(" (").filter(|_| ui.painter().layout_job(job.clone()).elided) {
+                            job = name_job(&format!("{caret} {short}"), key.as_deref(), text, 13.0, w);
+                        }
+                        // Truncate: in a horizontal layout a label would grow under the map button.
+                        let name = ui.add(egui::Label::new(job).truncate().sense(Sense::click())).on_hover_text(&row.name);
                         if many && name.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             toggle = Some(row.id.clone());
                         }
@@ -2311,7 +2646,7 @@ impl MetricsTab {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.spacing_mut().interact_size.y = 18.0;
-                        Self::chip(ui, p, &c.key, c.value, stale);
+                        Self::chip(ui, p, &c.key, c.value, stale, verdict(&c.key));
                         ui.with_layout(right, |ui| {
                             Self::arrow(ui, p, c.direction);
                             let v = ui.label(RichText::new(c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into())).color(muted).size(theme::text::SMALL));
@@ -2322,7 +2657,7 @@ impl MetricsTab {
                                 ui.add_space(14.0);
                                 let short = key_label(&row.id, short_key(&row.id, &c.key));
                                 let job = name_job(&short, None, muted, theme::text::SMALL, ui.available_width());
-                                let lab = ui.add(egui::Label::new(job).sense(Sense::click()));
+                                let lab = ui.add(egui::Label::new(job).truncate().sense(Sense::click()));
                                 if c.worst.is_some() && lab.on_hover_text("Click to show the worst frame").clicked() {
                                     seek = c.worst;
                                 }
@@ -2349,8 +2684,8 @@ impl MetricsTab {
         }
         if !notes.is_empty() {
             ui.add_space(4.0);
-            for n in notes {
-                ui.label(RichText::new(format!("{}  {n}", I::INFO)).size(11.0).color(p.warn));
+            for (n, warn) in notes {
+                ui.add(egui::Label::new(RichText::new(format!("{}  {n}", I::INFO)).size(11.0).color(if warn { p.warn } else { p.muted })).wrap());
             }
         }
     }

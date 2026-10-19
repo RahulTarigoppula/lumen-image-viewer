@@ -1539,6 +1539,7 @@ impl Viewer {
         let content: f32 = items.iter().map(|i| i.width()).sum();
         let w = (content + 12.0).min(view.width() - 8.0).max(0.0);
         let rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 34.0), Vec2::new(w, 44.0));
+        crate::analysis_ui::canvas::occlude(ui.ctx(), rect);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
         child.set_clip_rect(rect.expand(24.0).intersect(view));
         let radius = CornerRadius::same(theme::radius::WINDOW);
@@ -1578,6 +1579,7 @@ impl Viewer {
                 _ => {
                     let Some(cmd) = self.bar_command(item) else { continue };
                     let (icon, tip, sel) = self.bar_button(item, cmd);
+                    let sel = sel || (item == B::Analysis && core.analysis_open);
                     if widgets::icon_button_sized(&mut child, icon, &tip, sel, BAR_BUTTON, size::ICON_TOOLBAR).clicked() {
                         ev.push(ViewerEvent::Command(cmd));
                     }
@@ -1591,7 +1593,8 @@ impl Viewer {
     fn more_menu(&self, ui: &mut Ui, hidden: &[BarItem], dirty: bool, analysis_open: bool, ev: &mut Vec<ViewerEvent>) {
         ui.set_min_width(250.0);
         let mut any = false;
-        for &h in hidden {
+        // Analysis has its row below whether or not the bar shows it.
+        for &h in hidden.iter().filter(|h| **h != BarItem::Analysis) {
             let Some(c) = self.bar_command(h) else { continue };
             match h {
                 BarItem::Info => menu_check(ui, c, "Info panel", self.show_info, ev),
@@ -1633,6 +1636,7 @@ impl Viewer {
             B::Info => Command::ToggleInfo,
             B::Film => Command::ToggleFilmstrip,
             B::Fullscreen => Command::ToggleFullscreen,
+            B::Analysis => Command::ToggleAnalysis,
             B::Sep | B::ZoomPct | B::Edit | B::More => return None,
         })
     }
@@ -1653,6 +1657,7 @@ impl Viewer {
             B::Crop => (I::CROP, tip("Crop"), self.crop.is_some()),
             B::Info => (I::INFO, tip("Info panel"), self.show_info),
             B::Film => (I::FILM_STRIP, tip("Filmstrip"), self.show_filmstrip),
+            B::Analysis => (cmd.icon(), tip("Analysis: quality metrics and AI review"), false),
             B::Fullscreen => (if self.is_fullscreen { I::CORNERS_IN } else { I::CORNERS_OUT }, tip(if self.is_fullscreen { "Leave full screen" } else { "Full screen" }), false),
             B::Sep | B::ZoomPct | B::Edit | B::More => (I::DOTS_THREE, String::new(), false),
         }
@@ -2261,6 +2266,7 @@ enum BarItem {
     Crop,
     Edit,
     Info,
+    Analysis,
     Film,
     Fullscreen,
     More,
@@ -2288,14 +2294,14 @@ impl BarItem {
 /// commands (lock zoom, histogram, save, delete, slideshow...).
 fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     use BarItem as B;
-    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Film, B::Fullscreen, B::More];
+    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Analysis, B::Film, B::Fullscreen, B::More];
     let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
     if width(&full) <= avail {
         return (full.to_vec(), Vec::new());
     }
     let mut items: Vec<BarItem> = full.iter().copied().filter(|i| *i != B::Sep).collect();
     // Least important first; Prev / Next / the zoom figure / Fit / Edit / More always stay.
-    let drop_order = [B::Fullscreen, B::Film, B::Info, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
+    let drop_order = [B::Fullscreen, B::Film, B::Info, B::Analysis, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
     let mut hidden = Vec::new();
     for d in drop_order {
         if width(&items) <= avail {
@@ -2568,12 +2574,12 @@ mod tests {
                 assert!(items.contains(&keep), "{avail}: {keep:?}");
             }
             // Nothing is lost: what does not fit is in the More menu.
-            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Film, BarItem::Fullscreen] {
+            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Analysis, BarItem::Film, BarItem::Fullscreen] {
                 assert!(items.contains(&b) != hidden.contains(&b), "{avail}: {b:?}");
             }
         }
-        // About 15 items at full width.
-        assert!(all.iter().filter(|i| **i != BarItem::Sep).count() <= 15);
+        // About 16 items at full width.
+        assert!(all.iter().filter(|i| **i != BarItem::Sep).count() <= 16);
     }
 
     #[test]

@@ -121,13 +121,13 @@ Values are reported as `<id>.<key>`. dB values are capped at 100
 | `ssimulacra2` (feature) | FR, heavy | **`score`** (100 = identical, higher is better) | - |
 | `butteraugli` (feature) | FR, heavy | **`score`** (max-norm, below 1 good), `pnorm3` | diffmap |
 | `flip` (feature) | FR, heavy | **`mean`** `median max` (0..1, LDR, 67 ppd) | error map |
-| `sharpness.laplacian` | NR | **`var`** (levels^2) | tiles |
+| `sharpness.laplacian` | NR | **`p90`** (the sharpest tiles, 90th percentile of the tile variances) `var` (whole frame), levels^2 | tiles |
 | `sharpness.tenengrad` | NR | **`mean_g2`**, `edge_pct` | tiles |
 | `noise` | NR | **`y`** `cb cr` (Immerkaer sigma, levels, edges masked) | - |
-| `exposure` | NR | **`clip_pct`** (the larger of) `clip_lo_pct clip_hi_pct` (+ per channel for RGB), `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | - |
+| `exposure` | NR | **`clip_pct`** (the larger of) `clip_lo_pct clip_hi_pct` (+ per channel for RGB), `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | clipped pixels (1 highlights, -1 shadows) |
 | `color_cast` | NR | **`delta_e`** `a b hue neutral_pct` + a text note | - |
 | `blockiness` | NR | **`score`** `ratio_h ratio_v offset_x offset_y` | tiles |
-| `banding` | NR | **`score`** `smooth_pct contour_pct` | contour mask |
+| `banding` | NR | **`score`** `smooth_pct contour_pct` | 64 px tiles, each tile's score (clear below 1%) |
 | `temporal.flicker` | T | **`flicker`** `delta mean_luma` | - |
 | `temporal.freeze` | T | **`duplicate`** `mad run` | - |
 | `temporal.scene` | T | **`score`** `cut` | - |
