@@ -11,7 +11,6 @@ use super::Subject;
 use crate::app::Core;
 use crate::ui::icons as I;
 use crate::ui::roi::{ImageTransform, RoiEditor, RoiOptions};
-use crate::ui::theme::semibold;
 
 /// Something the app (or the active mode) must do for the panel.
 pub enum PanelAction {
@@ -180,7 +179,7 @@ impl AnalysisPanel {
         egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(I::CHART_LINE).size(15.0).color(p.accent));
-                ui.label(RichText::new("Analysis").font(semibold(super::look::TITLE)).color(p.text));
+                ui.label(RichText::new("Analysis").font(crate::ui::theme::text::title()).color(p.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let tip = format!("Close ({})", crate::ui::commands::Command::ToggleAnalysis.shortcut());
                     if crate::ui::widgets::icon_button_sized(ui, I::X, &tip, false, 24.0, 14.0).clicked() {
@@ -195,9 +194,11 @@ impl AnalysisPanel {
                 #[cfg(feature = "ai")]
                 ("AI review", Tab::Ai, "Ask your own vision model server for an opinion"),
             ];
-            let items: Vec<(&str, bool, &str)> = tabs.iter().map(|t| (t.0, true, t.2)).collect();
-            if let Some(i) = super::look::segmented(ui, &p, "analysis-tabs", &items, tabs.iter().position(|t| t.1 == self.tab)) {
-                self.tab = tabs[i].1;
+            let labels: Vec<&str> = tabs.iter().map(|t| t.0).collect();
+            let tips: Vec<&str> = tabs.iter().map(|t| t.2).collect();
+            let mut idx = tabs.iter().position(|t| t.1 == self.tab).unwrap_or(0);
+            if crate::ui::widgets::segmented_with_tips(ui, &mut idx, &labels, &tips) {
+                self.tab = tabs[idx].1;
             }
             ui.add_space(2.0);
             self.scope_row(ui, core, subject);
@@ -240,13 +241,13 @@ impl AnalysisPanel {
                 None => (whole.to_string(), p.muted),
             };
             ui.label(RichText::new(I::SELECTION).size(13.0).color(color));
-            let l = ui.add(egui::Label::new(RichText::new(text).size(super::look::SMALL).color(color)).truncate());
+            let l = ui.add(egui::Label::new(RichText::new(text).size(crate::ui::theme::text::SMALL).color(color)).truncate());
             if let Some((x, y, _, _)) = rect {
                 l.on_hover_text(format!("At {x}, {y} in A's pixels"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(super::look::SMALL).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
+                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(crate::ui::theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
                 if self.drawing {
                     if link(ui, "Cancel", "Esc") {
                         self.drawing = false;

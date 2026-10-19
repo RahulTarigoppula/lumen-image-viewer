@@ -13,7 +13,8 @@ use super::look;
 use super::{PanelAction, Subject, SubjectKind};
 use crate::app::Core;
 use crate::ui::icons as I;
-use crate::ui::theme::{semibold, Palette};
+use crate::ui::theme::{self, semibold, Palette};
+use crate::ui::widgets;
 
 /// Per-panel UI state of the AI tab.
 #[derive(Default)]
@@ -129,21 +130,21 @@ impl AiView {
         let ai = &mut core.ai;
         look::card(ui, &p, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(RichText::new("Get an AI opinion from your own server").font(semibold(look::SUBTITLE)).color(p.text));
+            ui.label(RichText::new("Get an AI opinion from your own server").font(theme::text::subtitle()).color(p.text));
             look::note(ui, &p, "Lumen asks a vision model you run, for example Qwen on vLLM, for a critique with the problem areas marked. Nothing is sent until you press Run AI review, and you see what is sent first.");
             ui.add_space(4.0);
-            ui.label(RichText::new("Server address").size(look::SMALL).color(p.muted));
+            ui.label(RichText::new("Server address").size(theme::text::SMALL).color(p.muted));
             let mut connect = false;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().interact_size.y = look::CONTROL_H;
-                let field_w = (ui.available_width() - 118.0).max(100.0);
+                ui.spacing_mut().interact_size.y = theme::size::CONTROL;
+                let field_w = (ui.available_width() - 120.0).max(100.0);
                 let resp = ui.add(egui::TextEdit::singleline(&mut ai.host_edit).hint_text("192.168.1.20").desired_width(field_w).margin(Vec2::new(6.0, 5.0)));
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     connect = true;
                 }
                 let busy = ai.testing();
-                if look::primary(ui, &p, if busy { "Connecting" } else { "Test & connect" }, !busy, 112.0).on_hover_text("Turn on AI review, check the server and pick a vision model").clicked() {
+                if widgets::primary_button_enabled(ui, &p, !busy, if busy { "Connecting" } else { "Test & connect" }).on_hover_text("Turn on AI review, check the server and pick a vision model").clicked() {
                     connect = true;
                 }
             });
@@ -151,7 +152,7 @@ impl AiView {
                 Some(e) if !ai.settings.host.is_empty() && ai.host_edit.trim() == ai.settings.host => format!("Connects to {}", e.display()),
                 _ => "IP address or host name; port 8000 unless you add one (host:port).".into(),
             };
-            ui.label(RichText::new(hint).size(look::CAPTION).color(p.faint));
+            ui.label(RichText::new(hint).size(theme::text::CAPTION).color(p.faint));
             if connect {
                 if ai.apply_host() {
                     ai.settings.enabled = true;
@@ -165,7 +166,7 @@ impl AiView {
             if let Some(e) = &ai.host_error {
                 ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
             }
-            if ui.add(egui::Button::new(RichText::new("All AI settings").size(look::SMALL).color(p.accent)).frame(false)).on_hover_text("API key, HTTPS, timeouts and privacy options").clicked() {
+            if ui.add(egui::Button::new(RichText::new("All AI settings").size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text("API key, HTTPS, timeouts and privacy options").clicked() {
                 out.push(PanelAction::OpenSettings("Ai"));
             }
         });
@@ -186,14 +187,14 @@ impl AiView {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             look::dot(ui, dot, &tip);
-            ui.add(egui::Label::new(RichText::new(server.clone().unwrap_or_else(|| "No server".into())).size(look::BODY).color(p.text)).truncate()).on_hover_text(tip.clone());
+            ui.add(egui::Label::new(RichText::new(server.clone().unwrap_or_else(|| "No server".into())).size(theme::text::BODY).color(p.text)).truncate()).on_hover_text(tip.clone());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if crate::ui::widgets::icon_button_sized(ui, I::GEAR_SIX, "All AI settings", false, 24.0, 14.0).clicked() {
                     out.push(PanelAction::OpenSettings("Ai"));
                 }
                 if ai.testing() {
                     ui.spinner();
-                } else if server.is_some() && ui.add(egui::Button::new(RichText::new("Test").size(look::SMALL).color(p.accent)).frame(false)).on_hover_text("Test the connection and list the models").clicked() {
+                } else if server.is_some() && ui.add(egui::Button::new(RichText::new("Test").size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text("Test the connection and list the models").clicked() {
                     ai.test_connection();
                 }
             });
@@ -213,7 +214,7 @@ impl AiView {
         let label = |ui: &mut Ui, text: &str| {
             ui.allocate_ui_with_layout(Vec2::new(label_w, 20.0), Layout::left_to_right(Align::Center), |ui| {
                 ui.set_width(label_w);
-                ui.label(RichText::new(text).size(look::SMALL).color(p.muted));
+                ui.label(RichText::new(text).size(theme::text::SMALL).color(p.muted));
             });
         };
         // The server's model list after a test, or the stored id.
@@ -229,7 +230,7 @@ impl AiView {
                 }
             } else {
                 let mut pick = None;
-                egui::ComboBox::from_id_salt("ai-model")
+                widgets::combo("ai-model")
                     .selected_text(if current.is_empty() { "Pick a model".to_string() } else { current.clone() })
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
@@ -249,7 +250,7 @@ impl AiView {
         .on_hover_text(if current.is_empty() { String::new() } else { ai.vision_label(&current) });
         ui.horizontal(|ui| {
             label(ui, "Mode");
-            egui::ComboBox::from_id_salt(("ai-preset", kind)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
+            widgets::combo(("ai-preset", kind)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
                 for pr in &list {
                     if ui.selectable_label(pr.id == cur.id, &pr.name).on_hover_text(&pr.description).clicked() {
                         pick = Some(pr.id.clone());
@@ -259,7 +260,7 @@ impl AiView {
         });
         ui.horizontal(|ui| {
             ui.add_space(label_w + ui.spacing().item_spacing.x);
-            ui.add(egui::Label::new(RichText::new(&cur.description).size(look::SMALL).color(p.faint)).wrap());
+            ui.add(egui::Label::new(RichText::new(&cur.description).size(theme::text::SMALL).color(p.faint)).wrap());
         });
         if let Some(id) = pick {
             self.set_preset(kind, &id);
@@ -275,7 +276,7 @@ impl AiView {
         let busy = core.ai.busy();
         let w = ui.available_width();
         ui.horizontal(|ui| {
-            ui.spacing_mut().interact_size.y = look::CONTROL_H;
+            ui.spacing_mut().interact_size.y = theme::size::CONTROL;
             if busy {
                 let status = match &core.ai.phase {
                     Phase::Idle => String::new(),
@@ -290,16 +291,17 @@ impl AiView {
                 if !matches!(core.ai.phase, Phase::Preview { .. }) {
                     ui.spinner();
                 }
-                ui.add_sized(Vec2::new((w - 120.0).max(60.0), look::CONTROL_H), egui::Label::new(RichText::new(status).size(look::SMALL).color(p.muted)).truncate());
+                ui.add_sized(Vec2::new((w - 120.0).max(60.0), theme::size::CONTROL), egui::Label::new(RichText::new(status).size(theme::text::SMALL).color(p.muted)).truncate());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(78.0, look::CONTROL_H))).clicked() {
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
                         core.ai.cancel();
                     }
                 });
             } else {
                 let ready = subject.a.is_some();
                 let what = if roi.is_some() { "the region" } else if subject.kind.is_pair() { "A and B" } else if subject.kind.is_video() { "the frame on screen" } else { "the whole image" };
-                let resp = look::primary(ui, &p, "Run AI review", ready, w).on_hover_text(format!("Send {what} to your AI server ({})", crate::ui::commands::Command::RunAi.shortcut()));
+                let run = ui.allocate_ui_with_layout(Vec2::new(w, theme::size::CONTROL), Layout::top_down_justified(Align::Center), |ui| widgets::primary_button_enabled(ui, &p, ready, "Run AI review")).inner;
+                let resp = run.on_hover_text(format!("Send {what} to your AI server ({})", crate::ui::commands::Command::RunAi.shortcut()));
                 if resp.clicked() {
                     self.run(core, subject, roi, metrics);
                 }
@@ -307,7 +309,7 @@ impl AiView {
         });
         let server_key = core.ai.endpoint().map(|e| e.server_key()).unwrap_or_default();
         let note = if core.ai.settings.needs_confirmation(&server_key) { "You see exactly what is sent before it leaves this computer." } else { "Sends without a preview to this server (Settings > AI review to change)." };
-        ui.label(RichText::new(format!("{}  {note}", I::SHIELD_CHECK)).size(look::CAPTION).color(p.faint));
+        ui.label(RichText::new(format!("{}  {note}", I::SHIELD_CHECK)).size(theme::text::CAPTION).color(p.faint));
     }
 
     fn live(&mut self, ui: &mut Ui, core: &mut Core) {
@@ -327,7 +329,7 @@ impl AiView {
         }
         ui.label(RichText::new(meta).size(11.0).color(p.faint));
         if !live.reasoning.is_empty() {
-            look::group(RichText::new("Model reasoning").size(look::SMALL), &core.pal).id_salt("ai-live-reasoning").default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Model reasoning").size(theme::text::SMALL)).icon(widgets::collapse_caret).id_salt("ai-live-reasoning").default_open(false).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&live.reasoning).size(11.5).color(p.muted)).wrap());
             });
         }
@@ -355,7 +357,7 @@ impl AiView {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut pick = None;
                 let text = format!("{} of {count}", shown + 1);
-                egui::ComboBox::from_id_salt("ai-history").selected_text(text).width(90.0).show_ui(ui, |ui| {
+                widgets::combo("ai-history").selected_text(text).width(90.0).show_ui(ui, |ui| {
                     ui.set_min_width(260.0);
                     for (i, r) in core.ai.records(key).iter().enumerate().rev() {
                         let state = match &r.outcome {
@@ -456,7 +458,7 @@ impl AiView {
             ui.label(RichText::new(txt).size(11.5).color(col));
         }
         if !res.reasoning.is_empty() {
-            look::group(RichText::new("Model reasoning").size(look::SMALL), p).id_salt(("ai-reasoning", &rec.when)).default_open(false).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Model reasoning").size(theme::text::SMALL)).icon(widgets::collapse_caret).id_salt(("ai-reasoning", &rec.when)).default_open(false).show(ui, |ui| {
                 ui.add(egui::Label::new(RichText::new(&res.reasoning).size(11.5).color(p.muted)).wrap());
             });
         }
@@ -695,7 +697,7 @@ fn finding_row(ui: &mut Ui, p: &Palette, i: usize, f: &lumen_ai::Finding) -> egu
 }
 
 fn raw_text(ui: &mut Ui, p: &Palette, title: &str, text: &str) {
-    look::group(RichText::new(title).size(look::SMALL), p).id_salt(("ai-raw", title, text.len())).default_open(false).show(ui, |ui| {
+    egui::CollapsingHeader::new(RichText::new(title).size(theme::text::SMALL)).icon(widgets::collapse_caret).id_salt(("ai-raw", title, text.len())).default_open(false).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(("ai-raw-scroll", title)).max_height(220.0).show(ui, |ui| {
             ui.add(egui::Label::new(RichText::new(text).monospace().size(10.5).color(p.muted)).wrap());
         });

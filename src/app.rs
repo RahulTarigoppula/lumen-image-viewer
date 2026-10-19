@@ -2585,12 +2585,14 @@ impl eframe::App for App {
                         });
                     });
                 egui::Panel::bottom("status")
-                    .exact_size(26.0)
-                    .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(12, 4)))
+                    .exact_size(crate::ui::theme::size::STATUS_BAR)
+                    .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(12, 0)))
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            ui.label(RichText::new(self.browser.status_text(&self.core)).size(12.0).color(p.muted));
+                            ui.label(RichText::new(self.browser.status_text(&self.core)).size(crate::ui::theme::text::SMALL).color(p.muted));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Thumbnail size at the far right (Explorer and Lightroom put it there).
+                                self.browser.status_size_slider(ui, &mut self.core);
                                 if !crate::analysis_ui::network_badge(ui, &self.core) {
                                     ui.label(RichText::new(format!("{} Offline & private", I::SHIELD_CHECK)).size(11.5).color(p.faint))
                                         .on_hover_text(crate::analysis_ui::privacy_note(&self.core));

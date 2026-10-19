@@ -496,17 +496,6 @@ fn slider_box<N: egui::emath::Numeric>(ui: &mut Ui, slider: widgets::Slider<'_, 
     .inner
 }
 
-/// An `egui::Slider` in the same box (the AI page still uses egui's slider).
-#[cfg(feature = "ai")]
-fn slider_box_resp(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
-    let w = 260.0f32.min(ui.available_width()).max(150.0);
-    ui.allocate_ui_with_layout(Vec2::new(w, 24.0), Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().slider_width = w - 80.0;
-        ui.add(slider)
-    })
-    .inner
-}
-
 fn toggle_row(ui: &mut Ui, p: &Palette, title: &str, desc: &str, value: &mut bool) -> bool {
     row(ui, p, title, desc, |ui| toggle(ui, p, value).changed())
 }
@@ -1129,13 +1118,14 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             };
             row(ui, p, "API key", key_desc, |ui| {
                 if has_key {
-                    if ui.button(format!("{}  Forget key", I::TRASH)).clicked() {
+                    if widgets::secondary_button(ui, &format!("{}  Forget key", I::TRASH)).clicked() {
                         ai.forget_key();
                     }
                     status_chip(ui, p, true, "Key saved", "");
                 } else {
                     let save = ui
-                        .add_enabled(ai.typed_key(), egui::Button::new("Save"))
+                        .add_enabled_ui(ai.typed_key(), |ui| widgets::secondary_button(ui, "Save"))
+                        .inner
                         .on_hover_text("Keep the key in Windows Credential Manager for next time");
                     let resp = ui.add(egui::TextEdit::singleline(&mut ai.key_edit).password(true).hint_text("none").desired_width(170.0));
                     if save.clicked() {
@@ -1154,7 +1144,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             }
             row(ui, p, "Test connection", "Checks the server, lists its models and picks one that accepts images", |ui| {
                 let testing = ai.testing();
-                if ui.add_enabled(!testing, egui::Button::new(RichText::new(format!("{}  Test connection", I::PLUGS_CONNECTED)).color(Color32::WHITE)).fill(crate::analysis_ui::look::accent_fill(p))).clicked() {
+                if widgets::primary_button_enabled(ui, p, !testing, &format!("{}  Test connection", I::PLUGS_CONNECTED)).clicked() {
                     ai.test_connection();
                 }
                 if testing {
@@ -1177,7 +1167,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                         };
                         ui.allocate_ui_with_layout(Vec2::new(62.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
                             ui.set_width(62.0);
-                            ui.label(RichText::new(step.label()).size(12.0).color(p.text));
+                            ui.label(RichText::new(step.label()).size(text::SMALL).color(p.text));
                         });
                         if let Some(s) = done {
                             let ms = if s.elapsed_ms > 0 { format!("  ({} ms)", s.elapsed_ms) } else { String::new() };
@@ -1196,19 +1186,19 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             let current = ai.settings.model.clone().unwrap_or_default();
             let desc = if current.is_empty() { "Test connection lists the server's models and picks one".to_string() } else { ai.vision_label(&current) };
             row(ui, p, "Model", &desc, |ui| {
-                if ui.add_enabled(ai.probing().is_none() && !current.is_empty(), egui::Button::new("Test vision")).on_hover_text("Sends a tiny gray test image to check that the model accepts images").clicked() {
+                if ui.add_enabled_ui(ai.probing().is_none() && !current.is_empty(), |ui| widgets::secondary_button(ui, "Test vision")).inner.on_hover_text("Sends a tiny gray test image to check that the model accepts images").clicked() {
                     ai.probe_vision(&current);
                 }
-                if ui.button(I::ARROW_CLOCKWISE).on_hover_text("Refresh the model list").clicked() {
+                if widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Refresh the model list", false).clicked() {
                     ai.refresh_models();
                 }
                 let mut pick = None;
-                egui::ComboBox::from_id_salt("settings-ai-model")
+                widgets::combo("settings-ai-model")
                     .selected_text(if current.is_empty() { "None".to_string() } else { current.clone() })
                     .width(230.0)
                     .show_ui(ui, |ui| {
                         if ai.models.is_empty() {
-                            ui.label(RichText::new("Press Test connection to list the models").size(12.0).color(p.muted));
+                            ui.label(RichText::new("Press Test connection to list the models").size(text::SMALL).color(p.muted));
                         }
                         for m in &ai.models {
                             let mut text = format!("{}  ({})", m.id, ai.vision_label(&m.id));
@@ -1240,7 +1230,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
     card(ui, p, |ui| {
         ui.add_enabled_ui(enabled, |ui| {
             row(ui, p, "Port", "Used when the address has no port (vLLM's default is 8000)", |ui| {
-                let r = ui.add(egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
+                let r = widgets::value_box_w(ui, 80.0, egui::DragValue::new(&mut ai.settings.port).range(1..=65535));
                 if r.changed() {
                     ai.port_edited();
                 }
@@ -1265,18 +1255,19 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
     });
 
     ui.add_enabled_ui(enabled, |ui| {
-        egui::CollapsingHeader::new(RichText::new("Advanced options").size(12.5).color(p.muted)).id_salt("settings-ai-advanced").default_open(false).show(ui, |ui| {
+        egui::CollapsingHeader::new(RichText::new("Advanced options").font(text::subtitle()).color(p.muted)).icon(widgets::collapse_caret).id_salt("settings-ai-advanced").default_open(false).show(ui, |ui| {
             let s = &mut ai.settings;
             let mut changed = false;
             card(ui, p, |ui| {
                 let num = |ui: &mut Ui, title: &str, desc: &str, v: &mut u32, range: std::ops::RangeInclusive<u32>, suffix: &str| {
-                    row(ui, p, title, desc, |ui| ui.add(egui::DragValue::new(v).range(range).suffix(suffix)).changed())
+                    row(ui, p, title, desc, |ui| widgets::value_box_w(ui, 80.0, egui::DragValue::new(v).range(range).suffix(suffix)).changed())
                 };
                 changed |= num(ui, "Connect timeout", "TCP and TLS connection", &mut s.timeout_connect_s, 1..=60, " s");
                 changed |= num(ui, "First token timeout", "Covers model warm-up and reading large images", &mut s.timeout_first_token_s, 5..=1800, " s");
                 changed |= num(ui, "Total timeout", "The whole request", &mut s.timeout_total_s, 10..=3600, " s");
                 changed |= num(ui, "Max output tokens", "Longer answers need more; reports need about 1500", &mut s.max_completion_tokens, 64..=16384, "");
-                changed |= row(ui, p, "Temperature", "Low values give repeatable scores", |ui| slider_box_resp(ui, egui::Slider::new(&mut s.temperature, 0.0..=1.5).fixed_decimals(2)).changed());
+                let default_temp = lumen_ai::AiSettings::default().temperature;
+                changed |= row(ui, p, "Temperature", "Low values give repeatable scores", |ui| slider_box(ui, widgets::Slider::new(&mut s.temperature, 0.0..=1.5).step_by(0.05).fixed_decimals(2).default_value(default_temp)).changed());
                 changed |= num(ui, "Overview size", "Long side of the downscaled full view", &mut s.max_side_overview, 512..=4096, " px");
                 changed |= num(ui, "Tile size", "Side of native-resolution ROI tiles (multiple of 32)", &mut s.tile_side, 256..=2048, " px");
                 changed |= num(ui, "Images per request", "Must not exceed the server's --limit-mm-per-prompt", &mut s.max_images, 1..=16, "");
@@ -1307,7 +1298,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                     let n = s.trusted_servers.len();
                     let desc = format!("{n} server(s) skip the send preview: {}", s.trusted_servers.join(", "));
                     changed |= row(ui, p, "Trusted servers", &desc, |ui| {
-                        let c = ui.button("Clear").clicked();
+                        let c = widgets::secondary_button(ui, "Clear").clicked();
                         if c {
                             s.trusted_servers.clear();
                         }

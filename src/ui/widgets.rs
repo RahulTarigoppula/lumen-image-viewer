@@ -10,7 +10,7 @@
 //! | Slider (+ value box, double-click reset, centre fill) | [`Slider`] (drop-in for `egui::Slider`) |
 //! | Number field | [`value_box`] around an `egui::DragValue` |
 //! | Checkbox / radio | [`checkbox`], [`radio`], [`radio_value`] |
-//! | Segmented control | [`segmented`], [`segmented_value`] |
+//! | Segmented control | [`segmented`], [`segmented_value`], [`segmented_with_tips`] |
 //! | Combo / collapsing carets | [`combo`], [`combo_caret`], [`collapse_caret`] |
 //! | Menu rows | [`menu_item`], [`menu_toggle`], [`submenu`] |
 //! | Shortcuts | [`keycap`], [`shortcut_keys`], [`paint_shortcut_keys`] |
@@ -696,6 +696,20 @@ pub fn segmented_value<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options:
         }
     }
     false
+}
+
+/// [`segmented`] with a tooltip per segment (needed when the labels are icons).
+/// `tips` pairs with `labels`; an empty tip shows none.
+pub fn segmented_with_tips(ui: &mut Ui, selected: &mut usize, labels: &[&str], tips: &[&str]) -> bool {
+    let r = ui.scope(|ui| segmented(ui, selected, labels));
+    let rect = r.response.rect;
+    let seg = (rect.width() - 4.0) / labels.len().max(1) as f32;
+    for (i, tip) in tips.iter().enumerate().filter(|(_, t)| !t.is_empty()) {
+        let sr = Rect::from_min_size(egui::pos2(rect.left() + 2.0 + i as f32 * seg, rect.top()), Vec2::new(seg, rect.height()));
+        // Hover-only, so it shows the tip without taking the segment's clicks.
+        ui.interact(sr, r.response.id.with(("tip", i)), Sense::hover()).on_hover_text(*tip);
+    }
+    r.inner
 }
 
 // ====================================================================== carets
