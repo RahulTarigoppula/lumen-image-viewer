@@ -382,11 +382,15 @@ struct TransportFit {
     first_last: bool,
     frame_word: bool,
     duration: bool,
+    /// The time readout (the frame counter stays).
+    time: bool,
+    /// The A-B loop button (Ctrl+L still works).
+    loop_button: bool,
 }
 
 impl Default for TransportFit {
     fn default() -> Self {
-        TransportFit { legend: true, speed_label: true, skip_secs: true, loop_label: true, volume: true, first_last: true, frame_word: true, duration: true }
+        TransportFit { legend: true, speed_label: true, skip_secs: true, loop_label: true, volume: true, first_last: true, frame_word: true, duration: true, time: true, loop_button: true }
     }
 }
 
@@ -888,10 +892,15 @@ impl VideoMode {
             // buttons on the right.
             let avail = ui.available_width();
             let narrow = avail < 900.0;
-            let title = if narrow { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
-            ui.label(RichText::new(title).font(crate::ui::theme::semibold(15.0)));
-            widgets::separator_v(ui);
             let pair = self.sources.len() == 2;
+            // Very narrow: the names become A / B buttons; with two videos
+            // Remove B, Scopes and Save frame join the compare menu.
+            let tiny = avail < 560.0;
+            if !tiny {
+                let title = if narrow { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
+                ui.label(RichText::new(title).font(crate::ui::theme::semibold(15.0)));
+                widgets::separator_v(ui);
+            }
             // Points: back, title, the four buttons on the right, the A / B labels and name buttons' padding.
             let fixed = 34.0 + if narrow { 30.0 } else { 80.0 } + 13.0 + 4.0 * 34.0 + 12.0 + 2.0 * 44.0 + if pair { 34.0 } else { 0.0 };
             let controls = if pair { self.compare_controls_width() } else { 0.0 };
@@ -902,11 +911,19 @@ impl VideoMode {
             for (i, label) in ["A", "B"].iter().enumerate() {
                 let name = self.sources.get(i).map(|s| shorten(&crate::ui::viewer::file_name(&s.path), name_chars));
                 let full = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_default();
-                let name = name.unwrap_or_else(|| if i == 0 { "Open video...".into() } else { "Add B to compare...".into() });
+                let name = name.unwrap_or_else(|| match (i, avail < 700.0) {
+                    (0, _) => "Open video...".into(),
+                    (_, true) => "Add B...".into(),
+                    _ => "Add B to compare...".into(),
+                });
                 let color = if i == 0 { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgb(90, 190, 255) };
-                ui.label(RichText::new(*label).strong().color(color));
-                let tip = if full != name { format!("{full}\nChoose a file") } else { "Choose a file".into() };
-                let resp = ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text(tip);
+                let resp = if tiny {
+                    ui.add(egui::Button::new(RichText::new(*label).strong().color(color)).min_size(Vec2::new(30.0, 24.0))).on_hover_text(if full.is_empty() { name.clone() } else { format!("{full}\nChoose a file") })
+                } else {
+                    ui.label(RichText::new(*label).strong().color(color));
+                    let tip = if full != name { format!("{full}\nChoose a file") } else { "Choose a file".into() };
+                    ui.add(egui::Button::new(RichText::new(name).size(12.5)).min_size(Vec2::new(60.0, 24.0))).on_hover_text(tip)
+                };
                 if resp.clicked() {
                     let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
                     if let Some(f) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_file() {
@@ -918,17 +935,31 @@ impl VideoMode {
                         self.add_source(&f, &core.ctx, &mut None);
                     }
                 }
-                if i == 1 && self.sources.len() == 2 && widgets::icon_button(ui, I::X, "Remove B", false).clicked() {
-                    self.sources.truncate(1);
-                    self.sources[0].player.send(Cmd::Native(false));
+                if i == 1 && self.sources.len() == 2 && !tiny && widgets::icon_button(ui, I::X, "Remove B", false).clicked() {
+                    self.remove_b();
                 }
             }
             if pair {
                 widgets::separator_v(ui);
-                if compact {
+                if compact || tiny {
                     let r = ui.menu_button(RichText::new(format!("{}  {}", self.mode.icon(), I::CARET_DOWN)).size(15.0), |ui| {
                         ui.set_min_width(220.0);
                         self.compare_controls(ui, &p, true);
+                        if tiny {
+                            ui.separator();
+                            if ui.add(egui::Button::new(format!("{}   Scopes", I::WAVEFORM)).selected(self.show_scopes).shortcut_text("F2")).clicked() {
+                                self.show_scopes = !self.show_scopes;
+                                ui.close();
+                            }
+                            if ui.add(egui::Button::new(format!("{}   Save frame as PNG", I::CAMERA)).shortcut_text("Ctrl+S")).clicked() {
+                                ui.close();
+                                self.snapshot(false, core);
+                            }
+                            if ui.button(format!("{}   Remove B", I::X)).clicked() {
+                                ui.close();
+                                self.remove_b();
+                            }
+                        }
                     });
                     r.response.on_hover_text(format!("{}: compare mode, B offset", self.mode.label()));
                 } else {
@@ -940,15 +971,22 @@ impl VideoMode {
                 if widgets::icon_button(ui, I::INFO, "Info & metrics (I)", self.show_info).clicked() {
                     self.show_info = !self.show_info;
                 }
-                if widgets::icon_button(ui, I::WAVEFORM, "Scopes (F2)", self.show_scopes).clicked() {
+                if !(tiny && pair) && widgets::icon_button(ui, I::WAVEFORM, "Scopes (F2)", self.show_scopes).clicked() {
                     self.show_scopes = !self.show_scopes;
                 }
-                if widgets::icon_button(ui, I::CAMERA, "Save frame as PNG (Ctrl+S)", false).clicked() {
+                if !(tiny && pair) && widgets::icon_button(ui, I::CAMERA, "Save frame as PNG (Ctrl+S)", false).clicked() {
                     self.snapshot(false, core);
                 }
             });
         });
         keep
+    }
+
+    fn remove_b(&mut self) {
+        if self.sources.len() == 2 {
+            self.sources.truncate(1);
+            self.sources[0].player.send(Cmd::Native(false));
+        }
     }
 
     /// Points the compare controls take in the top bar.
@@ -1491,18 +1529,22 @@ impl VideoMode {
             widgets::separator_v(ui);
             let a = &self.sources[0];
             let (time, frame) = self.position_text(fit.duration, fit.frame_word);
-            ui.label(RichText::new(time).monospace().color(p.text)).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
-            ui.add_space(6.0);
+            if fit.time {
+                ui.label(RichText::new(time).monospace().color(p.text)).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
+                ui.add_space(6.0);
+            }
             let fr = ui.add(egui::Button::new(RichText::new(frame).monospace().size(12.0)).frame(false)).on_hover_text("Go to frame or time (G)");
             if fr.clicked() {
                 self.goto = Some(String::new());
             }
-            widgets::separator_v(ui);
             // A-B loop
-            let lab = self.loop_label();
-            let text = if fit.loop_label { format!("{} {lab}", I::REPEAT) } else { I::REPEAT.to_string() };
-            if ui.add(egui::Button::new(RichText::new(text).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
-                self.toggle_loop();
+            if fit.loop_button {
+                widgets::separator_v(ui);
+                let lab = self.loop_label();
+                let text = if fit.loop_label { format!("{} {lab}", I::REPEAT) } else { I::REPEAT.to_string() };
+                if ui.add(egui::Button::new(RichText::new(text).size(12.0)).selected(self.loop_ab.1.is_some())).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
+                    self.toggle_loop();
+                }
             }
             if fit.legend {
                 widgets::separator_v(ui);
@@ -1577,8 +1619,10 @@ impl VideoMode {
             let (time, frame) = self.position_text(f.duration, f.frame_word);
             let mut w = 2.0 * icon + 34.0 + s + sep;
             w += if f.first_last { 2.0 * icon } else { 0.0 } + if f.skip_secs { 2.0 * icon } else { 0.0 };
-            w += text_w(&time, mono.clone()) + s + 6.0 + text_w(&frame, FontId::monospace(12.0)) + pad + s + sep;
-            w += if f.loop_label { text_w(&format!("{} {}", I::REPEAT, self.loop_label()), small.clone()) } else { text_w(I::REPEAT, small.clone()) } + pad + s;
+            w += if f.time { text_w(&time, mono.clone()) + s + 6.0 } else { 0.0 } + text_w(&frame, FontId::monospace(12.0)) + pad + s;
+            if f.loop_button {
+                w += sep + if f.loop_label { text_w(&format!("{} {}", I::REPEAT, self.loop_label()), small.clone()) } else { text_w(I::REPEAT, small.clone()) } + pad + s;
+            }
             if f.legend {
                 let psnr = if self.analysis.is_some() { 23.0 + text_w("PSNR-Y (20-60 dB)", FontId::proportional(11.0)) } else { 0.0 };
                 w += sep + 6.0 + 3.0 * (19.0 + text_w("B", FontId::proportional(11.0))) + psnr;
@@ -1595,7 +1639,7 @@ impl VideoMode {
             w + 12.0
         };
         let mut f = TransportFit::default();
-        for step in 0..8 {
+        for step in 0..10 {
             if width(&f) <= avail {
                 break;
             }
@@ -1607,7 +1651,9 @@ impl VideoMode {
                 4 => f.volume = false,
                 5 => f.first_last = false,
                 6 => f.frame_word = false,
-                _ => f.duration = false,
+                7 => f.duration = false,
+                8 => f.loop_button = false,
+                _ => f.time = false,
             }
         }
         f
@@ -2031,6 +2077,8 @@ impl VideoMode {
             }
             match k {
                 Key::Escape if self.was_editing => {}
+                // Esc with a menu or a list open only closes it (egui does).
+                Key::Escape if egui::Popup::is_any_open(ctx) => {}
                 Key::Escape => keep = false,
                 Key::Space | Key::K if !m.ctrl => self.toggle_play(),
                 Key::Period => self.step(1),

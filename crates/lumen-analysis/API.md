@@ -185,7 +185,8 @@ job.cancel();             // or drop the handle: dropping an unfinished job canc
 
 A new `submit_image` cancels the previous image job (same for video).
 `job.generation` vs `analyzer.latest_generation()` tells whether a handle is
-stale. Blocking variant (tests, batch): `job.wait() -> Result<AnalysisReport, String>`,
+stale. Blocking variant (tests, batch): `job.wait() -> Result<AnalysisReport, String>`
+(or `job.wait_timeout(limit)`, which gives up and cancels after `limit` without an event),
 or `job::run_image(&pool, &spec, &view_a, Some(&view_b), &JobControl::default(), &|ev| ...)`.
 
 ## 4. Video range job
@@ -240,7 +241,7 @@ let mut job = analyzer.submit_video(spec, rx);
 
 ## 6. Heatmaps
 
-`Heatmap { width, height, data: Vec<f32>, label, unit, fixed_range,
+`Heatmap { width, height, data: Vec<f32>, label, unit, fixed_range, min_span,
 colormap, invert, pool, x0, y0, cell_w, cell_h }`. Cell `(i, j)` covers image
 pixels `x0 + i * cell_w ..` (frame coordinates, ROI offset included). SSIM
 maps start at (5, 5) (valid windows); tile maps have 64 px cells; NaN means
@@ -257,8 +258,13 @@ let hover = m.value_at(img_x, img_y);               // Option<f32> for the reado
 let bar = lumen_analysis::heatmap::legend(opts.colormap, 256, opts.invert);
 ```
 
-- `RangeMode::Auto` = p1..p99 (symmetric for signed maps), `Fixed` = the
-  metric default (`fixed_range`, e.g. Delta-E 0..10, SSIM 0.5..1), `User { lo, hi }`.
+- `RangeMode::Auto`: maps with an ideal value (`min_span > 0`: differences,
+  Delta-E, SSIM, perceptual maps) run from that value (the clean end of
+  `fixed_range`) to the 99th percentile (SSIM: 1st), at least `min_span` wide,
+  so near-identical images look nearly clean and real differences still fill
+  the colormap; other maps p1..p99. Symmetric for signed maps. `Fixed` = the
+  metric default (`fixed_range`: Delta-E 0..10, abs diff 0..64 levels, signed
+  diff -32..32, SSIM 0.7..1, Butteraugli 0..3, FLIP 0..1), `User { lo, hi }`.
 - `threshold: Some(t)` draws only cells at or beyond `t` (below `t` when
   `invert`), the rest transparent.
 - Colormaps: `Magma` (default), `Viridis`, `Turbo`, `Gray`, `RdBu`
