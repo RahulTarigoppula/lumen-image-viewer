@@ -1247,7 +1247,10 @@ impl Viewer {
                 menu_item(ui, Command::Delete, ev);
             };
             if screen_h < 470.0 {
-                egui::ScrollArea::vertical().max_height((screen_h - 24.0).max(120.0)).show(ui, rows);
+                // A visible bar and a fade on the cut edge say there is more.
+                widgets::visible_scrollbars(ui);
+                let out = egui::ScrollArea::vertical().max_height((screen_h - 24.0).max(120.0)).show(ui, rows);
+                scroll_fades(ui, &out, theme::palette(ui.ctx()).raised);
             } else {
                 rows(ui);
             }
@@ -1902,6 +1905,7 @@ impl Viewer {
                 .or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions()))
                 .unwrap_or((base.image.width(), base.image.height()));
             let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &base.histogram, preview: Some(&base.image) };
+            widgets::visible_scrollbars(ui);
             let out = egui::ScrollArea::vertical().id_salt("tool-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
                 ui.set_max_width(w);
                 t.tool.ui(ui, &cx)

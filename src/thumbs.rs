@@ -7,7 +7,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use egui::TextureHandle;
 use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,9 @@ pub enum Thumb<'a> {
 struct Job {
     key: ThumbKey,
     seq: u64,
+    /// Request generation: a result whose generation is no longer the pending
+    /// one (the path was forgotten meanwhile) is dropped.
+    gen: u64,
 }
 
 struct Shared {
@@ -68,15 +71,17 @@ struct Shared {
     min_seq: AtomicU64,
 }
 
-type ThumbResult = (ThumbKey, Result<(image::RgbaImage, Option<(u32, u32)>), String>);
+type ThumbResult = (ThumbKey, u64, Result<(image::RgbaImage, Option<(u32, u32)>), String>);
 
 pub struct ThumbService {
     shared: Arc<Shared>,
     rx: Receiver<ThumbResult>,
     textures: LruCache<ThumbKey, ThumbInfo>,
-    pending: HashSet<ThumbKey>,
+    /// Requested and not finished, with the generation of the request.
+    pending: HashMap<ThumbKey, u64>,
     failed: HashSet<ThumbKey>,
     seq: u64,
+    gen: u64,
     ctx: egui::Context,
     cache_dir: PathBuf,
 }
@@ -116,9 +121,10 @@ impl ThumbService {
             rx,
             // ~400 x (384 px RGBA + mips) is about 300 MB of VRAM: plenty for any grid.
             textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             failed: HashSet::new(),
             seq: 0,
+            gen: 0,
             ctx,
             cache_dir,
         }
@@ -132,7 +138,12 @@ impl ThumbService {
     pub fn begin_frame(&mut self) {
         // Upload finished thumbnails (bounded per frame to keep scrolling smooth).
         let started = std::time::Instant::now();
-        while let Ok((key, res)) = self.rx.try_recv() {
+        while let Ok((key, gen, res)) = self.rx.try_recv() {
+            // A result for a request that was forgotten while it ran (the file was
+            // moved, renamed or rewritten meanwhile) says nothing about the file now.
+            if self.pending.get(&key) != Some(&gen) {
+                continue;
+            }
             self.pending.remove(&key);
             match res {
                 Ok((img, dims)) => {
@@ -174,14 +185,15 @@ impl ThumbService {
         }
         self.seq += 1;
         let mut jobs = self.shared.jobs.lock();
-        if self.pending.contains(key) {
+        if self.pending.contains_key(key) {
             if let Some(j) = jobs.iter_mut().find(|j| &j.key == key) {
                 j.seq = self.seq;
             }
             return Thumb::Pending;
         }
-        self.pending.insert(key.clone());
-        jobs.push(Job { key: key.clone(), seq: self.seq });
+        self.gen += 1;
+        self.pending.insert(key.clone(), self.gen);
+        jobs.push(Job { key: key.clone(), seq: self.seq, gen: self.gen });
         self.shared.cv.notify_one();
         Thumb::Pending
     }
@@ -202,6 +214,9 @@ impl ThumbService {
         self.failed.clear();
     }
 
+    /// The file at `path` changed, appeared or went away: drop its texture, cached
+    /// file, failure mark and any request in flight, so the next request starts over.
+    /// File operations call this for both the old and the new path.
     pub fn forget(&mut self, path: &Path) {
         let keys: Vec<ThumbKey> = self.textures.iter().filter(|(k, _)| k.path == path).map(|(k, _)| k.clone()).collect();
         for k in keys {
@@ -209,6 +224,14 @@ impl ThumbService {
             let _ = std::fs::remove_file(self.cache_dir.join(k.hash_name()));
         }
         self.failed.retain(|k| k.path != path);
+        self.pending.retain(|k, _| k.path != path);
+        self.shared.jobs.lock().retain(|j| j.key.path != path);
+    }
+
+    /// Retry every thumbnail that failed in `dir` (Refresh): a file that could not be
+    /// read a moment ago (still being written, moved away and back) may be fine now.
+    pub fn retry_failed_in(&mut self, dir: &Path) {
+        self.failed.retain(|k| k.path.parent() != Some(dir));
     }
 
     pub fn clear_disk_cache(&self) -> std::io::Result<u64> {
@@ -241,12 +264,12 @@ fn worker(s: Arc<Shared>, tx: Sender<ThumbResult>, ctx: egui::Context, dir: Path
             }
         };
         if job.seq < s.min_seq.load(Ordering::Relaxed) {
-            let _ = tx.send((job.key, Err("stale".into())));
+            let _ = tx.send((job.key, job.gen, Err("stale".into())));
             continue;
         }
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make_thumb(&job.key, &s, &dir)))
             .unwrap_or_else(|_| Err("panic".into()));
-        let _ = tx.send((job.key, res));
+        let _ = tx.send((job.key, job.gen, res));
         ctx.request_repaint();
     }
 }

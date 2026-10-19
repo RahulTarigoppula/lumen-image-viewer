@@ -53,7 +53,7 @@ fn poll(job: &Option<Job>) -> Polled {
 
 /// Output folder + file name editor. Returns the full path when valid.
 fn target_ui(ui: &mut Ui, p: &Palette, dir: &mut Option<PathBuf>, name: &mut String, ext: &str) -> Option<PathBuf> {
-    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
         ui.label("File name");
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(name).desired_width(180.0));
@@ -307,7 +307,7 @@ impl MultiPageWindow {
                 crate::ui::widgets::radio_value(ui, &mut s.format, f, f.label());
             }
             ui.add_space(4.0);
-            egui::Grid::new("mp-opts").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| match s.format {
+            egui::Grid::new("mp-opts").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| match s.format {
                 MultiFormat::Pdf => {
                     ui.label("Page size");
                     ui.horizontal(|ui| {
@@ -351,7 +351,7 @@ impl MultiPageWindow {
                         ui.end_row();
                     }
                     ui.label("Background");
-                    ui.color_edit_button_srgb(&mut s.bg);
+                    crate::ui::widgets::color_button(ui, &mut s.bg);
                     ui.end_row();
                     ui.label("");
                     hint(ui, p, "Loops forever. Every frame is fitted to the first image's shape.");
@@ -606,7 +606,7 @@ impl StripWindow {
     fn settings(&mut self, ui: &mut Ui, p: &Palette, limit: Option<&str>) {
         let s = &mut self.s;
         card(ui, p, I::COLUMNS, "Layout", |ui| {
-            egui::Grid::new("st-layout").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("st-layout").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Direction");
                 ui.horizontal(|ui| {
                     crate::ui::widgets::segmented_value(ui, &mut s.dir, &[(StripDir::Horizontal, "Horizontal"), (StripDir::Vertical, "Vertical")]);
@@ -645,7 +645,7 @@ impl StripWindow {
         });
         ui.add_space(8.0);
         card(ui, p, I::FLOPPY_DISK, "Save as", |ui| {
-            egui::Grid::new("st-fmt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("st-fmt").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Format");
                 crate::ui::widgets::combo("st-format").selected_text(if s.format == SaveFormat::WebP { "WebP" } else { s.format.label() }).show_ui(ui, |ui| {
                     for f in [SaveFormat::Jpeg, SaveFormat::Png, SaveFormat::WebP, SaveFormat::Tiff, SaveFormat::Bmp] {

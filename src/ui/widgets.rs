@@ -6,16 +6,23 @@
 //! |---|---|
 //! | Window with title row and close button | [`app_window`] |
 //! | Modal dialog | [`modal`], [`modal_title`], [`modal_body`], [`dialog_buttons`], [`show_confirm`], [`show_prompt`] |
+//! | Label / control form rows | [`form_row`] |
+//! | Scroll bars that show when content is cut | [`visible_scrollbars`] (already on in windows and modals) |
 //! | Buttons | [`primary_button`], [`danger_button`], [`success_button`], [`secondary_button`], [`icon_button`], [`labeled_icon_button`] |
 //! | Slider (+ value box, double-click reset, centre fill) | [`Slider`] (drop-in for `egui::Slider`) |
 //! | Number field | [`value_box`] around an `egui::DragValue` |
 //! | Checkbox / radio | [`checkbox`], [`radio`], [`radio_value`] |
+//! | Color well with picker | [`color_button`], [`color_button_rgba`] |
 //! | Segmented control | [`segmented`], [`segmented_value`], [`segmented_with_tips`] |
 //! | Combo / collapsing carets | [`combo`], [`combo_caret`], [`collapse_caret`] |
 //! | Menu rows | [`menu_item`], [`menu_toggle`], [`menu_check`], [`submenu`] |
 //! | Shortcuts | [`keycap`], [`shortcut_keys`], [`paint_shortcut_keys`] |
 //! | Section label | [`section_title`] |
 //! | Notifications | [`Toasts`] |
+//!
+//! One rule for the background: a [`modal`] blocks the app until answered and dims
+//! it with the scrim; an [`app_window`] is a floating tool window, the app stays
+//! usable behind it and is never dimmed.
 
 use super::icons as I;
 use super::theme::{self, mix, radius, size, text, Palette};
@@ -208,6 +215,47 @@ pub fn section_title(ui: &mut Ui, p: &Palette, text: &str) {
     ui.add_space(2.0);
 }
 
+/// One form row: `label` in a [`size::LABEL_W`] column, vertically centred on the
+/// control(s) that `add` lays out to its right. Stack rows with
+/// [`FORM_ROW_GAP`] between them (`ui.spacing_mut().item_spacing.y = FORM_ROW_GAP`).
+pub fn form_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(size::LABEL_W, size::CONTROL), Sense::hover());
+        if !label.is_empty() {
+            let p = theme::palette(ui.ctx());
+            let g = ui.painter().layout_no_wrap(label.to_string(), text::body(), p.text);
+            let pos = egui::pos2(rect.left(), rect.center().y - g.size().y / 2.0);
+            ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).galley(pos, g, p.text);
+        }
+        add(ui)
+    })
+    .inner
+}
+
+/// Vertical gap between [`form_row`]s.
+pub const FORM_ROW_GAP: f32 = 6.0;
+
+/// `text` shortened from the start ("...\Photos\2026") so it fits in `max_w`
+/// points in `font`: the end of a path is the part that tells folders apart.
+pub fn elide_start(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
+    let fits = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x <= max_w;
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Binary search the number of leading characters to drop.
+    let (mut lo, mut hi) = (1, chars.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(&format!("...{}", chars[mid..].iter().collect::<String>())) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    format!("...{}", chars[lo.min(chars.len())..].iter().collect::<String>())
+}
+
 /// One key / value row (info panels): 96 pt muted key, 12.5 pt value that wraps,
 /// at least 20 pt tall with 2 pt between rows. (The viewer's info panel uses a
 /// grid of these rows instead; kept for one-off key / value lines.)
@@ -224,6 +272,56 @@ pub fn kv_row(ui: &mut Ui, p: &Palette, key: &str, value: &str) {
             ui.add(egui::Label::new(RichText::new(value).size(12.5)).wrap());
         });
     });
+}
+
+/// Color well: a 36 x 24 pt rounded swatch with a ring that stays visible on any
+/// card (white on a light card, black on a dark one); click for a color picker.
+/// Drop-in for `ui.color_edit_button_srgb`; returns a response marked changed.
+pub fn color_button(ui: &mut Ui, rgb: &mut [u8; 3]) -> Response {
+    let mut c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    let mut resp = color_well(ui, &mut c, egui::color_picker::Alpha::Opaque);
+    if resp.changed() {
+        *rgb = [c.r(), c.g(), c.b()];
+        resp.mark_changed();
+    }
+    resp
+}
+
+/// [`color_button`] for a straight-alpha color (`alpha`: show the alpha slider).
+pub fn color_button_rgba(ui: &mut Ui, c: &mut Color32, alpha: bool) -> Response {
+    color_well(ui, c, if alpha { egui::color_picker::Alpha::OnlyBlend } else { egui::color_picker::Alpha::Opaque })
+}
+
+fn color_well(ui: &mut Ui, c: &mut Color32, alpha: egui::color_picker::Alpha) -> Response {
+    let p = theme::palette(ui.ctx());
+    let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(36.0, size::COMPACT), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let cr = CornerRadius::same(radius::SMALL);
+        let r = rect.shrink(2.0);
+        if c.a() < 255 {
+            // Checker behind a translucent color.
+            let half = Rect::from_min_max(r.min, egui::pos2(r.center().x, r.max.y));
+            painter.rect_filled(r, cr, Color32::WHITE);
+            painter.rect_filled(half, cr, Color32::from_gray(190));
+        }
+        painter.rect_filled(r, cr, *c);
+        let luma = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        let ring = if p.dark { Color32::from_white_alpha(if luma < 60.0 { 110 } else { 60 }) } else { Color32::from_black_alpha(if luma > 200.0 { 110 } else { 40 }) };
+        painter.rect_stroke(r, cr, Stroke::new(1.0, ring), StrokeKind::Inside);
+        if resp.hovered() || resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(radius::CONTROL), Stroke::new(1.0, if resp.has_focus() { p.accent } else { p.muted }), StrokeKind::Inside);
+        }
+    }
+    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        changed = egui::color_picker::color_picker_color32(ui, c, alpha);
+    });
+    if changed {
+        resp.mark_changed();
+    }
+    resp
 }
 
 /// Five clickable stars. Returns a new rating if clicked.
@@ -436,6 +534,15 @@ impl<'a, N: Numeric> Slider<'a, N> {
 
 impl<N: Numeric> egui::Widget for Slider<'_, N> {
     fn ui(self, ui: &mut Ui) -> Response {
+        // One allocation for the rail and the value box: in a `Grid` every widget
+        // added directly takes the next column, which pushed the value box into a
+        // third column past the edge of the card.
+        ui.horizontal(|ui| self.paint(ui)).inner
+    }
+}
+
+impl<N: Numeric> Slider<'_, N> {
+    fn paint(self, ui: &mut Ui) -> Response {
         let p = theme::palette(ui.ctx());
         let (min, max) = (self.range.start().to_f64(), self.range.end().to_f64());
         let (min, max) = (min.min(max), min.max(max));
@@ -1075,10 +1182,17 @@ impl<'a> AppWindow<'a> {
         self
     }
 
-    /// The largest size a window may take on the current screen.
+    /// The size a window opens at, at most, on the current screen: 960 x 720, and
+    /// always [`WINDOW_MARGIN`] less than the app window, so some of the app stays
+    /// visible around it at every interface size.
     pub fn cap(ctx: &egui::Context) -> Vec2 {
+        Self::max(ctx).min(Vec2::new(960.0, 720.0))
+    }
+
+    /// The largest size a window may be resized to.
+    fn max(ctx: &egui::Context) -> Vec2 {
         let s = ctx.content_rect().size();
-        Vec2::new((s.x - 64.0).min(960.0).max(240.0), (s.y - 64.0).min(720.0).max(160.0))
+        (s - 2.0 * WINDOW_MARGIN).max(Vec2::new(240.0, 160.0))
     }
 
     pub fn show<R>(self, ctx: &egui::Context, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
@@ -1106,7 +1220,7 @@ impl<'a> AppWindow<'a> {
             win = win.fixed_size(fs.min(cap)).resizable(false);
         } else if let Some(ds) = self.default_size {
             let min = self.min_size.unwrap_or(Vec2::new(320.0, 240.0)).min(cap);
-            win = win.default_size(ds.min(cap)).min_size(min).max_size(screen.size() - Vec2::splat(32.0)).resizable(true);
+            win = win.default_size(ds.min(cap)).min_size(min).max_size(Self::max(ctx)).resizable(true);
         } else {
             win = win.resizable(false);
             if let Some(w) = self.width {
@@ -1129,6 +1243,7 @@ impl<'a> AppWindow<'a> {
         let body_margin = self.body_margin;
         let anchored = self.anchored;
         let r = win.show(ctx, |ui| {
+            visible_scrollbars(ui);
             if let Some(w) = fixed_w {
                 ui.set_width(w);
             }
@@ -1173,6 +1288,29 @@ impl<'a> AppWindow<'a> {
     }
 }
 
+/// App window that windows and dialogs keep free on each side (left / right, top / bottom).
+pub const WINDOW_MARGIN: Vec2 = Vec2::new(48.0, 40.0);
+
+/// Scroll bars that show whenever content is clipped: a 4 pt handle that widens to
+/// 8 pt on hover, with room reserved so content never runs under it. egui's default
+/// floating bars stay invisible until hovered, so a cut-off row looked like a bug.
+/// [`app_window`] and [`modal`] bodies use this; call it on other scrolling panels.
+pub fn visible_scrollbars(ui: &mut Ui) {
+    let s = &mut ui.spacing_mut().scroll;
+    s.floating = true;
+    s.bar_width = 8.0;
+    s.floating_width = 4.0;
+    s.floating_allocated_width = 10.0;
+    s.bar_inner_margin = 2.0;
+    s.foreground_color = true;
+    s.dormant_background_opacity = 0.0;
+    s.active_background_opacity = 0.0;
+    s.interact_background_opacity = 0.3;
+    s.dormant_handle_opacity = 0.3;
+    s.active_handle_opacity = 0.45;
+    s.interact_handle_opacity = 0.7;
+}
+
 /// Modal dialog: scrim behind it, raised card with radius 12, the window shadow
 /// and a 20 pt margin, `width` points wide. Build the content with [`modal_title`],
 /// [`modal_body`] and [`dialog_buttons`]. Esc / Enter handling is up to the caller.
@@ -1184,8 +1322,9 @@ pub fn modal<R>(ctx: &egui::Context, id: Id, width: f32, add: impl FnOnce(&mut U
         .corner_radius(CornerRadius::same(radius::WINDOW))
         .shadow(theme::window_shadow(&p))
         .inner_margin(Margin::same(theme::space::WINDOW));
-    let w = width.min(ctx.content_rect().width() - 48.0).max(200.0);
+    let w = width.min(ctx.content_rect().width() - 2.0 * WINDOW_MARGIN.x).max(200.0);
     egui::Modal::new(id).frame(frame).backdrop_color(theme::scrim(&p)).show(ctx, |ui| {
+        visible_scrollbars(ui);
         ui.set_width(w);
         add(ui)
     })
@@ -1225,9 +1364,16 @@ pub struct Toast {
 #[derive(Default)]
 pub struct Toasts {
     items: Vec<Toast>,
+    /// Distance of the lowest toast above the bottom of the window (see [`Toasts::set_bottom`]).
+    bottom: Option<f32>,
 }
 
 impl Toasts {
+    /// Keep toasts `pt` points above the bottom of the window, clear of what the
+    /// current mode draws there (the status bar, the viewer's floating bar).
+    pub fn set_bottom(&mut self, pt: f32) {
+        self.bottom = Some(pt);
+    }
     pub fn info(&mut self, t: impl Into<String>) {
         self.push(t.into(), ToastKind::Info, 2.5);
     }
@@ -1253,7 +1399,7 @@ impl Toasts {
             return;
         }
         let screen = ctx.content_rect();
-        let mut y = screen.max.y - 44.0;
+        let mut y = screen.max.y - self.bottom.unwrap_or(44.0);
         let mut animating = false;
         for (i, t) in self.items.iter().enumerate().rev() {
             let (icon, color) = match t.kind {
