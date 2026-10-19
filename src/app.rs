@@ -1197,7 +1197,7 @@ impl App {
             (s.label.clone(), s.done, s.total)
         };
         let more = self.file_jobs.queued.saturating_sub(1);
-        egui::Area::new(egui::Id::new("file_job_progress"))
+        egui::Area::new(egui::Id::unique("file_job_progress"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(16.0, -16.0))
             .interactable(false)
@@ -1659,7 +1659,7 @@ impl App {
     fn gps_confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some((_, dont_ask)) = &mut self.gps_confirm else { return };
         let mut choice: Option<bool> = None;
-        let resp = egui::Modal::new(egui::Id::new("gps-confirm")).show(ctx, |ui| {
+        let resp = egui::Modal::new(egui::Id::unique("gps-confirm")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("Open map in browser?");
             ui.add_space(4.0);
@@ -1785,7 +1785,7 @@ impl App {
             let mut go: Option<PathBuf> = None;
             let title = if t.do_move { "Move to folder" } else { "Copy to folder" };
             let n = t.files.len();
-            egui::Modal::new(egui::Id::new("transfer")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("transfer")).show(ctx, |ui| {
                 ui.set_width(440.0);
                 ui.heading(title);
                 ui.label(RichText::new(format!("{n} item(s)")).color(p.muted));
@@ -2345,12 +2345,6 @@ impl eframe::App for App {
                     match e {
                         ViewerEvent::Command(c) => self.run(c),
                         ViewerEvent::Close => self.run(Command::CloseViewer),
-                        ViewerEvent::FileChanged(p) => {
-                            self.core.loader.invalidate(&p);
-                            self.core.thumbs.forget(&p);
-                            self.viewer.forget_stat(&p);
-                        }
-                        ViewerEvent::IndexChanged(_) => {}
                     }
                 }
             }
@@ -2620,7 +2614,7 @@ fn transfer_job(files: Vec<PathBuf>, dest: PathBuf, do_move: bool) -> FileJob {
         let (mut done, mut errs) = (Vec::new(), Vec::new());
         for (i, f) in files.iter().enumerate() {
             pr.set(i, total);
-            let (d, e) = fileops::transfer(std::slice::from_ref(f), &dest, do_move, fileops::Conflict::Rename);
+            let (d, e) = fileops::transfer(std::slice::from_ref(f), &dest, do_move);
             done.extend(d);
             errs.extend(e);
         }

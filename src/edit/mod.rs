@@ -30,9 +30,6 @@ pub struct CanvasCtx<'a> {
     pub dest: egui::Rect,
     /// Visible viewport (points).
     pub view: egui::Rect,
-    /// Physical screen pixels per image pixel.
-    pub zoom: f32,
-    pub pixels_per_point: f32,
     /// The preview-sized copy the live preview renders from, and its scale
     /// (preview size / full size).
     pub preview: Option<&'a RgbaImage>,
@@ -68,16 +65,6 @@ impl CanvasCtx<'_> {
     }
     pub fn clamp_to_image(&self, p: [f32; 2]) -> [f32; 2] {
         [p[0].clamp(0.0, self.image_size.0 as f32), p[1].clamp(0.0, self.image_size.1 as f32)]
-    }
-    /// Sample the preview image at a full-resolution image position.
-    pub fn sample(&self, p: [f32; 2]) -> Option<[u8; 4]> {
-        let img = self.preview?;
-        let x = (p[0] * self.preview_scale).floor();
-        let y = (p[1] * self.preview_scale).floor();
-        if x < 0.0 || y < 0.0 || x >= img.width() as f32 || y >= img.height() as f32 {
-            return None;
-        }
-        Some(img.get_pixel(x as u32, y as u32).0)
     }
 }
 

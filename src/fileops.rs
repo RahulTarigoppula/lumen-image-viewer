@@ -24,15 +24,10 @@ pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
     trash::delete_all(paths).map_err(|e| anyhow!("Could not move to Recycle Bin: {e}"))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Conflict {
-    Rename,
-    Overwrite,
-    Skip,
-}
-
 /// Copy or move files into `dest_dir`. Returns (source, destination) pairs that succeeded.
-pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool, conflict: Conflict) -> (Vec<(PathBuf, PathBuf)>, Vec<String>) {
+/// A name that already exists in `dest_dir` gets a number appended, so nothing is
+/// ever overwritten and every move can be undone.
+pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool) -> (Vec<(PathBuf, PathBuf)>, Vec<String>) {
     let mut done = Vec::new();
     let mut errors = Vec::new();
     for src in paths {
@@ -42,19 +37,11 @@ pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool, conflict: Con
             errors.push(format!("{}: cannot copy or move a folder into itself", src.display()));
             continue;
         }
-        let mut dst = dest_dir.join(name);
-        if dst == *src {
-            if do_move {
-                continue;
-            }
-            dst = unique_path(&dst);
-        } else if dst.exists() {
-            match conflict {
-                Conflict::Skip => continue,
-                Conflict::Rename => dst = unique_path(&dst),
-                Conflict::Overwrite => {}
-            }
+        let dst = dest_dir.join(name);
+        if dst == *src && do_move {
+            continue;
         }
+        let dst = unique_path(&dst);
         let res = if do_move {
             std::fs::rename(src, &dst).or_else(|_| {
                 // Cross-volume move: copy then delete.

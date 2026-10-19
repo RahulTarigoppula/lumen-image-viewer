@@ -192,9 +192,6 @@ impl MultiFormat {
             MultiFormat::WebP => "webp",
         }
     }
-    pub fn is_animation(self) -> bool {
-        matches!(self, MultiFormat::Gif | MultiFormat::WebP)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -314,7 +311,6 @@ fn write_tiff(files: &[PathBuf], s: &MultiSettings, f: std::fs::File, prog: &Out
         }
         prog.step(1);
     }
-    drop(enc);
     finish_file(out.into_result()?)
 }
 
