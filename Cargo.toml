@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/lumen-core"]
+members = [".", "crates/lumen-core", "crates/lumen-ai"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ repository = "https://github.com/RahulTarigoppula/lumen-image-viewer"
 # that crate's manifest.
 [workspace.dependencies]
 lumen-core = { path = "crates/lumen-core" }
+lumen-ai = { path = "crates/lumen-ai" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp", "ico", "tga", "pnm", "hdr", "exr", "qoi", "dds", "ff", "rayon"] }
 rayon = "1"
 crossbeam-channel = "0.5"

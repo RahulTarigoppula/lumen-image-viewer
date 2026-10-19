@@ -1,0 +1,41 @@
+[package]
+name = "lumen-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Lumen remote AI critique: the only network code in Lumen (OpenAI-compatible vLLM client, prompts, image preparation)"
+publish = false
+
+[lib]
+name = "lumen_ai"
+
+# No egui and no lumen-core: the UI talks to this crate through plain types
+# (RGBA images, strings, a repaint callback) so it stays small and auditable.
+[dependencies]
+# Blocking HTTP on a worker thread; rustls with the Windows certificate store.
+# The connector in client.rs uses ureq's `unversioned` transport API, so the
+# version is pinned to the one it was written against.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+base64 = "0.23.1"
+zeroize = "1.9.1"
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+jpeg-encoder.workspace = true
+ab_glyph.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+fast_image_resize = { version = "6", features = ["rayon", "image"] }
+epaint_default_fonts = "0.37"
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+]
