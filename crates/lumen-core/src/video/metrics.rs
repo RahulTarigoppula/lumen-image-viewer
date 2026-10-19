@@ -1,7 +1,8 @@
 //! Objective quality metrics on native YUV planes (PSNR, SSIM) and simple
-//! scene-change scoring. Pure Rust + rayon; independent of FFmpeg.
-
-use rayon::prelude::*;
+//! scene-change scoring. Pure Rust; independent of FFmpeg. The PSNR and SSIM
+//! kernels delegate to `lumen-analysis` (typed, integer fast paths), and
+//! [`YuvFrame`] is a `lumen_analysis::FrameSource`, so decoded frames can be
+//! fed to analysis jobs without copying.
 
 /// One plane of samples. 8-bit content uses `u8`, high bit depth `u16`.
 #[derive(Clone)]
@@ -20,6 +21,14 @@ pub struct Plane {
 impl Plane {
     pub fn len(&self) -> usize {
         self.width * self.height
+    }
+    /// Borrowed analysis view of the plane.
+    pub fn view(&self) -> lumen_analysis::PlaneView<'_> {
+        use lumen_analysis::frame::Plane as P;
+        match &self.data {
+            PlaneData::U8(v) => lumen_analysis::PlaneView::U8(P { data: v, width: self.width, height: self.height, stride: self.width }),
+            PlaneData::U16(v) => lumen_analysis::PlaneView::U16(P { data: v, width: self.width, height: self.height, stride: self.width }),
+        }
     }
     pub fn get(&self, i: usize) -> u32 {
         match &self.data {
@@ -40,10 +49,27 @@ impl YuvFrame {
     pub fn max_value(&self) -> f64 {
         ((1u64 << self.bit_depth) - 1) as f64
     }
+    /// Analysis view (BT.709 limited range assumed; the decoder does not
+    /// record the matrix). `None` for layouts other than gray or 3 planes.
+    pub fn analysis_view(&self) -> Option<lumen_analysis::FrameView<'_>> {
+        let y = self.planes.first()?.view();
+        let uv = match self.planes.len() {
+            1 => None,
+            3 => Some((self.planes[1].view(), self.planes[2].view())),
+            _ => return None,
+        };
+        lumen_analysis::YuvView::new(y, uv, self.bit_depth).ok().map(lumen_analysis::FrameView::Yuv)
+    }
     pub fn same_layout(&self, other: &YuvFrame) -> bool {
         self.bit_depth == other.bit_depth
             && self.planes.len() == other.planes.len()
             && self.planes.iter().zip(&other.planes).all(|(a, b)| a.width == b.width && a.height == b.height)
+    }
+}
+
+impl lumen_analysis::FrameSource for YuvFrame {
+    fn view(&self) -> lumen_analysis::FrameView<'_> {
+        self.analysis_view().expect("YuvFrame has 1 or 3 planes with a valid chroma layout")
     }
 }
 
@@ -59,42 +85,16 @@ pub struct FrameMetrics {
 
 pub fn mse_plane(a: &Plane, b: &Plane) -> f64 {
     assert_eq!(a.len(), b.len());
-    let w = a.width;
-    let rows: u64 = match (&a.data, &b.data) {
-        (PlaneData::U8(x), PlaneData::U8(y)) => x
-            .par_chunks(w)
-            .zip(y.par_chunks(w))
-            .map(|(ra, rb)| {
-                let mut acc: u64 = 0;
-                for (p, q) in ra.iter().zip(rb) {
-                    let d = *p as i32 - *q as i32;
-                    acc += (d * d) as u64;
-                }
-                acc
-            })
-            .sum(),
-        (PlaneData::U16(x), PlaneData::U16(y)) => x
-            .par_chunks(w)
-            .zip(y.par_chunks(w))
-            .map(|(ra, rb)| {
-                let mut acc: u64 = 0;
-                for (p, q) in ra.iter().zip(rb) {
-                    let d = *p as i64 - *q as i64;
-                    acc += (d * d) as u64;
-                }
-                acc
-            })
-            .sum(),
-        _ => {
-            let mut acc = 0u64;
-            for i in 0..a.len() {
-                let d = a.get(i) as i64 - b.get(i) as i64;
-                acc += (d * d) as u64;
-            }
-            acc
-        }
-    };
-    rows as f64 / a.len().max(1) as f64
+    if let Some(e) = lumen_analysis::metrics::reference::psnr::plane_error(&a.view(), &b.view()) {
+        return e.mse();
+    }
+    // Mixed sample types, or equal length with different shapes (not produced by the decoder).
+    let mut acc = 0u64;
+    for i in 0..a.len() {
+        let d = a.get(i) as i64 - b.get(i) as i64;
+        acc += (d * d) as u64;
+    }
+    acc as f64 / a.len().max(1) as f64
 }
 
 /// Ceiling for reported PSNR (and SSIM in dB). Identical planes have an
@@ -117,58 +117,8 @@ pub fn psnr_from_mse(mse: f64, max: f64) -> f64 {
 
 /// FFmpeg/x264-style SSIM: 8x8 windows at stride 4 built from 4x4 block sums.
 pub fn ssim_plane(a: &Plane, b: &Plane, bit_depth: u32) -> f64 {
-    let w = a.width;
-    let h = a.height;
-    let bw = w / 4;
-    let bh = h / 4;
-    if bw < 2 || bh < 2 {
-        return if mse_plane(a, b) == 0.0 { 1.0 } else { 0.0 };
-    }
     let max = ((1u64 << bit_depth) - 1) as f64;
-    // Per 4x4 block: s1, s2, ss (a²+b²), s12
-    let sums: Vec<[f64; 4]> = (0..bh)
-        .into_par_iter()
-        .flat_map_iter(|by| {
-            (0..bw).map(move |bx| {
-                let mut s = [0f64; 4];
-                for y in 0..4 {
-                    let row = (by * 4 + y) * w + bx * 4;
-                    for x in 0..4 {
-                        let p = a.get(row + x) as f64;
-                        let q = b.get(row + x) as f64;
-                        s[0] += p;
-                        s[1] += q;
-                        s[2] += p * p + q * q;
-                        s[3] += p * q;
-                    }
-                }
-                s
-            })
-        })
-        .collect();
-    let c1 = (0.01 * max).powi(2) * 64.0;
-    let c2 = (0.03 * max).powi(2) * 64.0 * 63.0;
-    let total: f64 = (0..bh - 1)
-        .into_par_iter()
-        .map(|by| {
-            let mut acc = 0.0;
-            for bx in 0..bw - 1 {
-                let mut s = [0f64; 4];
-                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                    let b4 = &sums[(by + dy) * bw + bx + dx];
-                    for k in 0..4 {
-                        s[k] += b4[k];
-                    }
-                }
-                let (s1, s2, ss, s12) = (s[0], s[1], s[2], s[3]);
-                let vars = ss * 64.0 - s1 * s1 - s2 * s2;
-                let covar = s12 * 64.0 - s1 * s2;
-                acc += (2.0 * s1 * s2 + c1) * (2.0 * covar + c2) / ((s1 * s1 + s2 * s2 + c1) * (vars + c2));
-            }
-            acc
-        })
-        .sum();
-    total / ((bw - 1) * (bh - 1)) as f64
+    lumen_analysis::metrics::reference::ssim::ssim_fast_plane(&a.view(), &b.view(), max, &lumen_analysis::CancelToken::new()).unwrap_or(0.0)
 }
 
 pub fn ssim_db(ssim: f64) -> f64 {

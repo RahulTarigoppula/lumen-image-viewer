@@ -1,0 +1,39 @@
+[package]
+name = "lumen-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Lumen analysis: objective image and video quality metrics, heatmaps, jobs, reports and cache"
+publish = false
+
+[lib]
+name = "lumen_analysis"
+
+[dependencies]
+rayon.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tiff.workspace = true
+png = "0.18"
+blake3 = "1.8"
+# v2 perceptual metrics (pure Rust, permissive licenses), on by default.
+fast-ssim2 = { version = "0.9", optional = true, features = ["rayon"] }
+bytemuck = { version = "1.25", optional = true }
+butteraugli = { version = "0.9.3", optional = true }
+flip-rs = { version = "0.1.2", optional = true }
+
+[features]
+default = ["ssimulacra2", "butteraugli", "flip"]
+# SSIMULACRA2 (fast-ssim2, BSD-2-Clause).
+ssimulacra2 = ["dep:fast-ssim2", "dep:bytemuck"]
+# Butteraugli (butteraugli, BSD-3-Clause).
+butteraugli = ["dep:butteraugli"]
+# NVIDIA FLIP (flip-rs, BSD-3-Clause).
+flip = ["dep:flip-rs"]
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = ["Win32_Foundation", "Win32_System_Threading"]
