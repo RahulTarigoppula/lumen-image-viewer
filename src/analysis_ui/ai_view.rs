@@ -595,8 +595,8 @@ impl AiView {
             // finding stays visible wherever the divider is, without being
             // mistaken for one of the other image.
             let twin = pane.twin(panes);
-            let painter = ui.painter().with_clip_rect(pane.clip);
-            let ghost = twin.map(|t| ui.painter().with_clip_rect(t.clip));
+            let painter = Uncovered::new(ui, pane.clip);
+            let ghost = twin.map(|t| Uncovered::new(ui, t.clip));
             let whole = twin.map(|t| pane.clip.union(t.clip)).unwrap_or(pane.clip);
             for (i, f) in report.findings.iter().enumerate() {
                 let Some(s) = f.source.filter(|s| s.label == label) else { continue };
@@ -621,7 +621,7 @@ impl AiView {
                 let tag_w = if twin.is_some() { 26.0 } else { 18.0 };
                 let tag_min = if r.min.y - 18.0 >= whole.min.y { Pos2::new(r.min.x, r.min.y - 18.0) } else { r.min };
                 let tag = Rect::from_min_size(tag_min, Vec2::new(tag_w, 18.0));
-                let tags = ui.painter().with_clip_rect(whole);
+                let tags = Uncovered::new(ui, whole);
                 if pane.clip.contains(tag.center()) || twin.is_none() {
                     tags.rect_filled(tag, CornerRadius::same(3), col);
                     tags.text(tag.center(), Align2::CENTER_CENTER, text, semibold(11.0), Color32::BLACK);
@@ -632,6 +632,40 @@ impl AiView {
                 }
             }
         }
+    }
+}
+
+/// A painter clipped to `clip` minus the controls drawn over the images
+/// (the viewer's toolbar), so finding boxes never cover them.
+struct Uncovered(Vec<egui::Painter>);
+
+impl Uncovered {
+    fn new(ui: &Ui, clip: Rect) -> Self {
+        Uncovered(super::canvas::uncovered(ui.ctx(), clip).into_iter().map(|r| ui.painter().with_clip_rect(r)).collect())
+    }
+    fn rect_filled(&self, r: Rect, c: impl Into<CornerRadius> + Copy, fill: Color32) {
+        self.0.iter().for_each(|p| {
+            p.rect_filled(r, c, fill);
+        });
+    }
+    fn rect_stroke(&self, r: Rect, c: impl Into<CornerRadius> + Copy, s: Stroke, k: egui::StrokeKind) {
+        self.0.iter().for_each(|p| {
+            p.rect_stroke(r, c, s, k);
+        });
+    }
+    fn add(&self, shape: egui::Shape) {
+        self.0.iter().for_each(|p| {
+            p.add(shape.clone());
+        });
+    }
+    fn extend(&self, shapes: Vec<egui::Shape>) {
+        self.0.iter().for_each(|p| p.extend(shapes.clone()));
+    }
+    fn text(&self, pos: Pos2, align: Align2, text: impl ToString, font: egui::FontId, color: Color32) {
+        let text = text.to_string();
+        self.0.iter().for_each(|p| {
+            p.text(pos, align, &text, font.clone(), color);
+        });
     }
 }
 
