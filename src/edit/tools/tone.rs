@@ -1,6 +1,7 @@
 //! Tonal tools: Levels and Curves.
 
-use super::{info, paint_histogram, row, segmented};
+use super::{combo, hint, info, paint_histogram, row, section, segmented};
+use crate::ui::widgets;
 use crate::edit::tone::{self, LevelsParams, CHANNEL_NAMES};
 use crate::edit::{EditTool, Histogram, ToolUiCtx};
 use egui::{pos2, vec2, Color32, Pos2, Rect, Sense, Shape, Stroke};
@@ -29,6 +30,9 @@ fn channel_hist(h: &Histogram, ch: usize) -> &[u32] {
         _ => &h.l,
     }
 }
+
+/// Width of the Levels number fields.
+const FIELD_W: f32 = 72.0;
 
 fn hist_max(data: &[u32]) -> u32 {
     data.iter().skip(1).take(254).copied().max().unwrap_or(1).max(1)
@@ -77,14 +81,15 @@ impl EditTool for Levels {
         ui.add_space(6.0);
         let ch = self.ch.min(3);
         let col = channel_color(ch, pal.dark);
-        let width = ui.available_width().min(312.0);
+        let width = ui.available_width();
+        section(ui, cx, "Input levels");
         // Histogram + input handles.
-        let (rect, resp) = ui.allocate_exact_size(vec2(width, 150.0), Sense::click_and_drag());
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, 136.0), Sense::click_and_drag());
         let hist_rect = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - 18.0));
         let painter = ui.painter_at(rect.expand(8.0));
-        painter.rect_filled(hist_rect, 4.0, if pal.dark { Color32::from_black_alpha(90) } else { Color32::from_black_alpha(14) });
+        painter.rect_filled(hist_rect, 6.0, pal.input_bg);
         let data = channel_hist(cx.histogram, ch);
-        paint_histogram(&painter, hist_rect.shrink(2.0), data, hist_max(data), col.gamma_multiply(0.55));
+        paint_histogram(&painter, hist_rect.shrink(2.0), data, hist_max(data), col);
         let p = &mut self.p[ch];
         let xof = |v: f32| hist_rect.min.x + v / 255.0 * hist_rect.width();
         let vof = |x: f32| ((x - hist_rect.min.x) / hist_rect.width() * 255.0).clamp(0.0, 255.0);
@@ -127,20 +132,21 @@ impl EditTool for Levels {
             *p = LevelsParams { out_black: p.out_black, out_white: p.out_white, ..Default::default() };
             c = true;
         }
+        // Three equal fields under the histogram: black at its left end, gamma in
+        // the middle, white at its right end.
+        let gap = ((width - 3.0 * FIELD_W) / 2.0).max(2.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label("Input");
-            let wv = ((width - 50.0) / 3.0 - 4.0).max(40.0);
-            c |= ui.add_sized([wv, 18.0], egui::DragValue::new(&mut p.in_black).range(0.0..=253.0).speed(0.5).fixed_decimals(0)).changed();
-            c |= ui.add_sized([wv, 18.0], egui::DragValue::new(&mut p.gamma).range(0.1..=9.99).speed(0.01).fixed_decimals(2)).changed();
-            c |= ui.add_sized([wv, 18.0], egui::DragValue::new(&mut p.in_white).range(2.0..=255.0).speed(0.5).fixed_decimals(0)).changed();
+            ui.spacing_mut().item_spacing.x = gap;
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_black).range(0.0..=253.0).speed(0.5).fixed_decimals(0)).on_hover_text("Black point").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.gamma).range(0.1..=9.99).speed(0.01).fixed_decimals(2)).on_hover_text("Midtones (gamma)").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_white).range(2.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("White point").changed();
         });
         if p.in_white <= p.in_black + 1.0 {
             p.in_white = (p.in_black + 2.0).min(255.0);
             p.in_black = p.in_black.min(p.in_white - 2.0);
         }
         // Output gradient.
-        ui.add_space(8.0);
+        section(ui, cx, "Output levels");
         let (orect, oresp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click_and_drag());
         let bar = Rect::from_min_max(orect.min, pos2(orect.max.x, orect.min.y + 12.0));
         let opainter = ui.painter_at(orect.expand(8.0));
@@ -174,13 +180,11 @@ impl EditTool for Levels {
             }
         }
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label("Output");
-            let wv = ((width - 56.0) / 2.0 - 4.0).max(40.0);
-            c |= ui.add_sized([wv, 18.0], egui::DragValue::new(&mut p.out_black).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).changed();
-            c |= ui.add_sized([wv, 18.0], egui::DragValue::new(&mut p.out_white).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).changed();
+            ui.spacing_mut().item_spacing.x = (width - 2.0 * FIELD_W).max(2.0);
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_black).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output black").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_white).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output white").changed();
         });
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button(format!("{}  Auto", crate::ui::icons::MAGIC_WAND)).on_hover_text("Stretch each channel (removes color casts)").clicked() {
                 self.auto(cx.histogram);
@@ -191,7 +195,7 @@ impl EditTool for Levels {
                 c = true;
             }
         });
-        info(ui, cx, "Double-click the histogram to reset input levels.");
+        hint(ui, "Drag the handles under the histogram: shadows, midtones, highlights. Double-click the histogram to reset the input levels.");
         c
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {
@@ -241,12 +245,12 @@ impl EditTool for Curves {
         ui.add_space(6.0);
         let ch = self.ch.min(3);
         let col = channel_color(ch, pal.dark);
-        let side = ui.available_width().min(300.0);
+        let side = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click_and_drag());
         let painter = ui.painter_at(rect.expand(6.0));
-        painter.rect_filled(rect, 4.0, if pal.dark { Color32::from_black_alpha(90) } else { Color32::from_black_alpha(14) });
+        painter.rect_filled(rect, 6.0, pal.input_bg);
         let data = channel_hist(cx.histogram, ch);
-        paint_histogram(&painter, rect.shrink(1.0), data, hist_max(data), col.gamma_multiply(0.22));
+        paint_histogram(&painter, rect.shrink(1.0), data, hist_max(data), col.gamma_multiply(0.45));
         let grid = Stroke::new(1.0, pal.border);
         for i in 1..4 {
             let f = i as f32 / 4.0;
@@ -327,23 +331,25 @@ impl EditTool for Curves {
         }
         let readout = self.drag.or(hovered_pt).and_then(|i| pts.get(i)).map(|q| format!("Input {:.0}  →  Output {:.0}", q[0] * 255.0, q[1] * 255.0));
         resp.on_hover_text("Click to add a point, drag to move, right-click or double-click to remove");
-        info(ui, cx, readout.unwrap_or_else(|| "Click to add points · right-click removes".into()));
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            for (name, p) in PRESETS {
-                if ui.button(*name).clicked() {
-                    self.pts[ch] = p.to_vec();
-                    self.drag = None;
-                    c = true;
-                }
-            }
-        });
+        // Always one line, so the controls below do not jump while hovering.
+        info(ui, cx, readout.unwrap_or_else(|| " ".into()));
         ui.add_space(4.0);
-        if ui.button("Reset all channels").clicked() {
-            *self = Curves { ch: self.ch, ..Default::default() };
+        let names: Vec<String> = PRESETS.iter().map(|(n, _)| n.to_string()).collect();
+        let mut preset = PRESETS.iter().position(|(_, p)| *p == pts.as_slice()).unwrap_or(usize::MAX);
+        if combo(ui, "Preset", "curves-preset", &mut preset, &names) {
+            if let Some((_, p)) = PRESETS.get(preset) {
+                self.pts[ch] = p.to_vec();
+                self.drag = None;
+                c = true;
+            }
+        }
+        ui.add_space(8.0);
+        if ui.button("Reset channel").clicked() {
+            self.pts[ch] = tone::identity_curve();
+            self.drag = None;
             c = true;
         }
+        hint(ui, "Click the graph to add a point, then drag it to bend the curve. Right-click or double-click a point to remove it.");
         c
     }
     fn apply(&self, img: &RgbaImage, _scale: f32) -> RgbaImage {

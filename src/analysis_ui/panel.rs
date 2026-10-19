@@ -156,7 +156,7 @@ impl AnalysisPanel {
         let max = (window * 0.4).clamp(PANEL_MIN, 620.0);
         egui::Panel::right("analysis-panel")
             .resizable(true)
-            .default_size(340.0_f32.min(max))
+            .default_size(360.0_f32.min(max))
             .size_range(PANEL_MIN..=max)
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(Margin { left: 12, right: 4, top: 10, bottom: 8 }))
             .show(ui, |ui| self.contents(ui, core, subject, &mut out));

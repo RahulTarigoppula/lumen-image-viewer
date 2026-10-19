@@ -4,7 +4,7 @@
 use super::commands::Command;
 use super::roi::{ImageTransform, RoiEditor, RoiOptions};
 use super::icons as I;
-use super::theme::Palette;
+use super::theme::{self, size, text, Palette};
 use super::widgets;
 use crate::app::Core;
 use crate::catalog;
@@ -72,6 +72,8 @@ struct ActiveTool {
     /// The user changed something (parameters, strokes, shapes) since the tool
     /// opened or was reset: closing it without Apply asks first.
     touched: bool,
+    /// The tool's how-to text from its last frame (the header's (i) tooltip).
+    hints: Vec<String>,
 }
 
 impl ActiveTool {
@@ -117,7 +119,16 @@ struct EdgeState {
 }
 
 const EDGE_MARGIN: f32 = 6.0;
-const EDGE_DWELL: Duration = Duration::from_millis(250);
+/// Long enough that passing the pointer over an edge does not pop a panel.
+const EDGE_DWELL: Duration = Duration::from_millis(400);
+
+/// Width of the tool and crop panels (every tool gets the same width).
+const TOOL_PANEL_W: f32 = 320.0;
+/// Height of a filmstrip thumbnail cell.
+const FILM_CELL_H: f32 = 64.0;
+
+/// Captions of `Command::EDIT_GROUPS`, in the same order.
+pub const EDIT_GROUP_NAMES: [&str; 5] = ["Rotate & flip", "Crop & size", "Adjust", "Text & frame", "Draw & retouch"];
 
 /// Wheel delta in points per mouse-wheel notch.
 pub const WHEEL_NOTCH: f32 = 40.0;
@@ -314,6 +325,8 @@ pub struct Viewer {
     view_img: (u32, u32),
     edge: EdgeState,
     wheel_nav: WheelNav,
+    /// The app window is full screen (the bar auto-hides, the menu shows the check).
+    is_fullscreen: bool,
 }
 
 impl Viewer {
@@ -355,6 +368,7 @@ impl Viewer {
             view_img: (0, 0),
             edge: EdgeState::default(),
             wheel_nav: WheelNav::default(),
+            is_fullscreen: false,
         }
     }
 
@@ -636,7 +650,7 @@ impl Viewer {
             }
             ctx.request_repaint();
         });
-        self.tool = Some(ActiveTool { tool, base: None, base_rx: Some(rx), version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, show_original: false, error: None, touched: false });
+        self.tool = Some(ActiveTool { tool, base: None, base_rx: Some(rx), version: 1, preview: None, preview_version: 0, rx: None, running: None, final_rx: None, show_original: false, error: None, touched: false, hints: Vec::new() });
     }
 
     pub fn start_crop(&mut self, core: &Core) {
@@ -774,6 +788,7 @@ impl Viewer {
 
     pub fn ui(&mut self, ui: &mut Ui, core: &mut Core, fullscreen: bool) -> Vec<ViewerEvent> {
         let mut ev = Vec::new();
+        self.is_fullscreen = fullscreen;
         self.request_loads(core);
         let p = core.pal;
         let full = ui.max_rect();
@@ -789,25 +804,19 @@ impl Viewer {
                 .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(12)))
                 .show(ui, |ui| self.info_panel(ui, core, &mut ev));
         }
+        let tool_frame = egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(theme::space::PANEL));
         if self.tool.is_some() {
-            egui::Panel::right("viewer-tool")
-                .resizable(false)
-                .exact_size(340.0)
-                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(14)))
-                .show(ui, |ui| self.tool_panel(ui, core, &mut ev));
+            egui::Panel::right("viewer-tool").resizable(false).exact_size(TOOL_PANEL_W).frame(tool_frame).show(ui, |ui| self.tool_panel(ui, core, &mut ev));
         }
         if self.crop.is_some() {
-            egui::Panel::right("viewer-crop")
-                .resizable(false)
-                .exact_size(300.0)
-                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(14)))
-                .show(ui, |ui| self.crop_panel(ui, core));
+            egui::Panel::right("viewer-crop").resizable(false).exact_size(TOOL_PANEL_W).frame(tool_frame).show(ui, |ui| self.crop_panel(ui, core));
         }
         if self.show_filmstrip {
+            // 64 pt cells with 10 pt above and below.
             egui::Panel::bottom("viewer-filmstrip")
                 .resizable(false)
-                .exact_size(96.0)
-                .frame(egui::Frame::NONE.fill(p.panel.gamma_multiply(0.96)).inner_margin(egui::Margin::symmetric(6, 6)))
+                .exact_size(FILM_CELL_H + 20.0)
+                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(8, 10)))
                 .show(ui, |ui| self.filmstrip(ui, core));
         }
         self.text_was_focused = ui.ctx().text_edit_focused();
@@ -1041,7 +1050,9 @@ impl Viewer {
         let edge_open = self.edge_panels_ui(ui, core, view, &mut ev);
         let idle = self.last_activity.elapsed() > Duration::from_millis(2200);
         let near_bottom = ui.input(|i| i.pointer.hover_pos()).map(|pos| pos.y > view.max.y - 90.0 && view.contains(pos)).unwrap_or(false);
-        if !idle || near_bottom || !fullscreen {
+        // Windowed, the bar always shows (FastStone users work from it); full
+        // screen it hides after a moment, but never while one of its menus is open.
+        if !idle || near_bottom || !fullscreen || egui::Popup::is_any_open(ui.ctx()) {
             self.bottom_bar(ui, core, view, size.is_some(), &mut ev);
         } else if fullscreen && self.crop.is_none() && self.tool.is_none() && !edge_open {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
@@ -1179,40 +1190,54 @@ impl Viewer {
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra2)) {
             ev.push(ViewerEvent::Command(Command::NextImage));
         }
-        let _ = Key::Escape;
+        let dirty = self.is_dirty();
+        let (info, film, full) = (self.show_info, self.show_filmstrip, self.is_fullscreen);
         resp.context_menu(|ui| {
-            ui.set_min_width(230.0);
-            // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
-            let analysis = Command::ToggleAnalysis;
-            if ui.add(egui::Button::new(format!("{}   Analyze...", analysis.icon())).shortcut_text(analysis.shortcut())).clicked() {
-                core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
-                ui.close();
-            }
-            ui.separator();
-            for c in [Command::ZoomFit, Command::ZoomActual, Command::ToggleFullscreen] {
-                menu_item(ui, c, ev);
-            }
-            ui.separator();
-            for c in [Command::RotateLeft, Command::RotateRight, Command::FlipHorizontal, Command::Crop, Command::Resize] {
-                menu_item(ui, c, ev);
-            }
-            ui.menu_button(format!("{}   Edit", I::SLIDERS_HORIZONTAL), |ui| {
-                for (gi, g) in Command::EDIT_GROUPS.iter().enumerate() {
-                    if gi > 0 {
-                        ui.separator();
-                    }
-                    for c in g.iter() {
+            ui.set_min_width(240.0);
+            // About 500 pt tall. On a shorter window (a large UI scale on a small
+            // screen) it scrolls; otherwise it moves to fit, which a scroll area
+            // would prevent (it would shrink to the room below the pointer).
+            let screen_h = ui.ctx().content_rect().height();
+            let mut rows = |ui: &mut Ui| {
+                // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
+                let analysis = Command::ToggleAnalysis;
+                if widgets::menu_item(ui, analysis.icon(), "Analyze...", &analysis.shortcut()).clicked() {
+                    core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
+                    ui.close();
+                }
+                ui.separator();
+                menu_item(ui, Command::ZoomFit, ev);
+                menu_item(ui, Command::ZoomActual, ev);
+                menu_check(ui, Command::ToggleFullscreen, "Full screen", full, ev);
+                ui.separator();
+                widgets::submenu(ui, Command::RotateRight.icon(), "Rotate & flip", |ui| {
+                    for c in Command::EDIT_GROUPS[0] {
                         menu_item(ui, *c, ev);
                     }
-                }
-            });
-            ui.separator();
-            for c in [Command::Save, Command::SaveAs, Command::CopyImage, Command::SetWallpaper, Command::Print] {
-                menu_item(ui, c, ev);
-            }
-            ui.separator();
-            for c in [Command::ToggleInfo, Command::ToggleFilmstrip, Command::Slideshow, Command::ShowInExplorer, Command::Delete, Command::CloseViewer] {
-                menu_item(ui, c, ev);
+                });
+                menu_item(ui, Command::Crop, ev);
+                menu_item(ui, Command::Resize, ev);
+                widgets::submenu(ui, I::SLIDERS_HORIZONTAL, "Edit", |ui| edit_menu(ui, ev));
+                ui.separator();
+                ui.add_enabled_ui(dirty, |ui| menu_item(ui, Command::Save, ev));
+                menu_item(ui, Command::SaveAs, ev);
+                menu_item(ui, Command::CopyImage, ev);
+                widgets::submenu(ui, I::EXPORT, "Share & export", |ui| {
+                    for c in [Command::SetWallpaper, Command::Print, Command::ShowInExplorer, Command::OpenWithEditor] {
+                        menu_item(ui, c, ev);
+                    }
+                });
+                ui.separator();
+                menu_check(ui, Command::ToggleInfo, "Info panel", info, ev);
+                menu_check(ui, Command::ToggleFilmstrip, "Filmstrip", film, ev);
+                menu_item(ui, Command::Slideshow, ev);
+                ui.separator();
+                menu_item(ui, Command::Delete, ev);
+            };
+            if screen_h < 540.0 {
+                egui::ScrollArea::vertical().max_height((screen_h - 24.0).max(120.0)).show(ui, rows);
+            } else {
+                rows(ui);
             }
         });
     }
@@ -1334,8 +1359,9 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(view);
         if let Some(h) = self.histogram_for(core, &ctx, path) {
-            painter.rect_filled(r.expand(6.0), CornerRadius::same(10), Color32::from_black_alpha(150));
-            h.paint(&painter, r, true);
+            painter.add(theme::popover_shadow(&core.pal).as_shape(r, CornerRadius::same(6)));
+            h.paint(&painter, r, core.pal.dark);
+            painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, core.pal.border), egui::StrokeKind::Outside);
         }
     }
 
@@ -1401,21 +1427,21 @@ impl Viewer {
         let interact = self.edge.open.is_some();
         let slide = (1.0 - t) * 18.0;
         let bottom_reserve = 70.0; // keep clear of the bottom toolbar
+        let margin = 10.0;
         let rect = match edge {
-            Edge::Top => Rect::from_min_size(view.min + Vec2::new(8.0, 4.0 - slide), Vec2::new(view.width() - 16.0, 112.0)),
+            Edge::Top => Rect::from_min_size(view.min + Vec2::new(8.0, 6.0 - slide), Vec2::new(view.width() - 16.0, FILM_CELL_H + 2.0 * margin)),
             Edge::Right => {
-                let w = 340.0_f32.min(view.width() - 16.0);
-                Rect::from_min_size(Pos2::new(view.max.x - w - 6.0 + slide, view.min.y + 8.0), Vec2::new(w, (view.height() - 16.0 - bottom_reserve).max(120.0)))
+                let w = 320.0_f32.min(view.width() - 16.0);
+                Rect::from_min_size(Pos2::new(view.max.x - w - 8.0 + slide, view.min.y + 8.0), Vec2::new(w, (view.height() - 16.0 - bottom_reserve).max(120.0)))
             }
             Edge::Left => {
-                // Size to the menu's content (about 29 rows) instead of the full
-                // height; it scrolls when the window is shorter.
-                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 790.0);
-                Rect::from_min_size(Pos2::new(view.min.x + 6.0 - slide, view.center().y - h / 2.0 - bottom_reserve / 2.0), Vec2::new(262.0, h))
+                // Size to the menu's content (25 rows and 5 captions) instead of the
+                // full height; it scrolls when the window is shorter.
+                let h = (view.height() - 16.0 - bottom_reserve).clamp(120.0, 900.0);
+                Rect::from_min_size(Pos2::new(view.min.x + 8.0 - slide, view.center().y - h / 2.0 - bottom_reserve / 2.0), Vec2::new(256.0, h))
             }
             Edge::Bottom => return false,
         };
-        let margin = 10.0;
         let area = egui::Area::new(ui.scope_id().with(("viewer-edge-panel", edge)))
             .order(egui::Order::Foreground)
             .fixed_pos(rect.min)
@@ -1426,7 +1452,8 @@ impl Viewer {
                 egui::Frame::NONE
                     .fill(p.panel)
                     .stroke(Stroke::new(1.0, p.border))
-                    .corner_radius(CornerRadius::same(10))
+                    .corner_radius(CornerRadius::same(theme::radius::WINDOW))
+                    .shadow(theme::popover_shadow(&p))
                     .inner_margin(egui::Margin::same(margin as i8))
                     .show(ui, |ui| {
                         let inner = rect.size() - Vec2::splat(margin * 2.0);
@@ -1449,31 +1476,31 @@ impl Viewer {
     /// Compact vertical list of edit commands for the left pop-out panel.
     fn edge_tool_menu(&mut self, ui: &mut Ui, ev: &mut Vec<ViewerEvent>) {
         let dirty = self.is_dirty();
-        // A solid bar takes its own column when the window is too short for
-        // the whole menu; a floating one would cover the shortcut column.
-        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-        egui::ScrollArea::vertical().id_salt("edge-tools").auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            ui.label(RichText::new("Edit").font(super::theme::semibold(13.0)));
-            ui.add_space(4.0);
-            for (gi, g) in Command::EDIT_GROUPS.iter().enumerate() {
-                if gi > 0 {
-                    ui.add_space(3.0);
-                    ui.separator();
-                    ui.add_space(3.0);
+        // A thin floating bar: the rows keep their full width (the shortcut
+        // column sits 10 pt in from the edge, clear of it).
+        ui.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 4.0, floating_width: 2.0, floating_allocated_width: 0.0, ..egui::style::ScrollStyle::floating() };
+        let out = egui::ScrollArea::vertical().id_salt("edge-tools").auto_shrink([false, false]).show(ui, |ui| {
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (gi, g) in Command::EDIT_GROUPS.iter().enumerate() {
+                    if gi > 0 {
+                        ui.add_space(4.0);
+                    }
+                    menu_caption(ui, EDIT_GROUP_NAMES[gi]);
+                    for c in g.iter() {
+                        edge_menu_item(ui, *c, ev);
+                    }
                 }
-                for c in g.iter() {
-                    edge_menu_item(ui, *c, ev);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                for c in [Command::Undo, Command::Redo] {
+                    edge_menu_item(ui, c, ev);
                 }
-            }
-            ui.add_space(3.0);
-            ui.separator();
-            ui.add_space(3.0);
-            for c in [Command::Undo, Command::Redo] {
-                edge_menu_item(ui, c, ev);
-            }
-            edge_menu_item(ui, if dirty { Command::Save } else { Command::SaveAs }, ev);
+                edge_menu_item(ui, if dirty { Command::Save } else { Command::SaveAs }, ev);
+            });
         });
+        scroll_fades(ui, &out, theme::palette(ui.ctx()).panel);
     }
 
     fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path) {
@@ -1506,59 +1533,92 @@ impl Viewer {
         use BarItem as B;
         let p = core.pal;
         // Fit the bar to the view: drop separators first, then move the least
-        // important buttons into a "..." menu (never Prev / Next / zoom / fit).
+        // important buttons into the More menu (never Prev / Next / zoom / Edit).
         let avail = (view.width() - 20.0 - 16.0).max(0.0);
         let (items, hidden) = bar_layout(avail);
         let content: f32 = items.iter().map(|i| i.width()).sum();
-        let w = (content + 16.0).min(view.width() - 8.0).max(0.0);
+        let w = (content + 12.0).min(view.width() - 8.0).max(0.0);
         let rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 34.0), Vec2::new(w, 44.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        child.set_clip_rect(rect.intersect(view));
-        child.painter().rect_filled(rect, CornerRadius::same(12), p.overlay);
-        child.painter().rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-        child.add_space(8.0);
+        child.set_clip_rect(rect.expand(24.0).intersect(view));
+        let radius = CornerRadius::same(theme::radius::WINDOW);
+        // The popover shadow lifts the bar off bright images.
+        child.painter().add(theme::popover_shadow(&p).as_shape(rect, radius));
+        child.painter().rect_filled(rect, radius, p.overlay);
+        child.painter().rect_stroke(rect, radius, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        child.add_space(6.0);
         child.spacing_mut().item_spacing.x = 1.0;
         let dirty = self.is_dirty();
-        let analysis_open = core.analysis_open;
         for item in items {
-            let cmd = self.bar_command(item, dirty);
             match item {
                 B::Sep => widgets::separator_v(&mut child),
                 B::ZoomPct => {
                     let pct = if shown { format!("{:.0}%", self.zoom * 100.0) } else { "-".into() };
-                    let zl = child.add_enabled_ui(shown, |ui| ui.add_sized([54.0, 26.0], egui::Button::new(RichText::new(pct).size(12.0)).frame(false))).inner;
+                    let zl = child.add_enabled_ui(shown, |ui| ui.add_sized([BAR_ZOOM_W, BAR_BUTTON], egui::Button::new(RichText::new(pct).size(12.0)).frame(false))).inner;
                     if zl.clicked() {
                         ev.push(ViewerEvent::Command(Command::ZoomActual));
                     }
                     zl.on_hover_text("Click: 100%");
                 }
+                B::Edit => {
+                    let open_id = child.scope_id().with("bar-edit-open");
+                    let was_open = child.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+                    let r = bar_menu_button(&mut child, &p, I::SLIDERS_HORIZONTAL, "Edit", "Edit tools: adjust, resize, text, draw, retouch", was_open);
+                    let open = egui::Popup::menu(&r).gap(10.0).show(|ui| edit_menu(ui, ev)).is_some();
+                    child.data_mut(|d| d.insert_temp(open_id, open));
+                }
                 B::More => {
-                    child.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| {
-                        for &h in &hidden {
-                            if let Some(c) = self.bar_command(h, dirty) {
-                                menu_item(ui, c, ev);
-                            }
-                        }
-                    });
+                    let open_id = child.scope_id().with("bar-more-open");
+                    let was_open = child.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+                    let r = widgets::icon_button_sized(&mut child, I::DOTS_THREE, "More", was_open, BAR_BUTTON, size::ICON_TOOLBAR);
+                    let analysis_open = core.analysis_open;
+                    let open = egui::Popup::menu(&r).gap(10.0).show(|ui| self.more_menu(ui, &hidden, dirty, analysis_open, ev)).is_some();
+                    child.data_mut(|d| d.insert_temp(open_id, open));
                 }
                 _ => {
-                    let Some(cmd) = cmd else { continue };
-                    let (icon, tip, sel) = self.bar_button(item, cmd, dirty);
-                    let sel = sel || (item == B::Analysis && analysis_open);
-                    if widgets::icon_button(&mut child, icon, &tip, sel).clicked() {
-                        if item == B::Lock {
-                            self.toggle_lock_zoom();
-                        } else {
-                            ev.push(ViewerEvent::Command(cmd));
-                        }
+                    let Some(cmd) = self.bar_command(item) else { continue };
+                    let (icon, tip, sel) = self.bar_button(item, cmd);
+                    if widgets::icon_button_sized(&mut child, icon, &tip, sel, BAR_BUTTON, size::ICON_TOOLBAR).clicked() {
+                        ev.push(ViewerEvent::Command(cmd));
                     }
                 }
             }
         }
     }
 
-    /// The command behind a toolbar item.
-    fn bar_command(&self, item: BarItem, dirty: bool) -> Option<Command> {
+    /// The toolbar's More menu: buttons that did not fit, then the commands that
+    /// live only here and in the context menu, palette and keys.
+    fn more_menu(&self, ui: &mut Ui, hidden: &[BarItem], dirty: bool, analysis_open: bool, ev: &mut Vec<ViewerEvent>) {
+        ui.set_min_width(250.0);
+        let mut any = false;
+        for &h in hidden {
+            let Some(c) = self.bar_command(h) else { continue };
+            match h {
+                BarItem::Info => menu_check(ui, c, "Info panel", self.show_info, ev),
+                BarItem::Film => menu_check(ui, c, "Filmstrip", self.show_filmstrip, ev),
+                BarItem::Fullscreen => menu_check(ui, c, "Full screen", self.is_fullscreen, ev),
+                _ => menu_item(ui, c, ev),
+            }
+            any = true;
+        }
+        if any {
+            ui.separator();
+        }
+        menu_check(ui, Command::ToggleLockZoom, "Lock zoom ratio", self.lock_zoom, ev);
+        menu_check(ui, Command::ToggleHistogram, "Histogram", self.show_histogram, ev);
+        menu_check(ui, Command::ToggleAnalysis, "Analysis panel", analysis_open, ev);
+        menu_item(ui, Command::Slideshow, ev);
+        ui.separator();
+        ui.add_enabled_ui(dirty, |ui| menu_item(ui, Command::Save, ev));
+        menu_item(ui, Command::SaveAs, ev);
+        menu_item(ui, Command::CopyImage, ev);
+        menu_item(ui, Command::Print, ev);
+        ui.separator();
+        menu_item(ui, Command::Delete, ev);
+    }
+
+    /// The command behind a toolbar button.
+    fn bar_command(&self, item: BarItem) -> Option<Command> {
         use BarItem as B;
         Some(match item {
             B::Browser => Command::CloseViewer,
@@ -1567,103 +1627,79 @@ impl Viewer {
             B::ZoomOut => Command::ZoomOut,
             B::ZoomIn => Command::ZoomIn,
             B::Fit => Command::ZoomFit,
-            B::Lock => Command::ToggleLockZoom,
             B::RotL => Command::RotateLeft,
             B::RotR => Command::RotateRight,
             B::Crop => Command::Crop,
-            B::Adjust => Command::AdjustColors,
-            B::Resize => Command::Resize,
-            B::Save => {
-                if dirty {
-                    Command::Save
-                } else {
-                    Command::SaveAs
-                }
-            }
-            B::Delete => Command::Delete,
             B::Info => Command::ToggleInfo,
-            B::Analysis => Command::ToggleAnalysis,
             B::Film => Command::ToggleFilmstrip,
-            B::Slideshow => Command::Slideshow,
             B::Fullscreen => Command::ToggleFullscreen,
-            B::Sep | B::ZoomPct | B::More => return None,
+            B::Sep | B::ZoomPct | B::Edit | B::More => return None,
         })
     }
 
     /// Icon, tooltip and selected state of a toolbar button.
-    fn bar_button(&self, item: BarItem, cmd: Command, dirty: bool) -> (&'static str, String, bool) {
+    fn bar_button(&self, item: BarItem, cmd: Command) -> (&'static str, String, bool) {
         use BarItem as B;
-        let plain = |icon: &'static str, tip: &str| (icon, format!("{tip}  ({})", cmd.shortcut()), false);
+        let tip = |t: &str| format!("{t}  ({})", cmd.shortcut());
         match item {
-            B::Browser => plain(I::SQUARES_FOUR, "Back to browser"),
-            B::Prev => plain(I::CARET_LEFT, "Previous"),
-            B::Next => plain(I::CARET_RIGHT, "Next"),
-            B::ZoomOut => plain(I::MAGNIFYING_GLASS_MINUS, "Zoom out"),
-            B::ZoomIn => plain(I::MAGNIFYING_GLASS_PLUS, "Zoom in"),
-            B::Fit => (I::ARROWS_IN, "Fit to window (/)".into(), self.auto_fit.is_some()),
-            B::Lock => {
-                if self.lock_zoom {
-                    (I::LOCK_SIMPLE, "Zoom ratio locked: next/previous keep zoom and position (click to unlock)".into(), true)
-                } else {
-                    (I::LOCK_SIMPLE_OPEN, "Lock zoom ratio: keep zoom and position when changing images".into(), false)
-                }
-            }
-            B::RotL => plain(I::ARROW_COUNTER_CLOCKWISE, "Rotate left"),
-            B::RotR => plain(I::ARROW_CLOCKWISE, "Rotate right"),
-            B::Crop => plain(I::CROP, "Crop"),
-            B::Adjust => plain(I::SLIDERS_HORIZONTAL, "Adjust colors"),
-            B::Resize => plain(I::RESIZE, "Resize"),
-            B::Save => {
-                if dirty {
-                    (I::FLOPPY_DISK, "Save changes (Ctrl+S)".into(), true)
-                } else {
-                    (I::FLOPPY_DISK_BACK, "Save as... (Ctrl+Shift+S)".into(), false)
-                }
-            }
-            B::Delete => plain(I::TRASH, "Delete"),
-            B::Info => (I::INFO, "Info panel (I)".into(), self.show_info),
-            B::Analysis => plain(I::CHART_LINE, "Analysis: metrics and AI"),
-            B::Film => (I::FILM_STRIP, "Filmstrip (F)".into(), self.show_filmstrip),
-            B::Slideshow => plain(I::PLAY_CIRCLE, "Slideshow"),
-            B::Fullscreen => plain(I::CORNERS_OUT, "Full screen"),
-            B::Sep | B::ZoomPct | B::More => (I::DOTS_THREE, String::new(), false),
+            B::Browser => (I::SQUARES_FOUR, tip("Back to browser"), false),
+            B::Prev => (I::CARET_LEFT, tip("Previous"), false),
+            B::Next => (I::CARET_RIGHT, tip("Next"), false),
+            B::ZoomOut => (I::MAGNIFYING_GLASS_MINUS, tip("Zoom out"), false),
+            B::ZoomIn => (I::MAGNIFYING_GLASS_PLUS, tip("Zoom in"), false),
+            B::Fit => (I::ARROWS_IN, tip("Fit to window"), self.auto_fit.is_some()),
+            B::RotL => (I::ARROW_COUNTER_CLOCKWISE, tip("Rotate left"), false),
+            B::RotR => (I::ARROW_CLOCKWISE, tip("Rotate right"), false),
+            B::Crop => (I::CROP, tip("Crop"), self.crop.is_some()),
+            B::Info => (I::INFO, tip("Info panel"), self.show_info),
+            B::Film => (I::FILM_STRIP, tip("Filmstrip"), self.show_filmstrip),
+            B::Fullscreen => (if self.is_fullscreen { I::CORNERS_IN } else { I::CORNERS_OUT }, tip(if self.is_fullscreen { "Leave full screen" } else { "Full screen" }), false),
+            B::Sep | B::ZoomPct | B::Edit | B::More => (I::DOTS_THREE, String::new(), false),
         }
     }
 
+    /// Thumbnails of the list, each fitted into a 64 pt tall cell at its own
+    /// aspect (40 to 96 pt wide). The wheel scrolls it sideways.
     fn filmstrip(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
-        let h = ui.available_height();
-        let cell = Vec2::new(h * 1.25, h);
+        let h = ui.available_height().min(FILM_CELL_H).max(24.0);
+        // A thin bar that shows on hover, over the thumbnails' bottom edge.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 4.0, floating_width: 2.0, floating_allocated_width: 0.0, ..egui::style::ScrollStyle::floating() };
         egui::ScrollArea::horizontal().id_salt("filmstrip").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 6.0;
                 for i in 0..self.list.len() {
+                    let path = self.list[i].clone();
+                    let key = self.thumb_key(&path);
+                    let thumb = core.thumbs.get(&key);
+                    // Natural aspect: the thumbnail once it is there, else the
+                    // known pixel size, else 4:3.
+                    let aspect = match &thumb {
+                        Thumb::Ready(t) => t.tex.size_vec2().x / t.tex.size_vec2().y.max(1.0),
+                        _ => core.meta.get(&path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32).unwrap_or(4.0 / 3.0),
+                    };
+                    let cell = Vec2::new((h * aspect).clamp(40.0, 96.0), h);
                     let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
                     if ui.is_rect_visible(rect) {
-                        let path = &self.list[i];
                         let sel = i == self.index;
-                        ui.painter().rect_filled(rect, CornerRadius::same(6), if sel { p.accent_soft } else if resp.hovered() { p.hover } else { Color32::TRANSPARENT });
-                        let path = path.clone();
-                        let key = self.thumb_key(&path);
-                        {
-                            match core.thumbs.get(&key) {
-                                Thumb::Ready(t) => {
-                                    let ts = t.tex.size_vec2();
-                                    let s = ((cell.x - 8.0) / ts.x).min((cell.y - 8.0) / ts.y);
-                                    let r = Rect::from_center_size(rect.center(), ts * s);
-                                    let mut mesh = egui::Mesh::with_texture(t.tex.id());
-                                    mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                                    ui.painter().add(egui::Shape::mesh(mesh));
-                                }
-                                // Undecodable file: a placeholder instead of an empty slot.
-                                Thumb::Failed => {
-                                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional((cell.y * 0.4).clamp(12.0, 32.0)), p.faint);
-                                }
-                                Thumb::Pending => {}
+                        let r4 = CornerRadius::same(theme::radius::SMALL);
+                        ui.painter().rect_filled(rect, r4, if sel { p.selected_bg } else if resp.hovered() { p.hover } else { p.faint_bg });
+                        match &thumb {
+                            Thumb::Ready(t) => {
+                                let ts = t.tex.size_vec2();
+                                let inner = rect.shrink(if sel { 3.0 } else { 0.0 });
+                                let s = (inner.width() / ts.x).min(inner.height() / ts.y);
+                                let r = Rect::from_center_size(rect.center(), ts * s);
+                                ui.painter().add(egui::epaint::RectShape::filled(r, CornerRadius::same(if sel { 2 } else { theme::radius::SMALL }), Color32::WHITE).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
                             }
+                            // Undecodable file: a placeholder instead of an empty slot.
+                            Thumb::Failed => {
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional((h * 0.4).clamp(12.0, 26.0)), p.faint);
+                            }
+                            Thumb::Pending => {}
                         }
                         if sel {
-                            ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                            ui.painter().rect_stroke(rect, r4, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
                         }
                     }
                     if i == self.index && resp.rect.is_positive() {
@@ -1672,6 +1708,7 @@ impl Viewer {
                             resp.scroll_to_me(Some(egui::Align::Center));
                         }
                     }
+                    let resp = resp.on_hover_text(file_name(&path));
                     if resp.clicked() {
                         self.go_to(i, core.settings.fit_mode);
                     }
@@ -1684,8 +1721,19 @@ impl Viewer {
         let p = core.pal;
         let Some(path) = self.current().cloned() else { return };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(file_name(&path)).font(super::theme::semibold(15.0))).wrap());
-            ui.add(egui::Label::new(RichText::new(path.parent().map(|d| d.display().to_string()).unwrap_or_default()).size(11.5).color(p.faint)).wrap());
+            ui.add(egui::Label::new(RichText::new(file_name(&path)).font(text::title())).wrap());
+            // The folder on one line, shortened in the middle; full path on hover.
+            let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let font = FontId::proportional(text::SMALL);
+                let shown = middle_ellipsis(ui, &dir, &font, (ui.available_width() - 26.0).max(40.0));
+                ui.add(egui::Label::new(RichText::new(shown).font(font).color(p.muted)).truncate()).on_hover_text(&dir);
+                if widgets::icon_button_sized(ui, I::COPY, "Copy path", false, 22.0, size::ICON).clicked() {
+                    ui.ctx().copy_text(path.display().to_string());
+                    core.toasts.success("Path copied");
+                }
+            });
             ui.add_space(8.0);
             let tag = core.tags.get(&path);
             ui.horizontal(|ui| {
@@ -1709,34 +1757,33 @@ impl Viewer {
                 }
             });
             ui.add_space(8.0);
-            // Histogram
             let ctx = ui.ctx().clone();
             if let Some(hist) = self.histogram_for(core, &ctx, &path) {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 90.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 80.0), Sense::hover());
                 hist.paint(ui.painter(), r, p.dark);
-                ui.add_space(6.0);
             }
-            widgets::section_title(ui, &p, "File");
+            ui.add_space(4.0);
             if let Some(l) = self.loaded(core) {
                 let d = &l.decoded;
-                widgets::kv_row(ui, &p, "Dimensions", &format!("{} × {}  ({:.1} MP)", d.width(), d.height(), d.width() as f64 * d.height() as f64 / 1e6));
-                widgets::kv_row(ui, &p, "File size", &catalog::human_size(l.file_size));
-                widgets::kv_row(ui, &p, "Format", &d.format);
-                widgets::kv_row(ui, &p, "Color", &d.color_info);
+                let mut rows = vec![
+                    ("Dimensions", format!("{} × {}  ({:.1} MP)", d.width(), d.height(), d.width() as f64 * d.height() as f64 / 1e6)),
+                    ("File size", catalog::human_size(l.file_size)),
+                    ("Format", d.format.clone()),
+                    ("Color", d.color_info.clone()),
+                ];
                 if d.frame_count > 1 {
-                    widgets::kv_row(ui, &p, "Frames", &d.frame_count.to_string());
+                    rows.push(("Frames", d.frame_count.to_string()));
                 }
                 if d.orientation != 1 {
-                    widgets::kv_row(ui, &p, "Orientation", &format!("EXIF {} (auto-rotated)", d.orientation));
+                    rows.push(("Orientation", format!("EXIF {} (auto-rotated)", d.orientation)));
                 }
-                widgets::kv_row(ui, &p, "Decoder", &format!("{} · {} ms", d.decoder, l.load_ms));
-                widgets::kv_row(ui, &p, "Modified", &catalog::format_time(l.modified));
+                rows.push(("Decoder", format!("{} · {} ms", d.decoder, l.load_ms)));
+                rows.push(("Modified", catalog::format_time(l.modified)));
+                info_group(ui, &p, "File", "info-file", &rows);
             }
             let p2 = path.clone();
             if let Some(Some(ex)) = self.exif_cache.get(&path, ui.ctx(), move || crate::meta::read_exif(&p2)) {
-                ui.add_space(6.0);
-                widgets::section_title(ui, &p, "Camera");
-                let rows: [(&str, &Option<String>); 10] = [
+                let fields: [(&str, &Option<String>); 10] = [
                     ("Camera", &ex.camera),
                     ("Lens", &ex.lens),
                     ("Exposure", &ex.exposure),
@@ -1748,26 +1795,29 @@ impl Viewer {
                     ("Software", &ex.software),
                     ("Artist", &ex.artist),
                 ];
-                for (k, v) in rows {
-                    if let Some(v) = v {
-                        widgets::kv_row(ui, &p, k, v);
-                    }
+                let rows: Vec<(&str, String)> = fields.iter().filter_map(|(k, v)| v.as_ref().map(|v| (*k, v.clone()))).collect();
+                if !rows.is_empty() {
+                    info_group(ui, &p, "Camera", "info-camera", &rows);
                 }
                 if let Some((lat, lon)) = ex.gps {
-                    ui.horizontal(|ui| {
-                        widgets::kv_row(ui, &p, "GPS", &format!("{lat:.5}, {lon:.5}"));
-                    });
-                    if ui.small_button(format!("{} Open location in browser", I::MAP_PIN)).on_hover_text("Opens OpenStreetMap in your web browser (the only time Lumen touches the network, and only when you click)").clicked() {
-                        let url = format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}");
-                        let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+                    let open = info_group(ui, &p, "Location", "info-location", &[("GPS", format!("{lat:.5}, {lon:.5}"))]);
+                    if open {
+                        ui.horizontal(|ui| {
+                            ui.add_space(size::LABEL_W + 12.0);
+                            let b = ui.button(format!("{}  Open map", I::MAP_PIN)).on_hover_text("Opens OpenStreetMap in your web browser (the only time Lumen touches the network, and only when you click)");
+                            if b.clicked() {
+                                let url = format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}");
+                                let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+                            }
+                        });
                     }
                 }
                 ui.add_space(4.0);
-                egui::CollapsingHeader::new(RichText::new(format!("All metadata ({})", ex.all.len())).color(p.muted)).show(ui, |ui| {
-                    egui::Grid::new("exif-all").num_columns(2).striped(true).show(ui, |ui| {
+                egui::CollapsingHeader::new(RichText::new(format!("All metadata ({})", ex.all.len())).font(text::caption()).color(p.muted)).icon(widgets::collapse_caret).show(ui, |ui| {
+                    egui::Grid::new("exif-all").num_columns(2).spacing([12.0, 2.0]).striped(true).show(ui, |ui| {
                         for (g, k, v) in &ex.all {
-                            ui.label(RichText::new(k.as_str()).size(11.5).color(p.muted)).on_hover_text(g);
-                            ui.add(egui::Label::new(RichText::new(v).size(11.5)).wrap());
+                            ui.label(RichText::new(k.as_str()).size(text::SMALL).color(p.muted)).on_hover_text(g);
+                            ui.add(egui::Label::new(RichText::new(v).size(text::SMALL)).wrap());
                             ui.end_row();
                         }
                     });
@@ -1821,15 +1871,16 @@ impl Viewer {
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
         }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(t.tool.title()).font(super::theme::semibold(16.0)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if t.running.is_some() || t.final_rx.is_some() || t.base_rx.is_some() {
-                    ui.spinner();
-                }
-            });
-        });
-        ui.add_space(8.0);
+        let busy = t.running.is_some() || t.final_rx.is_some() || t.base_rx.is_some();
+        if tool_header(ui, &p, &t.tool.title(), busy, &t.hints, t.touched) {
+            t.tool.reset();
+            t.version += 1;
+            t.touched = false;
+        }
+        // The body scrolls; the footer stays pinned to the bottom of the panel.
+        let error_h = if t.error.is_some() { 30.0 } else { 0.0 };
+        let body_h = (ui.available_height() - footer_height(true) - error_h - ui.spacing().item_spacing.y * 2.0).max(60.0);
+        let w = ui.available_width();
         let mut changed = false;
         if let Some(base) = &t.base {
             let size = self
@@ -1839,23 +1890,25 @@ impl Viewer {
                 .or_else(|| core.loader.get_ready(&self.list[self.index]).map(|l| l.decoded.image.dimensions()))
                 .unwrap_or((base.image.width(), base.image.height()));
             let cx = ToolUiCtx { palette: &p, image_size: size, histogram: &base.histogram, preview: Some(&base.image) };
-            let w = ui.available_width();
-            changed = egui::ScrollArea::vertical()
-                .max_height(ui.available_height() - 110.0)
-                .show(ui, |ui| {
-                    ui.set_max_width(w);
-                    t.tool.ui(ui, &cx)
-                })
-                .inner;
-        } else if t.base_rx.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Preparing preview...").color(p.muted));
+            let out = egui::ScrollArea::vertical().id_salt("tool-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
+                ui.set_max_width(w);
+                t.tool.ui(ui, &cx)
             });
+            scroll_fades(ui, &out, p.panel);
+            changed = out.inner;
+            t.hints = crate::edit::tools::take_hints(ui.ctx());
+        } else {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(w, body_h), Sense::hover());
+            if t.base_rx.is_some() {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
+                child.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Preparing preview...").color(p.muted));
+                });
+            }
         }
         if let Some(err) = &t.error {
-            ui.add_space(6.0);
-            ui.label(RichText::new(format!("{}  {err}", I::WARNING)).size(12.0).color(Color32::from_rgb(235, 110, 90)));
+            ui.add(egui::Label::new(RichText::new(format!("{}  {err}", I::WARNING)).size(text::SMALL).color(p.danger)).truncate());
         }
         if changed {
             t.version += 1;
@@ -1881,28 +1934,9 @@ impl Viewer {
                 t.running = Some(ver);
             }
         }
-        ui.add_space(10.0);
-        let hold = ui.add(egui::Button::new(format!("{}  Hold to compare with original", I::EYE)).min_size(Vec2::new(ui.available_width(), 28.0)).sense(Sense::click_and_drag()));
-        t.show_original = hold.is_pointer_button_down_on() || (ui.input(|i| i.key_down(Key::Backslash)) && !ui.ctx().egui_wants_keyboard_input());
-        ui.add_space(6.0);
-        let mut close = false;
-        let mut apply = false;
         let can_apply = t.final_rx.is_none() && t.base.is_some() && t.tool.can_apply();
-        ui.horizontal(|ui| {
-            if ui.button("Reset").clicked() {
-                t.tool.reset();
-                t.version += 1;
-                t.touched = false;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(can_apply, egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(80.0, 28.0))).clicked() {
-                    apply = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-            });
-        });
+        let (held, mut close, mut apply) = tool_footer(ui, &p, true, "Apply", can_apply);
+        t.show_original = held || (ui.input(|i| i.key_down(Key::Backslash)) && !ui.ctx().egui_wants_keyboard_input());
         // Esc with unapplied work asks first (Cancel is the explicit way out).
         if keys && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             if t.touched {
@@ -1969,51 +2003,67 @@ impl Viewer {
         // the frame began, and not while the discard prompt shows.
         let keys = keyboard_free(ui) && !self.text_was_focused && !self.confirm_discard;
         let Some(c) = &mut self.crop else { return };
-        ui.label(RichText::new("Crop").font(super::theme::semibold(16.0)));
-        ui.add_space(8.0);
-        ui.label(RichText::new("Aspect ratio").color(p.muted));
-        let presets: [(&str, Option<f32>); 10] = [
-            ("Free", None),
-            ("Original", Some(iw / ih)),
-            ("1:1", Some(1.0)),
-            ("4:3", Some(4.0 / 3.0)),
-            ("3:2", Some(1.5)),
-            ("16:9", Some(16.0 / 9.0)),
-            ("5:4", Some(1.25)),
-            ("3:4", Some(0.75)),
-            ("2:3", Some(2.0 / 3.0)),
-            ("9:16", Some(9.0 / 16.0)),
-        ];
-        ui.horizontal_wrapped(|ui| {
-            for (name, a) in presets {
-                let sel = match (c.roi.aspect(), a) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => (x - y).abs() < 1e-3,
-                    _ => false,
-                };
-                if ui.selectable_label(sel, name).clicked() {
+        let hints = ["Drag inside the area to move it, drag its edges or corners to resize it, drag outside it to draw a new one. Enter crops, Esc cancels.".to_string()];
+        if tool_header(ui, &p, "Crop", false, &hints, c.touched()) {
+            c.roi.set_aspect(None);
+            c.roi.set_rect(Some(c.initial));
+        }
+        let body_h = (ui.available_height() - footer_height(false) - ui.spacing().item_spacing.y * 2.0).max(60.0);
+        let w = ui.available_width();
+        egui::ScrollArea::vertical().id_salt("crop-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
+            ui.set_max_width(w);
+            widgets::section_title(ui, &p, "Aspect ratio");
+            // Free and Original as segments; fixed ratios in a combo beside them.
+            let ratios: [(&str, f32); 8] = [("1:1", 1.0), ("4:3", 4.0 / 3.0), ("3:2", 1.5), ("16:9", 16.0 / 9.0), ("5:4", 1.25), ("3:4", 0.75), ("2:3", 2.0 / 3.0), ("9:16", 9.0 / 16.0)];
+            let original = iw / ih;
+            let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+            let cur = c.roi.aspect();
+            let mut seg = match cur {
+                None => 0,
+                Some(a) if near(a, original) => 1,
+                Some(_) => usize::MAX,
+            };
+            let fixed = cur.filter(|_| seg == usize::MAX).and_then(|a| ratios.iter().position(|(_, r)| near(*r, a)));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let seg_w = ((ui.available_width() - 8.0) * 0.55).min(170.0);
+                let changed = ui.allocate_ui_with_layout(Vec2::new(seg_w, size::CONTROL), egui::Layout::left_to_right(egui::Align::Center), |ui| widgets::segmented(ui, &mut seg, &["Free", "Original"])).inner;
+                if changed {
                     // Fits the current crop to the new aspect around its center.
-                    c.roi.set_aspect(a);
+                    c.roi.set_aspect(if seg == 0 { None } else { Some(original) });
                 }
-            }
-        });
-        ui.add_space(8.0);
-        let r = c.rect();
-        let mut w = (r[2] - r[0]).round();
-        let mut h = (r[3] - r[1]).round();
-        let mut x = r[0].round();
-        let mut y = r[1].round();
-        egui::Grid::new("crop-grid").num_columns(4).show(ui, |ui| {
-            ui.label("X");
-            let cx = ui.add(egui::DragValue::new(&mut x).range(0.0..=iw - 1.0)).changed();
-            ui.label("Y");
-            let cy = ui.add(egui::DragValue::new(&mut y).range(0.0..=ih - 1.0)).changed();
-            ui.end_row();
-            ui.label("W");
-            let cw = ui.add(egui::DragValue::new(&mut w).range(1.0..=iw)).changed();
-            ui.label("H");
-            let ch = ui.add(egui::DragValue::new(&mut h).range(1.0..=ih)).changed();
-            ui.end_row();
+                let label = fixed.map(|i| ratios[i].0).unwrap_or("Ratio");
+                widgets::combo("crop-ratio").width(ui.available_width()).selected_text(label).show_ui(ui, |ui| {
+                    for (i, (name, r)) in ratios.iter().enumerate() {
+                        if ui.selectable_label(fixed == Some(i), *name).clicked() {
+                            c.roi.set_aspect(Some(*r));
+                        }
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            widgets::section_title(ui, &p, "Area");
+            let r = c.rect();
+            let mut w = (r[2] - r[0]).round();
+            let mut h = (r[3] - r[1]).round();
+            let mut x = r[0].round();
+            let mut y = r[1].round();
+            let field_w = ((ui.available_width() - 2.0 * 20.0 - 16.0) / 2.0).clamp(64.0, 112.0);
+            let field = |ui: &mut Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>| -> bool {
+                ui.add_sized([14.0, size::COMPACT], egui::Label::new(RichText::new(label).color(p.muted)));
+                widgets::value_box_w(ui, field_w, egui::DragValue::new(v).range(range).suffix(" px")).changed()
+            };
+            let (mut cx, mut cy, mut cw, mut ch) = (false, false, false, false);
+            ui.horizontal(|ui| {
+                cx = field(ui, "X", &mut x, 0.0..=iw - 1.0);
+                ui.add_space(8.0);
+                cy = field(ui, "Y", &mut y, 0.0..=ih - 1.0);
+            });
+            ui.horizontal(|ui| {
+                cw = field(ui, "W", &mut w, 1.0..=iw);
+                ui.add_space(8.0);
+                ch = field(ui, "H", &mut h, 1.0..=ih);
+            });
             if cx || cy || cw || ch {
                 if let Some(a) = c.roi.aspect() {
                     if cw {
@@ -2024,16 +2074,13 @@ impl Viewer {
                 }
                 c.roi.set_rect(Some([x, y, x + w, y + h]));
             }
+            ui.add_space(6.0);
+            let r = c.rect();
+            ui.label(RichText::new(format!("Result   {} × {} px", (r[2] - r[0]).round(), (r[3] - r[1]).round())).size(text::SMALL).color(p.muted));
         });
-        ui.add_space(4.0);
-        let r = c.rect();
-        ui.label(RichText::new(format!("{} × {} px", (r[2] - r[0]).round(), (r[3] - r[1]).round())).color(p.muted));
-        ui.add_space(12.0);
-        ui.label(RichText::new("Drag inside to move, drag edges or corners to resize, drag outside to draw a new area. Enter applies, Esc cancels.").size(11.5).color(p.faint));
-        ui.add_space(12.0);
         // Esc after changing the area asks first, like the tools.
-        let mut apply = keys && ui.input(|i| i.key_pressed(Key::Enter));
-        let mut cancel = false;
+        let (_, mut cancel, mut apply) = tool_footer(ui, &p, false, "Crop", true);
+        apply |= keys && ui.input(|i| i.key_pressed(Key::Enter));
         if keys && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             if c.touched() {
                 self.ask(Pending::CancelTool);
@@ -2041,14 +2088,6 @@ impl Viewer {
             }
             cancel = true;
         }
-        ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
-                cancel = true;
-            }
-            if ui.add(egui::Button::new(RichText::new("Crop").color(Color32::WHITE)).fill(p.accent).min_size(Vec2::new(80.0, 28.0))).clicked() {
-                apply = true;
-            }
-        });
         if apply {
             let (x, y, w, h) = super::roi::pixel_rect(c.rect());
             self.crop = None;
@@ -2087,37 +2126,33 @@ impl Viewer {
         }
         // 0 keep / cancel, 1 discard, 2 save
         let mut choice: Option<u8> = None;
-        egui::Modal::new(egui::Id::unique("discard-edits")).show(ctx, |ui| {
-            ui.set_width(380.0);
+        widgets::modal(ctx, egui::Id::unique("discard-edits"), 400.0, |ui| {
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                choice = Some(0);
+            }
             match &tool_title {
                 Some(title) => {
-                    ui.heading("Discard changes?");
-                    ui.add_space(6.0);
-                    ui.label(format!("{title}: changes not applied yet."));
-                    ui.add_space(12.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(RichText::new("Discard").color(Color32::WHITE)).fill(p.accent)).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
-                            choice = Some(1);
-                        }
-                        if ui.button("Keep editing").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                            choice = Some(0);
-                        }
-                    });
+                    // Destructive: red, and Enter does not discard.
+                    widgets::modal_title(ui, "Discard changes?");
+                    widgets::modal_body(ui, &format!("{title}: the changes are not applied yet."));
+                    if let Some(r) = widgets::dialog_buttons(ui, &p, "Keep editing", "Discard", widgets::ButtonKind::Danger, true) {
+                        choice = Some(if r { 1 } else { 0 });
+                    }
                 }
                 None => {
-                    ui.heading("Save changes?");
-                    ui.add_space(6.0);
-                    ui.label("This image has unsaved edits.");
-                    ui.add_space(12.0);
+                    widgets::modal_title(ui, "Save changes?");
+                    widgets::modal_body(ui, "This image has unsaved edits.");
+                    ui.add_space(theme::space::BUTTONS_GAP);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        // [Discard] [Cancel] [Save]: the primary last, Discard away from it.
+                        if widgets::primary_button(ui, &p, "Save").clicked() {
+                            choice = Some(2);
+                        }
+                        if widgets::secondary_button(ui, "Cancel").clicked() {
                             choice = Some(0);
                         }
-                        if ui.button("Discard").clicked() {
+                        if widgets::secondary_button(ui, "Discard").clicked() {
                             choice = Some(1);
-                        }
-                        if ui.add(egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(p.accent)).clicked() {
-                            choice = Some(2);
                         }
                     });
                 }
@@ -2209,7 +2244,8 @@ fn preload_limit(budget: u64) -> u64 {
     (budget / 2).min(60_000_000 * 4)
 }
 
-/// Items of the viewer's bottom toolbar.
+/// Items of the viewer's bottom toolbar: navigation, zoom, the most used edits
+/// with a labelled Edit menu, panels, and a More menu for everything else.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum BarItem {
     Sep,
@@ -2220,78 +2256,282 @@ enum BarItem {
     ZoomPct,
     ZoomIn,
     Fit,
-    Lock,
     RotL,
     RotR,
     Crop,
-    Adjust,
-    Resize,
-    Save,
-    Delete,
+    Edit,
     Info,
-    Analysis,
     Film,
-    Slideshow,
     Fullscreen,
     More,
 }
+
+/// Size of a toolbar button (16 pt glyph in a 32 pt target).
+const BAR_BUTTON: f32 = 32.0;
+const BAR_ZOOM_W: f32 = 52.0;
+const BAR_EDIT_W: f32 = 82.0;
 
 impl BarItem {
     /// Width in points including the 1 pt item spacing.
     fn width(self) -> f32 {
         match self {
             BarItem::Sep => 10.0,
-            BarItem::ZoomPct => 55.0,
-            _ => 31.0,
+            BarItem::ZoomPct => BAR_ZOOM_W + 1.0,
+            BarItem::Edit => BAR_EDIT_W + 1.0,
+            _ => BAR_BUTTON + 1.0,
         }
     }
 }
 
-/// Toolbar items that fit in `avail` points, plus the ones moved to the
-/// "..." menu (in toolbar order).
+/// Toolbar items that fit in `avail` points, plus the ones moved to the More
+/// menu (in toolbar order). More is always there: it holds the less used
+/// commands (lock zoom, histogram, save, delete, slideshow...).
 fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     use BarItem as B;
-    let full = [
-        B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Lock, B::Sep, B::RotL, B::RotR, B::Crop, B::Adjust, B::Resize, B::Sep,
-        B::Save, B::Delete, B::Sep, B::Info, B::Analysis, B::Film, B::Slideshow, B::Fullscreen,
-    ];
+    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Film, B::Fullscreen, B::More];
     let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
     if width(&full) <= avail {
         return (full.to_vec(), Vec::new());
     }
     let mut items: Vec<BarItem> = full.iter().copied().filter(|i| *i != B::Sep).collect();
-    if width(&items) <= avail {
-        return (items, Vec::new());
-    }
-    // Least important first; Prev / Next / zoom / fit always stay.
-    let drop_order = [B::Fullscreen, B::Slideshow, B::Lock, B::Film, B::Resize, B::Adjust, B::Delete, B::RotR, B::Info, B::RotL, B::Browser, B::ZoomOut, B::ZoomIn, B::Analysis, B::Crop, B::Save];
+    // Least important first; Prev / Next / the zoom figure / Fit / Edit / More always stay.
+    let drop_order = [B::Fullscreen, B::Film, B::Info, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
     let mut hidden = Vec::new();
     for d in drop_order {
-        if width(&items) + B::More.width() <= avail {
+        if width(&items) <= avail {
             break;
         }
         items.retain(|i| *i != d);
         hidden.push(d);
     }
-    items.push(B::More);
     hidden.sort_by_key(|h| full.iter().position(|f| f == h));
     (items, hidden)
 }
 
+/// A 28 pt menu row for a command (icon, label, shortcut); runs it on click.
 fn menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
-    let r = ui.add(egui::Button::new(format!("{}   {}", c.icon(), c.label())).shortcut_text(c.shortcut()));
-    if r.clicked() {
+    if widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
         ev.push(ViewerEvent::Command(c));
         ui.close();
     }
 }
 
+/// A row of the left edge panel, in the menu row style; runs the command.
 fn edge_menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
-    let text = RichText::new(format!("{}   {}", c.icon(), c.label())).size(12.5);
-    let r = ui.add_sized([ui.available_width(), 24.0], egui::Button::new(text).frame(false).shortcut_text(RichText::new(c.shortcut()).size(11.0).weak()));
-    if r.clicked() {
+    if widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
         ev.push(ViewerEvent::Command(c));
     }
+}
+
+/// A menu row for an on / off command: a check mark instead of "Toggle ...".
+fn menu_check(ui: &mut Ui, c: Command, label: &str, on: bool, ev: &mut Vec<ViewerEvent>) {
+    if widgets::menu_toggle(ui, on, label, &c.shortcut()).clicked() {
+        ev.push(ViewerEvent::Command(c));
+        ui.close();
+    }
+}
+
+/// Caption above a group of menu rows, aligned with the row labels.
+fn menu_caption(ui: &mut Ui, label: &str) {
+    let p = theme::palette(ui.ctx());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.label(RichText::new(label).font(text::caption()).color(p.muted));
+    });
+    ui.add_space(2.0);
+}
+
+/// Every edit tool in two columns with group captions (the Edit menus of the
+/// toolbar and the context menu): short enough to fit any window.
+fn edit_menu(ui: &mut Ui, ev: &mut Vec<ViewerEvent>) {
+    const COL_W: f32 = 236.0;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for groups in [[0usize, 1, 3].as_slice(), [2, 4].as_slice()] {
+            ui.allocate_ui_with_layout(Vec2::new(COL_W, 0.0), egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                ui.set_width(COL_W);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for &g in groups {
+                    menu_caption(ui, EDIT_GROUP_NAMES[g]);
+                    for c in Command::EDIT_GROUPS[g] {
+                        menu_item(ui, *c, ev);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// A labelled toolbar button with a caret ("Edit"), drawn like `icon_button`.
+fn bar_menu_button(ui: &mut Ui, p: &Palette, icon: &str, label: &str, tip: &str, open: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(BAR_EDIT_W, BAR_BUTTON), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let vis = ui.visuals();
+        let hovered = resp.hovered();
+        let bg = if open {
+            vis.selection.bg_fill
+        } else if resp.is_pointer_button_down_on() {
+            vis.widgets.active.weak_bg_fill
+        } else if hovered {
+            vis.widgets.hovered.weak_bg_fill
+        } else {
+            Color32::TRANSPARENT
+        };
+        let fg = if open { vis.selection.stroke.color } else if hovered { vis.strong_text_color() } else { vis.text_color() };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(theme::radius::CONTROL), bg);
+        let label_g = painter.layout_no_wrap(label.to_string(), text::body(), fg);
+        // Icon, 6 pt gap, label, 6 pt gap, caret: centred as one group.
+        let w = size::ICON_TOOLBAR + 6.0 + label_g.size().x + 6.0 + size::ICON_CARET;
+        let x0 = rect.center().x - w / 2.0;
+        painter.text(egui::pos2(x0 + size::ICON_TOOLBAR / 2.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(size::ICON_TOOLBAR), fg);
+        let lx = x0 + size::ICON_TOOLBAR + 6.0;
+        painter.galley(egui::pos2(lx, rect.center().y - label_g.size().y / 2.0), label_g.clone(), fg);
+        painter.text(egui::pos2(lx + label_g.size().x + 6.0 + size::ICON_CARET / 2.0, rect.center().y), Align2::CENTER_CENTER, I::CARET_DOWN, FontId::proportional(size::ICON_CARET), p.muted);
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(theme::radius::CONTROL), Stroke::new(1.0, vis.text_color()), egui::StrokeKind::Inside);
+        }
+    }
+    resp.on_hover_text(tip)
+}
+
+/// Fade the top / bottom 12 pt of a scrolled area into `bg` where more content
+/// is hidden, so the cut-off reads as "scroll for more".
+fn scroll_fades<R>(ui: &Ui, out: &egui::scroll_area::ScrollAreaOutput<R>, bg: Color32) {
+    let r = out.inner_rect;
+    let off = out.state.clamped_offset().y;
+    let max = (out.content_size.y - r.height()).max(0.0);
+    let fade = |top: bool| {
+        let h = 12.0;
+        let band = if top { Rect::from_min_size(r.min, Vec2::new(r.width(), h)) } else { Rect::from_min_max(egui::pos2(r.min.x, r.max.y - h), r.max) };
+        let (a, b) = if top { (bg, Color32::TRANSPARENT) } else { (Color32::TRANSPARENT, bg) };
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(band.left_top(), a);
+        mesh.colored_vertex(band.right_top(), a);
+        mesh.colored_vertex(band.right_bottom(), b);
+        mesh.colored_vertex(band.left_bottom(), b);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().add(egui::Shape::mesh(mesh));
+    };
+    if off > 0.5 {
+        fade(true);
+    }
+    if off < max - 0.5 {
+        fade(false);
+    }
+}
+
+/// A collapsible group of key / value rows in the info panel ("File", "Camera"):
+/// 96 pt muted keys, wrapping values, 20 pt rows. Returns whether it is open.
+fn info_group(ui: &mut Ui, p: &Palette, title: &str, id: &str, rows: &[(&str, String)]) -> bool {
+    let r = egui::CollapsingHeader::new(RichText::new(title).font(text::caption()).color(p.muted)).id_salt(id).default_open(true).icon(widgets::collapse_caret).show_unindented(ui, |ui| {
+        let value_w = (ui.available_width() - size::LABEL_W - 12.0).max(60.0);
+        egui::Grid::new(id).num_columns(2).striped(false).spacing([12.0, 4.0]).min_row_height(20.0).min_col_width(size::LABEL_W).max_col_width(value_w).show(ui, |ui| {
+            for (k, v) in rows {
+                ui.add(egui::Label::new(RichText::new(*k).size(text::SMALL).color(p.muted)).truncate());
+                ui.add(egui::Label::new(RichText::new(v).size(12.5).color(p.text)).wrap());
+                ui.end_row();
+            }
+        });
+        ui.add_space(4.0);
+    });
+    r.openness > 0.5
+}
+
+/// `text` shortened in the middle with "..." to fit `max_w` (keeps the start of
+/// a path and the folder it ends in).
+fn middle_ellipsis(ui: &Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x;
+    if w(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Keep about a third of the room for the start and the rest for the end.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let keep = (lo + hi).div_ceil(2);
+        let head = keep / 3;
+        let s: String = chars[..head].iter().chain(['.', '.', '.'].iter()).chain(chars[chars.len() - (keep - head)..].iter()).collect();
+        if w(&s) <= max_w {
+            lo = keep;
+        } else {
+            hi = keep - 1;
+        }
+    }
+    let head = lo / 3;
+    chars[..head].iter().chain(['.', '.', '.'].iter()).chain(chars[chars.len() - (lo - head)..].iter()).collect()
+}
+
+/// The header of a tool panel: title, a spinner while busy, an (i) button whose
+/// tooltip holds the tool's how-to text, and Reset as a text link on the right.
+/// Returns true when Reset was clicked.
+fn tool_header(ui: &mut Ui, p: &Palette, title: &str, busy: bool, hints: &[String], can_reset: bool) -> bool {
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        ui.set_min_height(size::CONTROL);
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.add(egui::Label::new(RichText::new(title).font(text::title()).color(p.text)).truncate());
+        if !hints.is_empty() {
+            let show = |ui: &mut Ui| {
+                ui.set_max_width(280.0);
+                for (i, h) in hints.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(4.0);
+                    }
+                    ui.add(egui::Label::new(RichText::new(h).size(text::SMALL)).wrap());
+                }
+            };
+            // Hover shows the tips; a click pins them until the next click.
+            let r = widgets::icon_button_sized(ui, I::INFO, "", false, 24.0, size::ICON_TOOLBAR);
+            let pinned = egui::Popup::from_toggle_button_response(&r).show(|ui| egui::Frame::new().inner_margin(egui::Margin::same(6)).show(ui, show)).is_some();
+            if !pinned {
+                r.on_hover_ui(show);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let link = egui::Button::new(RichText::new("Reset").color(if can_reset { p.accent_text } else { p.faint })).frame(false);
+            if ui.add_enabled(can_reset, link).on_hover_text("Back to the defaults").clicked() {
+                reset = true;
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+    });
+    ui.add_space(4.0);
+    reset
+}
+
+/// Height of the pinned panel footer: divider, gap, optional Hold to compare,
+/// gap, buttons.
+fn footer_height(hold: bool) -> f32 {
+    1.0 + 12.0 + if hold { size::CONTROL + 8.0 } else { 0.0 } + size::CONTROL
+}
+
+/// The pinned footer of a tool panel. Returns (hold pressed, cancel, apply).
+fn tool_footer(ui: &mut Ui, p: &Palette, hold: bool, apply_label: &str, can_apply: bool) -> (bool, bool, bool) {
+    let w = ui.available_width();
+    let (line, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+    ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, p.border));
+    ui.add_space(12.0 - ui.spacing().item_spacing.y);
+    let mut held = false;
+    if hold {
+        let b = egui::Button::new(format!("{}  Hold to compare", I::EYE)).min_size(Vec2::new(w, size::CONTROL)).sense(Sense::click_and_drag());
+        held = ui.add(b).on_hover_text("Shows the original while pressed (or hold \\)").is_pointer_button_down_on();
+        ui.add_space(8.0 - ui.spacing().item_spacing.y);
+    }
+    let (mut cancel, mut apply) = (false, false);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if widgets::primary_button_enabled(ui, p, can_apply, apply_label).clicked() {
+            apply = true;
+        }
+        if widgets::secondary_button(ui, "Cancel").clicked() {
+            cancel = true;
+        }
+    });
+    (held, cancel, apply)
 }
 
 pub fn file_name(p: &Path) -> String {
@@ -2320,13 +2560,20 @@ mod tests {
     fn bottom_bar_always_fits() {
         let (all, hidden) = bar_layout(1000.0);
         assert!(hidden.is_empty() && all.contains(&BarItem::Sep));
-        for avail in [600.0, 400.0, 300.0, 250.0] {
+        for avail in [600.0, 400.0, 300.0] {
             let (items, hidden) = bar_layout(avail);
             let w: f32 = items.iter().map(|i| i.width()).sum();
             assert!(w <= avail, "{avail}: {w}");
-            assert!(items.contains(&BarItem::Prev) && items.contains(&BarItem::Next) && items.contains(&BarItem::Fit));
-            assert_eq!(items.contains(&BarItem::More), !hidden.is_empty());
+            for keep in [BarItem::Prev, BarItem::Next, BarItem::Fit, BarItem::Edit, BarItem::More] {
+                assert!(items.contains(&keep), "{avail}: {keep:?}");
+            }
+            // Nothing is lost: what does not fit is in the More menu.
+            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Film, BarItem::Fullscreen] {
+                assert!(items.contains(&b) != hidden.contains(&b), "{avail}: {b:?}");
+            }
         }
+        // About 15 items at full width.
+        assert!(all.iter().filter(|i| **i != BarItem::Sep).count() <= 15);
     }
 
     #[test]
