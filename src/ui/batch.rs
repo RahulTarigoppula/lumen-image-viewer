@@ -55,8 +55,12 @@ pub(crate) fn danger_button(ui: &mut Ui, p: &Palette, text: &str) -> egui::Respo
     widgets::danger_button(ui, p, text)
 }
 
+/// Small muted note. Ragged right: in the justified layout of `ui.columns` egui
+/// would otherwise stretch the word gaps of every wrapped line.
 pub(crate) fn hint(ui: &mut Ui, p: &Palette, t: &str) {
-    ui.label(RichText::new(t).size(text::SMALL).color(p.muted));
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.add(egui::Label::new(RichText::new(t).size(text::SMALL).color(p.muted)).wrap());
+    });
 }
 
 /// Centered empty-state message.
@@ -164,6 +168,9 @@ fn fmt_duration(d: std::time::Duration) -> String {
 
 pub struct BatchConvert {
     pub files: Vec<PathBuf>,
+    /// The browser selection and every image of the folder, while the list is one
+    /// of them (the Selected / All switch); `None` once the list was edited.
+    scopes: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
     folder: PathBuf,
     selected: HashSet<usize>,
     s: ConvertSettings,
@@ -200,11 +207,23 @@ pub struct BatchConvert {
 }
 
 impl BatchConvert {
-    pub fn new(files: Vec<PathBuf>, folder: PathBuf, _core: &Core) -> Self {
+    /// `selected` are the files picked in the browser (or the viewer's image) and `all`
+    /// every image in the folder. With a selection the list starts with it, as in
+    /// FastStone, and a switch in the Source card goes to the whole folder.
+    pub fn new(selected: Vec<PathBuf>, all: Vec<PathBuf>, folder: PathBuf, _core: &Core) -> Self {
         let s = convert::load_prefs().convert;
-        let files: Vec<PathBuf> = files.into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
+        let images = |v: Vec<PathBuf>| -> Vec<PathBuf> { v.into_iter().filter(|p| crate::formats::is_image_path(p)).collect() };
+        let (selected, all) = (images(selected), images(all));
+        let (files, scopes) = if selected.is_empty() {
+            (all, None)
+        } else if all.len() <= selected.len() {
+            (selected, None)
+        } else {
+            (selected.clone(), Some((selected, all)))
+        };
         BatchConvert {
             files,
+            scopes,
             folder,
             selected: HashSet::new(),
             last_s: s.clone(),
@@ -235,6 +254,12 @@ impl BatchConvert {
         }
     }
 
+    /// The list was edited by hand: it is no longer "the selection" or "the folder".
+    fn files_edited(&mut self) {
+        self.scopes = None;
+        self.files_changed();
+    }
+
     fn files_changed(&mut self) {
         self.selected.clear();
         self.total_bytes = None;
@@ -252,7 +277,7 @@ impl BatchConvert {
             }
         }
         if added > 0 {
-            self.files_changed();
+            self.files_edited();
         }
     }
 
@@ -515,6 +540,15 @@ impl BatchConvert {
 
     fn sources_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::IMAGES, "Source files", |ui| {
+            if let Some((sel, all)) = &self.scopes {
+                let (sel_label, all_label) = (format!("Selected ({})", sel.len()), format!("All in folder ({})", all.len()));
+                let mut i = if self.files.len() == sel.len() { 0 } else { 1 };
+                if widgets::segmented(ui, &mut i, &[sel_label.as_str(), all_label.as_str()]) {
+                    self.files = if i == 0 { sel.clone() } else { all.clone() };
+                    self.files_changed();
+                }
+                ui.add_space(4.0);
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.button(format!("{}  Add files", I::FILE_PLUS)).clicked() {
                     if let Some(v) = rfd::FileDialog::new().add_filter("Images", &image_exts()).set_directory(&self.folder).pick_files() {
@@ -535,11 +569,11 @@ impl BatchConvert {
                         i += 1;
                         keep
                     });
-                    self.files_changed();
+                    self.files_edited();
                 }
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new(format!("{}  Clear", I::BROOM))).on_hover_text("Remove every file from the list").clicked() {
                     self.files.clear();
-                    self.files_changed();
+                    self.files_edited();
                 }
             });
             crate::ui::widgets::checkbox(ui, &mut self.s.include_subfolders, "Include subfolders when adding a folder");
@@ -657,7 +691,7 @@ impl BatchConvert {
                     hint(ui, p, "This format has no transparency: transparent areas are filled with white.");
                 }
             }
-            egui::Grid::new("bc-format-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("bc-format-grid").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 if fmt.is_none() || fmt == Some(SaveFormat::Jpeg) {
                     ui.label("JPEG quality");
                     ui.add(crate::ui::widgets::Slider::new(&mut self.s.jpeg_quality, 1..=100));
@@ -700,7 +734,7 @@ impl BatchConvert {
     fn resize_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::ARROWS_OUT_SIMPLE, "Resize", |ui| {
             let r = &mut self.s.resize;
-            egui::Grid::new("bc-resize-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("bc-resize-grid").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Mode");
                 crate::ui::widgets::combo("bc-resize-mode").width(160.0).selected_text(r.mode.label()).show_ui(ui, |ui| {
                     for m in ResizeMode::ALL {
@@ -1462,7 +1496,7 @@ impl BatchRename {
                 });
             } else {
                 card(ui, p, I::MAGNIFYING_GLASS, "Find, replace & case", |ui| {
-                    egui::Grid::new("br-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    egui::Grid::new("br-grid").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                         ui.label("Find");
                         ui.add(egui::TextEdit::singleline(&mut self.s.find).desired_width(f32::INFINITY));
                         ui.end_row();

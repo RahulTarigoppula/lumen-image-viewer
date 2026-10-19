@@ -165,12 +165,7 @@ pub fn section(ui: &mut egui::Ui, cx: &ToolUiCtx, text: &str) {
 /// Colour swatch button (straight-alpha RGBA).
 pub fn color_button(ui: &mut egui::Ui, rgba: &mut [u8; 4], alpha: bool) -> bool {
     let mut c = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
-    let mode = if alpha { egui::color_picker::Alpha::OnlyBlend } else { egui::color_picker::Alpha::Opaque };
-    let r = egui::color_picker::color_edit_button_srgba(ui, &mut c, mode);
-    // A hairline edge, so white shows on the light panel (and black on the dark one).
-    let edge = theme::palette(ui.ctx()).border;
-    ui.painter().rect_stroke(r.rect, ui.visuals().widgets.inactive.corner_radius, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-    if r.changed() {
+    if widgets::color_button_rgba(ui, &mut c, alpha).changed() {
         let n = c.to_srgba_unmultiplied();
         if n != *rgba {
             *rgba = if alpha { n } else { [n[0], n[1], n[2], 255] };
