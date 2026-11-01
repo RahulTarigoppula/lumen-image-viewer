@@ -94,6 +94,10 @@ pub struct Comparison {
 /// A parsed, validated report.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AiReport {
+    /// One-sentence decision ("B is better: ..."). Empty in replies to
+    /// older prompts and in history saved before it existed.
+    #[serde(default)]
+    pub verdict: String,
     pub overall: Option<u8>,
     pub categories: Vec<CategoryScore>,
     pub comparison: Option<Comparison>,
@@ -339,6 +343,7 @@ pub fn parse_report(text: &str, kind: OutputKind, conv: CoordConvention) -> Resu
         warnings.push("the output was cut off; the report is incomplete".into());
     }
     Ok(AiReport {
+        verdict: v.get("verdict").and_then(|s| s.as_str()).unwrap_or("").trim().to_string(),
         overall,
         categories,
         comparison,
@@ -395,6 +400,9 @@ impl AiReport {
                     p => format!("{} preferred", p.as_str()),
                 };
                 md.push_str(&format!("## {title}: {verdict}, confidence {:.2}\n\n", c.confidence));
+                if !self.verdict.is_empty() {
+                    md.push_str(&format!("**{}**\n\n", self.verdict));
+                }
                 md.push_str(&format!("Overall: A {}/10, B {}/10\n\n", score(c.overall_a), score(c.overall_b)));
                 md.push_str("| Category | A | B | Notes (B) |\n|---|---|---|---|\n");
                 for (a, b) in c.scores_a.iter().zip(&c.scores_b) {
@@ -407,6 +415,9 @@ impl AiReport {
             }
             None => {
                 md.push_str(&format!("## {title}: {}/10\n\n", score(self.overall)));
+                if !self.verdict.is_empty() {
+                    md.push_str(&format!("**{}**\n\n", self.verdict));
+                }
                 md.push_str("| Category | Score | Notes |\n|---|---|---|\n");
                 for c in self.categories.iter().filter(|c| c.score.is_some()) {
                     md.push_str(&format!("| {} | {} | {} |\n", c.label, score(c.score), cell(&c.rationale)));
@@ -532,6 +543,22 @@ mod tests {
         assert!(md.contains("2. **moderate** blur: x"), "{md}");
         assert!(!md.contains("image A"), "{md}");
         assert!(md.contains("### Summary\n\nGood overall."));
+    }
+
+    #[test]
+    fn verdict_is_read_and_optional() {
+        let text = r#"{"verdict": "Usable: sharp and clean, only the sky is slightly banded.", "overall": 8, "findings": [], "summary": "Fine."}"#;
+        let r = parse_report(text, OutputKind::QualityJson, CoordConvention::Relative1000).unwrap();
+        assert_eq!(r.verdict, "Usable: sharp and clean, only the sky is slightly banded.");
+        assert!(r.to_markdown("Quality critique", false).contains("**Usable: sharp and clean"));
+        // Replies to the older prompt have none.
+        let r = parse_report(FULL, OutputKind::QualityJson, CoordConvention::Relative1000).unwrap();
+        assert!(r.verdict.is_empty());
+        assert!(!r.to_markdown("Quality critique", false).contains("**\n"));
+        // History saved before the field existed still loads.
+        let mut old = serde_json::to_value(&r).unwrap();
+        old.as_object_mut().unwrap().remove("verdict");
+        assert!(serde_json::from_value::<AiReport>(old).unwrap().verdict.is_empty());
     }
 
     #[test]

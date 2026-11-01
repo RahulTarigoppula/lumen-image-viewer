@@ -17,6 +17,7 @@ pub mod frame;
 pub mod heatmap;
 pub mod job;
 pub mod metrics;
+pub mod regions;
 pub mod report;
 mod simd;
 pub mod stats;
@@ -25,4 +26,5 @@ pub use frame::{FrameCtx, FrameSource, FrameView, Matrix, OwnedFrame, OwnedPlane
 pub use heatmap::{Colormap, ColorizeOptions, Heatmap, RangeMode};
 pub use job::{Analyzer, CancelToken, FrameResult, ImageSpec, JobControl, JobEvent, JobHandle, SharedFrame, VideoSpec};
 pub use metrics::{Metric, MetricOptions, MetricResult, Unit, Value, PSNR_CAP_DB};
+pub use regions::{find_regions, Region, RegionKind, RegionLevel};
 pub use report::{AnalysisReport, FrameRange, Scope, ScopeKind};

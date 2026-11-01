@@ -1098,7 +1098,7 @@ impl App {
                         Mode::Viewer => self.viewer.zoom_to_region(rect, ppp),
                         Mode::Compare => {
                             if let Some(c) = &mut self.compare {
-                                c.zoom_to_region(if slot == canvas::Slot::B { 1 } else { 0 }, rect, ppp);
+                                c.zoom_to_region(slot.index(), rect, ppp);
                             }
                         }
                         Mode::Video => {

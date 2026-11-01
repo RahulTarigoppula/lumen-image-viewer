@@ -18,6 +18,7 @@
 
 pub mod adapters;
 pub mod canvas;
+pub mod each_image;
 pub mod heatmap_view;
 pub mod look;
 pub mod metrics_view;

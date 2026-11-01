@@ -11,6 +11,8 @@
 //! [`MetricsTab::take_seek`].
 
 use super::adapters;
+use super::canvas::{Pane, Slot};
+use super::each_image::{self, AreaSet, EachImage};
 use super::heatmap_view::HeatmapView;
 use super::plots::{self, PlotAction, Plots, Series};
 use super::look;
@@ -23,7 +25,7 @@ use egui::{CursorIcon, Painter, RichText, Sense, Stroke, Ui, Vec2};
 use image::RgbaImage;
 use lumen_analysis::cache::{CacheKey, DiskCache, DEFAULT_MAX_BYTES};
 use lumen_analysis::metrics::{self, Direction, MetricKind, Unit};
-use lumen_analysis::{AnalysisReport, Analyzer, Heatmap, JobEvent, JobHandle, MetricResult, Roi, ScopeKind};
+use lumen_analysis::{AnalysisReport, Analyzer, Heatmap, JobEvent, JobHandle, MetricResult, Region, Roi, ScopeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -112,6 +114,49 @@ pub fn threshold(key: &str) -> Option<Threshold> {
 
 pub fn grade(key: &str, v: f64) -> Option<Grade> {
     threshold(key).map(|t| t.grade(v))
+}
+
+/// What metric `id` tells, in plain words, and which way is better (the
+/// hover note of its name in the tables and the picker).
+pub fn plain_explain(id: &str) -> &'static str {
+    match id {
+        "psnr" | "psnr.rgb" => "How close the pixels are to A, in dB. Higher is better: above 40 dB differences are hard to see, below 30 dB they are visible.",
+        "ssim.fast" | "ssim.gauss" | "ms_ssim" => "How similar the structure (edges, texture) is to A, 0 to 1. Higher is better: above 0.98 it looks the same, below 0.90 it clearly differs.",
+        "diff.abs" | "diff.signed" => "Plain pixel difference from A, in 8-bit levels. Lower is better: 0 is identical.",
+        "ssimulacra2" => "Perceptual similarity to A, 0 to 100. Higher is better: above 70 differences are hard to notice.",
+        "butteraugli" => "Perceptual difference from A. Lower is better: below 1 it looks the same, above 2 it differs visibly.",
+        "flip" => "How a viewer flipping between A and this image would notice differences, 0 to 1. Lower is better.",
+        "sharpness.laplacian" => "Edge contrast (Laplacian variance). Higher is sharper; smooth subjects such as sky score low too.",
+        "sharpness.tenengrad" => "Gradient energy of edges (Tenengrad). Higher is sharper; used with the Laplacian to find blurry areas.",
+        "noise" => "Estimated grain in 8-bit levels. Lower is better: below 2 it is hard to see.",
+        "exposure" => "Clipped (pure white or black) pixels and brightness. Lower clipping is better.",
+        "color_cast" => "How far gray areas lean to a color (Delta-E). Lower is better: below 2 is hard to see.",
+        "blockiness" => "8 × 8 compression blocks. Lower is better: 0 is none, above 0.3 they show.",
+        "banding" => "Steps in smooth gradients. Lower is better: below 1% gradients are clean.",
+        "temporal.flicker" => "Brightness changes from frame to frame. Lower is steadier.",
+        "temporal.freeze" => "Frames that repeat the one before (dropped or frozen frames in camera footage).",
+        "temporal.scene" => "Large picture changes between frames, such as cuts between shots.",
+        id if id.starts_with("deltae.") => "Color difference from A (Delta-E). Lower is better: below 1 it is invisible, above 3 it is clear.",
+        _ => "",
+    }
+}
+
+/// `name`, then the plain explanation of `id` when there is one.
+fn name_tip(id: &str, name: &str) -> String {
+    match plain_explain(id) {
+        "" => name.to_string(),
+        e => format!("{name}\n{e}"),
+    }
+}
+
+/// Metrics a run adds to those chosen because another one needs them:
+/// blurry areas are found with the Laplacian and the Tenengrad maps together.
+fn with_helpers(ids: &[String]) -> Vec<String> {
+    let mut v = ids.to_vec();
+    if v.iter().any(|i| i == "sharpness.laplacian") && !v.iter().any(|i| i == "sharpness.tenengrad") {
+        v.push("sharpness.tenengrad".into());
+    }
+    v
 }
 
 // ------------------------------------------------------------------ ranges
@@ -382,7 +427,9 @@ pub fn native_roi(r: Roi, rotation: i32, size: (u32, u32)) -> Roi {
 #[serde(default)]
 struct Prefs {
     image: Option<Vec<String>>,
-    compare: Option<Vec<String>>,
+    /// Compare's choice since every image is checked on its own (choices
+    /// saved before, of reference metrics only, are not used).
+    compare_each: Option<Vec<String>>,
     video: Option<Vec<String>>,
     video_pair: Option<Vec<String>>,
     stride: Option<String>,
@@ -415,7 +462,7 @@ impl Prefs {
         match k {
             Kind::None => None,
             Kind::Image => Some(&mut self.image),
-            Kind::Compare => Some(&mut self.compare),
+            Kind::Compare => Some(&mut self.compare_each),
             Kind::Video => Some(&mut self.video),
             Kind::VideoPair => Some(&mut self.video_pair),
         }
@@ -423,18 +470,22 @@ impl Prefs {
 }
 
 /// The recommended metric set (before the user chose one): everything the
-/// summary talks about, and cheap enough for one click. Pairs get the
-/// metrics with a heatmap for "Show where"; video ranges stay fast.
+/// summary talks about, and cheap enough for one click. A compare checks
+/// every image on its own (comparing with A is one click away, see
+/// [`REFERENCE_METRICS`]); video ranges stay fast.
 fn default_metrics(k: Kind) -> Vec<String> {
     let ids: &[&str] = match k {
         Kind::None => &[],
-        Kind::Image => &["sharpness.laplacian", "noise", "exposure", "color_cast", "blockiness", "banding"],
-        Kind::Compare => &["psnr", "ssim.gauss", "deltae.2000"],
+        Kind::Image | Kind::Compare => &["sharpness.laplacian", "noise", "exposure", "color_cast", "blockiness", "banding"],
         Kind::Video => &["sharpness.laplacian", "noise", "exposure", "blockiness", "banding", "temporal.freeze", "temporal.scene"],
         Kind::VideoPair => &["psnr", "ssim.fast"],
     };
     ids.iter().map(|s| s.to_string()).collect()
 }
+
+/// What "Compare with A" adds in a compare: closeness, structure and color,
+/// with a heatmap for "Show where".
+const REFERENCE_METRICS: [&str; 3] = ["psnr", "ssim.gauss", "deltae.2000"];
 
 /// Range speed (ms per measured frame and megapixel) before any run: what
 /// the recommended sets take on a 1.5 MP screen recording (8 threads).
@@ -1085,6 +1136,18 @@ pub struct MetricsTab {
     dev_open: Option<bool>,
     /// Frames waited for the paused frame's planes (see `run_video`).
     frame_tries: u8,
+    /// Compare: the no-reference checks of every image on its own.
+    each: EachImage,
+    /// One image: the problem areas of the shown report, and the pixels
+    /// they are in.
+    regions: Vec<Region>,
+    regions_size: (u32, u32),
+    /// Problem area under the pointer in the list (image, area).
+    hover_area: Option<(usize, usize)>,
+    /// Draw the problem areas on the image.
+    show_areas: bool,
+    /// A problem area was clicked: zoom the view there (see `take_zoom`).
+    zoom: Option<(Slot, [f32; 4])>,
 }
 
 impl Default for MetricsTab {
@@ -1146,6 +1209,12 @@ impl MetricsTab {
             fps: 25.0,
             dev_open: None,
             frame_tries: 0,
+            each: EachImage::default(),
+            regions: Vec::new(),
+            regions_size: (0, 0),
+            hover_area: None,
+            show_areas: true,
+            zoom: None,
         }
     }
 
@@ -1219,7 +1288,7 @@ impl MetricsTab {
             SubjectKind::Pair => match (ready(&s.a), ready(&s.b)) {
                 // 3 or 4 panes: the picked one against A, the others in the same run.
                 (Some((a, image_a)), Some(_)) if panes.len() > 2 && panes.first().is_some_and(|p| p.0 == a) => {
-                    let pick = self.pair_pick.clamp(1, panes.len() - 1);
+                    let pick = self.pair_pick.clamp(1, panes.len().saturating_sub(1).max(1));
                     let Some(image_b) = panes[pick].1.clone() else { return Subject::None };
                     let others = panes.iter().enumerate().skip(1).filter(|(i, _)| *i != pick).filter_map(|(i, (p, img))| Some((LETTERS[i.min(3)], p.clone(), img.clone()?))).collect();
                     Subject::Compare { a, image_a, b: panes[pick].0.clone(), image_b, source_bits, letter: LETTERS[pick.min(3)], others }
@@ -1278,6 +1347,11 @@ impl MetricsTab {
                 _ => self.stride_auto = true,
             },
             "recommended" => self.selected = default_metrics(self.kind).into_iter().collect(),
+            // `reference`: add the metrics that compare each image with A.
+            "reference" => self.selected.extend(REFERENCE_METRICS.iter().map(|s| s.to_string())),
+            // `area <tag>` ("B2", or "2" for one image): like clicking that problem area.
+            "area" => self.zoom = self.area_zoom(rest),
+            "boxes" => self.show_areas = rest != "off",
             "where" => self.show_where(),
             // `pair B|C|D`: the pane of a 3 or 4 image compare measured against A.
             "pair" => self.pair_pick = LETTERS.iter().position(|l| l.eq_ignore_ascii_case(rest)).unwrap_or(1).max(1),
@@ -1328,7 +1402,7 @@ impl MetricsTab {
             v.join("; ")
         });
         format!(
-            "metrics: kind={:?} scope={:?} stride_auto={} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} visible={} notes={} history={} worst={:?} pair={} stashed={} side_runs={} summary=[{}]",
+            "metrics: kind={:?} scope={:?} stride_auto={} running={} stale={} status={:?} frames={} selected=[{}] values=[{}] map={:?} visible={} notes={} history={} worst={:?} pair={} stashed={} side_runs={} summary=[{}] areas={} {} zoom={:?}",
             self.kind,
             self.scope,
             self.stride_auto,
@@ -1347,7 +1421,69 @@ impl MetricsTab {
             self.stash.len(),
             self.side_runs.len(),
             summary.unwrap_or_default(),
+            self.regions.len(),
+            self.each.state(),
+            self.zoom,
         )
+    }
+
+    /// The zoom target of problem area `tag` ("B2"; "2" or "A2" for one image).
+    fn area_zoom(&self, tag: &str) -> Option<(Slot, [f32; 4])> {
+        let (letter, n) = tag.split_at(tag.find(|c: char| c.is_ascii_digit()).unwrap_or(0));
+        let n: usize = n.parse().ok()?;
+        let sets = self.area_sets();
+        let set = sets.iter().find(|s| letter.is_empty() || s.slot.letter().eq_ignore_ascii_case(letter))?;
+        let r = set.regions.get(n.checked_sub(1)?)?;
+        let (w, h) = (set.size.0.max(1) as f32, set.size.1.max(1) as f32);
+        Some((set.slot, [r.rect[0] / w, r.rect[1] / h, r.rect[2] / w, r.rect[3] / h]))
+    }
+
+    /// The problem areas shown: every image of a compare, or the image.
+    fn area_sets(&self) -> Vec<AreaSet<'_>> {
+        if self.kind == Kind::Compare {
+            self.each.shots.iter().map(|s| AreaSet { slot: s.slot(), size: s.size, regions: &s.regions }).collect()
+        } else if self.kind == Kind::Image && !self.regions.is_empty() {
+            vec![AreaSet { slot: Slot::A, size: self.regions_size, regions: &self.regions }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The per-image results stopped matching the panel's region.
+    fn each_stale(&self) -> bool {
+        self.each.measured.is_some_and(|r| r != self.cur_roi)
+    }
+
+    /// Numbered boxes of the problem areas on the panes (the Metrics tab's
+    /// overlay; not while the results are out of date).
+    pub fn paint_areas(&self, ui: &Ui, panes: &[Pane]) {
+        let stale = if self.kind == Kind::Compare { self.each_stale() } else { self.stale() };
+        if !self.show_areas || stale {
+            return;
+        }
+        each_image::paint_areas(ui, panes, &self.area_sets(), self.kind == Kind::Compare, self.hover_area);
+    }
+
+    /// A problem area clicked in the list: the pane and the area as
+    /// fractions of its image, once.
+    pub fn take_zoom(&mut self) -> Option<(Slot, [f32; 4])> {
+        self.zoom.take()
+    }
+
+    /// The per-image no-reference results as a report table: one column
+    /// per image of a compare ("A", "B"...), or the one image; each cell the
+    /// value and its verdict word, with a note on which way is better.
+    #[allow(dead_code)] // The review report (compare) takes it; wired at integration.
+    pub fn report_table(&self) -> Option<lumen_core::report::Table> {
+        match self.kind {
+            Kind::Compare => self.each.table(),
+            Kind::Image => {
+                let r = self.report.as_ref()?;
+                let name = self.file_a.as_deref().map(super::file_name).unwrap_or_default();
+                each_image::table(&[("A", name.as_str(), &each_image::values_of(r))])
+            }
+            _ => None,
+        }
     }
 
     /// Headline results of the shown report as (name, value, unit), for
@@ -1453,7 +1589,10 @@ impl MetricsTab {
             if let Some(r) = self.run.take() {
                 r.handle.cancel();
             }
+            self.each.clear();
         }
+        self.regions.clear();
+        self.hover_area = None;
         let shown = self.heat.id().filter(|_| self.heat.visible).map(str::to_string);
         self.kind = s.kind();
         self.letter = s.letter();
@@ -1612,29 +1751,76 @@ impl MetricsTab {
         let hist = Some(history_key(&fa));
         match &ctx.subject {
             Subject::None => {}
-            Subject::Image { image, source_bits, .. } | Subject::Compare { image_a: image, source_bits, .. } => {
-                let b = match &ctx.subject {
-                    Subject::Compare { image_b, .. } => Some(image_b),
-                    _ => None,
-                };
-                let Some(pair) = adapters::image_pair(image, b) else {
+            Subject::Image { image, source_bits, .. } => {
+                let Some(pair) = adapters::image_pair(image, None) else {
                     self.set_status("The image is empty", true);
                     return;
                 };
-                let rescaled = pair.rescaled;
-                let spec = adapters::image_spec(ids.clone(), roi, Some(&fa), fb.as_deref(), rescaled, *source_bits);
-                let key = run_key("image", &fa, fb.as_deref(), &ids, roi, None, 0);
-                let mut jobs = vec![(spec, pair.a, pair.b)];
-                // A 3 or 4 image compare: the other panes against A, one after the other.
+                let ids = with_helpers(&ids);
+                let spec = adapters::image_spec(ids.clone(), roi, Some(&fa), None, false, *source_bits);
+                let key = run_key("image", &fa, None, &ids, roi, None, 0);
+                let handle = self.analyzer(egui_ctx).submit_image(spec, pair.a, None);
+                self.start(Run {
+                    handle,
+                    key,
+                    history: hist,
+                    started: Instant::now(),
+                    roi,
+                    #[cfg(feature = "video")]
+                    decode: None,
+                });
+            }
+            Subject::Compare { a, image_a: image, b, image_b, source_bits, letter, others } => {
+                // Every image on its own with the no-reference checks, then
+                // the reference metrics (each image against A) if chosen; one
+                // batch, as a new batch cancels the running one.
+                let is_nr = |id: &String| metrics::get(id).is_some_and(|m| m.info().kind == MetricKind::NoReference);
+                let nr: Vec<String> = ids.iter().filter(|i| is_nr(i)).cloned().collect();
+                let fr: Vec<String> = ids.iter().filter(|i| !is_nr(i)).cloned().collect();
+                let mut images = vec![("A", a.clone(), image.clone()), (*letter, b.clone(), image_b.clone())];
+                images.extend(others.iter().map(|(l, p, i)| (*l, p.clone(), i.clone())));
+                images.sort_by_key(|i| LETTERS.iter().position(|l| *l == i.0));
+                let mut jobs = if nr.is_empty() {
+                    self.each.clear();
+                    Vec::new()
+                } else {
+                    self.each.jobs(&images, &with_helpers(&nr), roi, *source_bits)
+                };
+                let n_each = jobs.len();
                 let mut sides = Vec::new();
-                if let Subject::Compare { others, .. } = &ctx.subject {
+                let mut rescaled = false;
+                let mut key = None;
+                if !fr.is_empty() {
+                    let Some(pair) = adapters::image_pair(image, Some(image_b)) else {
+                        self.set_status("The image is empty", true);
+                        return;
+                    };
+                    rescaled = pair.rescaled;
+                    jobs.push((adapters::image_spec(fr.clone(), roi, Some(&fa), fb.as_deref(), rescaled, *source_bits), pair.a, pair.b));
+                    key = Some(run_key("image", &fa, fb.as_deref(), &fr, roi, None, 0));
+                    // A 3 or 4 image compare: the other panes against A, one after the other.
                     for (letter, path, img) in others {
                         let Some(pair) = adapters::image_pair(image, Some(img)) else { continue };
-                        jobs.push((adapters::image_spec(ids.clone(), roi, Some(&fa), Some(path), pair.rescaled, *source_bits), pair.a, pair.b));
-                        sides.push((subject_id(Kind::Compare, Some(&fa), Some(path)), *letter, run_key("image", &fa, Some(path), &ids, roi, None, 0)));
+                        jobs.push((adapters::image_spec(fr.clone(), roi, Some(&fa), Some(path), pair.rescaled, *source_bits), pair.a, pair.b));
+                        sides.push((subject_id(Kind::Compare, Some(&fa), Some(path)), *letter, run_key("image", &fa, Some(path), &fr, roi, None, 0)));
                     }
                 }
                 let mut handles = self.analyzer(egui_ctx).submit_images(jobs).into_iter();
+                self.each.attach(handles.by_ref().take(n_each));
+                self.status = None;
+                let Some(key) = key else {
+                    // No reference metrics chosen: earlier results against A are dropped.
+                    if let Some(old) = self.run.take() {
+                        old.handle.cancel();
+                    }
+                    self.side_runs.clear();
+                    drop_later(std::mem::take(&mut self.stash));
+                    drop_later(std::mem::take(&mut self.maps));
+                    self.report = None;
+                    self.summary = None;
+                    self.heat.clear();
+                    return;
+                };
                 let handle = handles.next().expect("the shown pair");
                 self.start(Run {
                     handle,
@@ -1753,6 +1939,8 @@ impl MetricsTab {
         self.report = None;
         self.summary = None;
         self.status = None;
+        self.regions.clear();
+        self.hover_area = None;
         self.run = Some(run);
     }
 
@@ -1760,6 +1948,12 @@ impl MetricsTab {
         for r in self.run.iter().chain(self.side_runs.iter().map(|s| &s.run)) {
             r.handle.cancel();
         }
+        self.each.cancel();
+    }
+
+    /// A run of this tab is going (the pair, or the images on their own).
+    fn busy(&self) -> bool {
+        self.run.is_some() || self.each.running()
     }
 
     /// Take the job's events; call every frame (the tab's `ui` does).
@@ -1779,6 +1973,14 @@ impl MetricsTab {
             }
         }
         self.poll_side_runs();
+        let each_was = self.each.running();
+        if self.each.poll() && each_was && !self.each.running() && self.run.is_none() && self.status.is_none() {
+            let ms = self.each.started().map(|t| t.elapsed().as_secs_f32() * 1000.0).unwrap_or(1.0);
+            self.set_status(format!("Done in {}", fmt_cost(ms.max(1.0))), false);
+        }
+        if self.each.running() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         let Some(run) = &mut self.run else { return };
         let mut done: Option<Result<AnalysisReport, String>> = None;
         while let Some(ev) = run.handle.try_recv() {
@@ -1879,6 +2081,15 @@ impl MetricsTab {
         drop_later(std::mem::take(&mut self.live));
         self.result_roi = None;
         let maps = take_maps(&mut report);
+        // One image: its prominent problem areas, from the maps.
+        self.hover_area = None;
+        self.regions = if report.scope.kind == ScopeKind::Image && report.scope.file_b.is_none() {
+            let refs: Vec<(&str, &Heatmap)> = maps.iter().map(|m| (m.0.as_str(), m.2.as_ref())).collect();
+            self.regions_size = (report.scope.width, report.scope.height);
+            lumen_analysis::find_regions(&refs, report.scope.width, report.scope.height)
+        } else {
+            Vec::new()
+        };
         drop_later(std::mem::replace(&mut self.maps, maps));
         if !report.frames.is_empty() {
             self.series = Series::from_report(&report);
@@ -2015,25 +2226,52 @@ impl MetricsTab {
         if self.report.is_some() && self.summary.is_none() {
             self.summary = self.facts().map(|f| summary::summarize(&f));
         }
+        // A compare whose panes changed: the per-image results are of other images.
+        if self.kind == Kind::Compare && !self.each.shots.is_empty() {
+            let (a, b) = ctx.subject.files();
+            let now: Vec<PathBuf> = if self.compare_panes.len() > 1 { self.compare_panes.clone() } else { a.into_iter().chain(b).map(Path::to_path_buf).collect() };
+            let mut had = self.each.paths();
+            let mut want = now;
+            had.sort();
+            want.sort();
+            if had != want {
+                self.each.clear();
+            }
+        }
         ui.spacing_mut().item_spacing.y = 6.0;
         self.scope_bar(ui, &p, &ctx.subject, ctx.roi);
         self.run_row(ui, &p, ctx);
-        if self.kind == Kind::Compare && self.compare_panes.len() > 2 {
-            self.pairs_card(ui, &p);
-        }
-        if self.report.is_none() && self.live.is_empty() && self.run.is_none() && self.status.is_none() {
-            self.intro(ui, &p);
-        }
-        self.summary_card(ui, &p);
-        self.heatmap_row(ui, &p);
         let force = self.dev_open.take();
-        #[cfg(feature = "video")]
-        if !self.series.is_empty() {
-            self.worst_section(ui, &p, &ctx.subject, force);
-        }
-        ui.add_space(2.0);
-        if self.report.is_some() || !self.live.is_empty() {
-            egui::CollapsingHeader::new(RichText::new("All numbers").font(theme::text::subtitle()).color(p.text)).icon(widgets::collapse_caret).id_salt("metrics-all-numbers").default_open(false).open(force).show(ui, |ui| self.results(ui, &p));
+        if self.kind == Kind::Compare {
+            if self.each.shots.is_empty() && self.report.is_none() && !self.busy() && self.status.is_none() {
+                self.intro(ui, &p);
+            }
+            let stale = self.each_stale();
+            self.each.ui(ui, &p, stale);
+            if self.each.has_results() {
+                self.areas_card(ui, &p, stale);
+            }
+            ui.add_space(2.0);
+            self.reference_section(ui, &p, ctx, force);
+        } else {
+            if self.report.is_none() && self.live.is_empty() && self.run.is_none() && self.status.is_none() {
+                self.intro(ui, &p);
+            }
+            self.measured_on(ui, &p, &ctx.subject);
+            self.summary_card(ui, &p);
+            if self.kind == Kind::Image && self.report.is_some() {
+                let stale = self.stale();
+                self.areas_card(ui, &p, stale);
+            }
+            self.heatmap_row(ui, &p);
+            #[cfg(feature = "video")]
+            if !self.series.is_empty() {
+                self.worst_section(ui, &p, &ctx.subject, force);
+            }
+            ui.add_space(2.0);
+            if self.report.is_some() || !self.live.is_empty() {
+                egui::CollapsingHeader::new(RichText::new("All numbers").font(theme::text::subtitle()).color(p.text)).icon(widgets::collapse_caret).id_salt("metrics-all-numbers").default_open(false).open(force).show(ui, |ui| self.results(ui, &p));
+            }
         }
         egui::CollapsingHeader::new(RichText::new("Details and options").font(theme::text::subtitle()).color(p.text)).icon(widgets::collapse_caret).id_salt("metrics-details").default_open(false).open(force).show(ui, |ui| {
             self.picker(ui, &p, &ctx.subject, ctx.roi);
@@ -2045,6 +2283,64 @@ impl MetricsTab {
         if self.dev_scroll != 0.0 {
             ui.scroll_with_delta(Vec2::new(0.0, -std::mem::take(&mut self.dev_scroll)));
         }
+    }
+
+    /// The problem-area list (and its zoom clicks).
+    fn areas_card(&mut self, ui: &mut Ui, p: &Palette, stale: bool) {
+        let named = self.kind == Kind::Compare;
+        let mut hovered = self.hover_area;
+        let mut show = self.show_areas;
+        let zoom = each_image::area_list(ui, p, &self.area_sets(), named, stale, &mut hovered, &mut show);
+        self.hover_area = hovered;
+        self.show_areas = show;
+        if zoom.is_some() {
+            self.zoom = zoom;
+            self.show_areas = true;
+        }
+    }
+
+    /// Compare: how close each image is to A, below the per-image checks.
+    /// Runs only when its metrics are chosen ("Compare with A").
+    fn reference_section(&mut self, ui: &mut Ui, p: &Palette, ctx: &MetricsCtx, force: Option<bool>) {
+        let has = self.report.is_some() || self.run.is_some() || !self.stash.is_empty() || !self.side_runs.is_empty();
+        let head = RichText::new("Compared with A (reference)").font(theme::text::subtitle()).color(p.text);
+        let resp = egui::CollapsingHeader::new(head).icon(widgets::collapse_caret).id_salt("metrics-reference").default_open(false).open(force).show(ui, |ui| {
+            if !has {
+                look::note(ui, p, "How close each image is to A, pixel by pixel: PSNR, structure (SSIM) and color difference, with a map of where they differ. Useful when A is the original and the others are copies or encodes of it.");
+                ui.horizontal(|ui| {
+                    let tip = "Add PSNR, SSIM and color difference against A to the checks and analyze again (Shift+Q)";
+                    if widgets::secondary_button(ui, "Compare with A").on_hover_text(tip).clicked() {
+                        self.selected.extend(REFERENCE_METRICS.iter().map(|s| s.to_string()));
+                        self.save_selection();
+                        self.run(ctx, ui.ctx());
+                    }
+                });
+                return;
+            }
+            if self.compare_panes.len() > 2 {
+                self.pairs_card(ui, p);
+            }
+            self.summary_card(ui, p);
+            self.heatmap_row(ui, p);
+            if self.report.is_some() || !self.live.is_empty() {
+                egui::CollapsingHeader::new(RichText::new("All numbers").font(theme::text::subtitle()).color(p.text)).icon(widgets::collapse_caret).id_salt("metrics-all-numbers").default_open(false).open(force).show(ui, |ui| self.results(ui, p));
+            }
+        });
+        resp.header_response.on_hover_text("Each image measured against A, for when A is the reference (the original)");
+    }
+
+    /// Video: which file the numbers are of.
+    fn measured_on(&self, ui: &mut Ui, p: &Palette, s: &Subject) {
+        if !s.is_video() || (self.report.is_none() && self.run.is_none()) {
+            return;
+        }
+        let (a, b) = s.files();
+        let name = |x: Option<&Path>| x.map(super::file_name).unwrap_or_default();
+        let text = match b {
+            Some(_) => format!("Checks of A · {}; comparisons of B · {} against A", name(a), name(b)),
+            None => format!("Checks of A · {}", name(a)),
+        };
+        ui.add(egui::Label::new(RichText::new(text).size(11.0).color(p.faint)).truncate()).on_hover_text("No-reference checks (sharpness, noise, exposure...) are measured on A; reference metrics compare B with A");
     }
 
     /// Video: the scope choice (frame on screen, A-B loop, whole video) and
@@ -2173,7 +2469,7 @@ impl MetricsTab {
         let threads = analysis_threads() as f32;
         // Frames run in parallel in range jobs.
         let scale = if frames > 1.0 { frames / threads } else { 1.0 };
-        let groups = [(MetricKind::FullReference, "Full reference (A vs B)"), (MetricKind::NoReference, "No reference"), (MetricKind::Temporal, "Temporal")];
+        let groups = [(MetricKind::FullReference, "Compared with A (reference)"), (MetricKind::NoReference, "On its own (no reference)"), (MetricKind::Temporal, "Over time (video)")];
         for (kind, title) in groups {
             if kind == MetricKind::Temporal && !s.is_video() {
                 continue;
@@ -2204,7 +2500,11 @@ impl MetricsTab {
                 for (id, name, desc, cost, heavy) in entries {
                     ui.horizontal(|ui| {
                         let mut on = self.selected.contains(id);
-                        let resp = ui.add_enabled_ui(blocked.is_none(), |ui| widgets::checkbox(ui, &mut on, name)).inner.on_hover_text(desc);
+                        let tip = match plain_explain(id) {
+                            "" => desc.to_string(),
+                            e => format!("{e}\n{desc}"),
+                        };
+                        let resp = ui.add_enabled_ui(blocked.is_none(), |ui| widgets::checkbox(ui, &mut on, name)).inner.on_hover_text(tip);
                         if resp.changed() {
                             if on {
                                 self.selected.insert(id.to_string());
@@ -2236,15 +2536,25 @@ impl MetricsTab {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.spacing_mut().interact_size.y = theme::size::CONTROL;
-            if let Some(run) = &self.run {
-                let prog = run.handle.progress();
-                let frac = prog.fraction().unwrap_or(0.0);
-                let eta = prog.eta().map(fmt_eta).unwrap_or_default();
-                let text = if prog.total() > 1 { format!("{} of {}  {eta}", prog.done(), prog.total()) } else if eta.is_empty() { "Analyzing".to_string() } else { eta };
+            if self.busy() {
+                let (frac, text) = match &self.run {
+                    // The images on their own run first.
+                    _ if self.each.running() => {
+                        let (done, n) = self.each.progress();
+                        (done as f32 / n.max(1) as f32, format!("Image {} of {n}", (done + 1).min(n)))
+                    }
+                    Some(run) => {
+                        let prog = run.handle.progress();
+                        let eta = prog.eta().map(fmt_eta).unwrap_or_default();
+                        let text = if prog.total() > 1 { format!("{} of {}  {eta}", prog.done(), prog.total()) } else if eta.is_empty() { "Analyzing".to_string() } else { eta };
+                        (prog.fraction().unwrap_or(0.0), text)
+                    }
+                    None => (0.0, "Analyzing".to_string()),
+                };
                 // Right to left: the button takes its own width and the bar the rest, so the
                 // row never asks for more than the panel has (a wider row grows the panel).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                    if widgets::secondary_button(ui, "Cancel").on_hover_text("Stop the analysis").clicked() {
                         cancel = true;
                     }
                     let bar_w = ui.available_width().max(40.0);
@@ -2261,11 +2571,13 @@ impl MetricsTab {
                     (Kind::Compare, false, _) => "",
                     _ => "the whole image",
                 };
-                let what = match self.compare_panes.len() {
+                let against = metrics::all().iter().any(|m| m.info().kind == MetricKind::FullReference && self.selected.contains(m.id()));
+                let what = match (self.compare_panes.len(), against) {
                     _ if !what.is_empty() => what.to_string(),
-                    3 => "B and C against A".to_string(),
-                    4 => "B, C and D against A".to_string(),
-                    _ => "B against A".to_string(),
+                    (3, true) => "each image on its own, and B and C against A".to_string(),
+                    (4, true) => "each image on its own, and B, C and D against A".to_string(),
+                    (_, true) => "each image on its own, and B against A".to_string(),
+                    _ => "each image on its own".to_string(),
                 };
                 let tip = format!("Measure {what} with {n} metric{} (Shift+Q)", if n == 1 { "" } else { "s" });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2281,7 +2593,7 @@ impl MetricsTab {
         if cancel {
             self.cancel();
         }
-        if self.stale() && self.run.is_none() && self.report.is_some() {
+        if (self.stale() && self.report.is_some() || self.each_stale() && self.each.has_results()) && !self.busy() {
             ui.label(RichText::new(format!("{}  The region changed: Analyze again to update", I::WARNING)).size(11.5).color(p.warn));
         } else if let Some((msg, err)) = &self.status {
             ui.add(egui::Label::new(RichText::new(msg).size(11.5).color(if *err { p.danger } else { p.faint })).wrap());
@@ -2352,8 +2664,7 @@ impl MetricsTab {
     /// What the tab does, before the first run.
     fn intro(&self, ui: &mut Ui, p: &Palette) {
         let what = match self.kind {
-            Kind::Compare if self.compare_panes.len() > 2 => "Measures each image against A: how close it is, and where they differ.",
-            Kind::Compare => "Shows how close B is to A, and where they differ.",
+            Kind::Compare => "Checks every image on its own (sharpness, noise, exposure, color, compression, banding), says which is best at what, and marks problem areas. Comparing with A is below.",
             Kind::Video => "Checks the frame on screen, the A-B loop or the whole video.",
             Kind::VideoPair => "Compares B with A on the frame on screen, the A-B loop or the whole video.",
             _ => "Checks sharpness, noise, exposure, color and compression in one click.",
@@ -2633,7 +2944,7 @@ impl MetricsTab {
                             job = name_job(&format!("{caret} {short}"), key.as_deref(), text, 13.0, w);
                         }
                         // Truncate: in a horizontal layout a label would grow under the map button.
-                        let name = ui.add(egui::Label::new(job).truncate().sense(Sense::click())).on_hover_text(&row.name);
+                        let name = ui.add(egui::Label::new(job).truncate().sense(Sense::click())).on_hover_text(name_tip(&row.id, &row.name));
                         if many && name.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             toggle = Some(row.id.clone());
                         }
@@ -2698,13 +3009,17 @@ impl MetricsTab {
                 let cur = self.heat.id().map(str::to_string).unwrap_or_default();
                 let name = maps.iter().find(|m| m.0 == cur).map(|m| m.1.clone()).unwrap_or_else(|| "Choose".into());
                 let mut pick = None;
-                widgets::combo("heatmap-metric").selected_text(name).show_ui(ui, |ui| {
-                    for (id, n) in &maps {
-                        if ui.selectable_label(*id == cur, n).clicked() {
-                            pick = Some(id.clone());
+                widgets::combo("heatmap-metric")
+                    .selected_text(name)
+                    .show_ui(ui, |ui| {
+                        for (id, n) in &maps {
+                            if ui.selectable_label(*id == cur, n).on_hover_text(name_tip(id, n)).clicked() {
+                                pick = Some(id.clone());
+                            }
                         }
-                    }
-                });
+                    })
+                    .response
+                    .on_hover_text("Which measurement colors the image");
                 if let Some(id) = pick {
                     if let Some(m) = self.map_of(&id) {
                         self.heat.set_map(&id, m);
@@ -2731,7 +3046,9 @@ impl MetricsTab {
             if let Some(a) = self.plots.worst_ui(ui, p, &self.series, thumbs) {
                 self.plot_action(a);
             }
-            if !self.plots.worst_frames(&self.series).is_empty() && ui.button(format!("{}  Export worst frames as PNG pairs", I::DOWNLOAD_SIMPLE)).clicked() {
+            if !self.plots.worst_frames(&self.series).is_empty()
+                && ui.button(format!("{}  Export worst frames as PNG pairs", I::DOWNLOAD_SIMPLE)).on_hover_text("Save the worst frames of A (and B) as PNG files into a folder you pick").clicked()
+            {
                 self.export_worst(None);
             }
         });

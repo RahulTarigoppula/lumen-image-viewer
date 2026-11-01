@@ -1,7 +1,8 @@
 //! The Analysis panel shell: header, the Metrics and AI tabs, the region of
 //! interest shared by both (R draws it on the image while the panel is
-//! open, Esc clears it), and the overlay pass that draws the ROI and the AI
-//! finding boxes over the active mode's images.
+//! open, Esc clears it), and the overlay pass that draws the ROI, the
+//! Metrics tab's problem areas and the AI finding boxes over the active
+//! mode's images.
 
 use egui::{Align, Color32, Layout, Margin, Rect, RichText, Sense, Ui};
 
@@ -216,7 +217,13 @@ impl AnalysisPanel {
             egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 match self.tab {
-                    Tab::Metrics => self.metrics_tab(ui, core, subject),
+                    Tab::Metrics => {
+                        self.metrics_tab(ui, core, subject);
+                        // A problem area clicked in the list.
+                        if let Some((slot, rect)) = core.metrics.take_zoom() {
+                            out.push(PanelAction::ZoomTo { slot, rect });
+                        }
+                    }
                     Tab::Text => self.text.ui(ui, core, subject, out),
                     #[cfg(feature = "ai")]
                     Tab::Ai => {
@@ -235,6 +242,8 @@ impl AnalysisPanel {
         let p = core.pal;
         let whole = match subject.kind {
             k if k.is_video() => "Whole frame".to_string(),
+            // The Metrics tab checks every image; the AI tab sends A and B.
+            k if k.is_pair() && self.tab == Tab::Metrics => "Whole image, every image".to_string(),
             k if k.is_pair() => format!("Whole image, {} against A", core.metrics.pair_letter()),
             _ => "Whole image".to_string(),
         };
@@ -313,6 +322,7 @@ impl AnalysisPanel {
         let panes = canvas::panes(ui.ctx());
         if self.tab == Tab::Metrics {
             Self::heatmap_overlay(ui, core, subject, &panes);
+            core.metrics.paint_areas(ui, &panes);
         }
         #[cfg(feature = "ai")]
         if self.tab == Tab::Ai {
@@ -357,8 +367,8 @@ impl AnalysisPanel {
             Some(super::Pixels::Ready(img)) => Some(img.clone()),
             _ => None,
         };
-        // Pane B shows B: in a 3 or 4 image compare with C or D picked, the
-        // map (C against A) is drawn over A only, and the readout reads C.
+        // The map is drawn over A and the image compared with it (B, or the
+        // C or D picked in a 3 or 4 image compare); the readout reads that image.
         let other = core.metrics.pair_letter();
         let a = img(&subject.a);
         let b = if other == "B" { img(&subject.b) } else { core.metrics.compare_panes().get(if other == "C" { 2 } else { 3 }).and_then(|p| core.loader.get_ready(p)).map(|l| l.decoded.image.clone()) };
@@ -369,7 +379,7 @@ impl AnalysisPanel {
             (pa, pb)
         };
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| !crate::ui::pointer_over_overlay(ui.ctx()) && !egui::Popup::is_any_open(ui.ctx()));
-        for pane in panes.iter().filter(|p| p.slot == Slot::A || other == "B") {
+        for pane in panes.iter().filter(|p| p.slot == Slot::A || p.slot.letter() == other) {
             let xf = ImageTransform { dest: pane.xf.dest, size: a_size };
             // Not over the viewer's floating toolbar.
             for clip in canvas::uncovered(ui.ctx(), pane.clip) {

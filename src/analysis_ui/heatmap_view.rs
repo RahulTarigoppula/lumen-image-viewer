@@ -395,12 +395,17 @@ impl HeatmapView {
     pub fn controls(&mut self, ui: &mut Ui, p: &Palette) {
         let Some(m) = self.full.clone() else { return };
         ui.horizontal(|ui| {
-            widgets::checkbox(ui, &mut self.visible, "Overlay");
-            widgets::combo("heatmap-colormap").width(90.0).selected_text(self.colormap.name()).show_ui(ui, |ui| {
-                for c in Colormap::ALL {
-                    ui.selectable_value(&mut self.colormap, c, c.name());
-                }
-            });
+            widgets::checkbox(ui, &mut self.visible, "Overlay").on_hover_text("Color the image by this measurement (turn off to see the picture)");
+            widgets::combo("heatmap-colormap")
+                .width(90.0)
+                .selected_text(self.colormap.name())
+                .show_ui(ui, |ui| {
+                    for c in Colormap::ALL {
+                        ui.selectable_value(&mut self.colormap, c, c.name());
+                    }
+                })
+                .response
+                .on_hover_text("Color scale of the overlay; the bar below shows which color is which value");
             if self.pending.is_some() {
                 ui.spinner();
             }
@@ -411,7 +416,7 @@ impl HeatmapView {
             let auto_tip = if m.min_span > 0.0 { "From the ideal value to the 99th percentile" } else { "1st to 99th percentile" };
             ui.selectable_value(&mut self.range, RangeKind::Auto, "Auto").on_hover_text(auto_tip);
             ui.selectable_value(&mut self.range, RangeKind::Fixed, "Fixed").on_hover_text("The metric's default range");
-            ui.selectable_value(&mut self.range, RangeKind::Custom, "Custom");
+            ui.selectable_value(&mut self.range, RangeKind::Custom, "Custom").on_hover_text("Set the lowest and highest value of the color scale yourself");
             if before != self.range && self.range == RangeKind::Custom {
                 self.user = self.range_of(if before == RangeKind::Fixed { RangeMode::Fixed } else { RangeMode::Auto });
             }
@@ -420,19 +425,19 @@ impl HeatmapView {
         let speed = ((hi - lo).abs() / 200.0).max(1e-4) as f64;
         if self.range == RangeKind::Custom {
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.user.0).speed(speed).max_decimals(4).prefix("lo "));
-                ui.add(egui::DragValue::new(&mut self.user.1).speed(speed).max_decimals(4).prefix("hi "));
+                ui.add(egui::DragValue::new(&mut self.user.0).speed(speed).max_decimals(4).prefix("lo ")).on_hover_text("Value shown with the first color of the scale (drag or type)");
+                ui.add(egui::DragValue::new(&mut self.user.1).speed(speed).max_decimals(4).prefix("hi ")).on_hover_text("Value shown with the last color of the scale (drag or type)");
             });
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity").color(p.muted));
-            ui.add(widgets::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false).width(140.0));
+            ui.add(widgets::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false).width(140.0)).on_hover_text("How strongly the overlay covers the picture");
         });
         ui.horizontal(|ui| {
             let tip = if m.invert { "Show only values at or below" } else { "Show only values at or above" };
             widgets::checkbox(ui, &mut self.threshold_on, "Threshold").on_hover_text(tip);
             if self.threshold_on {
-                ui.add(egui::DragValue::new(&mut self.threshold).speed(speed).max_decimals(4));
+                ui.add(egui::DragValue::new(&mut self.threshold).speed(speed).max_decimals(4)).on_hover_text(tip);
             }
         });
         legend(ui, p, self.colormap, m.invert, (lo, hi), m.unit, self.threshold_on.then_some(self.threshold));

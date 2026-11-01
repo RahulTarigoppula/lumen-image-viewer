@@ -122,9 +122,17 @@ const CATEGORIES_TEXT: &str = "Categories:
 
 const VIDEO_NOTES: &str = "These are single frames paused from moving video. Motion blur on moving objects and gentle softness from camera motion are normal at playback speed: do not score them as focus defects unless they look wrong (for example a static background blurred, or ghosting from bad deinterlacing). Look for codec artifacts that are typical of video: macroblocking in dark and fast-moving areas, banding in skies and fades, mosquito noise around titles and edges, texture smeared by deblocking or denoising, interlacing combs, scaling aliasing, and limited/full range mistakes (gray blacks or crushed shadows).";
 
+/// The report is read by people deciding something, not by experts:
+/// a verdict, then only what matters.
+const FOCUS: &str = "What to report:
+- verdict: one plain sentence that answers the real question first, for one image whether it is acceptable for its purpose (and the main reason), for two images which one is better and why (for example \"B is better: A loses the fine detail in the hair to compression\"). Write it for someone who is not an image expert.
+- findings: only significant problems, moderate or severe, that a viewer would notice at normal viewing or that change the decision. Skip minor nitpicks and anything you are unsure about. At most 6, the most important first; one finding per problem area, not one per small spot.
+- Describe each finding plainly: what is wrong and where, in words (for example \"the sky at the top left shows visible bands instead of a smooth gradient\"), plus its box.
+- summary: two or three sentences on what matters most; no repetition of every score.";
+
 const HONESTY: &str = "Rules:
 - Judge only what is visible in the provided pixels. Do not guess about content you cannot see.
-- Do not invent defects. If you are unsure, say so in the finding and use severity minor.
+- Do not invent defects. If you are unsure whether something is a defect, leave it out.
 - Intentional choices (shallow depth of field, added film grain, low-key lighting, stylized grading) are not defects unless they look like mistakes.
 - Downscaled views hide noise and fine detail: judge sharpness, noise and compression mainly from the native-resolution tiles when they are provided, and say when only a downscaled view was available.
 - Keep rationales short and concrete (what, where, how bad).";
@@ -165,7 +173,7 @@ impl Preset {
                 format!(
                     "{ROLE_ANALYST}\nAssess the technical quality of the image: how well it was captured, processed and encoded, not whether the subject or composition is pleasing."
                 ),
-                "Assess the technical quality of image A and return the quality report.",
+                "Assess the technical quality of image A and return the quality report: a one-sentence verdict, then only the significant problems.",
                 (None, None),
             ),
             PresetId::Compare => p(
@@ -177,7 +185,7 @@ impl Preset {
                 format!(
                     "{ROLE_ANALYST}\nYou compare two versions of the same image. A is the reference unless stated otherwise. Describe differences, not absolute quality: point to regions where B lost detail or gained artifacts, or where B is better than A. Prefer the version a careful viewer would choose at 100% zoom; answer tie when the differences are invisible at normal viewing. Confidence is your probability (0 to 1) that the preferred version is really better; use about 0.5 for a tie or when unsure."
                 ),
-                "Compare B with A and return the comparison report.",
+                "Compare B with A and return the comparison report: a one-sentence verdict saying which is better and why, then only the significant differences.",
                 (Some("reference"), Some("test")),
             ),
             PresetId::Encode => p(
@@ -189,7 +197,7 @@ impl Preset {
                 format!(
                     "{ROLE_ANALYST}\nB is a lossy encode (or transcode, resize or re-export) of the reference A. Review the encode: where B lost detail (smeared texture, softened edges, missing grain), and which artifacts it gained (blocking, ringing, mosquito noise, banding, posterization, chroma bleeding or subsampling blur on saturated edges and text, color or gamma shifts, limited/full range errors). A difference that exists in A too is not an encode defect. Judge whether the encode is visually transparent: preferred is A when B shows visible losses, tie when they are indistinguishable."
                 ),
-                "Review B as an encode of the reference A and return the comparison report.",
+                "Review B as an encode of the reference A and return the comparison report: a one-sentence verdict (is the encode acceptable, and why), then only the significant losses and artifacts.",
                 (Some("reference"), Some("encode")),
             ),
             PresetId::Photo => p(
@@ -201,7 +209,7 @@ impl Preset {
                 format!(
                     "{ROLE_ANALYST}\nReview this camera photograph technically, as a photo editor deciding whether it is usable. Focus: is the intended subject sharp, and is softness missed focus, subject motion or camera shake? Noise: luminance and chroma noise for the apparent ISO, and over-aggressive noise reduction. Exposure: clipped highlights (skies, skin, specular areas), blocked shadows, overall brightness and contrast. Color: white balance, casts, skin tones, saturation. Optics and processing: chromatic aberration on high-contrast edges, vignetting, distortion, sharpening halos, HDR halos. If capture settings are given, use them to set expectations (for example noise at high ISO, blur at slow shutter speeds)."
                 ),
-                "Review photo A technically and return the quality report.",
+                "Review photo A technically and return the quality report: a one-sentence verdict (is it usable, and why), then only the significant problems.",
                 (None, None),
             ),
             PresetId::FreeForm => p(
@@ -233,7 +241,7 @@ impl Preset {
                 OutputKind::QualityJson,
                 true,
                 format!("{ROLE_VIDEO}\nAssess the technical quality of the frame as delivered video: capture, processing and encoding.\n{VIDEO_NOTES}"),
-                "Assess the technical quality of video frame A and return the quality report.",
+                "Assess the technical quality of video frame A and return the quality report: a one-sentence verdict, then only the significant problems.",
                 (None, None),
             ),
             PresetId::VideoCompare => p(
@@ -245,7 +253,7 @@ impl Preset {
                 format!(
                     "{ROLE_VIDEO}\nYou compare the same frame from two versions of a video (for example two encodes, or an encode and its source). A is the reference unless stated otherwise. Describe differences, not absolute quality: where B lost detail or gained artifacts, or where it is better. Answer tie when the differences would be invisible at playback.\n{VIDEO_NOTES}"
                 ),
-                "Compare frame B with frame A and return the comparison report.",
+                "Compare frame B with frame A and return the comparison report: a one-sentence verdict saying which is better and why, then only the significant differences.",
                 (Some("reference"), Some("test")),
             ),
         }
@@ -294,6 +302,8 @@ impl Preset {
             if self.output == OutputKind::ComparisonJson {
                 s.push_str("\nGive scores_a and scores_b for the same categories; detail_vs_reference is null for the reference itself.");
             }
+            s.push_str("\n\n");
+            s.push_str(FOCUS);
             s.push_str("\n\n");
             s.push_str(&location_rules(conv));
         }
@@ -357,13 +367,16 @@ fn categories_schema() -> Value {
     json!({"type": "object", "additionalProperties": false, "required": keys, "properties": props})
 }
 
+/// Most findings a report may list (only significant ones are asked for).
+pub const MAX_FINDINGS: usize = 6;
+
 fn findings_schema(labels: &[&str], max_coord: u32) -> Value {
     let keys: Vec<&str> = CATEGORIES.iter().map(|c| c.0).collect();
-    json!({"type": "array", "maxItems": 20, "items": {"type": "object", "additionalProperties": false,
+    json!({"type": "array", "maxItems": MAX_FINDINGS, "items": {"type": "object", "additionalProperties": false,
         "required": ["category", "severity", "image", "tile", "bbox", "description"],
         "properties": {
             "category": {"enum": keys},
-            "severity": {"enum": ["minor", "moderate", "severe"]},
+            "severity": {"enum": ["moderate", "severe"]},
             "image": {"enum": labels},
             "tile": {"type": "integer", "minimum": 0},
             "bbox": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": max_coord}, "minItems": 4, "maxItems": 4},
@@ -375,8 +388,9 @@ fn findings_schema(labels: &[&str], max_coord: u32) -> Value {
 /// side for absolute pixel coordinates.
 pub fn quality_schema(labels: &[&str], max_coord: u32) -> Value {
     json!({"type": "object", "additionalProperties": false,
-        "required": ["overall", "categories", "findings", "summary"],
+        "required": ["verdict", "overall", "categories", "findings", "summary"],
         "properties": {
+            "verdict": {"type": "string", "maxLength": 240},
             "overall": {"type": "integer", "minimum": 1, "maximum": 10},
             "categories": categories_schema(),
             "findings": findings_schema(labels, max_coord),
@@ -388,8 +402,9 @@ pub fn quality_schema(labels: &[&str], max_coord: u32) -> Value {
 /// `confidence` and per-image scores.
 pub fn comparison_schema(max_coord: u32) -> Value {
     json!({"type": "object", "additionalProperties": false,
-        "required": ["preferred", "confidence", "overall_a", "overall_b", "scores_a", "scores_b", "findings", "summary"],
+        "required": ["verdict", "preferred", "confidence", "overall_a", "overall_b", "scores_a", "scores_b", "findings", "summary"],
         "properties": {
+            "verdict": {"type": "string", "maxLength": 240},
             "preferred": {"enum": ["A", "B", "tie"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "overall_a": {"type": "integer", "minimum": 1, "maximum": 10},
@@ -515,7 +530,7 @@ mod tests {
     #[test]
     fn system_prompts_carry_rubric_and_rules() {
         let q = Preset::builtin(PresetId::Quality).system_prompt(CoordConvention::Relative1000, None);
-        for needle in ["9-10: no visible defects at 100% zoom", "0 to 1000", "Do not invent defects", "Objective metrics", "JSON report only"] {
+        for needle in ["9-10: no visible defects at 100% zoom", "0 to 1000", "Do not invent defects", "Objective metrics", "JSON report only", "verdict: one plain sentence", "Skip minor nitpicks", "At most 6"] {
             assert!(q.contains(needle), "missing {needle}");
         }
         let abs = Preset::builtin(PresetId::Quality).system_prompt(CoordConvention::AbsolutePixels, None);
@@ -533,13 +548,16 @@ mod tests {
     #[test]
     fn schemas_match_the_plan() {
         let s = quality_schema(&["A", "B"], 1000);
-        assert_eq!(s["required"], json!(["overall", "categories", "findings", "summary"]));
+        assert_eq!(s["required"], json!(["verdict", "overall", "categories", "findings", "summary"]));
+        assert_eq!(s["properties"]["findings"]["maxItems"], 6);
+        assert_eq!(s["properties"]["findings"]["items"]["properties"]["severity"]["enum"], json!(["moderate", "severe"]));
         assert_eq!(s["properties"]["categories"]["required"].as_array().unwrap().len(), 6);
         assert_eq!(s["properties"]["findings"]["items"]["properties"]["bbox"]["items"]["maximum"], 1000);
         assert_eq!(s["properties"]["findings"]["items"]["properties"]["image"]["enum"], json!(["A", "B"]));
         assert_eq!(s["$defs"]["cat"]["properties"]["score"]["maximum"], 10);
         let c = comparison_schema(2048);
         assert_eq!(c["properties"]["preferred"]["enum"], json!(["A", "B", "tie"]));
+        assert_eq!(c["required"][0], "verdict");
         assert_eq!(c["properties"]["findings"]["items"]["properties"]["bbox"]["items"]["maximum"], 2048);
         let rf = response_format("lumen_quality_report", &s);
         assert_eq!(rf["json_schema"]["strict"], true);

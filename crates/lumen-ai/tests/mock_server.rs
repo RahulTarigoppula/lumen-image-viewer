@@ -323,10 +323,26 @@ fn public_address_is_blocked_before_connecting() {
     let s = AiSettings { host: "8.8.8.8".into(), ..Default::default() };
     let report = Client::from_settings(&s, None).unwrap().test_connection(None, false, &mut |_| {});
     assert_eq!(report.steps[0].status, StepStatus::Failed);
-    assert!(report.steps[0].message.contains("not a local network address"), "{}", report.steps[0].message);
+    assert!(report.steps[0].message.contains("isn't a private network address"), "{}", report.steps[0].message);
+    assert!(report.steps[0].can_trust, "offers Trust this server");
     // The guarded connector refuses too, for any request path.
     let client = Client::from_settings(&s, None).unwrap();
     assert!(matches!(client.list_models(), Err(AiError::NotLocal { .. })));
+}
+
+#[test]
+fn trusted_public_host_gets_past_the_policy() {
+    // A company server on a public range, over plain HTTP. Port 9 on a
+    // public resolver never answers, so the request ends at the connect.
+    let mut s = AiSettings { timeout_connect_s: 1, ..Default::default() };
+    s.apply_server_input("http://8.8.8.8:9/v1").unwrap();
+    s.trust_current_host();
+    let client = Client::from_settings(&s, None).unwrap();
+    let report = client.test_connection(None, false, &mut |_| {});
+    assert_eq!(report.steps[0].status, StepStatus::Failed);
+    assert!(!report.steps[0].can_trust, "{}", report.steps[0].message);
+    let e = client.list_models().unwrap_err();
+    assert!(!e.can_trust() && !matches!(e, AiError::NotLocal { .. } | AiError::PublicNeedsHttps { .. }), "{e:?}");
 }
 
 #[test]

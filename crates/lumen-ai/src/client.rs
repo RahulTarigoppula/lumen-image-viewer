@@ -297,7 +297,7 @@ impl Client {
         match self.tcp_check() {
             Ok(addr) => push(&mut report, StepResult::new(TestStep::Tcp, StepStatus::Ok, format!("Connected to {addr}"), t.elapsed())),
             Err(e) => {
-                push(&mut report, StepResult::new(TestStep::Tcp, StepStatus::Failed, describe(&e), t.elapsed()));
+                push(&mut report, StepResult::failed(TestStep::Tcp, &e, t.elapsed()));
                 skip_rest(&mut report, 1, &mut push);
                 return report;
             }
@@ -789,11 +789,19 @@ pub struct StepResult {
     pub status: StepStatus,
     pub message: String,
     pub elapsed_ms: u64,
+    /// Failed only because the address is not private: offer "Trust this
+    /// server" (see `AiError::can_trust`).
+    #[serde(default)]
+    pub can_trust: bool,
 }
 
 impl StepResult {
     fn new(step: TestStep, status: StepStatus, message: String, elapsed: Duration) -> StepResult {
-        StepResult { step, status, message, elapsed_ms: elapsed.as_millis() as u64 }
+        StepResult { step, status, message, elapsed_ms: elapsed.as_millis() as u64, can_trust: false }
+    }
+
+    fn failed(step: TestStep, e: &AiError, elapsed: Duration) -> StepResult {
+        StepResult { can_trust: e.can_trust(), ..StepResult::new(step, StepStatus::Failed, describe(e), elapsed) }
     }
 }
 

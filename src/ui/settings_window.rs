@@ -1229,6 +1229,17 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                         }
                     });
                 }
+                if ai.trust_offer() && !ai.testing() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if widgets::primary_button(ui, p, &format!("{}  Trust this server", I::SHIELD_CHECK))
+                            .on_hover_text("Treat this server as part of your own network (for example a company server whose address is not private) and test again. Only for servers you know.")
+                            .clicked()
+                        {
+                            ai.trust_server(true);
+                        }
+                    });
+                }
                 ui.add_space(6.0);
             }
         });
@@ -1304,6 +1315,31 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
             }
             if ai.settings.lan_only && toggle_row(ui, p, "Also allow Tailscale addresses", "100.64.0.0/10 (CGNAT)", &mut ai.settings.allow_cgnat) {
                 ai.dirty = true;
+            }
+            if let Some(ep) = ai.endpoint() {
+                let mut local = ai.settings.is_local_host(&ep.host);
+                let desc = format!(
+                    "For a company server whose address isn't private: lets Lumen use {} like a local network server, over plain HTTP too. Only for servers you know.",
+                    ep.host
+                );
+                if toggle_row(ui, p, "Treat this server as local (company network)", &desc, &mut local) {
+                    if local {
+                        ai.trust_server(false);
+                    } else {
+                        ai.settings.untrust_host(&ep.host);
+                        ai.dirty = true;
+                    }
+                }
+            }
+            let others: Vec<String> = ai.endpoint().map(|ep| ai.settings.local_hosts.iter().filter(|h| !h.eq_ignore_ascii_case(&ep.host)).cloned().collect()).unwrap_or_else(|| ai.settings.local_hosts.clone());
+            if !others.is_empty() {
+                let desc = format!("Also treated as local: {}", others.join(", "));
+                if row(ui, p, "Other trusted servers", &desc, |ui| widgets::secondary_button(ui, "Clear").on_hover_text("Stop treating these servers as local").clicked()) {
+                    for h in others {
+                        ai.settings.untrust_host(&h);
+                    }
+                    ai.dirty = true;
+                }
             }
         });
     });

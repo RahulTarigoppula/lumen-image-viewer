@@ -205,6 +205,13 @@ impl AiView {
         });
         if let (false, Some((false, m))) = (ai.testing(), ai.connected()) {
             ui.add(egui::Label::new(RichText::new(m).size(11.5).color(p.danger)).wrap());
+            if ai.trust_offer()
+                && widgets::secondary_button(ui, &format!("{}  Trust this server", I::SHIELD_CHECK))
+                    .on_hover_text("Treat this server as part of your own network (for example a company server whose address is not private) and test again. Only for servers you know.")
+                    .clicked()
+            {
+                ai.trust_server(true);
+            }
         }
     }
 
@@ -234,7 +241,7 @@ impl AiView {
                 }
             } else {
                 let mut pick = None;
-                widgets::combo("ai-model")
+                let combo = widgets::combo("ai-model")
                     .selected_text(if current.is_empty() { "Pick a model".to_string() } else { current.clone() })
                     .width(ui.available_width())
                     .show_ui(ui, |ui| {
@@ -245,13 +252,13 @@ impl AiView {
                             }
                         }
                     });
+                let tip = if current.is_empty() { "The model on your server that reviews the image (one that accepts images)".to_string() } else { format!("The model on your server that reviews the image: {}", ai.vision_label(&current)) };
+                combo.response.on_hover_text(tip);
                 if let Some(m) = pick {
                     ai.set_model(&m);
                 }
             }
-        })
-        .response
-        .on_hover_text(if current.is_empty() { String::new() } else { ai.vision_label(&current) });
+        });
         ui.horizontal(|ui| {
             label(ui, "Mode");
             widgets::combo(("ai-preset", kind)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
@@ -361,7 +368,7 @@ impl AiView {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut pick = None;
                 let text = format!("{} of {count}", shown + 1);
-                widgets::combo("ai-history").selected_text(text).width(90.0).show_ui(ui, |ui| {
+                let combo = widgets::combo("ai-history").selected_text(text).width(90.0).show_ui(ui, |ui| {
                     ui.set_min_width(260.0);
                     for (i, r) in core.ai.records(key).iter().enumerate().rev() {
                         let state = match &r.outcome {
@@ -375,10 +382,11 @@ impl AiView {
                         }
                     }
                     ui.separator();
-                    if ui.button("Clear history for this file").clicked() {
+                    if ui.button("Clear history for this file").on_hover_text("Delete the saved AI results of this file (stored on this computer only)").clicked() {
                         pick = Some(usize::MAX);
                     }
                 });
+                combo.response.on_hover_text("Earlier AI results for this file: pick one to show it again");
                 match pick {
                     Some(usize::MAX) => core.ai.clear_history(key),
                     Some(i) => core.ai.show_record(key, i),
@@ -484,11 +492,11 @@ impl AiView {
             ui.label(RichText::new(c).size(10.5).color(p.faint));
         }
         ui.horizontal(|ui| {
-            if ui.button(format!("{}  Copy as Markdown", I::COPY)).clicked() {
+            if ui.button(format!("{}  Copy as Markdown", I::COPY)).on_hover_text("Copy the verdict, scores and problems as Markdown text, to paste into a report, chat or ticket").clicked() {
                 crate::fileops::copy_text(&markdown(rec, res));
                 out.push(PanelAction::Toast("Copied the result as Markdown".into()));
             }
-            if ui.button(format!("{}  Export JSON", I::EXPORT)).clicked() {
+            if ui.button(format!("{}  Export JSON", I::EXPORT)).on_hover_text("Save the whole result (answer, scores, boxes, what was sent) as a JSON file").clicked() {
                 out.push(PanelAction::ExportJson(serde_json::to_string_pretty(res).unwrap_or_default()));
             }
         });
@@ -496,6 +504,16 @@ impl AiView {
 
     fn report(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, r: &AiReport, out: &mut Vec<PanelAction>) {
         ui.add_space(2.0);
+        // The decision first, in the model's own plain words.
+        if !r.verdict.is_empty() {
+            let col = verdict_color(p, r);
+            egui::Frame::new().fill(col.gamma_multiply(0.14)).stroke(Stroke::new(1.0, col.gamma_multiply(0.6))).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("Verdict").size(theme::text::CAPTION).color(p.muted));
+                ui.add(egui::Label::new(RichText::new(&r.verdict).font(semibold(13.5)).color(p.text)).wrap());
+            });
+            ui.add_space(2.0);
+        }
         match &r.comparison {
             Some(c) => {
                 ui.horizontal(|ui| {
@@ -544,7 +562,8 @@ impl AiView {
         }
         if !r.findings.is_empty() {
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("Findings ({})", r.findings.len())).font(semibold(12.5)).color(p.text));
+            ui.label(RichText::new(format!("Problems found ({})", r.findings.len())).font(semibold(12.5)).color(p.text))
+                .on_hover_text("Only problems that matter are listed. Click one to zoom to it; the numbers match the boxes on the image.");
             let mut hovered = None;
             for (i, f) in r.findings.iter().enumerate() {
                 let resp = finding_row(ui, p, i, f, rec.dims[1].is_some());
@@ -588,7 +607,12 @@ impl AiView {
         }
         let Some(Ok(report)) = rec.result().and_then(|r| r.report.as_ref()) else { return };
         for pane in panes {
-            let label = if pane.slot == Slot::B { ImageLabel::B } else { ImageLabel::A };
+            // Only A and B are sent; C and D panes have no findings.
+            let label = match pane.slot {
+                Slot::A => ImageLabel::A,
+                Slot::B => ImageLabel::B,
+                _ => continue,
+            };
             let Some((w, h)) = rec.dims[if pane.slot == Slot::B { 1 } else { 0 }] else { continue };
             // In a wipe or split view the other image covers the rest of the
             // same place: its side shows this image's boxes dashed, so a
@@ -666,6 +690,19 @@ impl Uncovered {
         self.0.iter().for_each(|p| {
             p.text(pos, align, &text, font.clone(), color);
         });
+    }
+}
+
+/// Frame color of the verdict: the preferred image's color for a pair, the
+/// score's color for one image.
+fn verdict_color(p: &Palette, r: &AiReport) -> Color32 {
+    match &r.comparison {
+        Some(c) => match c.preferred {
+            Preference::A => p.accent,
+            Preference::B => Color32::from_rgb(232, 120, 60),
+            Preference::Tie => p.muted,
+        },
+        None => r.overall.map(|s| score_color(p, s)).unwrap_or(p.muted),
     }
 }
 

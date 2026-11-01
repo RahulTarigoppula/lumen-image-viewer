@@ -7,11 +7,35 @@
 use crate::ui::roi::ImageTransform;
 use egui::{Context, Id, Rect};
 
-/// Which subject image a pane shows.
+/// Which subject image a pane shows: compare panes A to D (video and the
+/// AI tab use A and B).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Slot {
     A,
     B,
+    C,
+    D,
+}
+
+impl Slot {
+    pub const ALL: [Slot; 4] = [Slot::A, Slot::B, Slot::C, Slot::D];
+
+    /// Pane index: A is 0.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<Slot> {
+        Slot::ALL.get(i).copied()
+    }
+
+    pub fn letter(self) -> &'static str {
+        ["A", "B", "C", "D"][self.index()]
+    }
+
+    pub fn from_letter(l: &str) -> Option<Slot> {
+        Slot::ALL.into_iter().find(|s| s.letter().eq_ignore_ascii_case(l))
+    }
 }
 
 /// One image drawn this frame.
