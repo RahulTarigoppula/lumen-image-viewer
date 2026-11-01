@@ -607,7 +607,12 @@ impl AiView {
         }
         let Some(Ok(report)) = rec.result().and_then(|r| r.report.as_ref()) else { return };
         for pane in panes {
-            let label = if pane.slot == Slot::B { ImageLabel::B } else { ImageLabel::A };
+            // Only A and B are sent; C and D panes have no findings.
+            let label = match pane.slot {
+                Slot::A => ImageLabel::A,
+                Slot::B => ImageLabel::B,
+                _ => continue,
+            };
             let Some((w, h)) = rec.dims[if pane.slot == Slot::B { 1 } else { 0 }] else { continue };
             // In a wipe or split view the other image covers the rest of the
             // same place: its side shows this image's boxes dashed, so a

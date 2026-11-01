@@ -381,9 +381,9 @@ impl Plots {
             // Threshold controls at the right edge.
             let mut v = thr.unwrap_or_else(|| s.data[fam.cols[0]].iter().map(|p| p.1).sum::<f64>() / s.data[fam.cols[0]].len().max(1) as f64);
             ui.add_space((width - (ui.cursor().min.x - left) - need).max(0.0));
-            let mut changed = crate::ui::widgets::checkbox(ui, &mut on, RichText::new("Threshold").size(crate::ui::theme::text::SMALL)).changed();
+            let mut changed = crate::ui::widgets::checkbox(ui, &mut on, RichText::new("Threshold").size(crate::ui::theme::text::SMALL)).on_hover_text("Draw a line at a value, so frames beyond it stand out").changed();
             if on {
-                changed |= crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).changed();
+                changed |= crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut v).speed(0.01).max_decimals(4)).on_hover_text("The threshold value (drag or type)").changed();
             }
             if changed {
                 self.thresholds.insert(fam.id.clone(), on.then_some(v));
@@ -521,11 +521,17 @@ impl Plots {
             ui.label(RichText::new("Rank by").size(12.0).color(p.muted));
             let label = |k: &str| format!("{}, {}", metric_name(metric_of(k)), key_label(metric_of(k), k.rsplit_once('.').map(|x| x.1).unwrap_or(k)));
             // Fits the panel: long metric names are cut short.
-            crate::ui::widgets::combo("worst-key").selected_text(label(&key)).width(ui.available_width().max(80.0)).truncate().show_ui(ui, |ui| {
-                for k in &keys {
-                    ui.selectable_value(&mut key, k.clone(), label(k));
-                }
-            });
+            crate::ui::widgets::combo("worst-key")
+                .selected_text(label(&key))
+                .width(ui.available_width().max(80.0))
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for k in &keys {
+                        ui.selectable_value(&mut key, k.clone(), label(k));
+                    }
+                })
+                .response
+                .on_hover_text("Which measurement decides the worst frames");
         });
         self.rank_key = Some(key.clone());
         let mut action = None;

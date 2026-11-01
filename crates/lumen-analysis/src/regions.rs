@@ -78,8 +78,14 @@ impl Region {
     /// "Blurry area: fine detail is much softer here ... (6% of the image)".
     pub fn description(&self) -> String {
         let size = if self.area_pct >= 50.0 { "most of the image".to_string() } else if self.area_pct >= 1.0 { format!("{:.0}% of the image", self.area_pct) } else { "a small area".to_string() };
-        let strong = if self.level == RegionLevel::Severe { "Strong: " } else { "" };
-        format!("{strong}{} ({size})", self.kind.explain())
+        let text = match self.level {
+            RegionLevel::Severe => format!("Strong: {}", self.kind.explain()),
+            RegionLevel::Moderate => {
+                let e = self.kind.explain();
+                e[..1].to_uppercase() + &e[1..]
+            }
+        };
+        format!("{text} ({size})")
     }
 
     fn score(&self) -> f32 {
@@ -123,13 +129,16 @@ fn blur_grid(lap: &Heatmap, ten: &Heatmap) -> Option<Grid> {
         return None;
     }
     let t90 = percentile(ten.data.clone(), 90.0)?;
-    let structured = |t: f32| t.is_finite() && t > (0.03 * t90).max(4.0);
+    let structured = |t: f32| t.is_finite() && t > (0.01 * t90).max(4.0);
     let ratios: Vec<f32> = lap.data.iter().zip(&ten.data).map(|(&l, &t)| if structured(t) && l.is_finite() { l / t } else { f32::NAN }).collect();
     let n = ratios.iter().filter(|r| r.is_finite()).count();
     if n < 8 {
         return None;
     }
-    let reference = percentile(ratios.clone(), 75.0)?;
+    // The reference is the textured half of the picture: flat areas are
+    // mostly sensor noise, whose ratio is high and says nothing about focus.
+    let t50 = percentile(ten.data.iter().copied().filter(|&t| structured(t)).collect(), 50.0)?;
+    let reference = percentile(ratios.iter().zip(&ten.data).filter(|(_, &t)| t >= t50).map(|(&r, _)| r).collect(), 50.0)?;
     if reference <= 0.0 {
         return None;
     }

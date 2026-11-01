@@ -1113,8 +1113,8 @@ impl Compare {
         let p = core.pal;
         let (z, c, d) = self.effective(i, rects, ppp, fit_ref)?;
         let dest = dest_rect(rect, ppp, d, z, c);
-        // Panes A and B for the Analysis panel's overlays.
-        let slot = [crate::analysis_ui::canvas::Slot::A, crate::analysis_ui::canvas::Slot::B].get(i).copied();
+        // Panes A to D for the Analysis panel's overlays.
+        let slot = crate::analysis_ui::canvas::Slot::from_index(i);
         if let Some(slot) = slot {
             crate::analysis_ui::canvas::publish(ui.ctx(), slot, dest, d, clip);
         }
