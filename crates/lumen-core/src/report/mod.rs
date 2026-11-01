@@ -622,7 +622,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let crops = items.iter().map(|it| (it.label.clone(), it.picture.clone())).collect();
         Report {
-            title: "Camera A vs B — low light".into(),
+            title: "Camera A vs B, low light".into(),
             author: "Rahul".into(),
             date: "1 November 2026".into(),
             summary: "B keeps more detail in the shadows; A is noisier but sharper.".into(),
