@@ -65,6 +65,63 @@ pub const LABEL_W: f32 = size::LABEL_W;
 /// Width of a pixel field ("60000 px").
 const PX_W: f32 = 84.0;
 
+fn tip_id() -> egui::Id {
+    egui::Id::unique("edit-tool-row-tip")
+}
+
+/// Run `add` with `tip` as the hover description of the next labelled row
+/// (slider, field, combo) it draws, for labels that mean something specific
+/// in one tool. Rows without one fall back to [`label_tip`].
+pub fn tipped<R>(ui: &mut egui::Ui, tip: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.data_mut(|d| d.insert_temp(tip_id(), tip.to_string()));
+    let r = add(ui);
+    ui.data_mut(|d| d.remove::<String>(tip_id()));
+    r
+}
+
+/// The description of the row being drawn: from [`tipped`], else the shared one for its label.
+fn take_row_tip(ui: &egui::Ui, label: &str) -> Option<String> {
+    let t = ui.data_mut(|d| d.remove_temp::<String>(tip_id()));
+    t.or_else(|| label_tip(label).map(str::to_string)).filter(|t| !t.is_empty())
+}
+
+/// Hover descriptions for row labels that mean the same in every tool.
+fn label_tip(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "Exposure" => "Brighten or darken the whole image as if by changing the camera exposure",
+        "Brightness" => "Make the whole image lighter or darker",
+        "Contrast" => "Increase or reduce the difference between light and dark areas",
+        "Gamma" => "Brighten or darken the midtones without touching black and white",
+        "Shadows" => "Lighten or darken only the dark areas",
+        "Highlights" => "Lighten or darken only the bright areas",
+        "Saturation" => "Make all colors stronger or weaker (left end: black and white)",
+        "Vibrance" => "Boost dull colors more than already strong ones (gentle on skin tones)",
+        "Hue" => "Shift every color around the color wheel",
+        "Temperature" => "Make the image warmer (yellow) or cooler (blue)",
+        "Tint" => "Correct a green or magenta color cast",
+        "Opacity" => "How see-through it is: lower lets the image show through",
+        "Feather" => "How softly the edge fades out; 0 is a hard edge",
+        "Softness" => "How gradually the effect fades at its edges",
+        "Angle" => "Rotation in degrees",
+        "Color" => "Click to pick a color",
+        "Corner radius" => "Rounds the corners; 0 keeps them square",
+        "Drop shadow" => "Add a soft shadow behind it",
+        "Outline" => "Draw a line around the edge of each letter",
+        "Outline color" => "Color of the line around the letters",
+        "Shadow color" => "Color of the shadow",
+        "Font" => "Typeface of the text",
+        "Text size" => "Height of the letters",
+        "Line spacing" => "Space between lines of text",
+        "Offset X" => "Move sideways (negative is left)",
+        "Offset Y" => "Move up or down (negative is up)",
+        "Anchor" => "Which side or corner it is attached to",
+        "Seed" => "Changes the random pattern; same number gives the same result",
+        "Units" => "Measure in pixels, percent or print size",
+        "Background" => "Color used for the new or empty area",
+        _ => return None,
+    })
+}
+
 fn row_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
     // Fixed-width column, text left-aligned (add_sized would centre it), as tall
     // as the value boxes so labels and fields share a baseline.
@@ -88,13 +145,18 @@ fn slider_row<'a, N: egui::emath::Numeric>(
     build: impl FnOnce(widgets::Slider<'a, N>) -> widgets::Slider<'a, N>,
 ) -> bool {
     let mut changed = false;
+    let tip = take_row_tip(ui, label);
     ui.horizontal(|ui| {
         let lr = row_label(ui, label);
         if lr.double_clicked() {
             *value = default;
             changed = true;
         }
-        lr.on_hover_text("Double-click to reset");
+        lr.on_hover_text(match &tip {
+            Some(t) => format!("{t}
+Double-click to reset"),
+            None => "Double-click to reset".into(),
+        });
         let signed = range.start().to_f64() < 0.0 && range.end().to_f64() > 0.0;
         let mut s = widgets::Slider::new(value, range).default_value(default);
         if signed {
@@ -102,7 +164,12 @@ fn slider_row<'a, N: egui::emath::Numeric>(
         }
         // The rail takes what the label and the value box leave.
         ui.spacing_mut().slider_width = f32::INFINITY;
-        if ui.add(build(s)).changed() {
+        let r = ui.add(build(s));
+        let r = match &tip {
+            Some(t) => r.on_hover_text(t),
+            None => r,
+        };
+        if r.changed() {
             changed = true;
         }
     });
@@ -133,8 +200,12 @@ pub fn drag_px(ui: &mut egui::Ui, label: &str, value: &mut i64, range: std::ops:
 
 /// A row with the standard label column followed by arbitrary widgets.
 pub fn row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let tip = take_row_tip(ui, label);
     ui.horizontal(|ui| {
-        row_label(ui, label);
+        let lr = row_label(ui, label);
+        if let Some(t) = tip {
+            lr.on_hover_text(t);
+        }
         add(ui)
     })
     .inner
@@ -153,7 +224,12 @@ pub fn indented<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R
 /// it at the label column, its rows follow while it is on.
 pub fn section_toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
     ui.add_space(8.0);
-    widgets::checkbox(ui, on, label).changed()
+    let tip = take_row_tip(ui, label);
+    let r = widgets::checkbox(ui, on, label);
+    match tip {
+        Some(t) => r.on_hover_text(t).changed(),
+        None => r.changed(),
+    }
 }
 
 /// Section label inside a tool panel (sentence case, 11 pt semibold, muted).
@@ -218,6 +294,11 @@ pub fn color_row(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4], alpha: bool
 /// Segmented control (one control, equal segments). Returns true if changed.
 pub fn segmented(ui: &mut egui::Ui, value: &mut usize, labels: &[&str]) -> bool {
     widgets::segmented(ui, value, labels)
+}
+
+/// [`segmented`] with a hover description per segment.
+pub fn segmented_tips(ui: &mut egui::Ui, value: &mut usize, labels: &[&str], tips: &[&str]) -> bool {
+    widgets::segmented_with_tips(ui, value, labels, tips)
 }
 
 /// Labeled combo box over string options.

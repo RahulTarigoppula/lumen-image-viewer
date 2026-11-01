@@ -505,6 +505,18 @@ fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &st
     widgets::segmented_value(ui, value, options)
 }
 
+/// [`segmented`] with a tooltip per option: `(value, label, tip)`.
+fn segmented_tips<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str, &str)]) -> bool {
+    let mut i = options.iter().position(|o| o.0 == *value).unwrap_or(0);
+    let labels: Vec<&str> = options.iter().map(|o| o.1).collect();
+    let tips: Vec<&str> = options.iter().map(|o| o.2).collect();
+    if widgets::segmented_with_tips(ui, &mut i, &labels, &tips) && options[i].0 != *value {
+        *value = options[i].0;
+        return true;
+    }
+    false
+}
+
 /// A round color swatch: 1 pt ring so dark and light colors both show on the card,
 /// and a 2 pt accent ring (2 pt out) when selected.
 fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -> Response {
@@ -613,7 +625,15 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
     section_title(ui, p, "Theme");
     card(ui, p, |ui| {
         changed |= row(ui, p, "App theme", "System follows the Windows light/dark setting.", |ui| {
-            segmented(ui, &mut s.theme, &[(ThemeChoice::Dark, "Dark"), (ThemeChoice::Light, "Light"), (ThemeChoice::System, "System")])
+            segmented_tips(
+                ui,
+                &mut s.theme,
+                &[
+                    (ThemeChoice::Dark, "Dark", "Dark backgrounds, easy on the eyes when viewing photos"),
+                    (ThemeChoice::Light, "Light", "Light backgrounds"),
+                    (ThemeChoice::System, "System", "Follow the Windows light / dark setting"),
+                ],
+            )
         });
         changed |= row(ui, p, "Accent color", "Used for selections, highlights and focus.", |ui| {
             let mut c = false;
@@ -632,7 +652,8 @@ fn appearance(ui: &mut Ui, p: &Palette, s: &mut Settings, st: &mut State) -> boo
         changed |= row(ui, p, "Interface size", "Scales all text and controls.", |ui| {
             let mut c = false;
             let mut v = st.scale_edit.unwrap_or(s.ui_scale);
-            let resp = slider_box(ui, widgets::Slider::new(&mut v, 0.75..=2.0).step_by(0.05).default_value(1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)));
+            let resp = slider_box(ui, widgets::Slider::new(&mut v, 0.75..=2.0).step_by(0.05).default_value(1.0).custom_formatter(|x, _| format!("{:.0}%", x * 100.0)).custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|x| x / 100.0)))
+                .on_hover_text("Make all text and controls bigger or smaller (double-click for 100%)");
             if resp.changed() {
                 st.scale_edit = Some(v);
             }
@@ -675,14 +696,25 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     let mut changed = false;
     section_title(ui, p, "Opening & navigation");
     card(ui, p, |ui| {
-        changed |= row(ui, p, "Mouse wheel", "Hold Ctrl for the other action.", |ui| segmented(ui, &mut s.wheel_action, &[(WheelAction::Navigate, "Next / previous"), (WheelAction::Zoom, "Zoom")]));
+        changed |= row(ui, p, "Mouse wheel", "Hold Ctrl for the other action.", |ui| {
+            segmented_tips(
+                ui,
+                &mut s.wheel_action,
+                &[
+                    (WheelAction::Navigate, "Next / previous", "The wheel steps through the folder; Ctrl + wheel zooms"),
+                    (WheelAction::Zoom, "Zoom", "The wheel zooms at the mouse; Ctrl + wheel steps through the folder"),
+                ],
+            )
+        });
         changed |= row(ui, p, "Default fit", "How images are sized when opened.", |ui| {
             let mut c = false;
             crate::ui::widgets::combo("settings-fit").width(190.0).selected_text(s.fit_mode.label()).show_ui(ui, |ui| {
                 for m in FitMode::ALL {
                     c |= ui.selectable_value(&mut s.fit_mode, m, m.label()).changed();
                 }
-            });
+            })
+            .response
+            .on_hover_text("How big an image is when it opens; change it any time with the * key");
             c
         });
         changed |= toggle_row(ui, p, "Open viewer in full screen", "Images opened from the browser or Explorer fill the screen.", &mut s.open_viewer_fullscreen);
@@ -697,10 +729,14 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= toggle_row(ui, p, "Smooth zoom-in filtering", "Off shows crisp pixels when enlarging (good for pixel art).", &mut s.smooth_zoom_in);
         changed |= toggle_row(ui, p, "Animated zoom", "Ease between zoom levels.", &mut s.animate_zoom);
         changed |= row(ui, p, "Magnifier zoom", "Magnification of the loupe.", |ui| {
-            slider_box(ui, widgets::Slider::new(&mut s.magnifier_zoom, 1.5..=8.0).step_by(0.5).default_value(Settings::default().magnifier_zoom).custom_formatter(|x, _| format!("{x:.1}×"))).changed()
+            slider_box(ui, widgets::Slider::new(&mut s.magnifier_zoom, 1.5..=8.0).step_by(0.5).default_value(Settings::default().magnifier_zoom).custom_formatter(|x, _| format!("{x:.1}×")))
+                .on_hover_text("How much the loupe enlarges (press and hold on an image to use it)")
+                .changed()
         });
         changed |= row(ui, p, "Magnifier size", "Diameter of the loupe.", |ui| {
-            slider_box(ui, widgets::Slider::new(&mut s.magnifier_size, 120.0..=600.0).step_by(10.0).default_value(Settings::default().magnifier_size).suffix(" px")).changed()
+            slider_box(ui, widgets::Slider::new(&mut s.magnifier_size, 120.0..=600.0).step_by(10.0).default_value(Settings::default().magnifier_size).suffix(" px"))
+                .on_hover_text("How big the loupe circle is on screen")
+                .changed()
         });
     });
     changed
@@ -711,7 +747,9 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     section_title(ui, p, "Grid");
     card(ui, p, |ui| {
         changed |= row(ui, p, "Thumbnail size", "Also adjustable with Ctrl + mouse wheel in the browser.", |ui| {
-            slider_box(ui, widgets::Slider::new(&mut s.thumb_size, 80.0..=384.0).step_by(4.0).default_value(Settings::default().thumb_size).suffix(" px")).changed()
+            slider_box(ui, widgets::Slider::new(&mut s.thumb_size, 80.0..=384.0).step_by(4.0).default_value(Settings::default().thumb_size).suffix(" px"))
+                .on_hover_text("Size of the pictures in the browser grid (Ctrl + mouse wheel there too)")
+                .changed()
         });
         changed |= row(ui, p, "Thumbnail captions", "Text under thumbnails in the grid. Also in the View menu.", |ui| {
             let mut c = false;
@@ -723,7 +761,9 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
                         c = true;
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("What is written under each thumbnail");
             c
         });
         changed |= toggle_row(ui, p, "Show folders in grid", "Sub-folders appear as tiles before the images.", &mut s.show_folders_in_grid);
@@ -734,7 +774,7 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= row(ui, p, "Default sort", "", |ui| {
             let mut c = false;
             let icon = if s.sort_desc { I::SORT_DESCENDING } else { I::SORT_ASCENDING };
-            if widgets::icon_button_sized(ui, icon, if s.sort_desc { "Descending" } else { "Ascending" }, false, 28.0, 16.0).clicked() {
+            if widgets::icon_button_sized(ui, icon, if s.sort_desc { "Descending (Z to A, newest or largest first) - click to reverse" } else { "Ascending (A to Z, oldest or smallest first) - click to reverse" }, false, 28.0, 16.0).clicked() {
                 s.sort_desc = !s.sort_desc;
                 c = true;
             }
@@ -742,7 +782,9 @@ fn browser(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
                 for k in SortKey::ALL {
                     c |= ui.selectable_value(&mut s.sort_key, k, k.label()).changed();
                 }
-            });
+            })
+            .response
+            .on_hover_text("The order files are listed in when a folder opens");
             c
         });
         changed |= toggle_row(ui, p, "Folders first", "Keep folders above files regardless of sort order.", &mut s.folders_first);
@@ -759,14 +801,16 @@ fn editing(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     section_title(ui, p, "Saving");
     card(ui, p, |ui| {
         changed |= row(ui, p, "JPEG quality", "Default for Save and Save as. 85-95 is visually lossless for most photos.", |ui| {
-            slider_box(ui, widgets::Slider::new(&mut s.jpeg_quality, 1..=100).default_value(Settings::default().jpeg_quality)).changed()
+            slider_box(ui, widgets::Slider::new(&mut s.jpeg_quality, 1..=100).default_value(Settings::default().jpeg_quality))
+                .on_hover_text("Higher keeps more detail but makes bigger files")
+                .changed()
         });
         changed |= toggle_row(ui, p, "Keep EXIF metadata", "Copy camera data, date taken and GPS into saved files.", &mut s.keep_exif_on_save);
         changed |= toggle_row(ui, p, "Lossless JPEG rotation", "Rotate and flip JPEGs without re-encoding when possible.", &mut s.lossless_jpeg_rotate);
     });
     section_title(ui, p, "Color");
     card(ui, p, |ui| {
-        changed |= toggle_row(ui, p, "Color management", "Convert images with embedded ICC profiles (Adobe RGB, Display P3, ...) to sRGB for accurate colors.", &mut s.color_manage);
+        changed |= toggle_row(ui, p, "Color management", "Show colors as the camera or file intends, using its color profile (Adobe RGB, Display P3, ...).", &mut s.color_manage);
     });
     changed
 }
@@ -792,7 +836,9 @@ fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             "Decoded images kept in RAM for instant back-and-forth.".to_string()
         };
         changed |= row(ui, p, "Image cache budget", &desc, |ui| {
-            slider_box(ui, widgets::Slider::new(&mut s.cache_budget_mb, 256..=8192).logarithmic(true).step_by(64.0).default_value(Settings::default().cache_budget_mb).suffix(" MB").value_width(80.0)).changed()
+            slider_box(ui, widgets::Slider::new(&mut s.cache_budget_mb, 256..=8192).logarithmic(true).step_by(64.0).default_value(Settings::default().cache_budget_mb).suffix(" MB").value_width(80.0))
+                .on_hover_text("More memory lets you flip back to recent images instantly")
+                .changed()
         });
         if ram > 0 && (s.cache_budget_mb << 20) > ram / 2 {
             ui.label(RichText::new(format!("{}  More than half of this PC's memory - other programs may slow down.", I::WARNING)).size(11.5).color(p.warn));
@@ -805,10 +851,10 @@ fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
         changed |= toggle_row(ui, p, "Cache thumbnails on disk", "Folders you have visited before open instantly.", &mut s.thumb_disk_cache);
         let size = st.cache_size.unwrap_or(0);
         row(ui, p, "Disk cache", &format!("{} used", fmt_bytes(size)), |ui| {
-            if ui.add_enabled(size > 0, egui::Button::new(format!("{}  Clear", I::BROOM))).clicked() {
+            if ui.add_enabled(size > 0, egui::Button::new(format!("{}  Clear", I::BROOM))).on_hover_text("Delete the saved thumbnails; they are made again when needed").clicked() {
                 st.confirm_clear_cache = true;
             }
-            if ui.button(format!("{}  Open folder", I::FOLDER_OPEN)).clicked() {
+            if ui.button(format!("{}  Open folder", I::FOLDER_OPEN)).on_hover_text("Show the thumbnail cache folder in Explorer").clicked() {
                 open_folder(&crate::settings::cache_dir().join("thumbs"));
             }
             false
@@ -846,7 +892,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    changed |= ui.add(egui::TextEdit::singleline(&mut ed.name).hint_text("Name").desired_width(w.min(260.0))).changed();
+                    changed |= ui.add(egui::TextEdit::singleline(&mut ed.name).hint_text("Name").desired_width(w.min(260.0))).on_hover_text("The name shown in menus").changed();
                     let exists = ed.exe.is_file();
                     let path = ed.exe.display().to_string();
                     let text = if exists { RichText::new(&path).size(11.0).color(p.muted) } else { RichText::new(format!("{}  {path} (not found)", I::WARNING)).size(11.0).color(p.warn) };
@@ -884,7 +930,7 @@ fn editors(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         }
     });
     ui.horizontal(|ui| {
-        if ui.button(format!("{}  Add editor...", I::PLUS)).clicked() {
+        if ui.button(format!("{}  Add editor...", I::PLUS)).on_hover_text("Choose a program (.exe) to open images in").clicked() {
             if let Some(exe) = rfd::FileDialog::new().set_title("Choose an editor program").add_filter("Programs", &["exe"]).pick_file() {
                 if core.settings.external_editors.iter().any(|e| same_path(&e.exe, &exe)) {
                     core.toasts.info("That editor is already in the list");
@@ -927,7 +973,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
     card(ui, p, |ui| {
         row(ui, p, "Open with Lumen", "Adds Lumen to 'Open with' for all supported image and video types and lists it under Windows Default apps. Per-user - no administrator rights needed.", |ui| {
             if status.file_types {
-                if ui.button("Unregister").clicked() {
+                if ui.button("Unregister").on_hover_text("Remove Lumen from 'Open with' in Explorer").clicked() {
                     match crate::shell::unregister_file_types() {
                         Ok(()) => core.toasts.success("File associations removed"),
                         Err(e) => core.toasts.error(format!("Could not remove file associations: {e}")),
@@ -936,7 +982,8 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
                 }
             }
             let label = if status.file_types { if status.stale() { "Update" } else { "Re-register" } } else { "Register" };
-            let clicked = if status.file_types { ui.button(label).clicked() } else { widgets::primary_button(ui, p, label).clicked() };
+            let tip = "Add Lumen to 'Open with' for every image and video type it can open";
+            let clicked = if status.file_types { ui.button(label).on_hover_text(tip).clicked() } else { widgets::primary_button(ui, p, label).on_hover_text(tip).clicked() };
             if clicked {
                 match crate::shell::register_file_types() {
                     Ok(n) => core.toasts.success(format!("Lumen registered for {n} file types")),
@@ -955,7 +1002,7 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
             }
         }
         row(ui, p, "Make Lumen the default viewer", "Windows only lets you choose defaults yourself. Register first, then pick Lumen for the types you want in Settings > Default apps.", |ui| {
-            if ui.add_enabled(status.file_types, egui::Button::new(format!("{}  Open Default apps", I::ARROW_SQUARE_OUT))).clicked() {
+            if ui.add_enabled(status.file_types, egui::Button::new(format!("{}  Open Default apps", I::ARROW_SQUARE_OUT))).on_hover_text("Open Windows Settings, where you pick Lumen for each file type").clicked() {
                 if let Err(e) = crate::shell::open_default_apps() {
                     core.toasts.error(e.to_string());
                 }
@@ -968,14 +1015,14 @@ fn integration(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
     card(ui, p, |ui| {
         row(ui, p, "'Browse with Lumen' menu", "Right-click any folder, drive or folder background in Explorer to open it in Lumen's browser.", |ui| {
             if status.context_menu {
-                if ui.button("Remove").clicked() {
+                if ui.button("Remove").on_hover_text("Remove 'Browse with Lumen' from Explorer's right-click menu").clicked() {
                     match crate::shell::unregister_context_menu() {
                         Ok(()) => core.toasts.success("Explorer menu entry removed"),
                         Err(e) => core.toasts.error(format!("Could not remove the Explorer menu entry: {e}")),
                     }
                     refresh = true;
                 }
-            } else if widgets::primary_button(ui, p, "Add").clicked() {
+            } else if widgets::primary_button(ui, p, "Add").on_hover_text("Add 'Browse with Lumen' to Explorer's right-click menu").clicked() {
                 match crate::shell::register_context_menu() {
                     Ok(()) => core.toasts.success("'Browse with Lumen' added to Explorer"),
                     Err(e) => core.toasts.error(format!("Could not add the Explorer menu entry: {e}")),
@@ -1060,7 +1107,7 @@ fn privacy(ui: &mut Ui, p: &Palette, st: &mut State) -> bool {
     section_title(ui, p, "Reset");
     card(ui, p, |ui| {
         row(ui, p, "Reset all settings", "Restore every preference to its default. Favorites, recent folders, tags and ratings are kept.", |ui| {
-            if ui.button(RichText::new(format!("{}  Reset...", I::ARROW_COUNTER_CLOCKWISE)).color(p.danger)).clicked() {
+            if ui.button(RichText::new(format!("{}  Reset...", I::ARROW_COUNTER_CLOCKWISE)).color(p.danger)).on_hover_text("Asks first; tags, ratings and favorites are kept").clicked() {
                 st.confirm_reset = true;
             }
             false
@@ -1324,7 +1371,7 @@ fn ai_page(ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
 
 fn path_row(ui: &mut Ui, p: &Palette, title: &str, path: &Path) {
     row(ui, p, title, &path.display().to_string(), |ui| {
-        if ui.button(format!("{}  Open folder", I::FOLDER_OPEN)).clicked() {
+        if ui.button(format!("{}  Open folder", I::FOLDER_OPEN)).on_hover_text("Show this folder in Explorer").clicked() {
             open_folder(path);
         }
         false
@@ -1672,12 +1719,14 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                         }
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("A ready-made set of keyboard shortcuts to start from");
             false
         });
         let n = core.settings.key_overrides.len();
         row(ui, p, "Custom shortcuts", &if n == 0 { "None - every key works as in the preset.".to_string() } else { format!("{n} command(s) changed from the preset.") }, |ui| {
-            if ui.add_enabled(n > 0, egui::Button::new(format!("{}  Reset to preset", I::ARROW_COUNTER_CLOCKWISE))).clicked() {
+            if ui.add_enabled(n > 0, egui::Button::new(format!("{}  Reset to preset", I::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Undo every shortcut you changed (asks first)").clicked() {
                 st.confirm_reset_keys = true;
             }
             false
@@ -1691,7 +1740,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(RichText::new(format!("{}  {} is already used by {}.", I::WARNING, keymap::format_shortcut(&c.sc), names.join(", "))).color(p.text)).wrap());
             ui.horizontal_wrapped(|ui| {
-                if ui.button(format!("Use for '{}' only", c.cap.cmd.label())).clicked() {
+                if ui.button(format!("Use for '{}' only", c.cap.cmd.label())).on_hover_text("Take the key away from the other command").clicked() {
                     apply_capture(core, c.cap, c.sc, &c.others);
                     st.conflict = None;
                     changed = true;
@@ -1787,7 +1836,11 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
                     ui.set_width(name_w);
                     ui.spacing_mut().item_spacing.x = 10.0;
                     ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(cmd.icon()).size(size::ICON).color(p.muted)));
-                    ui.add(egui::Label::new(RichText::new(cmd.label()).color(p.text)).truncate());
+                    let d = crate::ui::tips::describe(cmd);
+                    let l = ui.add(egui::Label::new(RichText::new(cmd.label()).color(p.text)).truncate());
+                    if !d.is_empty() {
+                        l.on_hover_text(d);
+                    }
                 });
                 let keys_w = (ui.available_width() - restore_w).max(60.0);
                 ui.allocate_ui_with_layout(Vec2::new(keys_w, 26.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {

@@ -177,7 +177,21 @@ impl MetadataDialog {
     fn ui(&mut self, ui: &mut Ui, p: &Palette, core: &mut Core) -> bool {
         let mut close = false;
         let busy = self.job.is_some();
-        crate::ui::widgets::segmented_value(ui, &mut self.tab, &[(Tab::Comment, "Comment"), (Tab::Strip, "Remove metadata"), (Tab::Dates, "Dates"), (Tab::Sidecar, "XMP sidecar")]);
+        let tabs = [Tab::Comment, Tab::Strip, Tab::Dates, Tab::Sidecar];
+        let mut i = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+        if crate::ui::widgets::segmented_with_tips(
+            ui,
+            &mut i,
+            &["Comment", "Remove metadata", "Dates", "XMP sidecar"],
+            &[
+                "A text note stored inside the JPEG file",
+                "Strip camera data, GPS location and other hidden data",
+                "Change file dates or fix the camera's date taken",
+                "Share ratings and labels with Lightroom, Bridge and darktable",
+            ],
+        ) {
+            self.tab = tabs[i];
+        }
         ui.add_space(8.0);
         ui.add_enabled_ui(!busy, |ui| match self.tab {
             Tab::Comment => self.comment_ui(ui, p),
@@ -242,7 +256,7 @@ impl MetadataDialog {
                     Ok(String::new())
                 });
             }
-            if self.original_comment.is_some() && ui.button("Remove comment").clicked() {
+            if self.original_comment.is_some() && ui.button("Remove comment").on_hover_text("Empty the box; Save then removes the comment from the file").clicked() {
                 self.comment.clear();
             }
         });
@@ -255,11 +269,11 @@ impl MetadataDialog {
             ui.label(RichText::new(format!("{} file(s) are not JPEG or PNG and will be skipped.", self.paths.len() - n)).color(p.warn));
         }
         ui.add_space(4.0);
-        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_icc, "Keep the color profile (ICC)");
-        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_orientation, "Keep the orientation (photo stays upright)");
-        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_comment, "Keep the JPEG comment");
+        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_icc, "Keep the color profile (ICC)").on_hover_text("Without it, colors of wide-gamut photos can look dull");
+        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_orientation, "Keep the orientation (photo stays upright)").on_hover_text("Without it, photos taken sideways may show sideways");
+        crate::ui::widgets::checkbox(ui, &mut self.strip.keep_comment, "Keep the JPEG comment").on_hover_text("Keep the text note written in the file");
         ui.add_space(4.0);
-        if ui.add_enabled(n > 0, egui::Button::new(format!("Remove metadata from {n} file(s)"))).clicked() {
+        if ui.add_enabled(n > 0, egui::Button::new(format!("Remove metadata from {n} file(s)"))).on_hover_text("Rewrites the files; the picture itself is not changed").clicked() {
             let opts = self.strip;
             let keep = self.keep_times;
             let ctx = ui.ctx().clone();
@@ -276,10 +290,10 @@ impl MetadataDialog {
     fn dates_ui(&mut self, ui: &mut Ui, p: &Palette) {
         ui.label(RichText::new("File dates").strong());
         ui.horizontal(|ui| {
-            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::Keep, "Don't change");
-            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::FromExif, "Set to EXIF date taken");
-            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::Specific, "Set to:");
-            ui.add_enabled(self.file_mode == FileDateMode::Specific, egui::TextEdit::singleline(&mut self.file_date).desired_width(150.0));
+            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::Keep, "Don't change").on_hover_text("Leave the dates Windows shows for the files");
+            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::FromExif, "Set to EXIF date taken").on_hover_text("Use the date the camera recorded when the photo was taken");
+            crate::ui::widgets::radio_value(ui, &mut self.file_mode, FileDateMode::Specific, "Set to:").on_hover_text("Use the date and time typed in the box");
+            ui.add_enabled(self.file_mode == FileDateMode::Specific, egui::TextEdit::singleline(&mut self.file_date).desired_width(150.0)).on_hover_text("YYYY-MM-DD HH:MM:SS");
         });
         let specific = metaedit::parse_datetime(&self.file_date);
         if self.file_mode == FileDateMode::Specific && specific.is_none() {
@@ -287,25 +301,28 @@ impl MetadataDialog {
         }
         ui.add_enabled_ui(self.file_mode != FileDateMode::Keep, |ui| {
             ui.horizontal(|ui| {
-                crate::ui::widgets::checkbox(ui, &mut self.set_modified, "Modified");
-                crate::ui::widgets::checkbox(ui, &mut self.set_created, "Created");
+                crate::ui::widgets::checkbox(ui, &mut self.set_modified, "Modified").on_hover_text("Change the file's last modified date");
+                crate::ui::widgets::checkbox(ui, &mut self.set_created, "Created").on_hover_text("Change the file's created date");
             });
         });
         ui.add_space(6.0);
         ui.label(RichText::new("EXIF dates (JPEG, PNG, WebP)").strong());
-        crate::ui::widgets::checkbox(ui, &mut self.shift_exif, "Shift EXIF dates by:");
+        crate::ui::widgets::checkbox(ui, &mut self.shift_exif, "Shift EXIF dates by:").on_hover_text("Move the camera's recorded dates later (+) or earlier (-)");
         ui.add_enabled_ui(self.shift_exif, |ui| {
             ui.horizontal(|ui| {
-                crate::ui::widgets::segmented_value(ui, &mut self.shift_sign, &[(1, "+"), (-1, "-")]);
+                let mut si = if self.shift_sign < 0 { 1 } else { 0 };
+                if crate::ui::widgets::segmented_with_tips(ui, &mut si, &["+", "-"], &["Later", "Earlier"]) {
+                    self.shift_sign = if si == 1 { -1 } else { 1 };
+                }
                 for (i, unit) in ["days", "h", "min", "s"].iter().enumerate() {
                     crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.shift[i]).range(0..=if i == 0 { 36500 } else { 59 }));
                     ui.label(*unit);
                 }
             });
             ui.horizontal(|ui| {
-                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.original, "Date taken");
-                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.digitized, "Digitized");
-                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.modified, "Modified");
+                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.original, "Date taken").on_hover_text("When the photo was taken");
+                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.digitized, "Digitized").on_hover_text("When the photo was stored or scanned (usually the same as taken)");
+                crate::ui::widgets::checkbox(ui, &mut self.exif_tags.modified, "Modified").on_hover_text("When the photo was last edited");
             });
             ui.label(RichText::new("Useful when the camera clock was wrong or set to another time zone.").color(p.muted));
         });
@@ -313,7 +330,7 @@ impl MetadataDialog {
         let offset = self.shift_sign as i64 * (self.shift[0] * 86400 + self.shift[1] * 3600 + self.shift[2] * 60 + self.shift[3]);
         let do_shift = self.shift_exif && offset != 0;
         let do_files = self.file_mode != FileDateMode::Keep && (self.set_created || self.set_modified) && (self.file_mode != FileDateMode::Specific || specific.is_some());
-        if ui.add_enabled(do_shift || do_files, egui::Button::new(format!("Apply to {} file(s)", self.paths.len()))).clicked() {
+        if ui.add_enabled(do_shift || do_files, egui::Button::new(format!("Apply to {} file(s)", self.paths.len()))).on_hover_text("Change the dates of the selected files now").clicked() {
             let (mode, created, modified, tags) = (self.file_mode, self.set_created, self.set_modified, self.exif_tags);
             let keep = self.keep_times;
             let ctx = ui.ctx().clone();
@@ -347,7 +364,7 @@ impl MetadataDialog {
         let tagged = self.paths.iter().filter(|path| !core.tags.get(path).is_empty()).count();
         ui.label(RichText::new(format!("{tagged} of {} file(s) have a rating, label or flag.", self.paths.len())).color(p.muted));
         ui.horizontal(|ui| {
-            if ui.add_enabled(tagged > 0, egui::Button::new("Export sidecars")).clicked() {
+            if ui.add_enabled(tagged > 0, egui::Button::new("Export sidecars")).on_hover_text("Write a .xmp file with the rating, label and flag next to each file").clicked() {
                 // Untagged files are left alone: writing Rating=0 / Label=""
                 // would wipe ratings another program stored in the sidecar.
                 let tags: Vec<(PathBuf, crate::tags::Tag)> = self.paths.iter().map(|path| (path.clone(), core.tags.get(path))).filter(|(_, t)| !t.is_empty()).collect();
@@ -359,7 +376,7 @@ impl MetadataDialog {
                     Ok(String::new())
                 });
             }
-            if ui.button("Import from sidecars").on_hover_text("Read xmp:Rating / xmp:Label back into Lumen").clicked() {
+            if ui.button("Import from sidecars").on_hover_text("Read ratings and labels from .xmp files next to the images back into Lumen").clicked() {
                 let mut n = 0;
                 for path in &self.paths {
                     if let Some(t) = metaedit::read_xmp_sidecar(path) {

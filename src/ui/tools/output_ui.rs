@@ -56,7 +56,7 @@ fn target_ui(ui: &mut Ui, p: &Palette, dir: &mut Option<PathBuf>, name: &mut Str
     egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
         ui.label("File name");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(name).desired_width(180.0));
+            ui.add(egui::TextEdit::singleline(name).desired_width(180.0)).on_hover_text("Name of the file to create");
             ui.label(RichText::new(format!(".{ext}")).color(p.muted));
         });
         ui.end_row();
@@ -111,21 +111,21 @@ fn footer(ui: &mut Ui, p: &Palette, id: &'static str, job: &Option<Job>, result:
             },
             |ui| {
                 if let Some(j) = job {
-                    if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).clicked() {
+                    if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).on_hover_text("Stop and discard the unfinished file").clicked() {
                         j.progress.cancel.store(true, Ordering::SeqCst);
                     }
                 } else {
-                    if primary_button(ui, p, can_create, create_label).clicked() {
+                    if primary_button(ui, p, can_create, create_label).on_disabled_hover_text("Add images and choose a file name and folder first").clicked() {
                         create = true;
                     }
                     if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
                         close = true;
                     }
                     if let Some((Ok(_), out)) = result {
-                        if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
+                        if ui.add(egui::Button::new(format!("{}  Show in Explorer", I::ARROW_SQUARE_OUT)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).on_hover_text("Open the folder with the new file selected").clicked() {
                             crate::fileops::show_in_explorer(out);
                         }
-                        if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).clicked() {
+                        if ui.add(egui::Button::new(format!("{}  Open", I::EYE)).min_size(Vec2::new(0.0, crate::ui::theme::size::CONTROL))).on_hover_text("Open the new file in its default app").clicked() {
                             crate::fileops::open_with_default(out);
                         }
                     }
@@ -160,10 +160,10 @@ fn file_list(ui: &mut Ui, p: &Palette, files: &mut Vec<PathBuf>, id: &str) -> bo
                         if ui.small_button(I::X).on_hover_text("Remove").clicked() {
                             action = Some((i, 0));
                         }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new(I::ARROW_DOWN).small()).clicked() {
+                        if ui.add_enabled(i + 1 < n, egui::Button::new(I::ARROW_DOWN).small()).on_hover_text("Move down").clicked() {
                             action = Some((i, 1));
                         }
-                        if ui.add_enabled(i > 0, egui::Button::new(I::ARROW_UP).small()).clicked() {
+                        if ui.add_enabled(i > 0, egui::Button::new(I::ARROW_UP).small()).on_hover_text("Move up").clicked() {
                             action = Some((i, -1));
                         }
                     });
@@ -311,19 +311,22 @@ impl MultiPageWindow {
                 MultiFormat::Pdf => {
                     ui.label("Page size");
                     ui.horizontal(|ui| {
-                        crate::ui::widgets::segmented_value(ui, &mut s.pdf_page, &[(PdfPage::A4, "A4"), (PdfPage::Letter, "Letter"), (PdfPage::Image, "Image size")]);
+                        let mut i = [PdfPage::A4, PdfPage::Letter, PdfPage::Image].iter().position(|x| *x == s.pdf_page).unwrap_or(0);
+                        if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["A4", "Letter", "Image size"], &["Standard paper size (Europe and most countries)", "Standard paper size (US)", "Each page is exactly as big as its image"]) {
+                            s.pdf_page = [PdfPage::A4, PdfPage::Letter, PdfPage::Image][i];
+                        }
                     });
                     ui.end_row();
                     if s.pdf_page == PdfPage::Image {
                         ui.label("Resolution");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi")).on_hover_text("Pixels per inch: sets how big each page prints");
                     } else {
                         ui.label("Margins");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin_mm).range(0.0..=60.0).suffix(" mm"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin_mm).range(0.0..=60.0).suffix(" mm")).on_hover_text("Empty space around each image on the page");
                     }
                     ui.end_row();
                     ui.label("JPEG quality");
-                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 30..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 30..=100)).on_hover_text("Higher looks better but makes a bigger PDF");
                     ui.end_row();
                     ui.label("Max image side");
                     crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.pdf_max_side).range(0..=20000).suffix(" px"))
@@ -332,7 +335,7 @@ impl MultiPageWindow {
                 }
                 MultiFormat::Tiff => {
                     ui.label("Resolution");
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.dpi).range(10..=1200).suffix(" dpi")).on_hover_text("Print size hint stored in the file: dots per inch when printed");
                     ui.end_row();
                     ui.label("");
                     hint(ui, p, "Lossless (LZW), one page per image, full size.");
@@ -340,14 +343,14 @@ impl MultiPageWindow {
                 }
                 MultiFormat::Gif | MultiFormat::WebP => {
                     ui.label("Frame time");
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.frame_ms).range(20..=60000).speed(10.0).suffix(" ms"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.frame_ms).range(20..=60000).speed(10.0).suffix(" ms")).on_hover_text("How long each image shows (1000 ms = 1 second)");
                     ui.end_row();
                     ui.label("Max size");
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.anim_max_side).range(16..=4000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.anim_max_side).range(16..=4000).suffix(" px")).on_hover_text("Longest side of the animation; smaller makes a lighter file");
                     ui.end_row();
                     if s.format == MultiFormat::WebP {
                         ui.label("Quality");
-                        ui.add(crate::ui::widgets::Slider::new(&mut s.webp_quality, 1.0..=100.0).fixed_decimals(0));
+                        ui.add(crate::ui::widgets::Slider::new(&mut s.webp_quality, 1.0..=100.0).fixed_decimals(0)).on_hover_text("Higher looks better but makes bigger files");
                         ui.end_row();
                     }
                     ui.label("Background");
@@ -609,7 +612,10 @@ impl StripWindow {
             egui::Grid::new("st-layout").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 ui.label("Direction");
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut s.dir, &[(StripDir::Horizontal, "Horizontal"), (StripDir::Vertical, "Vertical")]);
+                    let mut i = if s.dir == StripDir::Horizontal { 0 } else { 1 };
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["Horizontal", "Vertical"], &["Place the images side by side in a row", "Stack the images on top of each other"]) {
+                        s.dir = if i == 0 { StripDir::Horizontal } else { StripDir::Vertical };
+                    }
                 });
                 ui.end_row();
                 ui.label(if s.dir == StripDir::Horizontal { "Height" } else { "Width" });
@@ -622,18 +628,20 @@ impl StripWindow {
                     })
                     .show_ui(ui, |ui| {
                         crate::ui::widgets::segmented_value(ui, &mut s.size, &[(StripSize::Smallest, "Same as smallest"), (StripSize::Largest, "Same as largest"), (StripSize::Custom, "Custom"), (StripSize::Original, "Keep original sizes")]);
-                    });
+                    })
+                    .response
+                    .on_hover_text("Scale the images so they line up, or keep them as they are");
                 ui.end_row();
                 if s.size == StripSize::Custom {
                     ui.label("");
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.custom).range(8..=30000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.custom).range(8..=30000).suffix(" px")).on_hover_text("Every image is scaled to this size across the strip");
                     ui.end_row();
                 }
                 ui.label("Spacing");
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.spacing).range(0..=2000).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.spacing).range(0..=2000).suffix(" px")).on_hover_text("Gap between the images");
                 ui.end_row();
                 ui.label("Outer margin");
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin).range(0..=2000).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut s.margin).range(0..=2000).suffix(" px")).on_hover_text("Empty border around the whole strip");
                 ui.end_row();
                 ui.label("Background");
                 color_rgba(ui, &mut s.bg, true);
@@ -651,11 +659,13 @@ impl StripWindow {
                     for f in [SaveFormat::Jpeg, SaveFormat::Png, SaveFormat::WebP, SaveFormat::Tiff, SaveFormat::Bmp] {
                         ui.selectable_value(&mut s.format, f, if f == SaveFormat::WebP { "WebP" } else { f.label() });
                     }
-                });
+                })
+                .response
+                .on_hover_text("File type of the joined image");
                 ui.end_row();
                 if s.format == SaveFormat::Jpeg {
                     ui.label("Quality");
-                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 40..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut s.jpeg_quality, 40..=100)).on_hover_text("Higher looks better but makes bigger files");
                     ui.end_row();
                 }
             });
@@ -749,8 +759,8 @@ impl ZipWindow {
                         });
                         ui.add_space(8.0);
                         card(ui, &p, I::FILE_ZIP, "Archive", |ui| {
-                            crate::ui::widgets::checkbox(ui, &mut self.s.store_compressed, "Store JPEG, PNG, video... without recompressing (much faster)");
-                            crate::ui::widgets::checkbox(ui, &mut self.s.keep_folders, "Keep the folder structure");
+                            crate::ui::widgets::checkbox(ui, &mut self.s.store_compressed, "Store JPEG, PNG, video... without recompressing (much faster)").on_hover_text("These files are already compressed; zipping them again saves almost nothing");
+                            crate::ui::widgets::checkbox(ui, &mut self.s.keep_folders, "Keep the folder structure").on_hover_text("Recreate subfolders inside the ZIP instead of putting every file at the top");
                             ui.add_space(4.0);
                             target_ui(ui, &p, &mut self.dir, &mut self.name, "zip");
                         });

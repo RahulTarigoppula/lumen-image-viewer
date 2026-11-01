@@ -1,7 +1,7 @@
 //! Text overlay and watermark tools. All sizes are relative to the image so
 //! the downscaled live preview looks identical to the full-resolution result.
 
-use super::{anchor_grid, color_button, combo, hint, icon_toggle, info, row, section, section_toggle, segmented, slider, slider_ex};
+use super::{anchor_grid, color_button, combo, hint, icon_toggle, info, row, section, section_toggle, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::text::{self as txt, Stamp, TextStyle};
 use crate::edit::{geom, EditTool, ToolUiCtx};
@@ -19,7 +19,7 @@ fn opacity_color_row(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4], opacit
         super::row_label(ui, label);
         c |= color_button(ui, color, false);
         ui.spacing_mut().slider_width = f32::INFINITY;
-        c |= ui.add(widgets::Slider::new(opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0).default_value(100.0)).on_hover_text("Opacity").changed();
+        c |= ui.add(widgets::Slider::new(opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0).default_value(100.0)).on_hover_text("Opacity: lower lets the image show through").changed();
     });
     c
 }
@@ -160,30 +160,30 @@ impl EditTool for AddText {
                 }
             }
         });
-        c |= slider_ex(ui, "Size", &mut self.size, 0.5..=40.0, 6.0, " %", 0.1, 1, true);
+        c |= tipped(ui, "Height of the letters, as a percentage of the image height", |ui| slider_ex(ui, "Size", &mut self.size, 0.5..=40.0, 6.0, " %", 0.1, 1, true));
         c |= opacity_color_row(ui, "Color", &mut self.color, &mut self.opacity);
         c |= slider_ex(ui, "Line spacing", &mut self.spacing, 0.6..=3.0, 1.0, "×", 0.05, 2, false);
         section(ui, cx, "Position");
-        row(ui, &format!("{} Anchor", I::ANCHOR), |ui| c |= anchor_grid(ui, cx, &mut self.anchor));
-        c |= slider_ex(ui, "Margin", &mut self.margin, 0.0..=25.0, 4.0, " %", 0.1, 1, false);
+        tipped(ui, "Which side or corner of the image the text sits at", |ui| row(ui, &format!("{} Anchor", I::ANCHOR), |ui| c |= anchor_grid(ui, cx, &mut self.anchor)));
+        c |= tipped(ui, "Space between the text and the image edge", |ui| slider_ex(ui, "Margin", &mut self.margin, 0.0..=25.0, 4.0, " %", 0.1, 1, false));
         c |= slider_ex(ui, "Offset X", &mut self.off_x, -50.0..=50.0, 0.0, " %", 0.1, 1, false);
         c |= slider_ex(ui, "Offset Y", &mut self.off_y, -50.0..=50.0, 0.0, " %", 0.1, 1, false);
-        c |= slider_ex(ui, "Rotation", &mut self.angle, -180.0..=180.0, 0.0, "°", 0.5, 1, false);
+        c |= tipped(ui, "Turn the text by this angle", |ui| slider_ex(ui, "Rotation", &mut self.angle, -180.0..=180.0, 0.0, "°", 0.5, 1, false));
         c |= section_toggle(ui, &mut self.outline, "Outline");
         if self.outline {
-            c |= slider_ex(ui, "Width", &mut self.outline_w, 0.5..=30.0, 5.0, " %", 0.5, 1, false);
+            c |= tipped(ui, "Thickness of the outline", |ui| slider_ex(ui, "Width", &mut self.outline_w, 0.5..=30.0, 5.0, " %", 0.5, 1, false));
             c |= super::color_row(ui, "Outline color", &mut self.outline_color, true);
         }
         c |= section_toggle(ui, &mut self.shadow, "Drop shadow");
         if self.shadow {
-            c |= slider_ex(ui, "Distance", &mut self.shadow_dist, 0.0..=50.0, 5.0, " %", 0.5, 1, false);
-            c |= slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=60.0, 8.0, " %", 0.5, 1, false);
+            c |= tipped(ui, "How far the shadow falls from the text", |ui| slider_ex(ui, "Distance", &mut self.shadow_dist, 0.0..=50.0, 5.0, " %", 0.5, 1, false));
+            c |= tipped(ui, "How blurry the shadow is", |ui| slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=60.0, 8.0, " %", 0.5, 1, false));
             c |= super::color_row(ui, "Shadow color", &mut self.shadow_color, true);
         }
-        c |= section_toggle(ui, &mut self.bg, "Box behind the text");
+        c |= tipped(ui, "A filled box behind the text so it reads on any background", |ui| section_toggle(ui, &mut self.bg, "Box behind the text"));
         if self.bg {
-            c |= super::color_row(ui, "Box color", &mut self.bg_color, true);
-            c |= slider_ex(ui, "Padding", &mut self.bg_pad, 0.0..=150.0, 30.0, " %", 1.0, 0, false);
+            c |= tipped(ui, "Color of the box (with see-through amount)", |ui| super::color_row(ui, "Box color", &mut self.bg_color, true));
+            c |= tipped(ui, "Space between the text and the box edge", |ui| slider_ex(ui, "Padding", &mut self.bg_pad, 0.0..=150.0, 30.0, " %", 1.0, 0, false));
             c |= slider_ex(ui, "Corner radius", &mut self.bg_radius, 0.0..=100.0, 20.0, " %", 1.0, 0, false);
         }
         section(ui, cx, "Result");
@@ -320,22 +320,22 @@ impl EditTool for Watermark {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
-        c |= row(ui, "Type", |ui| segmented(ui, &mut self.kind, &["Text", "Image"]));
+        c |= row(ui, "Type", |ui| segmented_tips(ui, &mut self.kind, &["Text", "Image"], &["Stamp a line of text", "Stamp a logo or picture from a file"]));
         ui.add_space(4.0);
         if self.kind == 0 {
-            c |= ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(ui.available_width()).hint_text("© Your Name")).changed();
+            c |= ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(ui.available_width()).hint_text("© Your Name")).on_hover_text("The watermark text").changed();
             c |= combo(ui, "Font", "wm-font", &mut self.family, &font_names());
             row(ui, "Style", |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 c |= icon_toggle(ui, &mut self.bold, I::TEXT_B, "Bold");
                 ui.add_space(8.0);
-                c |= widgets::checkbox(ui, &mut self.shadow, "Shadow").changed();
+                c |= widgets::checkbox(ui, &mut self.shadow, "Shadow").on_hover_text("A soft shadow so the text reads on light and dark areas").changed();
             });
-            c |= slider_ex(ui, "Size", &mut self.size, 0.5..=30.0, 4.0, " %", 0.1, 1, true);
+            c |= tipped(ui, "Height of the letters, as a percentage of the image height", |ui| slider_ex(ui, "Size", &mut self.size, 0.5..=30.0, 4.0, " %", 0.1, 1, true));
             c |= opacity_color_row(ui, "Color", &mut self.color, &mut self.opacity);
         } else {
             row(ui, "Image", |ui| {
-                if ui.button(format!("{}  Choose...", I::FOLDER_OPEN)).clicked() {
+                if ui.button(format!("{}  Choose...", I::FOLDER_OPEN)).on_hover_text("Pick the logo or picture to stamp").clicked() {
                     c |= self.pick_logo();
                 }
             });
@@ -347,17 +347,17 @@ impl EditTool for Watermark {
             if let Some(e) = &self.error {
                 ui.colored_label(cx.palette.danger, e);
             }
-            c |= slider_ex(ui, "Width", &mut self.logo_size, 2.0..=100.0, 18.0, " %", 0.5, 1, false);
+            c |= tipped(ui, "Width of the logo, as a percentage of the image width", |ui| slider_ex(ui, "Width", &mut self.logo_size, 2.0..=100.0, 18.0, " %", 0.5, 1, false));
             c |= slider(ui, "Opacity", &mut self.opacity, 0.0..=100.0, 45.0, " %");
         }
         section(ui, cx, "Placement");
-        c |= row(ui, "Layout", |ui| segmented(ui, &mut self.layout, &["Single", "Tiled"]));
+        c |= row(ui, "Layout", |ui| segmented_tips(ui, &mut self.layout, &["Single", "Tiled"], &["One watermark in a corner or side", "Repeat the watermark across the whole image"]));
         if self.layout == 0 {
-            row(ui, &format!("{} Anchor", I::ANCHOR), |ui| c |= anchor_grid(ui, cx, &mut self.anchor));
-            c |= slider_ex(ui, "Margin", &mut self.margin, 0.0..=25.0, 3.0, " %", 0.1, 1, false);
+            tipped(ui, "Which side or corner of the image the watermark sits at", |ui| row(ui, &format!("{} Anchor", I::ANCHOR), |ui| c |= anchor_grid(ui, cx, &mut self.anchor)));
+            c |= tipped(ui, "Space between the watermark and the image edge", |ui| slider_ex(ui, "Margin", &mut self.margin, 0.0..=25.0, 3.0, " %", 0.1, 1, false));
         } else {
-            c |= slider_ex(ui, "Angle", &mut self.angle, -90.0..=90.0, -30.0, "°", 1.0, 0, false);
-            c |= slider_ex(ui, "Spacing", &mut self.gap, 0.0..=50.0, 8.0, " %", 0.5, 1, false);
+            c |= tipped(ui, "Slant of the repeated watermarks", |ui| slider_ex(ui, "Angle", &mut self.angle, -90.0..=90.0, -30.0, "°", 1.0, 0, false));
+            c |= tipped(ui, "Space between the repeated watermarks", |ui| slider_ex(ui, "Spacing", &mut self.gap, 0.0..=50.0, 8.0, " %", 0.5, 1, false));
         }
         c
     }

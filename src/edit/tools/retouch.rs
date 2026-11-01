@@ -1,7 +1,7 @@
 //! Brush retouching: Clone stamp and Healing brush (same tool, two modes).
 
 use super::canvas::{self, Pointer};
-use super::{hint, indented, info, section, slider, slider_ex};
+use super::{hint, indented, info, section, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::retouch::{self, BrushStroke};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
@@ -81,16 +81,17 @@ impl EditTool for CloneStamp {
         }
         let mut c = false;
         let mut i = self.heal as usize;
-        if super::segmented(ui, &mut i, &[&format!("{}  Clone", I::STAMP), &format!("{}  Heal", I::BANDAIDS)]) {
+        let tips = ["Copy pixels exactly from the source spot (Alt+click to set it)", "Copy texture from the source but blend in the colors around the spot"];
+        if super::segmented_tips(ui, &mut i, &[&format!("{}  Clone", I::STAMP), &format!("{}  Heal", I::BANDAIDS)], &tips) {
             self.heal = i == 1;
         }
         ui.add_space(4.0);
         let mut size = self.radius * 2.0;
-        if slider_ex(ui, "Size", &mut size, 2.0..=self.max_radius * 2.0, (short / 30.0).round().max(6.0), " px", 1.0, 0, true) {
+        if tipped(ui, "Diameter of the brush", |ui| slider_ex(ui, "Size", &mut size, 2.0..=self.max_radius * 2.0, (short / 30.0).round().max(6.0), " px", 1.0, 0, true)) {
             self.radius = (size / 2.0).max(1.0);
         }
         let mut hard = self.hardness * 100.0;
-        if slider(ui, "Hardness", &mut hard, 0.0..=100.0, if self.heal { 50.0 } else { 70.0 }, " %") {
+        if tipped(ui, "How sharp the brush edge is; lower blends more softly", |ui| slider(ui, "Hardness", &mut hard, 0.0..=100.0, if self.heal { 50.0 } else { 70.0 }, " %")) {
             self.hardness = hard / 100.0;
         }
         let mut op = self.opacity * 100.0;

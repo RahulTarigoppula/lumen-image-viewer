@@ -3,7 +3,7 @@
 //! and Red-eye removal.
 
 use super::canvas::{self, NewShape, ShapeEditor};
-use super::{color_row, hint, indented, info, row, section, segmented, slider, slider_ex};
+use super::{color_row, hint, indented, info, row, section, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::mask::{self, Shape};
 use crate::edit::retouch::{self, Obscure};
@@ -22,8 +22,9 @@ fn shape_kind_row(ui: &mut egui::Ui, kind: &mut NewShape, lasso: bool) {
     let ell = format!("{}  Ellipse", I::CIRCLE);
     let las = format!("{}  Lasso", I::LASSO);
     let labels: Vec<&str> = if lasso { vec![&rect, &ell, &las] } else { vec![&rect, &ell] };
+    let tips = ["Drag a box on the image", "Drag an oval on the image", "Draw any shape freehand"];
     // Full width (like a mode switch) so the labels fit.
-    segmented(ui, &mut i, &labels);
+    segmented_tips(ui, &mut i, &labels, &tips[..labels.len()]);
     ui.add_space(4.0);
     *kind = match i {
         1 => NewShape::Ellipse,
@@ -77,11 +78,11 @@ impl EditTool for ObscureRegion {
         }
         let mut c = false;
         shape_kind_row(ui, &mut self.kind, false);
-        c |= row(ui, "Effect", |ui| segmented(ui, &mut self.mode, &["Pixelate", "Blur", "Solid"]));
+        c |= row(ui, "Effect", |ui| segmented_tips(ui, &mut self.mode, &["Pixelate", "Blur", "Solid"], &["Big square blocks", "Smooth blur", "Cover with one color"]));
         match self.mode {
-            1 => c |= slider_ex(ui, "Strength", &mut self.blur, 1.0..=(short / 4.0).max(10.0), (short / 70.0).round().max(4.0), " px", 1.0, 0, true),
-            2 => c |= color_row(ui, "Color", &mut self.color, false),
-            _ => c |= slider_ex(ui, "Cell size", &mut self.cell, 2.0..=(short / 4.0).max(10.0), (short / 45.0).round().max(6.0), " px", 1.0, 0, true),
+            1 => c |= tipped(ui, "How strongly the area is blurred", |ui| slider_ex(ui, "Strength", &mut self.blur, 1.0..=(short / 4.0).max(10.0), (short / 70.0).round().max(4.0), " px", 1.0, 0, true)),
+            2 => c |= tipped(ui, "Color that covers the area", |ui| color_row(ui, "Color", &mut self.color, false)),
+            _ => c |= tipped(ui, "Size of each square block; larger hides more", |ui| slider_ex(ui, "Cell size", &mut self.cell, 2.0..=(short / 4.0).max(10.0), (short / 45.0).round().max(6.0), " px", 1.0, 0, true)),
         }
         c |= slider_ex(ui, "Feather", &mut self.feather, 0.0..=(short / 20.0).max(5.0), 0.0, " px", 0.5, 1, false);
         section(ui, cx, &format!("Areas ({})", self.ed.shapes.len()));
@@ -185,7 +186,7 @@ impl EditTool for Selection {
         indented(ui, |ui| {
             c |= widgets::checkbox(ui, &mut self.invert, "Invert").on_hover_text("Adjust everything outside the selection").changed();
             ui.add_space(8.0);
-            widgets::checkbox(ui, &mut self.show_outline, "Show outline");
+            widgets::checkbox(ui, &mut self.show_outline, "Show outline").on_hover_text("Draw a dashed line around the selected areas");
         });
         section(ui, cx, &format!("Areas ({})", self.ed.shapes.len()));
         c |= canvas::shape_buttons(ui, &mut self.ed);
@@ -195,7 +196,7 @@ impl EditTool for Selection {
         section(ui, cx, "Adjustment");
         let opts: Vec<String> = INNER.iter().map(|s| s.to_string()).collect();
         let before = self.which;
-        if super::combo(ui, "Apply", "selection-inner", &mut self.which, &opts) && self.which != before {
+        if tipped(ui, "The adjustment made inside the selected areas", |ui| super::combo(ui, "Apply", "selection-inner", &mut self.which, &opts)) && self.which != before {
             self.inner = make_inner(self.which);
             c = true;
         }
@@ -285,8 +286,8 @@ impl EditTool for RedEye {
             self.click_size = (short_side(cx) / 30.0).clamp(8.0, 600.0);
         }
         let mut c = false;
-        c |= slider(ui, "Sensitivity", &mut self.sensitivity, 0.0..=100.0, 50.0, " %");
-        c |= slider(ui, "Darken", &mut self.darken, 0.0..=100.0, 40.0, " %");
+        c |= tipped(ui, "How red a pixel must be to count as red eye; raise it if some red is left", |ui| slider(ui, "Sensitivity", &mut self.sensitivity, 0.0..=100.0, 50.0, " %"));
+        c |= tipped(ui, "How dark the fixed pupils become", |ui| slider(ui, "Darken", &mut self.darken, 0.0..=100.0, 40.0, " %"));
         section(ui, cx, &format!("Eyes ({})", self.ed.shapes.len()));
         c |= canvas::shape_buttons(ui, &mut self.ed);
         ui.add_space(4.0);

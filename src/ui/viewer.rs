@@ -3,15 +3,17 @@
 
 use super::commands::Command;
 use super::roi::{ImageTransform, RoiEditor, RoiOptions};
+use super::safe::{safe_clamp, sane_zoom};
 use super::icons as I;
 use super::theme::{self, size, text, Palette};
+use super::tips;
 use super::widgets;
 use crate::app::Core;
 use crate::catalog;
 use crate::edit::{EditSession, EditTool, Histogram, HistogramPaint, ToolUiCtx};
 use crate::loader::{LoadState, LoadedImage};
 use crate::render::{self, GpuImage};
-use crate::settings::{FitMode, WheelAction};
+use crate::settings::{FitMode, ViewerHistogram, WheelAction};
 use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -841,6 +843,8 @@ impl Viewer {
 
         let Some(path) = self.current().cloned() else {
             ui.painter().text(view.center(), Align2::CENTER_CENTER, "No images", FontId::proportional(16.0), p.muted);
+            let hint = format!("Open a file ({}) or a folder ({}), or drop images here", Command::OpenFile.shortcut(), Command::OpenFolder.shortcut());
+            ui.painter().text(view.center() + Vec2::new(0.0, 24.0), Align2::CENTER_TOP, hint, FontId::proportional(12.5), p.faint);
             return ev;
         };
 
@@ -1009,7 +1013,7 @@ impl Viewer {
                     let mut shown = false;
                     if let Some(LoadState::Preview(img)) = core.loader.state(&path) {
                         if !matches!(&self.preview_tex, Some((pp, _)) if pp == &path) {
-                            let tex = ui.ctx().load_texture(format!("preview:{}", path.display()), render::color_image_from_rgba(img), egui::TextureOptions::LINEAR);
+                            let tex = ui.ctx().load_texture(format!("preview:{}", path.display()), crate::ui::safe::color_image(ui.ctx(), img), egui::TextureOptions::LINEAR);
                             self.preview_tex = Some((path.clone(), tex));
                         }
                     }
@@ -1285,11 +1289,11 @@ impl Viewer {
         let tex_id = if !a.frame_tex.is_empty() {
             let i = a.frame;
             a.frame_tex[i]
-                .get_or_insert_with(|| ui.ctx().load_texture(format!("anim:{}#{i}", path.display()), render::color_image_from_rgba(&frames[i].image), egui::TextureOptions::LINEAR))
+                .get_or_insert_with(|| ui.ctx().load_texture(format!("anim:{}#{i}", path.display()), crate::ui::safe::color_image(ui.ctx(), &frames[i].image), egui::TextureOptions::LINEAR))
                 .id()
         } else {
             if a.shown_frame != a.frame || a.tex.is_none() {
-                let ci = render::color_image_from_rgba(&frames[a.frame].image);
+                let ci = crate::ui::safe::color_image(ui.ctx(), &frames[a.frame].image);
                 match &mut a.tex {
                     Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
                     None => a.tex = Some(ui.ctx().load_texture("anim", ci, egui::TextureOptions::LINEAR)),
@@ -1375,18 +1379,22 @@ impl Viewer {
         self.hist_cache.get(&key, ctx, move || Histogram::compute(&img))
     }
 
-    fn histogram_overlay(&mut self, ui: &mut Ui, core: &Core, view: Rect, path: &Path) {
+    fn histogram_overlay(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, path: &Path) {
         let r = Rect::from_min_size(Pos2::new(view.max.x - 12.0 - 240.0, view.min.y + 12.0), Vec2::new(240.0, 96.0));
         if r.min.x < view.min.x + 8.0 || r.max.y > view.max.y - 8.0 {
             return;
         }
         let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(view);
+        let mode = core.settings.viewer_histogram;
+        let resp = ui.interact(r, ui.scope_id().with("histogram-overlay"), Sense::click());
+        let pal = core.pal;
         if let Some(h) = self.histogram_for(core, &ctx, path) {
-            painter.add(theme::popover_shadow(&core.pal).as_shape(r, CornerRadius::same(6)));
-            h.paint(&painter, r, core.pal.dark);
-            painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, core.pal.border), egui::StrokeKind::Outside);
+            painter.add(theme::popover_shadow(&pal).as_shape(r, CornerRadius::same(6)));
+            paint_histogram(&painter, r, h, mode, &pal, resp.hovered());
+            painter.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, pal.border), egui::StrokeKind::Outside);
         }
+        histogram_clicks(resp, core);
     }
 
     /// FastStone-style pop-out panels: dwell at a window edge to show a floating
@@ -1583,7 +1591,7 @@ impl Viewer {
                     if zl.clicked() {
                         ev.push(ViewerEvent::Command(Command::ZoomActual));
                     }
-                    zl.on_hover_text("Click: 100%");
+                    zl.on_hover_text(tips::with_shortcut("Zoom level. Click to show the image at actual size (100%)", &Command::ZoomActual.shortcut()));
                 }
                 B::Edit => {
                     let open_id = child.scope_id().with("bar-edit-open");
@@ -1595,7 +1603,7 @@ impl Viewer {
                 B::More => {
                     let open_id = child.scope_id().with("bar-more-open");
                     let was_open = child.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
-                    let r = widgets::icon_button_sized(&mut child, I::DOTS_THREE, "More", was_open, BAR_BUTTON, size::ICON_TOOLBAR);
+                    let r = widgets::icon_button_sized(&mut child, I::DOTS_THREE, "More: save, copy, print, slideshow, file details and other commands", was_open, BAR_BUTTON, size::ICON_TOOLBAR);
                     let analysis_open = core.analysis_open;
                     let open = egui::Popup::menu(&r).gap(10.0).show(|ui| self.more_menu(ui, &hidden, dirty, analysis_open, ev)).is_some();
                     child.data_mut(|d| d.insert_temp(open_id, open));
@@ -1668,7 +1676,7 @@ impl Viewer {
     /// Icon, tooltip and selected state of a toolbar button.
     fn bar_button(&self, item: BarItem, cmd: Command) -> (&'static str, String, bool) {
         use BarItem as B;
-        let tip = |t: &str| format!("{t}  ({})", cmd.shortcut());
+        let tip = |t: &str| tips::with_shortcut(t, &cmd.shortcut());
         match item {
             B::Browser => (I::SQUARES_FOUR, tip("Back to browser"), false),
             B::Prev => (I::CARET_LEFT, tip("Previous"), false),
@@ -1679,8 +1687,8 @@ impl Viewer {
             B::RotL => (I::ARROW_COUNTER_CLOCKWISE, tip("Rotate left"), false),
             B::RotR => (I::ARROW_CLOCKWISE, tip("Rotate right"), false),
             B::Crop => (I::CROP, tip("Crop"), self.crop.is_some()),
-            B::Info => (I::INFO, tip("Info panel"), self.show_info),
-            B::Film => (I::FILM_STRIP, tip("Filmstrip"), self.show_filmstrip),
+            B::Info => (I::INFO, tip("Info panel: file details, camera settings and histogram"), self.show_info),
+            B::Film => (I::FILM_STRIP, tip("Filmstrip: thumbnails of the folder"), self.show_filmstrip),
             B::Analysis => (cmd.icon(), tip("Analysis: quality metrics and AI review"), false),
             B::Fullscreen => (if self.is_fullscreen { I::CORNERS_IN } else { I::CORNERS_OUT }, tip(if self.is_fullscreen { "Leave full screen" } else { "Full screen" }), false),
             B::Sep | B::ZoomPct | B::Edit | B::More => (I::DOTS_THREE, String::new(), false),
@@ -1787,10 +1795,12 @@ impl Viewer {
             });
             ui.add_space(8.0);
             let ctx = ui.ctx().clone();
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 80.0), Sense::click());
+            let mode = core.settings.viewer_histogram;
             if let Some(hist) = self.histogram_for(core, &ctx, &path) {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 80.0), Sense::hover());
-                hist.paint(ui.painter(), r, p.dark);
+                paint_histogram(ui.painter(), r, hist, mode, &p, resp.hovered());
             }
+            histogram_clicks(resp, core);
             ui.add_space(4.0);
             if let Some(l) = self.loaded(core) {
                 let d = &l.decoded;
@@ -2252,22 +2262,6 @@ pub fn advance_animation(frame: usize, next_at: Instant, now: Instant, delay: im
     (f, next)
 }
 
-/// Zoom factors must stay finite and positive (a collapsed view gives 0 or NaN,
-/// and `f32::clamp` panics on NaN bounds).
-fn sane_zoom(z: f32) -> f32 {
-    if z.is_finite() && z > 0.0 {
-        z.clamp(0.001, 64.0)
-    } else {
-        1.0
-    }
-}
-
-/// `v` limited to `lo..=hi` that never panics: an inverted range collapses
-/// to `lo` and NaN bounds are ignored (`f32::clamp` panics on both).
-fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
-    v.max(lo).min(hi.max(lo))
-}
-
 /// Neighbours bigger than this (decoded bytes) are not kept preloaded: half
 /// the cache budget, and never more than a 60 MP image.
 fn preload_limit(budget: u64) -> u64 {
@@ -2339,9 +2333,52 @@ fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     (items, hidden)
 }
 
+/// The viewer's histogram: brightness (Luminance), the three channels (RGB),
+/// or the channels with the brightness curve on top (Both). Its mode is named
+/// in the top-left corner.
+fn paint_histogram(painter: &egui::Painter, rect: Rect, h: &Histogram, mode: ViewerHistogram, p: &Palette, hovered: bool) {
+    use crate::edit::tools::{paint_area, smooth_bins};
+    match mode {
+        ViewerHistogram::Rgb | ViewerHistogram::Both => h.paint(painter, rect, p.dark),
+        ViewerHistogram::Luminance => {
+            painter.rect_filled(rect, 6.0, p.input_bg);
+        }
+    }
+    if mode != ViewerHistogram::Rgb && !h.l.is_empty() {
+        // Scaled like the channels: to the tallest bin short of pure black / white.
+        let max = h.l.iter().skip(1).take(254).copied().max().unwrap_or(1).max(1);
+        let area = rect.shrink2(Vec2::new(4.0, 4.0));
+        let bins = smooth_bins(&h.l, max);
+        let ink = if p.dark { Color32::from_gray(235) } else { Color32::from_gray(40) };
+        let fill = if mode == ViewerHistogram::Luminance { ink.gamma_multiply(0.45) } else { ink.gamma_multiply(0.08) };
+        paint_area(painter, area, &bins, fill, ink);
+    }
+    if h.l.is_empty() {
+        return;
+    }
+    let color = if hovered { p.text } else { p.muted };
+    painter.text(rect.left_top() + Vec2::new(7.0, 5.0), Align2::LEFT_TOP, mode.label(), text::caption(), color);
+}
+
+/// Hover tip and click handling of a viewer histogram: a click shows the next mode.
+fn histogram_clicks(resp: egui::Response, core: &mut Core) {
+    let mode = core.settings.viewer_histogram;
+    let resp = resp.on_hover_text(format!(
+        "How dark and bright tones are spread: left is black, right is white. Showing {}. Click to show {}",
+        mode.label(),
+        mode.next().label()
+    ));
+    if resp.hovered() {
+        resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        core.settings.viewer_histogram = mode.next();
+    }
+}
+
 /// A 28 pt menu row for a command (icon, label, shortcut); runs it on click.
 fn menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
-    if widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
+    if tips::menu_tip(widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()), c).clicked() {
         ev.push(ViewerEvent::Command(c));
         ui.close();
     }
@@ -2349,7 +2386,7 @@ fn menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
 
 /// A row of the left edge panel, in the menu row style; runs the command.
 fn edge_menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
-    if widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
+    if tips::menu_tip(widgets::menu_item(ui, c.icon(), &c.label(), &c.shortcut()), c).clicked() {
         ev.push(ViewerEvent::Command(c));
     }
 }
@@ -2357,7 +2394,7 @@ fn edge_menu_item(ui: &mut Ui, c: Command, ev: &mut Vec<ViewerEvent>) {
 /// A menu row for an on / off command: its icon while off, a check mark
 /// while on (instead of "Toggle ...").
 fn menu_check(ui: &mut Ui, c: Command, label: &str, on: bool, ev: &mut Vec<ViewerEvent>) {
-    if widgets::menu_check(ui, on, c.icon(), label, &c.shortcut()).clicked() {
+    if tips::menu_tip(widgets::menu_check(ui, on, c.icon(), label, &c.shortcut()), c).clicked() {
         ev.push(ViewerEvent::Command(c));
         ui.close();
     }

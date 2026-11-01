@@ -2450,7 +2450,7 @@ impl App {
         let mut fire = None;
         use crate::ui::widgets::{menu_item, menu_toggle, submenu};
         let item = |ui: &mut egui::Ui, c: Command, fire: &mut Option<Command>| {
-            if menu_item(ui, c.icon(), &c.label(), &c.shortcut()).clicked() {
+            if crate::ui::tips::menu_tip(menu_item(ui, c.icon(), &c.label(), &c.shortcut()), c).clicked() {
                 *fire = Some(c);
                 ui.close();
             }
@@ -2478,7 +2478,7 @@ impl App {
             submenu(ui, I::EYE, "View", |ui| {
                 // On / off settings show a check mark instead of "Toggle ...".
                 for (c, label, on) in [(Command::ToggleDetails, "Details view", details), (Command::TogglePreviewPane, "Preview pane", preview), (Command::ShowFlaggedOnly, "Flagged only", flagged), (Command::ToggleFullscreen, "Full screen", full)] {
-                    if menu_toggle(ui, on, label, &c.shortcut()).clicked() {
+                    if crate::ui::tips::menu_tip(menu_toggle(ui, on, label, &c.shortcut()), c).clicked() {
                         fire = Some(c);
                         ui.close();
                     }
@@ -2530,7 +2530,9 @@ impl App {
             item(ui, Command::About, &mut fire);
             ui.separator();
             item(ui, Command::Exit, &mut fire);
-        });
+        })
+        .response
+        .on_hover_text("Menu: open, edit, view, tools, settings and help");
         if let Some(c) = fire {
             self.run(c);
         }
@@ -2738,7 +2740,7 @@ impl eframe::App for App {
                         });
                     });
                 let range = crate::ui::browser::sidebar_range(&ctx);
-                let tree_w = self.core.settings.tree_width.clamp(*range.start(), *range.end());
+                let tree_w = crate::ui::safe::safe_clamp(self.core.settings.tree_width, *range.start(), *range.end());
                 egui::Panel::left("sidebar")
                     .resizable(true)
                     .default_size(tree_w)
@@ -2799,7 +2801,9 @@ impl eframe::App for App {
                 let fullscreen = self.fullscreen;
                 let mut events = Vec::new();
                 egui::CentralPanel::no_frame().show(ui, |ui| {
+                    let t = std::time::Instant::now();
                     events = self.viewer.ui(ui, &mut self.core, fullscreen);
+                    crate::devhook::prof("viewer", t);
                 });
                 for e in events {
                     match e {
@@ -2955,6 +2959,25 @@ impl App {
                     let button = if secondary { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
                     self.dev_input.push(egui::Event::PointerMoved(pos));
                     self.dev_input.push(egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE });
+                    ctx.request_repaint();
+                }
+                crate::devhook::DevAction::Hover(pos) => {
+                    self.dev_input.push(egui::Event::PointerMoved(pos));
+                    ctx.request_repaint();
+                }
+                crate::devhook::DevAction::Scroll(dy) => {
+                    self.dev_input.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::Vec2::new(0.0, dy),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    ctx.request_repaint();
+                }
+                crate::devhook::DevAction::Ppp(s) => {
+                    // Same effect on layout and textures as a display with another scale.
+                    ctx.set_zoom_factor(s * self.core.settings.ui_scale.clamp(0.6, 2.5));
                     ctx.request_repaint();
                 }
                 crate::devhook::DevAction::Open(p) => {

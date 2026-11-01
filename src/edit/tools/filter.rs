@@ -1,6 +1,6 @@
 //! Filter tools: Sharpen (unsharp mask), Blur, and the Effects gallery.
 
-use super::{color_row, combo, hint, info, row, section, segmented, slider, slider_ex};
+use super::{color_row, combo, hint, info, row, section, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::{effects as fx, filters, EditTool, ToolUiCtx};
 use egui::{vec2, Color32, Sense, Stroke};
@@ -59,17 +59,23 @@ impl EditTool for Sharpen {
         let mut c = false;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            for (name, a, r, t) in [("Subtle", 50.0, 0.8, 2.0), ("Medium", 100.0, 1.0, 2.0), ("Strong", 180.0, 1.4, 3.0), ("Web", 60.0, 0.5, 0.0), ("Clarity", 25.0, 30.0, 0.0)] {
-                if ui.button(name).clicked() {
+            for (name, a, r, t, tip) in [
+                ("Subtle", 50.0, 0.8, 2.0, "A light touch for most photos"),
+                ("Medium", 100.0, 1.0, 2.0, "Clearly crisper detail"),
+                ("Strong", 180.0, 1.4, 3.0, "Heavy sharpening for soft or slightly blurred photos"),
+                ("Web", 60.0, 0.5, 0.0, "Fine sharpening for images made smaller for the web"),
+                ("Clarity", 25.0, 30.0, 0.0, "Adds punch to midtone contrast instead of edges"),
+            ] {
+                if ui.button(name).on_hover_text(tip).clicked() {
                     *self = Sharpen { amount: a, radius: r, threshold: t };
                     c = true;
                 }
             }
         });
         ui.add_space(4.0);
-        c |= slider_ex(ui, "Amount", &mut self.amount, 0.0..=500.0, 80.0, " %", 1.0, 0, false);
-        c |= slider_ex(ui, "Radius", &mut self.radius, 0.1..=100.0, 1.0, " px", 0.1, 1, true);
-        c |= slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 2.0, "", 1.0, 0, false);
+        c |= tipped(ui, "How strong the sharpening is", |ui| slider_ex(ui, "Amount", &mut self.amount, 0.0..=500.0, 80.0, " %", 1.0, 0, false));
+        c |= tipped(ui, "How wide the edges that get sharpened are; small for fine detail", |ui| slider_ex(ui, "Radius", &mut self.radius, 0.1..=100.0, 1.0, " px", 0.1, 1, true));
+        c |= tipped(ui, "Leave smooth areas alone; raise it to avoid sharpening noise", |ui| slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 2.0, "", 1.0, 0, false));
         ui.add_space(6.0);
         hint(ui, "Judge sharpening at 100% zoom: the preview is downscaled.");
         fine_detail_note(ui, cx, self.radius);
@@ -113,17 +119,22 @@ impl EditTool for Blur {
     }
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
-        c |= segmented(ui, &mut self.mode, &["Gaussian", "Box", "Motion", "Smart"]);
+        c |= segmented_tips(
+            ui,
+            &mut self.mode,
+            &["Gaussian", "Box", "Motion", "Smart"],
+            &["Natural soft focus", "Even averaging; fast, slightly boxy", "Streaks in one direction, like camera shake", "Smooths flat areas but keeps edges sharp"],
+        );
         ui.add_space(4.0);
         match self.mode {
             2 => {
-                c |= slider_ex(ui, "Angle", &mut self.angle, -180.0..=180.0, 0.0, "°", 1.0, 0, false);
-                c |= slider_ex(ui, "Distance", &mut self.distance, 1.0..=500.0, 30.0, " px", 1.0, 0, true);
+                c |= tipped(ui, "Direction of the streaks", |ui| slider_ex(ui, "Angle", &mut self.angle, -180.0..=180.0, 0.0, "°", 1.0, 0, false));
+                c |= tipped(ui, "Length of the streaks", |ui| slider_ex(ui, "Distance", &mut self.distance, 1.0..=500.0, 30.0, " px", 1.0, 0, true));
             }
             _ => {
-                c |= slider_ex(ui, "Radius", &mut self.radius, 0.1..=250.0, 4.0, " px", 0.1, 1, true);
+                c |= tipped(ui, "How far each pixel is blended with its neighbours; larger is blurrier", |ui| slider_ex(ui, "Radius", &mut self.radius, 0.1..=250.0, 4.0, " px", 0.1, 1, true));
                 if self.mode == 3 {
-                    c |= slider_ex(ui, "Threshold", &mut self.threshold, 1.0..=100.0, 25.0, "", 1.0, 0, false);
+                    c |= tipped(ui, "How different neighbours may be and still get smoothed; higher blurs more edges", |ui| slider_ex(ui, "Threshold", &mut self.threshold, 1.0..=100.0, 25.0, "", 1.0, 0, false));
                 }
             }
         }
@@ -176,6 +187,24 @@ const EFFECTS: [&str; 14] = [
     "Denoise",
     "B&W filter",
     "Duotone",
+];
+
+/// Hover descriptions of [`EFFECTS`], in the same order.
+const EFFECT_TIPS: [&str; 14] = [
+    "Black and white",
+    "Warm brown old-photo look",
+    "Swap dark and light, like a film negative",
+    "Fewer tones for a flat, poster look",
+    "Invert only the bright tones",
+    "Raised, stamped-metal look",
+    "Keep only the outlines",
+    "Looks painted with a brush",
+    "Big square blocks",
+    "Darken the corners",
+    "Add film-like grain",
+    "Reduce noise and specks",
+    "Black and white with a colored lens filter",
+    "Two colors: one for shadows, one for highlights",
 ];
 
 /// `Effects::kind` before the user picks one: the preview is the original.
@@ -336,7 +365,7 @@ impl EditTool for Effects {
                         egui::FontId::proportional(crate::ui::theme::text::CAPTION),
                         if sel { pal.text } else { pal.muted },
                     );
-                    if resp.clicked() && !sel {
+                    if resp.on_hover_text(EFFECT_TIPS[k]).clicked() && !sel {
                         self.kind = k;
                         self.strength = Self::default_strength(k);
                         c = true;
@@ -354,22 +383,22 @@ impl EditTool for Effects {
             9 | 10 => "Amount",
             _ => "Strength",
         };
-        c |= slider(ui, strength_label, &mut self.strength, 0.0..=100.0, Self::default_strength(self.kind), " %");
+        c |= tipped(ui, "How much of the effect is mixed into the image", |ui| slider(ui, strength_label, &mut self.strength, 0.0..=100.0, Self::default_strength(self.kind), " %"));
         match self.kind {
-            3 => c |= slider_ex(ui, "Levels", &mut self.levels, 2.0..=16.0, 5.0, "", 1.0, 0, false),
-            4 => c |= slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 128.0, "", 1.0, 0, false),
-            5 => c |= slider_ex(ui, "Depth", &mut self.depth, 0.5..=20.0, 2.0, " px", 0.5, 1, false),
-            7 => c |= slider_ex(ui, "Brush size", &mut self.oil_radius, 1.0..=16.0, 4.0, " px", 1.0, 0, false),
-            8 => c |= slider_ex(ui, "Cell size", &mut self.block, 2.0..=200.0, 16.0, " px", 1.0, 0, true),
+            3 => c |= tipped(ui, "Number of tones per color; fewer gives a flatter, poster look", |ui| slider_ex(ui, "Levels", &mut self.levels, 2.0..=16.0, 5.0, "", 1.0, 0, false)),
+            4 => c |= tipped(ui, "Tones brighter than this are inverted", |ui| slider_ex(ui, "Threshold", &mut self.threshold, 0.0..=255.0, 128.0, "", 1.0, 0, false)),
+            5 => c |= tipped(ui, "How raised the embossed edges look", |ui| slider_ex(ui, "Depth", &mut self.depth, 0.5..=20.0, 2.0, " px", 0.5, 1, false)),
+            7 => c |= tipped(ui, "Size of the paint strokes", |ui| slider_ex(ui, "Brush size", &mut self.oil_radius, 1.0..=16.0, 4.0, " px", 1.0, 0, false)),
+            8 => c |= tipped(ui, "Size of each square block", |ui| slider_ex(ui, "Cell size", &mut self.block, 2.0..=200.0, 16.0, " px", 1.0, 0, true)),
             9 => {
-                c |= slider_ex(ui, "Midpoint", &mut self.vig_mid, 0.0..=1.0, 0.35, "", 0.01, 2, false);
-                c |= slider_ex(ui, "Feather", &mut self.vig_feather, 0.05..=1.0, 0.6, "", 0.01, 2, false);
+                c |= tipped(ui, "Where the darkening starts, from the centre (0) to the corners (1)", |ui| slider_ex(ui, "Midpoint", &mut self.vig_mid, 0.0..=1.0, 0.35, "", 0.01, 2, false));
+                c |= tipped(ui, "How gradually the corners darken", |ui| slider_ex(ui, "Feather", &mut self.vig_feather, 0.05..=1.0, 0.6, "", 0.01, 2, false));
             }
             10 => {
-                c |= slider_ex(ui, "Grain size", &mut self.grain_size, 1.0..=8.0, 1.5, " px", 0.1, 1, false);
+                c |= tipped(ui, "Size of the grain specks", |ui| slider_ex(ui, "Grain size", &mut self.grain_size, 1.0..=8.0, 1.5, " px", 0.1, 1, false));
                 c |= row(ui, "Seed", |ui| {
                     let r = widgets::value_box(ui, egui::DragValue::new(&mut self.grain_seed).range(0..=9999));
-                    let b = ui.button("Shuffle").clicked();
+                    let b = ui.button("Shuffle").on_hover_text("Try another random grain pattern").clicked();
                     if b {
                         self.grain_seed = (self.grain_seed.wrapping_mul(1_103_515_245).wrapping_add(12345)) % 10_000;
                     }
@@ -377,16 +406,16 @@ impl EditTool for Effects {
                 });
             }
             11 => {
-                c |= row(ui, "Despeckle", |ui| segmented(ui, &mut self.nr_radius, &["3×3", "5×5"]));
-                c |= slider_ex(ui, "Smoothing", &mut self.nr_smooth, 0.0..=6.0, 1.5, " px", 0.1, 1, false);
+                c |= row(ui, "Despeckle", |ui| segmented_tips(ui, &mut self.nr_radius, &["3×3", "5×5"], &["Remove single specks", "Remove larger specks too"]));
+                c |= tipped(ui, "Extra smoothing of the remaining noise", |ui| slider_ex(ui, "Smoothing", &mut self.nr_smooth, 0.0..=6.0, 1.5, " px", 0.1, 1, false));
             }
             12 => {
                 let names: Vec<String> = BW_FILTERS.iter().map(|s| s.to_string()).collect();
-                c |= combo(ui, "Lens filter", "fx-bw-filter", &mut self.bw, &names);
+                c |= tipped(ui, "Like a colored filter on a black and white film camera: it lightens its own color", |ui| combo(ui, "Lens filter", "fx-bw-filter", &mut self.bw, &names));
             }
             13 => {
-                c |= color_row(ui, "Shadows", &mut self.dark, false);
-                c |= color_row(ui, "Highlights", &mut self.light, false);
+                c |= tipped(ui, "Color given to the dark tones", |ui| color_row(ui, "Shadows", &mut self.dark, false));
+                c |= tipped(ui, "Color given to the bright tones", |ui| color_row(ui, "Highlights", &mut self.light, false));
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
                     for (name, d, l) in [
@@ -396,7 +425,7 @@ impl EditTool for Effects {
                         ("Rose", [60, 20, 50, 255], [255, 210, 200, 255]),
                     ] {
                         let swatch = Color32::from_rgb(d[0], d[1], d[2]);
-                        if ui.button(egui::RichText::new(name).color(if pal.dark { pal.text } else { swatch })).clicked() {
+                        if ui.button(egui::RichText::new(name).color(if pal.dark { pal.text } else { swatch })).on_hover_text("Use this pair of colors").clicked() {
                             self.dark = d;
                             self.light = l;
                             c = true;

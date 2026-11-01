@@ -1204,9 +1204,11 @@ impl Slideshow {
             for v in INTERVALS {
                 ui.selectable_value(&mut cfg.interval_secs, v, fmt_secs(v));
             }
-        });
+        })
+        .response
+        .on_hover_text("How long each picture stays on screen  (+ / -)");
         child.add_space(4.0);
-        child.label(RichText::new(I::SPARKLE).size(15.0).color(Color32::from_gray(190))).on_hover_text("Transition");
+        child.label(RichText::new(I::SPARKLE).size(15.0).color(Color32::from_gray(190))).on_hover_text("How one picture changes to the next");
         let cur = Transition::from_name(&cfg.transition);
         widgets::combo("ss-transition").width(150.0).selected_text(cur.label()).height(420.0).show_ui(&mut child, |ui| {
             for t in Transition::ALL {
@@ -1214,30 +1216,32 @@ impl Slideshow {
                     cfg.transition = t.name().to_string();
                 }
             }
-        });
+        })
+        .response
+        .on_hover_text("How one picture changes to the next");
         widgets::combo("ss-duration").width(56.0).selected_text(fmt_secs(cfg.transition_secs)).show_ui(&mut child, |ui| {
             for v in DURATIONS {
                 ui.selectable_value(&mut cfg.transition_secs, v, fmt_secs(v));
             }
-        }).response.on_hover_text("Transition duration");
+        }).response.on_hover_text("How long the change between pictures takes");
         widgets::separator_v(&mut child);
 
         let mut reshuffle = None;
-        if widgets::icon_button(&mut child, I::SHUFFLE, "Shuffle  (S)", cfg.random_order).clicked() {
+        if widgets::icon_button(&mut child, I::SHUFFLE, "Shuffle: show the pictures in random order  (S)", cfg.random_order).clicked() {
             cfg.random_order = !cfg.random_order;
             reshuffle = Some(cfg.random_order);
         }
-        if widgets::icon_button(&mut child, I::REPEAT, "Loop  (L)", looping).clicked() {
+        if widgets::icon_button(&mut child, I::REPEAT, "Loop: start again after the last picture  (L)", looping).clicked() {
             cfg.loop_show = !cfg.loop_show;
         }
-        if widgets::icon_button(&mut child, I::FRAME_CORNERS, "Ken Burns pan & zoom  (K)", cfg.ken_burns).clicked() {
+        if widgets::icon_button(&mut child, I::FRAME_CORNERS, "Slow pan and zoom on each picture  (K)", cfg.ken_burns).clicked() {
             cfg.ken_burns = !cfg.ken_burns;
         }
-        if widgets::icon_button(&mut child, I::CLOSED_CAPTIONING, "Caption  (C)", cfg.show_caption).clicked() {
+        if widgets::icon_button(&mut child, I::CLOSED_CAPTIONING, "Show the file name and position  (C)", cfg.show_caption).clicked() {
             cfg.show_caption = !cfg.show_caption;
         }
         let mut subfolders = None;
-        if widgets::icon_button(&mut child, I::FOLDERS, "Include subfolders", cfg.include_subfolders).clicked() {
+        if widgets::icon_button(&mut child, I::FOLDERS, "Also show pictures from folders inside this one", cfg.include_subfolders).clicked() {
             cfg.include_subfolders = !cfg.include_subfolders;
             subfolders = Some(cfg.include_subfolders);
         }

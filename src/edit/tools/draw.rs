@@ -3,7 +3,7 @@
 //! editable until Apply rasterizes them with anti-aliasing.
 
 use super::canvas::{self, Pointer, HANDLE_HIT};
-use super::{color_button, hint, icon_toggle, indented, row, section, segmented, slider_ex};
+use super::{color_button, hint, icon_toggle, indented, row, section, segmented_tips, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::raster::{self, DrawObj, Kind, CALLOUT_BUBBLE, CALLOUT_PLAIN};
 use crate::edit::{CanvasCtx, EditTool, ToolUiCtx};
@@ -206,7 +206,12 @@ impl DrawBoard {
             _ => "Color",
         };
         ui.horizontal(|ui| {
-            super::row_label(ui, color_label);
+            let tip = match kind {
+                Kind::Text => "Color of the box border",
+                Kind::Number => "Color of the numbered disc",
+                _ => "Color of the line or shape",
+            };
+            super::row_label(ui, color_label).on_hover_text(tip);
             color_button(ui, &mut st.color, false);
             ui.spacing_mut().item_spacing.x = 3.0;
             for s in SWATCHES {
@@ -215,7 +220,7 @@ impl DrawBoard {
                 ui.painter().rect_filled(r, 3.0, c);
                 let ring = if st.color[..3] == s[..3] { Stroke::new(2.0, cx.palette.accent) } else { Stroke::new(1.0, cx.palette.border) };
                 ui.painter().rect_stroke(r, 3.0, ring, egui::StrokeKind::Outside);
-                if resp.clicked() {
+                if resp.on_hover_text("Use this color").clicked() {
                     st.color = s;
                 }
             }
@@ -223,7 +228,7 @@ impl DrawBoard {
         if kind != Kind::Number {
             let label = if kind == Kind::Text { "Border width" } else { "Width" };
             let min = if kind == Kind::Text { 0.0 } else { 1.0 };
-            slider_ex(ui, label, &mut st.width, min..=self.max_width, before.width, " px", 1.0, 0, true);
+            tipped(ui, "Thickness of the line", |ui| slider_ex(ui, label, &mut st.width, min..=self.max_width, before.width, " px", 1.0, 0, true));
         }
         let mut op = st.opacity * 100.0;
         if slider_ex(ui, "Opacity", &mut op, 5.0..=100.0, 100.0, " %", 1.0, 0, false) {
@@ -231,9 +236,9 @@ impl DrawBoard {
         }
         if kind.has_fill() {
             ui.horizontal(|ui| {
-                super::row_label(ui, "Fill");
+                super::row_label(ui, "Fill").on_hover_text("Fill the inside of the shape with a color");
                 let mut on = st.fill.is_some();
-                if widgets::checkbox(ui, &mut on, "").changed() {
+                if widgets::checkbox(ui, &mut on, "").on_hover_text("Fill the inside of the shape with a color").changed() {
                     st.fill = if on { Some(if kind == Kind::Text { [255, 255, 255, 255] } else { [st.color[0], st.color[1], st.color[2], 90] }) } else { None };
                 }
                 if let Some(f) = &mut st.fill {
@@ -243,12 +248,12 @@ impl DrawBoard {
         }
         match kind {
             Kind::Arrow => {
-                indented(ui, |ui| widgets::checkbox(ui, &mut st.both_heads, "Both ends"));
+                indented(ui, |ui| widgets::checkbox(ui, &mut st.both_heads, "Both ends").on_hover_text("Arrow heads at both ends"));
             }
             Kind::Text => {
                 row(ui, "Style", |ui| {
                     let mut c = st.callout as usize;
-                    if segmented(ui, &mut c, &["Plain", "Box", "Bubble"]) {
+                    if segmented_tips(ui, &mut c, &["Plain", "Box", "Bubble"], &["Just the text", "Text in a box", "Text in a speech bubble"]) {
                         st.callout = c as u8;
                     }
                 });
@@ -261,22 +266,22 @@ impl DrawBoard {
                     te.state.store(ui.ctx(), te.response.id);
                     self.focus_text = false;
                 }
-                slider_ex(ui, "Text size", &mut st.font_px, 6.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
+                tipped(ui, "Height of the letters", |ui| slider_ex(ui, "Text size", &mut st.font_px, 6.0..=self.max_font, before.font_px, " px", 1.0, 0, true));
                 ui.horizontal(|ui| {
-                    super::row_label(ui, "Text color");
+                    super::row_label(ui, "Text color").on_hover_text("Color of the letters");
                     color_button(ui, &mut st.text_color, false);
                     icon_toggle(ui, &mut st.bold, I::TEXT_B, "Bold");
                 });
             }
             Kind::Number => {
-                slider_ex(ui, "Size", &mut st.font_px, 8.0..=self.max_font, before.font_px, " px", 1.0, 0, true);
+                tipped(ui, "Size of the numbered disc", |ui| slider_ex(ui, "Size", &mut st.font_px, 8.0..=self.max_font, before.font_px, " px", 1.0, 0, true));
                 ui.horizontal(|ui| {
-                    super::row_label(ui, "Number");
+                    super::row_label(ui, "Number").on_hover_text("Color and value of the number");
                     color_button(ui, &mut st.text_color, false);
                     if sel.is_some() {
-                        widgets::value_box(ui, egui::DragValue::new(&mut st.number).range(0..=9999));
+                        widgets::value_box(ui, egui::DragValue::new(&mut st.number).range(0..=9999)).on_hover_text("Number shown in the selected disc");
                     } else {
-                        widgets::value_box(ui, egui::DragValue::new(&mut self.next_number).range(0..=9999)).on_hover_text("Next number");
+                        widgets::value_box(ui, egui::DragValue::new(&mut self.next_number).range(0..=9999)).on_hover_text("Number the next disc you place gets (counts up by itself)");
                     }
                 });
             }
@@ -285,10 +290,10 @@ impl DrawBoard {
         if !matches!(kind, Kind::Highlighter) {
             indented(ui, |ui| {
                 if !matches!(kind, Kind::Number | Kind::Text) {
-                    widgets::checkbox(ui, &mut st.dashed, "Dashed");
+                    widgets::checkbox(ui, &mut st.dashed, "Dashed").on_hover_text("Draw the line as dashes");
                     ui.add_space(8.0);
                 }
-                widgets::checkbox(ui, &mut st.shadow, "Shadow");
+                widgets::checkbox(ui, &mut st.shadow, "Shadow").on_hover_text("A soft shadow so it stands out from the photo");
             });
         }
         if st == before {
@@ -462,16 +467,16 @@ impl EditTool for DrawBoard {
         section(ui, cx, &format!("Objects ({})", self.objs.len()));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-            if ui.add_enabled(!self.history.is_empty(), egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE))).clicked() {
+            if ui.add_enabled(!self.history.is_empty(), egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Undo the last drawing change (Ctrl+Z)").clicked() {
                 c |= self.undo();
             }
-            if ui.add_enabled(!self.future.is_empty(), egui::Button::new(format!("{}  Redo", I::ARROW_CLOCKWISE))).clicked() {
+            if ui.add_enabled(!self.future.is_empty(), egui::Button::new(format!("{}  Redo", I::ARROW_CLOCKWISE))).on_hover_text("Redo the change you undid (Ctrl+Y)").clicked() {
                 c |= self.redo();
             }
             if ui.add_enabled(self.selected.is_some(), egui::Button::new(format!("{}  Delete", I::TRASH))).on_hover_text("Delete the selected object (Del)").clicked() {
                 c |= self.delete_selected();
             }
-            if ui.add_enabled(self.selected.is_some_and(|i| i + 1 < self.objs.len()), egui::Button::new("To front")).clicked() {
+            if ui.add_enabled(self.selected.is_some_and(|i| i + 1 < self.objs.len()), egui::Button::new("To front")).on_hover_text("Draw the selected object on top of the others").clicked() {
                 if let Some(i) = self.selected {
                     self.snapshot();
                     let o = self.objs.remove(i);
@@ -480,7 +485,7 @@ impl EditTool for DrawBoard {
                     c = true;
                 }
             }
-            if ui.add_enabled(!self.objs.is_empty(), egui::Button::new("Clear")).clicked() {
+            if ui.add_enabled(!self.objs.is_empty(), egui::Button::new("Clear")).on_hover_text("Remove every object").clicked() {
                 self.snapshot();
                 self.objs.clear();
                 self.selected = None;

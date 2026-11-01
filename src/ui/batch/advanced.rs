@@ -57,7 +57,9 @@ fn font_combo(ui: &mut Ui, id: &str, font: &mut String) {
                 *font = f.name.clone();
             }
         }
-    });
+    })
+    .response
+    .on_hover_text("Typeface of the text");
 }
 
 const TOKEN_HINT: &str = "Tokens: {name} {date} {taken} {taken:%Y} {n} {width} {height} {folder}";
@@ -72,50 +74,57 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                     for m in ResizeMode::ALL {
                         ui.selectable_value(&mut r.spec.mode, m, m.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("How the new size is given: a percentage, a box to fit in, or one side");
             });
             match r.spec.mode {
                 ResizeMode::None => {}
                 ResizeMode::Percent => row(ui, "Scale", |ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.percent).range(1.0..=1000.0).suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.percent).range(1.0..=1000.0).suffix(" %")).on_hover_text("New size as a percentage of the original");
                 }),
                 ResizeMode::Fit => row(ui, "Box", |ui| {
                     ui.horizontal(|ui| {
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px")).on_hover_text("Largest width; the shape of the image is kept");
                         ui.label("x");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.b).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.b).range(1..=60000).suffix(" px")).on_hover_text("Largest height; the shape of the image is kept");
                     });
                 }),
                 _ => row(ui, "Size", |ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.spec.a).range(1..=60000).suffix(" px")).on_hover_text("New length of that side; the other side follows the shape");
                 }),
             }
             row(ui, "", |ui| {
-                crate::ui::widgets::checkbox(ui, &mut r.spec.no_upscale, "Don't enlarge smaller images");
+                crate::ui::widgets::checkbox(ui, &mut r.spec.no_upscale, "Don't enlarge smaller images").on_hover_text("Images already smaller than the target keep their size");
             });
             row(ui, "Filter", |ui| {
                 crate::ui::widgets::combo(gid("rfilter")).width(150.0).selected_text(r.filter.label()).show_ui(ui, |ui| {
                     for f in Filter::ALL {
                         ui.selectable_value(&mut r.filter, f, f.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("How pixels are blended when resizing; Lanczos is sharpest");
             });
         }
         Step::Crop(c) => {
             row(ui, "Crop by", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut c.mode, &[(CropMode::Aspect, "Aspect ratio"), (CropMode::Size, "Size"), (CropMode::Rect, "Rectangle")]);
+                    let mut i = [CropMode::Aspect, CropMode::Size, CropMode::Rect].iter().position(|m| *m == c.mode).unwrap_or(0);
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["Aspect ratio", "Size", "Rectangle"], &["Keep the largest area with this width-to-height shape", "Keep an area of this many pixels", "Keep an exact area given by its corner and size"]) {
+                        c.mode = [CropMode::Aspect, CropMode::Size, CropMode::Rect][i];
+                    }
                 });
             });
             match c.mode {
                 CropMode::Aspect => {
                     row(ui, "Ratio", |ui| {
                         ui.horizontal(|ui| {
-                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_w).range(0.1..=100.0).speed(0.1));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_w).range(0.1..=100.0).speed(0.1)).on_hover_text("Width part of the shape, e.g. 16 in 16:9");
                             ui.label(":");
-                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_h).range(0.1..=100.0).speed(0.1));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.aspect_h).range(0.1..=100.0).speed(0.1)).on_hover_text("Height part of the shape, e.g. 9 in 16:9");
                             for (a, b) in [(1.0, 1.0), (3.0, 2.0), (4.0, 3.0), (16.0, 9.0)] {
-                                if ui.small_button(format!("{a}:{b}")).clicked() {
+                                if ui.small_button(format!("{a}:{b}")).on_hover_text("Use this shape").clicked() {
                                     c.aspect_w = a;
                                     c.aspect_h = b;
                                 }
@@ -127,8 +136,8 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                     if c.mode == CropMode::Rect {
                         row(ui, "Left, top", |ui| {
                             ui.horizontal(|ui| {
-                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.x).range(0..=60000).suffix(" px"));
-                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.y).range(0..=60000).suffix(" px"));
+                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.x).range(0..=60000).suffix(" px")).on_hover_text("Distance of the area from the left edge");
+                                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.y).range(0..=60000).suffix(" px")).on_hover_text("Distance of the area from the top edge");
                             });
                         });
                     }
@@ -150,12 +159,15 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Canvas(c) => {
             row(ui, "Canvas", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut c.mode, &[(CanvasMode::Add, "Add to sides"), (CanvasMode::Absolute, "Size"), (CanvasMode::Percent, "Percent")]);
+                    let mut i = [CanvasMode::Add, CanvasMode::Absolute, CanvasMode::Percent].iter().position(|m| *m == c.mode).unwrap_or(0);
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["Add to sides", "Size", "Percent"], &["Add the same space on every side", "Make the canvas an exact size (smaller trims)", "Make the canvas a percentage of the image size"]) {
+                        c.mode = [CanvasMode::Add, CanvasMode::Absolute, CanvasMode::Percent][i];
+                    }
                 });
             });
             match c.mode {
                 CanvasMode::Add => row(ui, "Per side", |ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.add).range(0..=20000).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut c.add).range(0..=20000).suffix(" px")).on_hover_text("Space added on each side");
                 }),
                 CanvasMode::Absolute => row(ui, "Size", |ui| {
                     ui.horizontal(|ui| {
@@ -185,17 +197,17 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             row(ui, "Rotate", |ui| {
                 ui.horizontal(|ui| {
                     for (q, l) in [(0u8, "0"), (1, "90 cw"), (2, "180"), (3, "90 ccw")] {
-                        ui.selectable_value(&mut r.quarter, q, l);
+                        ui.selectable_value(&mut r.quarter, q, l).on_hover_text("Turn by this many degrees (cw = clockwise, ccw = counter-clockwise)");
                     }
                 });
             });
             row(ui, "Fine angle", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut r.angle, -45.0..=45.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut r.angle, -45.0..=45.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(1)).on_hover_text("Small extra rotation to straighten (double-click to reset)");
             });
             if r.angle != 0.0 {
                 row(ui, "", |ui| {
                     ui.horizontal(|ui| {
-                        crate::ui::widgets::checkbox(ui, &mut r.crop, "Crop corners");
+                        crate::ui::widgets::checkbox(ui, &mut r.crop, "Crop corners").on_hover_text("Cut away the empty corners a tilt leaves, otherwise fill them with the color");
                         if !r.crop {
                             color_rgba(ui, &mut r.bg, true);
                         }
@@ -204,28 +216,31 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             }
             row(ui, "Flip", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::checkbox(ui, &mut r.flip_h, "Horizontal");
-                    crate::ui::widgets::checkbox(ui, &mut r.flip_v, "Vertical");
+                    crate::ui::widgets::checkbox(ui, &mut r.flip_h, "Horizontal").on_hover_text("Mirror left to right");
+                    crate::ui::widgets::checkbox(ui, &mut r.flip_v, "Vertical").on_hover_text("Mirror top to bottom");
                 });
             });
             row(ui, "Apply to", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut r.when, &[(RotateWhen::Always, "All"), (RotateWhen::Portrait, "Portrait"), (RotateWhen::Landscape, "Landscape")]);
+                    let mut i = [RotateWhen::Always, RotateWhen::Portrait, RotateWhen::Landscape].iter().position(|m| *m == r.when).unwrap_or(0);
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["All", "Portrait", "Landscape"], &["Rotate every image", "Rotate only images taller than wide", "Rotate only images wider than tall"]) {
+                        r.when = [RotateWhen::Always, RotateWhen::Portrait, RotateWhen::Landscape][i];
+                    }
                 });
             });
         }
         Step::Adjust(a) => {
             row(ui, "Brightness", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut a.brightness, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.brightness, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0)).on_hover_text("Make the image lighter or darker (double-click to reset)");
             });
             row(ui, "Contrast", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut a.contrast, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.contrast, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0)).on_hover_text("Increase or reduce the difference between light and dark (double-click to reset)");
             });
             row(ui, "Gamma", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut a.gamma, 0.2..=3.0).origin(1.0).default_value(1.0).fixed_decimals(2));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.gamma, 0.2..=3.0).origin(1.0).default_value(1.0).fixed_decimals(2)).on_hover_text("Brighten or darken the midtones, keeping black and white (1 = unchanged)");
             });
             row(ui, "Saturation", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut a.saturation, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut a.saturation, -100.0..=100.0).bipolar().default_value(0.0).fixed_decimals(0)).on_hover_text("Make colors more vivid or more muted (double-click to reset)");
             });
         }
         Step::AutoLevels => row(ui, "", |ui| {
@@ -238,43 +253,43 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         }),
         Step::Sharpen(s) => {
             row(ui, "Amount", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut s.amount, 0.0..=500.0).suffix(" %").fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.amount, 0.0..=500.0).suffix(" %").fixed_decimals(0)).on_hover_text("How strongly edges are sharpened");
             });
             row(ui, "Radius", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut s.radius, 0.2..=10.0).suffix(" px").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.radius, 0.2..=10.0).suffix(" px").fixed_decimals(1)).on_hover_text("Size of the detail sharpened: small for fine texture, large for outlines");
             });
             row(ui, "Threshold", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut s.threshold, 0..=64));
+                ui.add(crate::ui::widgets::Slider::new(&mut s.threshold, 0..=64)).on_hover_text("Skip smooth areas so noise and skin are not sharpened (0 = sharpen everything)");
             });
         }
         Step::Border(b) => {
             row(ui, "Width", |ui| {
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.width).range(0.0..=2000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.width).range(0.0..=2000.0).suffix(" px")).on_hover_text("Border width on each side");
             });
             row(ui, "Bottom", |ui| {
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.bottom).range(0.0..=4000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.bottom).range(0.0..=4000.0).suffix(" px")).on_hover_text("Extra space at the bottom, like a print frame or a caption strip");
             });
             row(ui, "Color", |ui| {
                 color_rgba(ui, &mut b.color, true);
             });
             row(ui, "Line", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.line_width).range(0.0..=200.0).suffix(" px"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.line_width).range(0.0..=200.0).suffix(" px")).on_hover_text("Thin line drawn around the image inside the border (0 = none)");
                     color_rgba(ui, &mut b.line_color, true);
                 });
             });
             row(ui, "Corner radius", |ui| {
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.radius).range(0.0..=2000.0).suffix(" px"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.radius).range(0.0..=2000.0).suffix(" px")).on_hover_text("Round the corners by this much (0 = square)");
             });
             row(ui, "", |ui| {
-                crate::ui::widgets::checkbox(ui, &mut b.shadow, "Drop shadow");
+                crate::ui::widgets::checkbox(ui, &mut b.shadow, "Drop shadow").on_hover_text("Draw a soft shadow under the framed image");
             });
             if b.shadow {
                 row(ui, "Shadow", |ui| {
                     ui.horizontal(|ui| {
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_blur).range(0.0..=500.0).prefix("blur "));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_offset).range(-500.0..=500.0).prefix("offset "));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_opacity).range(0.0..=100.0).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_blur).range(0.0..=500.0).prefix("blur ")).on_hover_text("How soft the shadow is");
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_offset).range(-500.0..=500.0).prefix("offset ")).on_hover_text("How far the shadow is moved down and right");
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut b.shadow_opacity).range(0.0..=100.0).suffix(" %")).on_hover_text("How dark the shadow is");
                     });
                 });
                 row(ui, "Behind", |ui| {
@@ -284,7 +299,7 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         }
         Step::Text(t) => {
             row(ui, "Text", |ui| {
-                ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2).desired_width(220.0));
+                ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2).desired_width(220.0)).on_hover_text("Text to stamp; tokens like {name} or {taken} are replaced per image");
             });
             row(ui, "", |ui| {
                 hint(ui, p, TOKEN_HINT);
@@ -292,23 +307,23 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             row(ui, "Font", |ui| {
                 ui.horizontal(|ui| {
                     font_combo(ui, &gid("tfont"), &mut t.font);
-                    crate::ui::widgets::checkbox(ui, &mut t.bold, "B");
-                    crate::ui::widgets::checkbox(ui, &mut t.italic, "I");
+                    crate::ui::widgets::checkbox(ui, &mut t.bold, "B").on_hover_text("Bold");
+                    crate::ui::widgets::checkbox(ui, &mut t.italic, "I").on_hover_text("Italic");
                 });
             });
             row(ui, "Size", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut t.size_pct, 0.5..=30.0).suffix(" % of short side").fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut t.size_pct, 0.5..=30.0).suffix(" % of short side").fixed_decimals(1)).on_hover_text("Text height relative to the image, so it looks the same on every size");
             });
             row(ui, "Color", |ui| {
                 ui.horizontal(|ui| {
                     color_rgba(ui, &mut t.color, true);
-                    ui.add(crate::ui::widgets::Slider::new(&mut t.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut t.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0)).on_hover_text("How solid the text is (0 = invisible)");
                 });
             });
             row(ui, "Position", |ui| {
                 ui.horizontal(|ui| {
                     anchor_grid(ui, p, &mut t.anchor);
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %")).on_hover_text("Distance from the image edge");
                 });
             });
             row(ui, "Align", |ui| {
@@ -318,14 +333,14 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             });
             row(ui, "Outline", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.outline_pct).range(0.0..=30.0).speed(0.2).suffix(" %"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut t.outline_pct).range(0.0..=30.0).speed(0.2).suffix(" %")).on_hover_text("Outline around the letters so they read on any background (0 = none)");
                     color_rgba(ui, &mut t.outline_color, true);
                 });
             });
             row(ui, "", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::checkbox(ui, &mut t.shadow, "Shadow");
-                    crate::ui::widgets::checkbox(ui, &mut t.background, "Background");
+                    crate::ui::widgets::checkbox(ui, &mut t.shadow, "Shadow").on_hover_text("Soft shadow behind the letters");
+                    crate::ui::widgets::checkbox(ui, &mut t.background, "Background").on_hover_text("Solid box behind the text");
                     if t.background {
                         color_rgba(ui, &mut t.bg_color, true);
                     }
@@ -335,13 +350,16 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Watermark(w) => {
             row(ui, "Source", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut w.source, &[(WatermarkSource::Text, "Text"), (WatermarkSource::Image, "Image (PNG logo)")]);
+                    let mut i = if w.source == WatermarkSource::Text { 0 } else { 1 };
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["Text", "Image (PNG logo)"], &["Stamp a line of text", "Stamp a picture, e.g. a logo with a transparent background"]) {
+                        w.source = if i == 0 { WatermarkSource::Text } else { WatermarkSource::Image };
+                    }
                 });
             });
             match w.source {
                 WatermarkSource::Text => {
                     row(ui, "Text", |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut w.text).desired_width(220.0));
+                        ui.add(egui::TextEdit::singleline(&mut w.text).desired_width(220.0)).on_hover_text("Watermark text; tokens like {name} or {taken} are replaced per image");
                     });
                     row(ui, "", |ui| {
                         hint(ui, p, TOKEN_HINT);
@@ -349,14 +367,14 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
                     row(ui, "Font", |ui| {
                         ui.horizontal(|ui| {
                             font_combo(ui, &gid("wfont"), &mut w.font);
-                            crate::ui::widgets::checkbox(ui, &mut w.bold, "B");
+                            crate::ui::widgets::checkbox(ui, &mut w.bold, "B").on_hover_text("Bold");
                             color_rgba(ui, &mut w.color, false);
                         });
                     });
                 }
                 WatermarkSource::Image => row(ui, "Image", |ui| {
                     let label = w.image.as_ref().map(|p| crate::ui::batch::file_name(p)).unwrap_or_else(|| "Choose...".into());
-                    if ui.add(egui::Button::new(format!("{}  {label}", I::FILE_IMAGE)).truncate()).clicked() {
+                    if ui.add(egui::Button::new(format!("{}  {label}", I::FILE_IMAGE)).truncate()).on_hover_text("Choose the logo image").clicked() {
                         if let Some(f) = rfd::FileDialog::new().add_filter("Images", &["png", "webp", "gif", "bmp", "jpg", "jpeg", "tif", "tiff"]).pick_file() {
                             w.image = Some(f);
                         }
@@ -365,28 +383,31 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
             }
             row(ui, "Size", |ui| {
                 let suffix = if w.source == WatermarkSource::Image { " % of width" } else { " % of short side" };
-                ui.add(crate::ui::widgets::Slider::new(&mut w.size_pct, 0.5..=100.0).suffix(suffix).fixed_decimals(1));
+                ui.add(crate::ui::widgets::Slider::new(&mut w.size_pct, 0.5..=100.0).suffix(suffix).fixed_decimals(1)).on_hover_text("Watermark size relative to the image, so it looks the same on every size");
             });
             row(ui, "Opacity", |ui| {
-                ui.add(crate::ui::widgets::Slider::new(&mut w.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0));
+                ui.add(crate::ui::widgets::Slider::new(&mut w.opacity, 0.0..=100.0).suffix(" %").fixed_decimals(0)).on_hover_text("How solid the watermark is (lower lets the photo show through)");
             });
             row(ui, "Layout", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::segmented_value(ui, &mut w.tiled, &[(false, "Single"), (true, "Tiled")]);
+                    let mut i = w.tiled as usize;
+                    if crate::ui::widgets::segmented_with_tips(ui, &mut i, &["Single", "Tiled"], &["One watermark at the chosen position", "Repeat the watermark across the whole image"]) {
+                        w.tiled = i == 1;
+                    }
                 });
             });
             if w.tiled {
                 row(ui, "Angle", |ui| {
-                    ui.add(crate::ui::widgets::Slider::new(&mut w.angle, -90.0..=90.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut w.angle, -90.0..=90.0).bipolar().default_value(0.0).suffix(" deg").fixed_decimals(0)).on_hover_text("Tilt of the repeated watermarks");
                 });
                 row(ui, "Gap", |ui| {
-                    ui.add(crate::ui::widgets::Slider::new(&mut w.gap_pct, 0.0..=60.0).suffix(" %").fixed_decimals(0));
+                    ui.add(crate::ui::widgets::Slider::new(&mut w.gap_pct, 0.0..=60.0).suffix(" %").fixed_decimals(0)).on_hover_text("Space between the repeated watermarks");
                 });
             } else {
                 row(ui, "Position", |ui| {
                     ui.horizontal(|ui| {
                         anchor_grid(ui, p, &mut w.anchor);
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut w.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut w.margin_pct).range(0.0..=40.0).speed(0.1).prefix("margin ").suffix(" %")).on_hover_text("Distance from the image edge");
                     });
                 });
             }
@@ -394,9 +415,9 @@ pub fn step_editor(ui: &mut Ui, p: &Palette, step: &mut Step, id: usize) {
         Step::Dpi { dpi } => {
             row(ui, "Resolution", |ui| {
                 ui.horizontal(|ui| {
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(dpi).range(1..=4800).suffix(" dpi"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(dpi).range(1..=4800).suffix(" dpi")).on_hover_text("Print size hint stored in the file: dots per inch when printed");
                     for d in [72u16, 96, 150, 300] {
-                        if ui.small_button(d.to_string()).clicked() {
+                        if ui.small_button(d.to_string()).on_hover_text("Use this resolution").clicked() {
                             *dpi = d;
                         }
                     }
@@ -494,7 +515,9 @@ pub fn pipeline_ui(ui: &mut Ui, p: &Palette, pipe: &mut Pipeline, selected: &mut
                 ui.close();
             }
         }
-    });
+    })
+    .response
+    .on_hover_text("Add a step such as crop, watermark or border to the end of the list");
 }
 
 /// Named presets of all batch convert settings.
@@ -532,7 +555,9 @@ impl PresetUi {
                         self.name = pr.name.clone();
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("Saved settings you can load again");
             let chosen = self.chosen.clone().and_then(|c| self.file.get(&c).cloned());
             if ui.add_enabled(chosen.is_some(), egui::Button::new(format!("{}  Load", I::DOWNLOAD_SIMPLE))).on_hover_text("Replace the current settings with this preset").clicked() {
                 if let Some(pr) = &chosen {
@@ -555,9 +580,9 @@ impl PresetUi {
             }
         });
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("Preset name").desired_width(170.0));
+            ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("Preset name").desired_width(170.0)).on_hover_text("Name for saving the current settings as a preset");
             let ok = !self.name.trim().is_empty();
-            if ui.add_enabled(ok, egui::Button::new(format!("{}  Save current", I::FLOPPY_DISK))).clicked() {
+            if ui.add_enabled(ok, egui::Button::new(format!("{}  Save current", I::FLOPPY_DISK))).on_hover_text("Save the current settings under this name").on_disabled_hover_text("Type a preset name first").clicked() {
                 if self.file.get(self.name.trim()).is_some() {
                     self.confirm_replace = true;
                 } else {

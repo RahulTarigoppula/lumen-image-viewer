@@ -180,40 +180,44 @@ impl SaveDialog {
                             changed = true;
                         }
                     }
-                });
+                })
+                .response
+                .on_hover_text("JPEG for photos, PNG for screenshots and graphics, WebP for small files");
             });
             match self.opts.format {
                 SaveFormat::Jpeg => {
                     widgets::form_row(ui, "Quality", |ui| {
-                        changed |= ui.add(widgets::Slider::new(&mut self.opts.jpeg_quality, 1..=100).default_value(92)).changed();
+                        changed |= ui.add(widgets::Slider::new(&mut self.opts.jpeg_quality, 1..=100).default_value(92)).on_hover_text("Higher keeps more detail but makes a bigger file (85-95 looks the same as the original)").changed();
                     });
                     widgets::form_row(ui, "Chroma", |ui| {
                         widgets::combo("chroma").selected_text(self.opts.jpeg_chroma.label()).show_ui(ui, |ui| {
                             for c in [Chroma::S444, Chroma::S422, Chroma::S420] {
                                 changed |= ui.selectable_value(&mut self.opts.jpeg_chroma, c, c.label()).changed();
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("How much color detail is kept: 4:4:4 keeps all (sharp colored text), 4:2:0 is smallest");
                     });
                     widgets::form_row(ui, "", |ui| {
-                        changed |= widgets::checkbox(ui, &mut self.opts.jpeg_progressive, "Progressive").changed();
+                        changed |= widgets::checkbox(ui, &mut self.opts.jpeg_progressive, "Progressive").on_hover_text("Web pages show the image blurry first, then sharp; often a little smaller").changed();
                     });
                     widgets::form_row(ui, "", |ui| {
-                        widgets::checkbox(ui, &mut self.opts.keep_metadata, "Keep EXIF metadata");
+                        widgets::checkbox(ui, &mut self.opts.keep_metadata, "Keep EXIF metadata").on_hover_text("Copy camera settings, date taken and GPS location into the saved file");
                     });
                 }
                 SaveFormat::WebP => {
                     if !self.opts.webp_lossless {
                         widgets::form_row(ui, "Quality", |ui| {
-                            changed |= ui.add(widgets::Slider::new(&mut self.opts.webp_quality, 1.0..=100.0).fixed_decimals(0).default_value(88.0)).changed();
+                            changed |= ui.add(widgets::Slider::new(&mut self.opts.webp_quality, 1.0..=100.0).fixed_decimals(0).default_value(88.0)).on_hover_text("Higher keeps more detail but makes a bigger file").changed();
                         });
                     }
                     widgets::form_row(ui, "", |ui| {
-                        changed |= widgets::checkbox(ui, &mut self.opts.webp_lossless, "Lossless").changed();
+                        changed |= widgets::checkbox(ui, &mut self.opts.webp_lossless, "Lossless").on_hover_text("Keep every pixel exactly; the file is bigger").changed();
                     });
                 }
                 SaveFormat::Png => {
                     widgets::form_row(ui, "", |ui| {
-                        changed |= widgets::checkbox(ui, &mut self.opts.png_best_compression, "Best compression (slower)").changed();
+                        changed |= widgets::checkbox(ui, &mut self.opts.png_best_compression, "Best compression (slower)").on_hover_text("A smaller file with the same pixels, but saving takes longer").changed();
                     });
                 }
                 _ => {}

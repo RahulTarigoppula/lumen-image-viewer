@@ -1,6 +1,6 @@
 //! Size-changing tools: Resize, Canvas size, Straighten / free rotate, Border.
 
-use super::{anchor_grid, color_button, color_presets, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented, slider, slider_ex};
+use super::{anchor_grid, color_button, color_presets, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::geom::{self, clamp_dim, BorderSpec, MAX_DIM};
 use crate::edit::{EditTool, ToolUiCtx};
@@ -72,7 +72,7 @@ impl EditTool for Resize {
             self.h = self.src.1 as i64;
         }
         let (sw, sh) = (self.src.0.max(1) as f64, self.src.1.max(1) as f64);
-        if segmented(ui, &mut self.mode, &["Pixels", "Percent"]) {
+        if segmented_tips(ui, &mut self.mode, &["Pixels", "Percent"], &["Type the new size in pixels", "Scale by a percentage of the current size"]) {
             if self.mode == 0 {
                 let (w, h) = (clamp_dim(sw * self.pct as f64 / 100.0), clamp_dim(sh * self.pct as f64 / 100.0));
                 self.w = w as i64;
@@ -84,26 +84,26 @@ impl EditTool for Resize {
         }
         ui.add_space(4.0);
         if self.mode == 0 {
-            if drag_px(ui, "Width", &mut self.w, 1..=MAX_DIM as i64) {
+            if tipped(ui, "New width in pixels", |ui| drag_px(ui, "Width", &mut self.w, 1..=MAX_DIM as i64)) {
                 if self.lock {
                     self.h = clamp_dim(self.w as f64 * sh / sw) as i64;
                 }
                 c = true;
             }
-            if drag_px(ui, "Height", &mut self.h, 1..=MAX_DIM as i64) {
+            if tipped(ui, "New height in pixels", |ui| drag_px(ui, "Height", &mut self.h, 1..=MAX_DIM as i64)) {
                 if self.lock {
                     self.w = clamp_dim(self.h as f64 * sw / sh) as i64;
                 }
                 c = true;
             }
             indented(ui, |ui| {
-                if widgets::checkbox(ui, &mut self.lock, "Keep aspect ratio").changed() && self.lock {
+                if widgets::checkbox(ui, &mut self.lock, "Keep aspect ratio").on_hover_text("Change width and height together so the image is not stretched").changed() && self.lock {
                     self.h = clamp_dim(self.w as f64 * sh / sw) as i64;
                     c = true;
                 }
             });
         } else {
-            c |= slider_ex(ui, "Scale", &mut self.pct, 1.0..=400.0, 100.0, " %", 0.0, 1, true);
+            c |= tipped(ui, "New size as a percentage of the current size", |ui| slider_ex(ui, "Scale", &mut self.pct, 1.0..=400.0, 100.0, " %", 0.0, 1, true));
         }
         section(ui, cx, "Presets");
         ui.horizontal_wrapped(|ui| {
@@ -115,7 +115,7 @@ impl EditTool for Resize {
                 }
             }
             for p in [50.0f32, 25.0] {
-                if ui.button(format!("{p}%")).clicked() {
+                if ui.button(format!("{p}%")).on_hover_text(format!("{p}% of the current size")).clicked() {
                     self.mode = 1;
                     self.pct = p;
                     c = true;
@@ -124,7 +124,7 @@ impl EditTool for Resize {
         });
         section(ui, cx, "Resampling");
         let names: Vec<String> = Filter::ALL.iter().map(|f| f.label().to_string()).collect();
-        c |= combo(ui, "Filter", "resize-filter", &mut self.filter, &names);
+        c |= tipped(ui, "How new pixels are calculated; the default is best for photos", |ui| combo(ui, "Filter", "resize-filter", &mut self.filter, &names));
         ui.add_space(8.0);
         let (tw, th) = self.target();
         section(ui, cx, "Size");
@@ -205,14 +205,14 @@ impl EditTool for CanvasSize {
             self.h = self.src.1 as i64;
         }
         let (sw, sh) = (self.src.0 as i64, self.src.1 as i64);
-        c |= segmented(ui, &mut self.mode, &["New size", "Add margins"]);
+        c |= segmented_tips(ui, &mut self.mode, &["New size", "Add margins"], &["Set the final canvas size", "Add (or with negative values remove) space on each side"]);
         ui.add_space(4.0);
         if self.mode == 0 {
-            c |= drag_px(ui, "Width", &mut self.w, 1..=MAX_DIM as i64);
-            c |= drag_px(ui, "Height", &mut self.h, 1..=MAX_DIM as i64);
+            c |= tipped(ui, "Canvas width; larger adds space, smaller trims the image", |ui| drag_px(ui, "Width", &mut self.w, 1..=MAX_DIM as i64));
+            c |= tipped(ui, "Canvas height; larger adds space, smaller trims the image", |ui| drag_px(ui, "Height", &mut self.h, 1..=MAX_DIM as i64));
             row(ui, "", |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if ui.button("Original").clicked() {
+                if ui.button("Original").on_hover_text("Back to the image's own size").clicked() {
                     self.w = sw;
                     self.h = sh;
                     c = true;
@@ -223,14 +223,14 @@ impl EditTool for CanvasSize {
                     self.h = m;
                     c = true;
                 }
-                if ui.button("+10%").clicked() {
+                if ui.button("+10%").on_hover_text("Make the canvas 10% larger on each side").clicked() {
                     self.w = (self.w as f64 * 1.1).round() as i64;
                     self.h = (self.h as f64 * 1.1).round() as i64;
                     c = true;
                 }
             });
             ui.add_space(4.0);
-            row(ui, "Anchor", |ui| c |= anchor_grid(ui, cx, &mut self.anchor));
+            tipped(ui, "Where the image sits on the new canvas", |ui| row(ui, "Anchor", |ui| c |= anchor_grid(ui, cx, &mut self.anchor)));
         } else {
             let names = ["Top", "Right", "Bottom", "Left"];
             for (i, n) in names.iter().enumerate() {
@@ -239,8 +239,8 @@ impl EditTool for CanvasSize {
             }
             row(ui, "", |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                for (label, v) in [("All 5%", 0.05), ("All 10%", 0.10), ("Clear", 0.0)] {
-                    if ui.button(label).clicked() {
+                for (label, v, tip) in [("All 5%", 0.05, "Margins of 5% of the short side all around"), ("All 10%", 0.10, "Margins of 10% of the short side all around"), ("Clear", 0.0, "Set every margin to 0")] {
+                    if ui.button(label).on_hover_text(tip).clicked() {
                         let m = (sw.min(sh) as f64 * v).round() as i64;
                         self.margins = [m; 4];
                         c = true;
@@ -249,12 +249,12 @@ impl EditTool for CanvasSize {
             });
         }
         section(ui, cx, "Fill");
-        row(ui, "Color", |ui| {
+        tipped(ui, "Color of the added space", |ui| row(ui, "Color", |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             c |= color_button(ui, &mut self.fill, true);
             ui.add_space(4.0);
             c |= color_presets(ui, &mut self.fill, &[("White", [255, 255, 255, 255]), ("Black", [0, 0, 0, 255]), ("None (transparent)", [0, 0, 0, 0])]);
-        });
+        }));
         section(ui, cx, "Size");
         let (tw, th) = self.target(sw as f64, sh as f64);
         let (tw, th) = (clamp_dim(tw), clamp_dim(th));
@@ -336,11 +336,11 @@ impl EditTool for FreeRotate {
     fn ui(&mut self, ui: &mut egui::Ui, cx: &ToolUiCtx) -> bool {
         let mut c = false;
         self.src = cx.image_size;
-        c |= slider_ex(ui, "Angle", &mut self.angle, -45.0..=45.0, 0.0, "°", 0.1, 1, false);
+        c |= tipped(ui, "Rotate to straighten; negative turns left, positive right", |ui| slider_ex(ui, "Angle", &mut self.angle, -45.0..=45.0, 0.0, "°", 0.1, 1, false));
         indented(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (label, d) in [("-1°", -1.0f32), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
-                if ui.button(label).clicked() {
+                if ui.button(label).on_hover_text(format!("Turn by {label}")).clicked() {
                     self.angle = ((self.angle + d) * 10.0).round() / 10.0;
                     self.angle = self.angle.clamp(-45.0, 45.0);
                     c = true;
@@ -359,10 +359,10 @@ impl EditTool for FreeRotate {
             }
         });
         section(ui, cx, "Corners");
-        if widgets::radio_value(ui, &mut self.mode, 0, "Crop to remove the empty corners").changed() {
+        if widgets::radio_value(ui, &mut self.mode, 0, "Crop to remove the empty corners").on_hover_text("Keep the original frame shape; a little of the edges is cut off").changed() {
             c = true;
         }
-        if widgets::radio_value(ui, &mut self.mode, 1, "Expand the canvas").changed() {
+        if widgets::radio_value(ui, &mut self.mode, 1, "Expand the canvas").on_hover_text("Keep the whole image; the corners are filled with the background color").changed() {
             c = true;
         }
         if self.mode == 1 {
@@ -483,33 +483,33 @@ impl EditTool for AddBorder {
                 ("Rounded", AddBorder { width_pct: 0.0, radius: 60.0, shadow: true, ..d.clone() }),
             ];
             for (name, p) in presets {
-                if ui.button(name).clicked() {
+                if ui.button(name).on_hover_text("Start from this border style").clicked() {
                     *self = AddBorder { src: self.src, ..p };
                     c = true;
                 }
             }
         });
         section(ui, cx, "Border");
-        c |= row(ui, "Units", |ui| segmented(ui, &mut self.unit, &["Pixels", "Percent"]));
+        c |= row(ui, "Units", |ui| segmented_tips(ui, &mut self.unit, &["Pixels", "Percent"], &["Border width in pixels", "Border width as a percentage of the image size"]));
         if self.unit == 0 {
-            c |= slider_ex(ui, "Width", &mut self.width_px, 0.0..=1000.0, 40.0, " px", 1.0, 0, true);
+            c |= tipped(ui, "How thick the border is", |ui| slider_ex(ui, "Width", &mut self.width_px, 0.0..=1000.0, 40.0, " px", 1.0, 0, true));
         } else {
-            c |= slider_ex(ui, "Width", &mut self.width_pct, 0.0..=25.0, 3.0, " %", 0.1, 1, false);
+            c |= tipped(ui, "How thick the border is", |ui| slider_ex(ui, "Width", &mut self.width_pct, 0.0..=25.0, 3.0, " %", 0.1, 1, false));
         }
-        c |= color_row(ui, "Color", &mut self.color, true);
-        c |= indented(ui, |ui| widgets::checkbox(ui, &mut self.polaroid, "Polaroid (thick bottom)").changed());
+        c |= tipped(ui, "Color of the border", |ui| color_row(ui, "Color", &mut self.color, true));
+        c |= indented(ui, |ui| widgets::checkbox(ui, &mut self.polaroid, "Polaroid (thick bottom)").on_hover_text("Make the bottom edge wider, like an instant photo").changed());
         c |= slider_ex(ui, "Corner radius", &mut self.radius, 0.0..=1000.0, 0.0, " px", 1.0, 0, true);
-        c |= section_toggle(ui, &mut self.line, "Line around the photo");
+        c |= tipped(ui, "A thin line between the photo and the border", |ui| section_toggle(ui, &mut self.line, "Line around the photo"));
         if self.line {
             c |= slider_ex(ui, "Line width", &mut self.line_w, 0.5..=50.0, 2.0, " px", 0.5, 1, false);
             c |= color_row(ui, "Line color", &mut self.line_color, true);
         }
         c |= section_toggle(ui, &mut self.shadow, "Drop shadow");
         if self.shadow {
-            c |= slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=300.0, 24.0, " px", 1.0, 0, false);
-            c |= slider_ex(ui, "Offset", &mut self.shadow_offset, 0.0..=300.0, 12.0, " px", 1.0, 0, false);
+            c |= tipped(ui, "How blurry the shadow's edge is", |ui| slider_ex(ui, "Softness", &mut self.shadow_blur, 0.0..=300.0, 24.0, " px", 1.0, 0, false));
+            c |= tipped(ui, "How far the shadow falls from the photo", |ui| slider_ex(ui, "Offset", &mut self.shadow_offset, 0.0..=300.0, 12.0, " px", 1.0, 0, false));
             c |= slider(ui, "Opacity", &mut self.shadow_opacity, 0.0..=100.0, 45.0, " %");
-            c |= color_row(ui, "Background", &mut self.shadow_bg, true);
+            c |= tipped(ui, "Color the shadow falls on (the new outer area)", |ui| color_row(ui, "Background", &mut self.shadow_bg, true));
         }
         section(ui, cx, "Result");
         let (w, h) = self.src;

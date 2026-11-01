@@ -4,6 +4,7 @@ use super::commands::Command;
 use super::icons as I;
 use super::theme::{self, radius, size, space, text, Palette};
 use super::tree::{DragFiles, FolderTree, TreeAction};
+use super::safe;
 use super::widgets;
 use crate::app::Core;
 use crate::catalog::{self, Entry, EntryKind, MediaFilter};
@@ -364,6 +365,7 @@ impl Browser {
                 filter_resp.request_focus();
                 self.focus_filter = false;
             }
+            let filter_resp = filter_resp.on_hover_text("Show only files whose names contain this text (Esc clears)");
             if filter_resp.changed() {
                 self.resort_needed = true;
             }
@@ -384,17 +386,17 @@ impl Browser {
                 ui.set_min_width(220.0);
                 ui.label(RichText::new("Show").font(text::caption()).color(p.muted));
                 for (f, label) in [(MediaFilter::All, "Images and videos"), (MediaFilter::Images, "Images only"), (MediaFilter::Videos, "Videos only")] {
-                    if widgets::radio(ui, self.media_filter == f, label).clicked() {
+                    if widgets::radio(ui, self.media_filter == f, label).on_hover_text("Which kinds of files the folder shows").clicked() {
                         self.media_filter = f;
                         self.resort_needed = true;
                     }
                 }
                 ui.separator();
-                if widgets::checkbox(ui, &mut self.flagged_only, "Flagged only").changed() {
+                if widgets::checkbox(ui, &mut self.flagged_only, "Flagged only").on_hover_text(crate::ui::tips::command_tip(Command::ShowFlaggedOnly)).changed() {
                     self.resort_needed = true;
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Minimum rating");
+                    ui.label("Minimum rating").on_hover_text("Hide files rated below this many stars; click the same star again to clear");
                     if let Some(r) = widgets::star_rating(ui, self.min_rating, 13.0, &p) {
                         self.min_rating = r;
                         self.resort_needed = true;
@@ -411,7 +413,7 @@ impl Browser {
             let modes = [(Command::Slideshow, "Slideshow"), (Command::Compare, "Compare")];
             if !modes_in_menu {
                 for (cmd, label) in modes {
-                    let tip = format!("{} ({})", cmd.label(), cmd.shortcut());
+                    let tip = crate::ui::tips::command_tip(cmd);
                     let clicked = if mode_labels { tool_button(ui, cmd.icon(), label, false).on_hover_text(tip).clicked() } else { widgets::icon_button(ui, cmd.icon(), &tip, false).clicked() };
                     if clicked {
                         ev.push(BrowserEvent::Command(cmd));
@@ -423,7 +425,7 @@ impl Browser {
             egui::Popup::menu(&tools).show(|ui| {
                 ui.set_min_width(250.0);
                 let mut item = |ui: &mut Ui, cmd: Command, label: &str| {
-                    if widgets::menu_item(ui, cmd.icon(), label, &cmd.shortcut()).clicked() {
+                    if crate::ui::tips::menu_tip(widgets::menu_item(ui, cmd.icon(), label, &cmd.shortcut()), cmd).clicked() {
                         ev.push(BrowserEvent::Command(cmd));
                         ui.close();
                     }
@@ -616,10 +618,10 @@ impl Browser {
         let mut tree_bottom: Option<f32> = None;
         if show_preview {
             // Never let the preview take more than ~60% of a short sidebar.
-            let max_h = (ui.available_height() * 0.6).clamp(180.0, PREVIEW_TEXT_H + PREVIEW_MAX_H + 24.0);
+            let max_h = safe::safe_clamp(safe::finite_or(ui.available_height(), 0.0) * 0.6, 180.0, PREVIEW_TEXT_H + PREVIEW_MAX_H + 24.0);
             // Tall enough for a picture above the file details.
             let min_h = (PREVIEW_TEXT_H + 150.0).min(max_h);
-            let preview_h = core.settings.preview_height.clamp(min_h, max_h);
+            let preview_h = safe::safe_clamp(core.settings.preview_height, min_h, max_h);
             let r = egui::Panel::bottom("preview-pane")
                 .resizable(true)
                 .default_size(preview_h)
@@ -1291,7 +1293,7 @@ impl Browser {
         let has_sel = !self.selected.is_empty() || self.focus.is_some();
         let build = |ui: &mut Ui, ev: &mut Vec<BrowserEvent>| {
             let item = |ui: &mut Ui, cmd: Command, ev: &mut Vec<BrowserEvent>| {
-                if widgets::menu_item(ui, cmd.icon(), &cmd.label(), &cmd.shortcut()).clicked() {
+                if crate::ui::tips::menu_tip(widgets::menu_item(ui, cmd.icon(), &cmd.label(), &cmd.shortcut()), cmd).clicked() {
                     ev.push(BrowserEvent::Command(cmd));
                     ui.close();
                 }
@@ -1453,6 +1455,15 @@ impl Browser {
             let (n, bytes) = self.entries.iter().filter(|e| self.selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size));
             if n > 0 {
                 s += &format!("   ·   {n} selected ({})", catalog::human_size(bytes));
+            }
+            // How to compare, where people look when they select images.
+            let key = if (1..=4).contains(&n) { Command::Compare.shortcut() } else { String::new() };
+            if !key.is_empty() {
+                match n {
+                    1 => s += &format!("   ·   Tip: Ctrl+click 2 to 4 images, then press {key} to compare them side by side"),
+                    2..=4 => s += &format!("   ·   Press {key} to compare side by side"),
+                    _ => {}
+                }
             }
         }
         if core.meta.pending() > 0 {
