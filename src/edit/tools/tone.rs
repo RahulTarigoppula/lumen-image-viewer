@@ -1,6 +1,6 @@
 //! Tonal tools: Levels and Curves.
 
-use super::{combo, hint, info, paint_histogram, row, section, segmented};
+use super::{combo, hint, info, paint_histogram, row, segmented, section, tipped};
 use crate::ui::widgets;
 use crate::edit::tone::{self, LevelsParams, CHANNEL_NAMES};
 use crate::edit::{EditTool, Histogram, ToolUiCtx};
@@ -39,7 +39,7 @@ fn hist_max(data: &[u32]) -> u32 {
 }
 
 fn channel_picker(ui: &mut egui::Ui, ch: &mut usize) -> bool {
-    row(ui, "Channel", |ui| segmented(ui, ch, &CHANNEL_NAMES))
+    tipped(ui, "Change all colors together (RGB) or one color channel on its own", |ui| row(ui, "Channel", |ui| segmented(ui, ch, &CHANNEL_NAMES)))
 }
 
 fn triangle(painter: &egui::Painter, x: f32, top: f32, fill: Color32, stroke: Color32, active: bool) {
@@ -92,7 +92,7 @@ impl EditTool for Levels {
         paint_histogram(&painter, hist_rect.shrink(2.0), data, hist_max(data), col);
         let p = &mut self.p[ch];
         let xof = |v: f32| hist_rect.min.x + v / 255.0 * hist_rect.width();
-        let vof = |x: f32| ((x - hist_rect.min.x) / hist_rect.width() * 255.0).clamp(0.0, 255.0);
+        let vof = |x: f32| (crate::ui::safe::safe_div(x - hist_rect.min.x, hist_rect.width(), 0.0) * 255.0).clamp(0.0, 255.0);
         let gpos = p.in_black + (p.in_white - p.in_black) * 0.5f32.powf(p.gamma);
         // Clipped region shading.
         painter.rect_filled(Rect::from_min_max(hist_rect.min, pos2(xof(p.in_black), hist_rect.max.y)), 0.0, Color32::from_black_alpha(50));
@@ -137,9 +137,9 @@ impl EditTool for Levels {
         let gap = ((width - 3.0 * FIELD_W) / 2.0).max(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_black).range(0.0..=253.0).speed(0.5).fixed_decimals(0)).on_hover_text("Black point").changed();
-            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.gamma).range(0.1..=9.99).speed(0.01).fixed_decimals(2)).on_hover_text("Midtones (gamma)").changed();
-            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_white).range(2.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("White point").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_black).range(0.0..=253.0).speed(0.5).fixed_decimals(0)).on_hover_text("Black point: tones this dark or darker become pure black").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.gamma).range(0.1..=9.99).speed(0.01).fixed_decimals(2)).on_hover_text("Midtones: above 1 brightens, below 1 darkens the middle tones").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.in_white).range(2.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("White point: tones this bright or brighter become pure white").changed();
         });
         if p.in_white <= p.in_black + 1.0 {
             p.in_white = (p.in_black + 2.0).min(255.0);
@@ -170,7 +170,7 @@ impl EditTool for Levels {
         }
         if let (Some(d), Some(pp)) = (self.drag, oresp.interact_pointer_pos()) {
             if oresp.is_pointer_button_down_on() && d >= 3 {
-                let v = ((pp.x - bar.min.x) / bar.width() * 255.0).clamp(0.0, 255.0).round();
+                let v = (crate::ui::safe::safe_div(pp.x - bar.min.x, bar.width(), 0.0) * 255.0).clamp(0.0, 255.0).round();
                 if d == 3 {
                     p.out_black = v;
                 } else {
@@ -181,8 +181,8 @@ impl EditTool for Levels {
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = (width - 2.0 * FIELD_W).max(2.0);
-            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_black).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output black").changed();
-            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_white).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output white").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_black).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output black: raise it to make the darkest tones gray (faded look)").changed();
+            c |= widgets::value_box_w(ui, FIELD_W, egui::DragValue::new(&mut p.out_white).range(0.0..=255.0).speed(0.5).fixed_decimals(0)).on_hover_text("Output white: lower it to dim the brightest tones").changed();
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -190,7 +190,7 @@ impl EditTool for Levels {
                 self.auto(cx.histogram);
                 c = true;
             }
-            if ui.button("Reset channel").clicked() {
+            if ui.button("Reset channel").on_hover_text("Undo the changes to the channel shown").clicked() {
                 self.p[ch] = LevelsParams::default();
                 c = true;
             }
@@ -262,7 +262,7 @@ impl EditTool for Curves {
         }
         painter.line_segment([rect.left_bottom(), rect.right_top()], Stroke::new(1.0, pal.faint.gamma_multiply(0.6)));
         let to_screen = |p: [f32; 2]| pos2(rect.min.x + p[0] * side, rect.max.y - p[1] * side);
-        let from_screen = |p: Pos2| [((p.x - rect.min.x) / side).clamp(0.0, 1.0), ((rect.max.y - p.y) / side).clamp(0.0, 1.0)];
+        let from_screen = |p: Pos2| [crate::ui::safe::safe_div(p.x - rect.min.x, side, 0.0).clamp(0.0, 1.0), crate::ui::safe::safe_div(rect.max.y - p.y, side, 0.0).clamp(0.0, 1.0)];
         // Other channels' curves, faintly.
         for other in 0..4 {
             if other == ch || self.pts[other] == tone::identity_curve() {
@@ -339,7 +339,7 @@ impl EditTool for Curves {
         ui.add_space(4.0);
         let names: Vec<String> = PRESETS.iter().map(|(n, _)| n.to_string()).collect();
         let mut preset = PRESETS.iter().position(|(_, p)| *p == pts.as_slice()).unwrap_or(usize::MAX);
-        if combo(ui, "Preset", "curves-preset", &mut preset, &names) {
+        if tipped(ui, "Start from a ready-made curve", |ui| combo(ui, "Preset", "curves-preset", &mut preset, &names)) {
             if let Some((_, p)) = PRESETS.get(preset) {
                 self.pts[ch] = p.to_vec();
                 self.drag = None;
@@ -347,7 +347,7 @@ impl EditTool for Curves {
             }
         }
         ui.add_space(8.0);
-        if ui.button("Reset channel").clicked() {
+        if ui.button("Reset channel").on_hover_text("Make the curve of the channel shown straight again").clicked() {
             self.pts[ch] = tone::identity_curve();
             self.drag = None;
             c = true;

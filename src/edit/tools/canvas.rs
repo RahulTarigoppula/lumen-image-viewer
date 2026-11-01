@@ -409,16 +409,16 @@ pub fn shape_buttons(ui: &mut egui::Ui, ed: &mut ShapeEditor) -> bool {
     let mut c = false;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        if ui.add_enabled(ed.can_undo(), egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE))).clicked() {
+        if ui.add_enabled(ed.can_undo(), egui::Button::new(format!("{}  Undo", I::ARROW_COUNTER_CLOCKWISE))).on_hover_text("Undo the last change to the areas (Ctrl+Z)").clicked() {
             c |= ed.undo();
         }
-        if ui.add_enabled(ed.can_redo(), egui::Button::new(format!("{}  Redo", I::ARROW_CLOCKWISE))).clicked() {
+        if ui.add_enabled(ed.can_redo(), egui::Button::new(format!("{}  Redo", I::ARROW_CLOCKWISE))).on_hover_text("Redo the change you undid (Ctrl+Y)").clicked() {
             c |= ed.redo();
         }
         if ui.add_enabled(ed.selected.is_some(), egui::Button::new(format!("{}  Delete", I::TRASH))).on_hover_text("Delete the selected area (Del)").clicked() {
             c |= ed.delete_selected();
         }
-        if ui.add_enabled(!ed.shapes.is_empty(), egui::Button::new("Clear")).clicked() {
+        if ui.add_enabled(!ed.shapes.is_empty(), egui::Button::new("Clear")).on_hover_text("Remove every area").clicked() {
             c |= ed.clear();
         }
     });

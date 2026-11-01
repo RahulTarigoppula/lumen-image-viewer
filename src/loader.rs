@@ -281,6 +281,7 @@ impl Loader {
 }
 
 fn worker(q: Arc<Queue>, tx: Sender<Msg>, ctx: egui::Context, opts: Arc<Mutex<DecodeOptions>>) {
+    crate::bg::background_priority();
     loop {
         let job = {
             let mut jobs = q.jobs.lock();

@@ -471,7 +471,7 @@ impl BatchConvert {
                 |ui| {
                     let label = format!("{}  Convert {} file{}", I::PLAY, n, if n == 1 { "" } else { "s" });
                     let ok = n > 0 && !(self.s.dest == DestMode::Folder && self.s.out_folder.is_none());
-                    if primary_button(ui, p, ok, &label).clicked() {
+                    if primary_button(ui, p, ok, &label).on_hover_text("Start converting; the originals are not changed unless they would be overwritten").clicked() {
                         if self.overwrites {
                             self.confirm_overwrite = true;
                         } else {
@@ -487,7 +487,10 @@ impl BatchConvert {
         egui::Panel::top("bc-tabs").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 10 })).show(ui, |ui| {
             let active = self.s.advanced.steps.iter().filter(|e| e.enabled).count();
             let adv = if self.s.use_advanced && active > 0 { format!("Advanced ({active})") } else { "Advanced".to_string() };
-            widgets::segmented_value(ui, &mut self.tab, &[(0, "Basic"), (1, adv.as_str())]);
+            let mut tab = self.tab as usize;
+            if widgets::segmented_with_tips(ui, &mut tab, &["Basic", adv.as_str()], &["Format, size, destination and simple adjustments", "Extra steps such as crop, watermark, borders and color changes"]) {
+                self.tab = tab as u8;
+            }
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.tab == 1 {
@@ -543,19 +546,19 @@ impl BatchConvert {
             if let Some((sel, all)) = &self.scopes {
                 let (sel_label, all_label) = (format!("Selected ({})", sel.len()), format!("All in folder ({})", all.len()));
                 let mut i = if self.files.len() == sel.len() { 0 } else { 1 };
-                if widgets::segmented(ui, &mut i, &[sel_label.as_str(), all_label.as_str()]) {
+                if widgets::segmented_with_tips(ui, &mut i, &[sel_label.as_str(), all_label.as_str()], &["Convert only the files selected in the browser", "Convert every image in the current folder"]) {
                     self.files = if i == 0 { sel.clone() } else { all.clone() };
                     self.files_changed();
                 }
                 ui.add_space(4.0);
             }
             ui.horizontal_wrapped(|ui| {
-                if ui.button(format!("{}  Add files", I::FILE_PLUS)).clicked() {
+                if ui.button(format!("{}  Add files", I::FILE_PLUS)).on_hover_text("Pick more images to add to the list").clicked() {
                     if let Some(v) = rfd::FileDialog::new().add_filter("Images", &image_exts()).set_directory(&self.folder).pick_files() {
                         self.add_files(v);
                     }
                 }
-                if ui.button(format!("{}  Add folder", I::FOLDER_PLUS)).clicked() {
+                if ui.button(format!("{}  Add folder", I::FOLDER_PLUS)).on_hover_text("Add every image in a folder to the list").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder() {
                         self.adding = Some(scan_folder(dir, self.s.include_subfolders, ui.ctx().clone()));
                     }
@@ -576,7 +579,7 @@ impl BatchConvert {
                     self.files_edited();
                 }
             });
-            crate::ui::widgets::checkbox(ui, &mut self.s.include_subfolders, "Include subfolders when adding a folder");
+            crate::ui::widgets::checkbox(ui, &mut self.s.include_subfolders, "Include subfolders when adding a folder").on_hover_text("Add folder also picks up images in folders inside it");
             ui.add_space(4.0);
             egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -619,15 +622,15 @@ impl BatchConvert {
 
     fn destination_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::FOLDER_OPEN, "Destination", |ui| {
-            crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Same, "Same folder as the original");
+            crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Same, "Same folder as the original").on_hover_text("Write each new file next to the image it was made from");
             ui.horizontal(|ui| {
-                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Subfolder, "Subfolder");
-                ui.add_enabled(self.s.dest == DestMode::Subfolder, egui::TextEdit::singleline(&mut self.s.subfolder).desired_width(140.0).hint_text("Converted"));
+                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Subfolder, "Subfolder").on_hover_text("Write into a folder with this name inside each image's folder");
+                ui.add_enabled(self.s.dest == DestMode::Subfolder, egui::TextEdit::singleline(&mut self.s.subfolder).desired_width(140.0).hint_text("Converted")).on_hover_text("Name of the subfolder (created if needed)");
             });
             ui.horizontal(|ui| {
-                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Folder, "Folder");
+                crate::ui::widgets::radio_value(ui, &mut self.s.dest, DestMode::Folder, "Folder").on_hover_text("Write every new file into one folder");
                 let label = self.s.out_folder.as_ref().map(|f| f.display().to_string()).unwrap_or_else(|| "Choose...".into());
-                let r = ui.add(egui::Button::new(format!("{}  {}", I::FOLDER, label)).truncate());
+                let r = ui.add(egui::Button::new(format!("{}  {}", I::FOLDER, label)).truncate()).on_hover_text("Choose the output folder");
                 if r.clicked() {
                     let mut dlg = rfd::FileDialog::new();
                     if let Some(f) = self.s.out_folder.as_ref().or(Some(&self.folder)) {
@@ -644,11 +647,12 @@ impl BatchConvert {
             }
             ui.add_space(6.0);
             ui.label(RichText::new("File name").color(p.muted));
-            ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"));
+            ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"))
+                .on_hover_text("Name of each new file; click a tag below to insert it ({name} = original name, {n} = counter)");
             token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{width}", "{height}", "{ext}"]);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Counter starts at").color(p.muted));
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(0..=1_000_000));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(0..=1_000_000)).on_hover_text("First number used for {n} in the file name");
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -657,7 +661,9 @@ impl BatchConvert {
                     for c in ConflictPolicy::ALL {
                         ui.selectable_value(&mut self.s.conflict, c, c.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("What to do when a file with the new name is already there");
             });
             if self.overwrites {
                 ui.label(RichText::new(format!("{}  Originals with the same name and format will be replaced.", I::WARNING)).size(12.0).color(p.danger));
@@ -676,7 +682,9 @@ impl BatchConvert {
                         self.s.format = f;
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text("File type of the converted images");
             let fmt = if self.s.keep_format { None } else { Some(self.s.format) };
             if self.s.keep_format {
                 hint(ui, p, "Formats Lumen can't write (HEIC, RAW, ...) are saved as JPEG.");
@@ -694,32 +702,34 @@ impl BatchConvert {
             egui::Grid::new("bc-format-grid").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                 if fmt.is_none() || fmt == Some(SaveFormat::Jpeg) {
                     ui.label("JPEG quality");
-                    ui.add(crate::ui::widgets::Slider::new(&mut self.s.jpeg_quality, 1..=100));
+                    ui.add(crate::ui::widgets::Slider::new(&mut self.s.jpeg_quality, 1..=100)).on_hover_text("Higher looks better but makes bigger files (85-92 suits most photos)");
                     ui.end_row();
                     ui.label("Chroma");
                     crate::ui::widgets::combo("bc-chroma").selected_text(self.s.jpeg_chroma.label()).show_ui(ui, |ui| {
                         for c in [Chroma::S444, Chroma::S422, Chroma::S420] {
                             ui.selectable_value(&mut self.s.jpeg_chroma, c, c.label());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Color detail kept: 4:4:4 keeps all (sharp text), 4:2:0 gives the smallest files");
                     ui.end_row();
                     ui.label("");
-                    crate::ui::widgets::checkbox(ui, &mut self.s.jpeg_progressive, "Progressive");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.jpeg_progressive, "Progressive").on_hover_text("Web pages show the image blurry first, then sharp; often slightly smaller");
                     ui.end_row();
                 }
                 if fmt.is_none() || fmt == Some(SaveFormat::WebP) {
                     ui.label("WebP");
-                    crate::ui::widgets::checkbox(ui, &mut self.s.webp_lossless, "Lossless");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.webp_lossless, "Lossless").on_hover_text("Keep every pixel exactly (bigger files)");
                     ui.end_row();
                     if !self.s.webp_lossless {
                         ui.label("WebP quality");
-                        ui.add(crate::ui::widgets::Slider::new(&mut self.s.webp_quality, 1.0..=100.0).fixed_decimals(0));
+                        ui.add(crate::ui::widgets::Slider::new(&mut self.s.webp_quality, 1.0..=100.0).fixed_decimals(0)).on_hover_text("Higher looks better but makes bigger files");
                         ui.end_row();
                     }
                 }
                 if fmt.is_none() || fmt == Some(SaveFormat::Png) {
                     ui.label("PNG");
-                    crate::ui::widgets::checkbox(ui, &mut self.s.png_best, "Best compression (slower)");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.png_best, "Best compression (slower)").on_hover_text("Smaller files with the same pixels; takes longer to save");
                     ui.end_row();
                 }
                 if fmt == Some(SaveFormat::Ico) {
@@ -740,43 +750,47 @@ impl BatchConvert {
                     for m in ResizeMode::ALL {
                         ui.selectable_value(&mut r.mode, m, m.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("How the new size is given: a percentage, a box to fit in, or one side");
                 ui.end_row();
                 match r.mode {
                     ResizeMode::None => {}
                     ResizeMode::Percent => {
                         ui.label("Scale");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.percent).range(1.0..=1000.0).speed(0.5).suffix(" %"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.percent).range(1.0..=1000.0).speed(0.5).suffix(" %")).on_hover_text("New size as a percentage of the original");
                         ui.end_row();
                     }
                     ResizeMode::Fit => {
                         ui.label("Box");
                         ui.horizontal(|ui| {
-                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px")).on_hover_text("Largest width; the shape of the image is kept");
                             ui.label("×");
-                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.b).range(1..=60000).suffix(" px"));
+                            crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.b).range(1..=60000).suffix(" px")).on_hover_text("Largest height; the shape of the image is kept");
                         });
                         ui.end_row();
                     }
                     _ => {
                         ui.label("Size");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut r.a).range(1..=60000).suffix(" px")).on_hover_text("New length of that side; the other side follows the shape");
                         ui.end_row();
                     }
                 }
                 if r.mode != ResizeMode::None {
                     ui.label("");
-                    crate::ui::widgets::checkbox(ui, &mut r.no_upscale, "Don't enlarge smaller images");
+                    crate::ui::widgets::checkbox(ui, &mut r.no_upscale, "Don't enlarge smaller images").on_hover_text("Images already smaller than the target keep their size");
                     ui.end_row();
                     ui.label("Filter");
                     crate::ui::widgets::combo("bc-filter").width(160.0).selected_text(self.s.filter.label()).show_ui(ui, |ui| {
                         for f in Filter::ALL {
                             ui.selectable_value(&mut self.s.filter, f, f.label());
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("How pixels are blended when resizing; Lanczos is sharpest");
                     ui.end_row();
                     ui.label("");
-                    crate::ui::widgets::checkbox(ui, &mut self.s.sharpen, "Light sharpening after downscale");
+                    crate::ui::widgets::checkbox(ui, &mut self.s.sharpen, "Light sharpening after downscale").on_hover_text("Restores crispness that shrinking softens");
                     ui.end_row();
                 }
             });
@@ -788,10 +802,10 @@ impl BatchConvert {
 
     fn adjust_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::MAGIC_WAND, "Adjustments & metadata", |ui| {
-            crate::ui::widgets::checkbox(ui, &mut self.s.auto_enhance, "Auto enhance (levels)");
-            crate::ui::widgets::checkbox(ui, &mut self.s.grayscale, "Convert to grayscale");
+            crate::ui::widgets::checkbox(ui, &mut self.s.auto_enhance, "Auto enhance (levels)").on_hover_text("Stretch each image's tones so its darkest part is black and brightest is white");
+            crate::ui::widgets::checkbox(ui, &mut self.s.grayscale, "Convert to grayscale").on_hover_text("Save the images in black and white");
             crate::ui::widgets::checkbox(ui, &mut self.s.keep_exif, "Keep EXIF metadata").on_hover_text("Camera data, date taken, GPS... (written to JPEG output)");
-            crate::ui::widgets::checkbox(ui, &mut self.s.preserve_date, "Keep the original modified date");
+            crate::ui::widgets::checkbox(ui, &mut self.s.preserve_date, "Keep the original modified date").on_hover_text("New files get the date of the original instead of today");
             hint(ui, p, "Photos are rotated upright using their EXIF orientation.");
         });
     }
@@ -805,7 +819,8 @@ impl BatchConvert {
 
     fn advanced_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, I::SLIDERS_HORIZONTAL, "Advanced steps", |ui| {
-            crate::ui::widgets::checkbox(ui, &mut self.s.use_advanced, "Apply these steps to every image (after the basic resize and adjustments)");
+            crate::ui::widgets::checkbox(ui, &mut self.s.use_advanced, "Apply these steps to every image (after the basic resize and adjustments)")
+                .on_hover_text("Turn the list of extra steps below on or off");
             ui.add_enabled_ui(self.s.use_advanced, |ui| {
                 advanced::pipeline_ui(ui, p, &mut self.s.advanced, &mut self.adv_selected);
             });
@@ -859,7 +874,9 @@ impl BatchConvert {
                         for (i, f) in self.files.iter().enumerate() {
                             ui.selectable_value(&mut idx, i, file_name(f));
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Choose which file the preview shows");
                     if idx != self.preview_index {
                         self.selected.clear();
                         self.selected.insert(idx);
@@ -1438,7 +1455,8 @@ impl BatchRename {
                 },
                 |ui| {
                     let label = format!("{}  Rename {changes} file{}", I::CHECK, if changes == 1 { "" } else { "s" });
-                    if primary_button(ui, p, !busy && conflicts == 0 && changes > 0, &label).clicked() {
+                    let tip = if conflicts > 0 { "Fix the names marked as conflicts first" } else { "Rename the files as shown in the preview (you can undo it)" };
+                    if primary_button(ui, p, !busy && conflicts == 0 && changes > 0, &label).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
                         do_rename = true;
                     }
                     if widgets::secondary_button(ui, "Close").clicked() {
@@ -1482,15 +1500,17 @@ impl BatchRename {
         columns_or_stack(ui, |ui, col| {
             if col == 0 {
                 card(ui, p, I::TEXTBOX, "New name", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"));
+                    ui.add(egui::TextEdit::singleline(&mut self.s.template).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).hint_text("{name}"))
+                        .on_hover_text("The new name; click a tag below to insert it ({n} = counter, {taken} = date taken)");
                     token_chips(ui, &mut self.s.template, &["{name}", "{n}", "{n:3}", "{date}", "{taken}", "{width}", "{height}", "{folder}"]);
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Start").color(p.muted));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.start).range(-1_000_000..=1_000_000)).on_hover_text("First number used for {n}");
                         ui.label(RichText::new("Step").color(p.muted));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.step).range(-1000..=1000));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.step).range(-1000..=1000)).on_hover_text("How much {n} grows from one file to the next");
                         ui.label(RichText::new("Digits").color(p.muted));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut self.s.pad).range(0..=10).custom_formatter(|v, _| if v == 0.0 { "auto".into() } else { format!("{v}") }))
+                            .on_hover_text("Pad {n} with leading zeros to this many digits (auto fits the file count)");
                     });
                     hint(ui, p, "The extension is kept. {date:%Y%m%d} accepts a custom date format.");
                 });
@@ -1498,27 +1518,31 @@ impl BatchRename {
                 card(ui, p, I::MAGNIFYING_GLASS, "Find, replace & case", |ui| {
                     egui::Grid::new("br-grid").num_columns(2).spacing([10.0, 6.0]).striped(false).show(ui, |ui| {
                         ui.label("Find");
-                        ui.add(egui::TextEdit::singleline(&mut self.s.find).desired_width(f32::INFINITY));
+                        ui.add(egui::TextEdit::singleline(&mut self.s.find).desired_width(f32::INFINITY)).on_hover_text("Text to look for in each new name");
                         ui.end_row();
                         ui.label("Replace");
-                        ui.add(egui::TextEdit::singleline(&mut self.s.replace).desired_width(f32::INFINITY));
+                        ui.add(egui::TextEdit::singleline(&mut self.s.replace).desired_width(f32::INFINITY)).on_hover_text("Text that takes its place (leave empty to remove it)");
                         ui.end_row();
                         ui.label("");
-                        crate::ui::widgets::checkbox(ui, &mut self.s.ignore_case, "Ignore case");
+                        crate::ui::widgets::checkbox(ui, &mut self.s.ignore_case, "Ignore case").on_hover_text("Find \"IMG\" also matches \"img\"");
                         ui.end_row();
                         ui.label("Name case");
                         crate::ui::widgets::combo("br-case").selected_text(self.s.case.label()).show_ui(ui, |ui| {
                             for c in CaseChange::ALL {
                                 ui.selectable_value(&mut self.s.case, c, c.label());
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Change names to lower case, upper case or title case");
                         ui.end_row();
                         ui.label("Extension");
                         crate::ui::widgets::combo("br-ext").selected_text(self.s.ext_case.label()).show_ui(ui, |ui| {
                             for c in ExtCase::ALL {
                                 ui.selectable_value(&mut self.s.ext_case, c, c.label());
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Change the case of the extension, e.g. .JPG to .jpg");
                         ui.end_row();
                     });
                 });
@@ -1529,7 +1553,7 @@ impl BatchRename {
     fn preview_header(&mut self, ui: &mut Ui, p: &Palette) {
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                widgets::checkbox(ui, &mut self.only_changed, "Only changed or conflicting");
+                widgets::checkbox(ui, &mut self.only_changed, "Only changed or conflicting").on_hover_text("Hide files whose name stays the same");
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.label(RichText::new("Preview").font(text::caption()).color(p.muted));
                     if let Some(m) = &self.meta {

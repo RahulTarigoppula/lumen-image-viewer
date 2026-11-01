@@ -17,6 +17,36 @@ pub enum WheelAction {
     Zoom,
 }
 
+/// What the viewer's histogram shows (overlay and info panel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewerHistogram {
+    /// Brightness only.
+    Luminance,
+    /// Red, green and blue channels.
+    Rgb,
+    /// Brightness behind the three channels.
+    #[default]
+    Both,
+}
+
+impl ViewerHistogram {
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewerHistogram::Luminance => "Luminance",
+            ViewerHistogram::Rgb => "RGB",
+            ViewerHistogram::Both => "Luminance + RGB",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            ViewerHistogram::Luminance => ViewerHistogram::Rgb,
+            ViewerHistogram::Rgb => ViewerHistogram::Both,
+            ViewerHistogram::Both => ViewerHistogram::Luminance,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FitMode {
     /// Shrink large images to fit, show small images at 100%.
@@ -185,6 +215,8 @@ pub struct Settings {
     pub thumb_caption: ThumbCaption,
     /// Viewer: slide-in panels when the mouse touches a screen edge.
     pub edge_panels: bool,
+    /// Viewer histogram: luminance, RGB or both (click the histogram to switch).
+    pub viewer_histogram: ViewerHistogram,
     /// Skip the "this sends the coordinates to openstreetmap.org" confirmation.
     pub gps_map_no_confirm: bool,
     /// Remote AI analysis settings (`lumen_ai::AiSettings`, read by the app).
@@ -280,6 +312,7 @@ impl Default for Settings {
             key_overrides: Vec::new(),
             thumb_caption: ThumbCaption::NameDetails,
             edge_panels: true,
+            viewer_histogram: ViewerHistogram::Both,
             gps_map_no_confirm: false,
             ai: serde_json::Value::Null,
         }
@@ -385,5 +418,27 @@ impl Settings {
         self.recent_folders.retain(|p| p != folder);
         self.recent_folders.insert(0, folder.to_path_buf());
         self.recent_folders.truncate(15);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewer_histogram_cycles_and_defaults() {
+        let mut m = ViewerHistogram::Luminance;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(m);
+            m = m.next();
+        }
+        assert_eq!(m, ViewerHistogram::Luminance);
+        assert!(seen.contains(&ViewerHistogram::Rgb) && seen.contains(&ViewerHistogram::Both));
+        // Settings saved before the option existed load with the default.
+        let s: Settings = serde_json::from_str(r#"{"thumb_size": 200.0}"#).unwrap();
+        assert_eq!(s.viewer_histogram, ViewerHistogram::Both);
+        let s: Settings = serde_json::from_str(r#"{"viewer_histogram": "Rgb"}"#).unwrap();
+        assert_eq!(s.viewer_histogram, ViewerHistogram::Rgb);
     }
 }

@@ -199,11 +199,11 @@ impl PrintWindow {
                 },
                 |ui| {
                     if let Some(job) = &self.job {
-                        if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).clicked() {
+                        if danger_button(ui, p, &format!("{}  Cancel", I::STOP)).on_hover_text("Stop sending pages to the printer").clicked() {
                             job.progress.cancel.store(true, Ordering::SeqCst);
                         }
                     } else {
-                        if primary_button(ui, p, !self.sources.is_empty() && self.infos.is_some(), &format!("{}  Print...", I::PRINTER)).clicked() {
+                        if primary_button(ui, p, !self.sources.is_empty() && self.infos.is_some(), &format!("{}  Print...", I::PRINTER)).on_hover_text("Choose the printer and paper, then print").clicked() {
                             start = true;
                         }
                         if crate::ui::widgets::secondary_button(ui, "Close").clicked() {
@@ -256,32 +256,39 @@ impl PrintWindow {
         let o = &mut self.opts;
         card(ui, p, I::ARROWS_OUT_SIMPLE, "Size", |ui| {
             for s in Sizing::ALL {
-                crate::ui::widgets::radio_value(ui, &mut o.sizing, s, s.label());
+                crate::ui::widgets::radio_value(ui, &mut o.sizing, s, s.label()).on_hover_text(match s {
+                    Sizing::Fit => "As large as the page allows, with the whole image visible",
+                    Sizing::Fill => "Cover the whole page, trimming what does not fit",
+                    Sizing::Actual => "Print at the size stored in the file (its DPI)",
+                    Sizing::Custom => "Print at a size you type in",
+                });
             }
             match o.sizing {
                 Sizing::Custom => {
                     ui.horizontal(|ui| {
                         let speed = if o.unit == Unit::Cm { 0.1 } else { 0.05 };
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_w).range(0.5..=200.0).speed(speed).max_decimals(2));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_w).range(0.5..=200.0).speed(speed).max_decimals(2)).on_hover_text("Print width");
                         ui.label("x");
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_h).range(0.5..=200.0).speed(speed).max_decimals(2));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.custom_h).range(0.5..=200.0).speed(speed).max_decimals(2)).on_hover_text("Print height");
                         crate::ui::widgets::combo("pr-unit").width(60.0).selected_text(o.unit.label()).show_ui(ui, |ui| {
                             for u in [Unit::Cm, Unit::Inch] {
                                 ui.selectable_value(&mut o.unit, u, u.label());
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Centimeters or inches");
                     });
                     hint(ui, p, "The image is fitted inside this box, keeping its shape.");
                 }
                 Sizing::Actual => {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("When a file has no DPI, use").color(p.muted));
-                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.assume_dpi).range(10.0..=2400.0).suffix(" dpi"));
+                        crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.assume_dpi).range(10.0..=2400.0).suffix(" dpi")).on_hover_text("Pixels per inch to assume; higher prints smaller");
                     });
                 }
                 _ => {}
             }
-            crate::ui::widgets::checkbox(ui, &mut o.center, "Center on the page");
+            crate::ui::widgets::checkbox(ui, &mut o.center, "Center on the page").on_hover_text("Otherwise the image starts at the top-left margin");
         });
         ui.add_space(8.0);
         card(ui, p, I::GRID_NINE, "Layout", |ui| {
@@ -301,18 +308,20 @@ impl PrintWindow {
                     })
                     .show_ui(ui, |ui| {
                         crate::ui::widgets::segmented_value(ui, &mut o.orientation, &[(Orientation::Auto, "Automatic"), (Orientation::Portrait, "Portrait"), (Orientation::Landscape, "Landscape")]);
-                    });
+                    })
+                    .response
+                    .on_hover_text("Paper turned upright or sideways; Automatic follows the image's shape");
                 ui.end_row();
                 ui.label("Margins");
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.margin_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.margin_mm).range(0.0..=60.0).speed(0.5).suffix(" mm")).on_hover_text("Empty space at the paper edges");
                 ui.end_row();
                 if o.per_page > 1 {
                     ui.label("Spacing");
-                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.gap_mm).range(0.0..=60.0).speed(0.5).suffix(" mm"));
+                    crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.gap_mm).range(0.0..=60.0).speed(0.5).suffix(" mm")).on_hover_text("Gap between images on the same page");
                     ui.end_row();
                 }
                 ui.label("Copies");
-                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.copies).range(1..=999));
+                crate::ui::widgets::value_box(ui, egui::DragValue::new(&mut o.copies).range(1..=999)).on_hover_text("How many times each page is printed");
                 ui.end_row();
             });
             hint(ui, p, "Printer, paper size and quality are chosen in the next dialog.");

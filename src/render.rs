@@ -21,6 +21,8 @@ pub const TILE: u32 = 1024;
 pub const GUTTER: u32 = 2;
 /// The coarsest level is at most this big so it fits in one texture.
 pub const TOP_MAX: u32 = 1024;
+/// Most tiles uploaded per frame (see `GpuImage::paint`).
+const MAX_TILE_UPLOADS: usize = 2;
 
 /// Build the halving pyramid for `img` (level 0 is `img` itself).
 pub fn build_pyramid(img: Arc<RgbaImage>) -> Vec<Arc<RgbaImage>> {
@@ -118,9 +120,15 @@ fn tex_options(nearest: bool) -> TextureOptions {
 }
 
 impl GpuImage {
-    pub fn new(ctx: &egui::Context, name: &str, pyramid: Vec<Arc<RgbaImage>>) -> Self {
+    pub fn new(ctx: &egui::Context, name: &str, mut pyramid: Vec<Arc<RgbaImage>>) -> Self {
+        // An empty image (a broken decoder) would make empty textures and
+        // tile ranges that underflow: show one transparent pixel instead.
+        if pyramid.first().is_none_or(|l| l.width() == 0 || l.height() == 0) {
+            pyramid = vec![Arc::new(RgbaImage::new(1, 1))];
+        }
         let width = pyramid[0].width();
         let height = pyramid[0].height();
+        let t0 = Instant::now();
         let levels = pyramid
             .iter()
             .map(|img| {
@@ -141,6 +149,7 @@ impl GpuImage {
             let n = (cols * rows) as usize;
             Level { cols, rows, tiles: vec![None; n], last_used: vec![0; n] }
         };
+        crate::devhook::prof("gpu_new", t0);
         GpuImage { width, height, pyramid, levels, top, nearest0, frame_counter: 0, name: name.to_string() }
     }
 
@@ -168,11 +177,20 @@ impl GpuImage {
         self.frame_counter += 1;
         let li = self.level_for_zoom(zoom);
         let started = Instant::now();
-        let budget = std::time::Duration::from_millis(12);
+        // The copy below is timed; the driver upload of each tile (4 MB plus
+        // mipmaps) happens later when the frame is painted, so the number of
+        // tiles per frame is capped as well. The coarse level fills in meanwhile.
+        let budget = std::time::Duration::from_millis(8);
+        let mut uploads = 0;
         let mut pending = false;
 
         let level_img = self.pyramid[li].clone();
         let (lw, lh) = (level_img.width(), level_img.height());
+        // Nothing to draw for a collapsed or not-yet-laid-out view (NaN or
+        // zero sizes happen for a frame while the window changes display).
+        if lw == 0 || lh == 0 || !dest.is_finite() || !clip.is_finite() || dest.width() <= 0.0 || dest.height() <= 0.0 {
+            return false;
+        }
         let sx = dest.width() / lw as f32;
         let sy = dest.height() / lh as f32;
         let visible = dest.intersect(clip);
@@ -193,8 +211,8 @@ impl GpuImage {
 
         // Center-out ordering so the middle of the screen sharpens first.
         let mut order: Vec<(u32, u32)> = Vec::new();
-        for r in r0..=r1.min(level.rows - 1) {
-            for c in c0..=c1.min(level.cols - 1) {
+        for r in r0..=r1.min(level.rows.saturating_sub(1)) {
+            for c in c0..=c1.min(level.cols.saturating_sub(1)) {
                 order.push((c, r));
             }
         }
@@ -203,7 +221,7 @@ impl GpuImage {
         order.sort_by(|a, b| {
             let da = (a.0 as f32 - cc).powi(2) + (a.1 as f32 - cr).powi(2);
             let db = (b.0 as f32 - cc).powi(2) + (b.1 as f32 - cr).powi(2);
-            da.partial_cmp(&db).unwrap()
+            da.total_cmp(&db)
         });
 
         let opts = tex_options(use_nearest);
@@ -220,7 +238,8 @@ impl GpuImage {
                 Pos2::new(dest.min.x + tx as f32 * sx, dest.min.y + ty as f32 * sy),
                 Pos2::new(dest.min.x + (tx + tw) as f32 * sx, dest.min.y + (ty + th) as f32 * sy),
             );
-            if level.tiles[idx].is_none() && (started.elapsed() < budget || meshes.is_empty() && li == self.pyramid.len() - 1) {
+            if level.tiles[idx].is_none() && (uploads < MAX_TILE_UPLOADS && started.elapsed() < budget || meshes.is_empty() && li == self.pyramid.len() - 1) {
+                uploads += 1;
                 let ci = to_color_image_gutter(&level_img, tx, ty, tw, th, GUTTER);
                 level.tiles[idx] = Some(ctx.load_texture(format!("{}#{li}{tag}/{idx}", self.name), ci, opts));
             }
@@ -246,6 +265,7 @@ impl GpuImage {
             painter.add(egui::Shape::mesh(mesh));
         }
         self.evict(if use_nearest { usize::MAX } else { li });
+        crate::devhook::prof("gpu_paint", started);
         if pending {
             ctx.request_repaint();
         }

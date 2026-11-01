@@ -449,11 +449,7 @@ pub fn pixel_rect(r: [f32; 4]) -> (u32, u32, u32, u32) {
     (x, y, w, h)
 }
 
-/// `v` limited to `lo..=hi` that never panics: an inverted range collapses
-/// to `lo` and NaN bounds are ignored (`f32::clamp` panics on both).
-fn safe_clamp(v: f32, lo: f32, hi: f32) -> f32 {
-    v.max(lo).min(hi.max(lo))
-}
+use crate::ui::safe::safe_clamp;
 
 /// Keep `r` inside an `iw` x `ih` image and at least 1 px in each direction.
 pub fn clamp_rect(r: &mut [f32; 4], iw: f32, ih: f32) {

@@ -170,6 +170,7 @@ impl ThumbService {
                 break;
             }
         }
+        crate::devhook::prof("thumb_upload", started);
         // Mark everything requested before the previous frame as stale; workers
         // skip stale jobs, so fast scrolling never builds a backlog.
         self.shared.min_seq.store(self.seq.saturating_sub(4000), Ordering::Relaxed);
@@ -253,6 +254,7 @@ impl ThumbService {
 }
 
 fn worker(s: Arc<Shared>, tx: Sender<ThumbResult>, ctx: egui::Context, dir: PathBuf) {
+    crate::bg::background_priority();
     loop {
         let job = {
             let mut jobs = s.jobs.lock();
