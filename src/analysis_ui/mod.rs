@@ -24,6 +24,7 @@ pub mod metrics_view;
 pub mod panel;
 pub mod plots;
 pub mod summary;
+pub mod text_view;
 
 #[cfg(feature = "ai")]
 pub mod ai;
@@ -235,6 +236,13 @@ pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Opti
                 let ctx: Vec<String> = core.metrics.metric_context(s, panel.roi_pixels()).iter().map(|(n, v, u)| format!("{n}={v:.4}{u}")).collect();
                 state += &format!(" ai_context=[{}]", ctx.join("; "));
             }
+            return (state, actions);
+        }
+        // `ai text <verb>`: the Text tab (see `TextView::dev`).
+        "text" => {
+            panel.open = true;
+            panel.tab = panel::Tab::Text;
+            let state = panel.text.dev(&core.ctx, rest, &mut actions);
             return (state, actions);
         }
         "close" => panel.open = false,
