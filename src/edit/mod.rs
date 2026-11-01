@@ -110,31 +110,82 @@ pub trait EditTool: Send {
     }
 }
 
+/// Which curves a histogram shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistMode {
+    /// Brightness only.
+    Luminance,
+    /// Red, green and blue.
+    Rgb,
+    /// Brightness behind the three channels.
+    Both,
+}
+
+impl HistMode {
+    pub const ALL: [HistMode; 3] = [HistMode::Luminance, HistMode::Rgb, HistMode::Both];
+    pub fn label(self) -> &'static str {
+        match self {
+            HistMode::Luminance => "Luminance",
+            HistMode::Rgb => "RGB",
+            HistMode::Both => "Both",
+        }
+    }
+    /// Short name for settings files.
+    pub fn key(self) -> &'static str {
+        match self {
+            HistMode::Luminance => "lum",
+            HistMode::Rgb => "rgb",
+            HistMode::Both => "both",
+        }
+    }
+    pub fn from_key(k: &str) -> HistMode {
+        HistMode::ALL.into_iter().find(|m| m.key() == k).unwrap_or(HistMode::Both)
+    }
+}
+
 /// Painting for [`Histogram`] (the data type lives in `lumen_core`).
 pub trait HistogramPaint {
-    fn paint(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool);
+    /// Red, green and blue (see [`HistogramPaint::paint_mode`]).
+    fn paint(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool) {
+        self.paint_mode(painter, rect, dark, HistMode::Rgb);
+    }
+    fn paint_mode(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool, mode: HistMode);
 }
 
 impl HistogramPaint for Histogram {
-    /// Red, green and blue as smoothed, filled areas (45% alpha, so overlaps mix)
-    /// with a 1 pt line on top, on the input-well background with radius 6.
-    fn paint(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool) {
+    /// Channels as smoothed, filled areas (45% alpha, so overlaps mix) with a
+    /// 1 pt line on top, on the input-well background with radius 6.
+    /// Luminance is a neutral area (behind the channels in `Both`).
+    fn paint_mode(&self, painter: &egui::Painter, rect: egui::Rect, dark: bool, mode: HistMode) {
         use egui::Color32;
         let p = crate::ui::theme::palette(painter.ctx());
         painter.rect_filled(rect, 6.0, p.input_bg);
         if self.l.is_empty() {
             return;
         }
+        let shown: Vec<&Vec<u32>> = match mode {
+            HistMode::Luminance => vec![&self.l],
+            HistMode::Rgb => vec![&self.r, &self.g, &self.b],
+            HistMode::Both => vec![&self.l, &self.r, &self.g, &self.b],
+        };
         // The extreme bins (pure black / white) can dwarf everything else: scale
         // to the tallest bin inside them.
-        let max = [&self.r, &self.g, &self.b].iter().flat_map(|d| d.iter().skip(1).take(254)).copied().max().unwrap_or(1).max(1);
+        let max = shown.iter().flat_map(|d| d.iter().skip(1).take(254)).copied().max().unwrap_or(1).max(1);
         let area = rect.shrink2(egui::vec2(4.0, 4.0));
         let line_a = if dark { 230 } else { 255 };
-        for (data, rgb) in [(&self.r, [235, 80, 80]), (&self.g, [80, 200, 120]), (&self.b, [80, 150, 255])] {
-            let bins = tools::smooth_bins(data, max);
-            let fill = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], 115);
-            let line = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], line_a);
+        if mode != HistMode::Rgb {
+            let bins = tools::smooth_bins(&self.l, max);
+            let (fill, line) = if dark { (Color32::from_white_alpha(64), Color32::from_white_alpha(210)) } else { (Color32::from_black_alpha(50), Color32::from_black_alpha(170)) };
             tools::paint_area(painter, area, &bins, fill, line);
+        }
+        if mode != HistMode::Luminance {
+            let alpha = if mode == HistMode::Both { 80 } else { 115 };
+            for (data, rgb) in [(&self.r, [235, 80, 80]), (&self.g, [80, 200, 120]), (&self.b, [80, 150, 255])] {
+                let bins = tools::smooth_bins(data, max);
+                let fill = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], alpha);
+                let line = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], line_a);
+                tools::paint_area(painter, area, &bins, fill, line);
+            }
         }
     }
 }

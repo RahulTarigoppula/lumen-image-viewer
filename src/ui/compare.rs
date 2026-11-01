@@ -1,5 +1,6 @@
 //! Side-by-side comparison of 2-4 images with synchronized zoom/pan, plus
-//! split-slider, flicker and difference modes for pairs.
+//! split-slider and difference modes for pairs, and review tools: marks,
+//! notes, comments and detail regions exported as a report (`review_ui`).
 //!
 //! View model: every pane has a `View`. With the *relative* basis the zoom is a
 //! multiple of the pane's fit zoom and the centre is a normalized image
@@ -13,7 +14,8 @@ use super::icons as I;
 use super::theme::{self, size, text};
 use super::widgets;
 use crate::app::Core;
-use crate::edit::{Histogram, HistogramPaint};
+use super::review_ui::{self, PaneGeo, ReviewUi};
+use crate::edit::{HistMode, Histogram, HistogramPaint};
 use crate::loader::{LoadState, LoadedImage};
 use crate::render::{self, GpuImage};
 use crossbeam_channel::{unbounded, Receiver};
@@ -21,7 +23,6 @@ use egui::{Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Ri
 use image::RgbaImage;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- layout
 
@@ -278,6 +279,8 @@ const SYNC_LABEL: &str = "Sync";
 const HIST_LABEL: &str = "Histogram";
 const EXIF_LABEL: &str = "Camera";
 const SWAP_LABEL: &str = "Swap";
+const MARKUP_LABEL: &str = "Mark up";
+const REVIEW_LABEL: &str = "Review";
 
 /// A toolbar toggle or action: icon and name when `labels`, else the icon.
 fn bar_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, selected: bool, labels: bool) -> egui::Response {
@@ -292,7 +295,6 @@ fn bar_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, selected: bool, l
 pub enum CmpMode {
     SideBySide,
     Split,
-    Flicker,
     Difference,
 }
 
@@ -301,7 +303,6 @@ impl CmpMode {
         match self {
             CmpMode::SideBySide => "Side by side",
             CmpMode::Split => "Split",
-            CmpMode::Flicker => "Flicker",
             CmpMode::Difference => "Difference",
         }
     }
@@ -309,7 +310,6 @@ impl CmpMode {
         match self {
             CmpMode::SideBySide => I::COLUMNS,
             CmpMode::Split => I::SQUARE_SPLIT_HORIZONTAL,
-            CmpMode::Flicker => I::SWAP,
             CmpMode::Difference => I::SUBTRACT_SQUARE,
         }
     }
@@ -317,7 +317,6 @@ impl CmpMode {
         match self {
             CmpMode::SideBySide => "B",
             CmpMode::Split => "W",
-            CmpMode::Flicker => "F",
             CmpMode::Difference => "D",
         }
     }
@@ -336,11 +335,29 @@ enum BarPart {
     Sync,
     /// Zoom out, the zoom percentage and zoom in (Fit stays).
     Zoom,
+    /// Mark up and Review.
+    Review,
 }
 
 impl BarPart {
-    const ALL: [BarPart; 8] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync, BarPart::Zoom];
+    const ALL: [BarPart; 9] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync, BarPart::Zoom, BarPart::Review];
 }
+
+/// What a mode is for, for its tooltip.
+fn mode_tip(m: CmpMode) -> String {
+    let what = match m {
+        CmpMode::SideBySide => "Side by side: every image in its own pane",
+        CmpMode::Split => "Split: A and B in one view with a divider you drag",
+        CmpMode::Difference => "Difference: |A - B|, bright where the images differ",
+    };
+    format!("{what}  ({})", m.key())
+}
+
+/// The modes in toolbar order.
+const MODES: [CmpMode; 3] = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Difference];
+
+/// How compare starts every time: side by side, zoom & pan linked, same field of view.
+pub const START: (CmpMode, bool, Basis) = (CmpMode::SideBySide, true, Basis::Relative);
 
 /// What the toolbar shows at its width (see `Compare::bar_plan`).
 #[derive(Debug)]
@@ -425,10 +442,6 @@ pub struct Compare {
     selected: usize,
     show_hist: bool,
     split: f32,
-    flicker_b: bool,
-    flicker_auto: bool,
-    flicker_secs: f32,
-    last_flip: Instant,
     amp: f32,
     diff: DiffState,
     help: bool,
@@ -447,6 +460,10 @@ pub struct Compare {
     analyze: bool,
     /// A menu or list was open when this frame started.
     popup_open: bool,
+    /// Marks, comments, details and the report export.
+    rv: ReviewUi,
+    /// The Analysis panel was open last frame (one right panel at a time).
+    analysis_was_open: bool,
 }
 
 fn name_of(p: &std::path::Path) -> String {
@@ -472,21 +489,19 @@ impl Compare {
     pub fn new(paths: Vec<PathBuf>, _core: &Core) -> Self {
         let paths: Vec<PathBuf> = paths.into_iter().take(4).collect();
         let panes = paths.iter().map(|p| Pane { path: p.clone(), loaded: None, gpu: None, error: None, hist: None, hist_rx: None, exif: Default::default() }).collect();
-        let views = vec![View::fitted(Basis::Relative); paths.len()];
+        let (mode, sync, basis) = START;
+        let views = vec![View::fitted(basis); paths.len()];
+        let rv = ReviewUi::new(&paths);
         Compare {
             paths,
             panes,
             views,
-            mode: CmpMode::SideBySide,
-            sync: true,
-            basis: Basis::Relative,
+            mode,
+            sync,
+            basis,
             selected: 0,
             show_hist: false,
             split: 0.5,
-            flicker_b: false,
-            flicker_auto: false,
-            flicker_secs: 0.5,
-            last_flip: Instant::now(),
             amp: 4.0,
             diff: DiffState::default(),
             help: false,
@@ -499,7 +514,15 @@ impl Compare {
             deleted: Vec::new(),
             analyze: false,
             popup_open: false,
+            rv,
+            analysis_was_open: false,
         }
+    }
+
+    /// The metrics table for the report (from the Analysis panel), or `None`.
+    #[allow(dead_code)] // Fed by the Analysis panel integration.
+    pub fn set_metrics_table(&mut self, t: Option<lumen_core::report::Table>) {
+        self.rv.metrics = t;
     }
 
     /// Files moved to the Recycle Bin while comparing, since the last call.
@@ -551,6 +574,7 @@ impl Compare {
                 self.panes.remove(i);
                 self.views.remove(i);
                 self.paths.remove(i);
+                self.rv.set_paths(&self.paths);
                 self.deleted.push(path.clone());
                 self.diff = DiffState::default();
                 if self.panes.len() != 2 {
@@ -576,7 +600,30 @@ impl Compare {
             return;
         }
         self.mode = m;
-        self.last_flip = Instant::now();
+        if m == CmpMode::Difference {
+            self.rv.markup = false;
+        }
+    }
+
+    /// Mark up works where each image is drawn in its own geometry.
+    fn markup_allowed(&self) -> bool {
+        !(self.pair_mode() && self.mode == CmpMode::Difference)
+    }
+
+    fn toggle_markup(&mut self, core: &mut Core) {
+        if !self.rv.markup && !self.markup_allowed() {
+            core.toasts.info("Mark up works in Side by side and Split");
+            return;
+        }
+        self.rv.markup = !self.rv.markup;
+    }
+
+    /// The Review panel; it replaces the Analysis panel (one right panel at a time).
+    fn toggle_review(&mut self, core: &mut Core) {
+        self.rv.panel = !self.rv.panel;
+        if self.rv.panel && core.analysis_open {
+            core.analysis_request = Some(crate::analysis_ui::PanelRequest::Toggle);
+        }
     }
 
     // ------------------------------------------------------------ loading
@@ -805,6 +852,20 @@ impl Compare {
         self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, c));
     }
 
+    /// Every pane shows detail `k` (the same fractions of each image).
+    fn zoom_to_detail(&mut self, k: usize, ppp: f32) {
+        let Some(r) = self.rv.review.details.get(k).map(|d| d.rect) else { return };
+        if self.sync && self.basis == Basis::Relative {
+            self.zoom_to_region(0, r, ppp);
+            return;
+        }
+        let sync = std::mem::replace(&mut self.sync, false);
+        for i in 0..self.panes.len() {
+            self.zoom_to_region(i, r, ppp);
+        }
+        self.sync = sync;
+    }
+
     fn pan(&mut self, src: usize, rects: &[Rect], ppp: f32, delta_pt: Vec2) {
         let (Some(d), Some(&r)) = (self.panes.get(src).and_then(|p| p.dims()), rects.get(src)) else { return };
         let fr = self.fit_ref(rects, ppp);
@@ -819,6 +880,7 @@ impl Compare {
         self.panes.remove(i);
         self.views.remove(i);
         self.paths.remove(i);
+        self.rv.set_paths(&self.paths);
         self.selected = self.selected.min(self.panes.len() - 1);
         if self.panes.len() != 2 {
             self.mode = CmpMode::SideBySide;
@@ -830,6 +892,7 @@ impl Compare {
             self.panes.swap(0, 1);
             self.views.swap(0, 1);
             self.paths.swap(0, 1);
+            self.rv.set_paths(&self.paths);
         }
     }
 
@@ -837,11 +900,13 @@ impl Compare {
 
     fn keys(&mut self, ui: &Ui, core: &mut Core, rects: &[Rect], ppp: f32) {
         let take = |k: Key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, k));
-        if self.confirm_delete.is_some() || ui.ctx().egui_wants_keyboard_input() {
-            return; // the confirmation modal (or a text field) owns the keyboard
+        if self.confirm_delete.is_some() || self.rv.dialog_open() || ui.ctx().egui_wants_keyboard_input() {
+            return; // the dialog (or a text field) owns the keyboard
         }
+        // Undo / redo, export, delete the selected mark, Esc out of mark up.
+        let rv_esc = self.rv.keys(ui);
         // Esc with a menu or a list open only closes it (egui does).
-        if !self.popup_open && !egui::Popup::is_any_open(ui.ctx()) && take(Key::Escape) {
+        if !rv_esc && !self.popup_open && !egui::Popup::is_any_open(ui.ctx()) && take(Key::Escape) {
             if self.help {
                 self.help = false;
             } else {
@@ -865,13 +930,9 @@ impl Compare {
                 self.confirm_delete = Some(t);
             }
         }
-        if take(Key::Tab) || take(Key::Space) {
-            if self.mode == CmpMode::Flicker {
-                self.flicker_b = !self.flicker_b;
-                self.last_flip = Instant::now();
-            } else if self.mode == CmpMode::Split {
-                self.split = if self.split < 0.5 { 1.0 } else { 0.0 };
-            }
+        // Space is held to pan while marking up.
+        if self.pair_mode() && self.mode == CmpMode::Split && (take(Key::Tab) || (!self.rv.markup && take(Key::Space))) {
+            self.split = if self.split < 0.5 { 1.0 } else { 0.0 };
         }
         let src = self.selected.min(self.panes.len().saturating_sub(1));
         if take(Key::Plus) || take(Key::Equals) {
@@ -901,7 +962,7 @@ impl Compare {
                 self.pan(src, rects, ppp, Vec2::new(0.0, -step.y));
             }
         }
-        for (k, m) in [(Key::B, CmpMode::SideBySide), (Key::W, CmpMode::Split), (Key::F, CmpMode::Flicker), (Key::D, CmpMode::Difference)] {
+        for (k, m) in [(Key::B, CmpMode::SideBySide), (Key::W, CmpMode::Split), (Key::D, CmpMode::Difference)] {
             if take(k) {
                 self.set_mode(m);
             }
@@ -917,6 +978,12 @@ impl Compare {
         }
         if take(Key::X) {
             self.swap_ab();
+        }
+        if take(Key::M) {
+            self.toggle_markup(core);
+        }
+        if take(Key::C) {
+            self.toggle_review(core);
         }
         if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"))) {
             self.help = !self.help;
@@ -939,6 +1006,42 @@ impl Compare {
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 0)))
             .show(ui, |ui| self.toolbar(ui, core));
 
+        // One right panel at a time: the Analysis panel opening closes Review.
+        if core.analysis_open && !self.analysis_was_open {
+            self.rv.panel = false;
+        }
+        self.analysis_was_open = core.analysis_open;
+        if std::mem::take(&mut self.rv.restored) {
+            core.toasts.info("Your review of these images was restored (marks and comments)");
+        }
+        self.rv.tick(ui.ctx(), &mut core.toasts);
+        if self.rv.panel {
+            let infos: Vec<review_ui::PaneInfo> = (0..self.panes.len()).map(|i| review_ui::PaneInfo { letter: LETTERS[i.min(3)], name: name_of(&self.panes[i].path), color: Self::badge_color(core, i) }).collect();
+            // At most 40% of the window, like the Analysis panel.
+            let max = (ui.ctx().content_rect().width() * 0.4).clamp(280.0, 560.0);
+            let out = egui::Panel::right("compare-review")
+                .resizable(true)
+                .default_size(330.0_f32.min(max))
+                .size_range(280.0..=max)
+                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin { left: 12, right: 4, top: 10, bottom: 8 }))
+                .show(ui, |ui| self.rv.panel(ui, &p, &infos))
+                .inner;
+            if out.close {
+                self.rv.panel = false;
+            }
+            if let Some(k) = out.zoom_detail {
+                self.zoom_to_detail(k, ppp);
+            }
+        }
+        if self.rv.markup && self.markup_allowed() {
+            let dims: Vec<Option<(u32, u32)>> = self.panes.iter().map(|p| p.dims()).collect();
+            egui::Panel::top("compare-markup")
+                .resizable(false)
+                .exact_size(40.0)
+                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 0)))
+                .show(ui, |ui| self.rv.strip(ui, &p, &dims));
+        }
+
         let area = ui.available_rect_before_wrap();
         self.last_area = area;
         let bgc = core.settings.viewer_background;
@@ -949,7 +1052,6 @@ impl Compare {
         self.hover_pane = pointer.and_then(|pos| match self.mode {
             _ if !self.pair_mode() => pane_at(&rects, pos),
             CmpMode::Split => Some(if pos.x < area.min.x + area.width() * self.split { 0 } else { 1 }),
-            CmpMode::Flicker => Some(if self.flicker_b { 1 } else { 0 }),
             _ => None,
         });
         self.keys(ui, core, &rects, ppp);
@@ -970,6 +1072,14 @@ impl Compare {
             self.help_overlay(ui, area);
         }
         self.delete_dialog(ui.ctx(), core);
+        let panes = &self.panes;
+        self.rv.export_dialog(ui.ctx(), &p, || {
+            panes
+                .iter()
+                .enumerate()
+                .map(|(i, pn)| review_ui::ExportSource { letter: LETTERS[i.min(3)], path: pn.path.clone(), image: pn.loaded.as_ref().map(|l| l.decoded.image.clone()), file_size: pn.loaded.as_ref().map(|l| l.file_size).unwrap_or(0) })
+                .collect()
+        });
         if std::mem::take(&mut self.analyze) {
             core.analysis_request = Some(crate::analysis_ui::PanelRequest::Open);
         }
@@ -1010,13 +1120,18 @@ impl Compare {
         }
     }
 
-    fn view_input(&mut self, ui: &Ui, core: &mut Core, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32) {
-        if resp.double_clicked() {
+    fn view_input(&mut self, ui: &Ui, core: &mut Core, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32, geos: &[Option<PaneGeo>]) {
+        // Marking up: the left button draws (Space or the middle button pans).
+        let marking = self.rv.markup && self.markup_allowed() && !ui.input(|i| i.key_down(Key::Space));
+        let hover = if self.pair_mode() { self.hover_pane } else { Some(src) };
+        let draws = marking && self.rv.input(ui, resp, hover, geos);
+        let selecting = !marking || self.rv.tool == review_ui::Tool::Select;
+        if resp.double_clicked() && selecting {
             self.fit_all();
         } else if resp.clicked() {
             self.selected = src;
         }
-        if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
+        if (resp.dragged_by(egui::PointerButton::Primary) && !draws) || resp.dragged_by(egui::PointerButton::Middle) {
             let d = resp.drag_delta();
             if d != Vec2::ZERO {
                 self.pan(src, rects, ppp, d);
@@ -1038,10 +1153,10 @@ impl Compare {
                 self.zoom_step(src, rects, ppp, pinch, anchor);
             }
         }
-        if resp.dragged() {
+        if resp.dragged() && !draws {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
-        // The pane the menu was opened on (in Split / Flicker: the one under the
+        // The pane the menu was opened on (in Split: the one under the
         // pointer then), kept while the pointer moves into the menu.
         if resp.secondary_clicked() {
             self.menu_pane = self.hover_pane.unwrap_or(src);
@@ -1072,7 +1187,7 @@ impl Compare {
             self.analyze = true;
         }
         ui.separator();
-        if item(ui, I::ARROWS_IN, "Fit", "0") {
+        if item(ui, I::ARROWS_IN, "Fit", "/") {
             self.fit_all();
         }
         if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
@@ -1084,8 +1199,29 @@ impl Compare {
         if toggle(ui, self.show_hist, I::CHART_BAR, "Histograms", "G") {
             self.show_hist = !self.show_hist;
         }
+        if self.show_hist {
+            let mode = self.rv.hist_mode();
+            widgets::submenu(ui, I::CHART_BAR, "Histogram shows", |ui| {
+                for m in HistMode::ALL {
+                    if widgets::menu_toggle(ui, mode == m, m.label(), "").clicked() {
+                        self.rv.set_hist_mode(m);
+                        ui.close();
+                    }
+                }
+            });
+        }
         if toggle(ui, self.show_exif, I::CAMERA, "Camera info strip", "H") {
             self.show_exif = !self.show_exif;
+        }
+        ui.separator();
+        if self.markup_allowed() && toggle(ui, self.rv.markup, I::PENCIL_SIMPLE_LINE, "Mark up", "M") {
+            self.toggle_markup(core);
+        }
+        if toggle(ui, self.rv.panel, I::CHAT_TEXT, "Review panel", "C") {
+            self.toggle_review(core);
+        }
+        if item(ui, I::EXPORT, "Export report...", "Ctrl+Shift+E") {
+            self.rv.open_export();
         }
         // Culling on the pane that was right-clicked.
         if pane < self.panes.len() {
@@ -1202,9 +1338,20 @@ impl Compare {
         [core.pal.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][i % 4]
     }
 
+    /// Where each pane's image is drawn (`clips` per pane).
+    fn geos(&self, rects: &[Rect], clips: &[Rect], ppp: f32, fit_ref: f32) -> Vec<Option<PaneGeo>> {
+        (0..self.panes.len())
+            .map(|i| {
+                let (z, c, d) = self.effective(i, rects, ppp, fit_ref)?;
+                Some(PaneGeo { dest: dest_rect(rects[i], ppp, d, z, c), dims: d, clip: *clips.get(i)? })
+            })
+            .collect()
+    }
+
     fn side_by_side(&mut self, ui: &mut Ui, core: &mut Core, rects: &[Rect], ppp: f32) {
         let p = core.pal;
         let fit_ref = self.fit_ref(rects, ppp);
+        let geos = self.geos(rects, rects, ppp, fit_ref);
         let mut remove = None;
         for i in 0..self.panes.len() {
             let rect = rects[i];
@@ -1213,7 +1360,10 @@ impl Compare {
             if zoom.is_none() {
                 self.placeholder(ui, core, i, rect);
             }
-            self.view_input(ui, core, &resp, i, rects, ppp);
+            if let Some(g) = &geos[i] {
+                self.rv.paint(ui, i, g);
+            }
+            self.view_input(ui, core, &resp, i, rects, ppp, &geos);
             // Caption pill; while the pointer is on the pane it makes room in
             // its row for "Keep, reject others" (and the remove button).
             let text = self.caption_text(i, zoom);
@@ -1356,15 +1506,34 @@ impl Compare {
         }
     }
 
-    fn paint_hist(&self, ui: &Ui, _core: &Core, i: usize, rect: Rect) {
+    /// The histogram overlay of pane `i` in the bottom-right of `rect`, with
+    /// its Luminance / RGB / Both switch above it.
+    fn paint_hist(&mut self, ui: &Ui, core: &Core, i: usize, rect: Rect) {
         let r = Rect::from_min_size(Pos2::new(rect.max.x - 222.0, rect.max.y - 104.0), Vec2::new(210.0, 92.0));
         if r.min.x < rect.min.x + 4.0 {
             return;
         }
+        let mode = self.rv.hist_mode();
         match &self.panes[i].hist {
             Some(h) => {
-                ui.painter().rect_filled(r.expand(4.0), CornerRadius::same(8), Color32::from_black_alpha(120));
-                h.paint(ui.painter(), r, true);
+                let chips = Rect::from_min_max(Pos2::new(r.min.x - 4.0, r.min.y - 30.0), Pos2::new(r.max.x + 4.0, r.min.y - 4.0));
+                let bg = Rect::from_min_max(chips.min, r.max + Vec2::splat(4.0));
+                ui.painter().rect_filled(bg, CornerRadius::same(8), Color32::from_black_alpha(150));
+                h.paint_mode(ui.painter(), r, true, mode);
+                let tips = ["Luminance: the brightness of each pixel", "RGB: the red, green and blue channels", "Both: brightness behind the three channels"];
+                let w = (chips.width() - 8.0) / 3.0;
+                for (k, m) in HistMode::ALL.into_iter().enumerate() {
+                    let cr = Rect::from_min_size(Pos2::new(chips.min.x + 4.0 + k as f32 * w, chips.min.y + 4.0), Vec2::new(w - 2.0, chips.height() - 6.0));
+                    let resp = ui.interact(cr, ui.scope_id().with(("cmp-hist-mode", i, k)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let on = m == mode;
+                    let fill = if on { core.pal.accent } else if resp.hovered() { Color32::from_white_alpha(30) } else { Color32::TRANSPARENT };
+                    ui.painter().rect_filled(cr, CornerRadius::same(5), fill);
+                    let fg = if on { theme::text_on(core.pal.accent) } else { Color32::from_white_alpha(220) };
+                    ui.painter().text(cr.center(), Align2::CENTER_CENTER, m.label(), FontId::proportional(11.5), fg);
+                    if resp.on_hover_text(format!("Histogram: {}", tips[k])).clicked() {
+                        self.rv.set_hist_mode(m);
+                    }
+                }
             }
             None if self.panes[i].gpu.is_some() => {
                 egui::Spinner::new().size(16.0).paint_at(ui, Rect::from_center_size(r.center(), Vec2::splat(16.0)));
@@ -1390,9 +1559,15 @@ impl Compare {
                 if zb.is_none() {
                     self.placeholder(ui, core, 1, Rect::from_min_max(Pos2::new(area.center().x, area.min.y), area.max));
                 }
+                let geos = self.geos(rects, &[left, right], ppp, fit_ref);
+                for (i, g) in geos.iter().enumerate() {
+                    if let Some(g) = g {
+                        self.rv.paint(ui, i, g);
+                    }
+                }
                 // Divider + handle (registered after the view so it wins the drag).
                 let handle = Rect::from_center_size(Pos2::new(x, area.center().y), Vec2::new(14.0, area.height()));
-                let hresp = ui.interact(handle, ui.scope_id().with("cmp-split-handle"), Sense::drag());
+                let hresp = ui.interact(handle, ui.scope_id().with("cmp-split-handle"), Sense::drag()).on_hover_text("Drag to move the divider between A and B  (Tab jumps it to one side)");
                 if hresp.hovered() || hresp.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
@@ -1422,34 +1597,8 @@ impl Compare {
                 self.pane_overlays(ui, core, 0, left, cap_a, 0.0);
                 self.pane_overlays(ui, core, 1, right, cap_b, 0.0);
                 if !hresp.dragged() {
-                    self.view_input(ui, core, &resp, 0, rects, ppp);
+                    self.view_input(ui, core, &resp, 0, rects, ppp, &geos);
                 }
-            }
-            CmpMode::Flicker => {
-                if self.flicker_auto {
-                    let el = self.last_flip.elapsed().as_secs_f32();
-                    if el >= self.flicker_secs {
-                        self.flicker_b = !self.flicker_b;
-                        self.last_flip = Instant::now();
-                    }
-                    let left = (self.flicker_secs - self.last_flip.elapsed().as_secs_f32()).max(0.01);
-                    ui.ctx().request_repaint_after(Duration::from_secs_f32(left));
-                }
-                let i = if self.flicker_b { 1 } else { 0 };
-                let z = self.paint_image(ui, core, i, area, area, rects, ppp, fit_ref);
-                if z.is_none() {
-                    self.placeholder(ui, core, i, area);
-                }
-                let t = self.caption_text(i, z);
-                let keep = if self.shows_keep(i, area) { Self::keep_size(ui).x + 8.0 } else { 0.0 };
-                let caption = Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &t, Some((LETTERS[i], Self::badge_color(core, i))), area.width() - 20.0 - keep);
-                let hint = if self.flicker_auto { format!("Auto flicker every {:.1} s", self.flicker_secs) } else { "Tab / Space to switch".to_string() };
-                Self::pill(ui, Pos2::new(area.center().x, area.max.y - if self.show_exif { 40.0 } else { 14.0 }), Align2::CENTER_BOTTOM, &hint, None, area.width() - 20.0);
-                if self.show_hist {
-                    self.paint_hist(ui, core, i, area);
-                }
-                self.pane_overlays(ui, core, i, area, caption, 0.0);
-                self.view_input(ui, core, &resp, i, rects, ppp);
             }
             CmpMode::Difference => {
                 let mut zshow = None;
@@ -1490,7 +1639,7 @@ impl Compare {
                     Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None, area.width() - 20.0);
                 }
                 let src = 0;
-                self.view_input(ui, core, &resp, src, rects, ppp);
+                self.view_input(ui, core, &resp, src, rects, ppp, &[]);
             }
             CmpMode::SideBySide => {}
         }
@@ -1512,9 +1661,10 @@ impl Compare {
         // An icon button, or with `labels` the icon and its name.
         let button = |label: &str, labels: bool| if labels { widgets::labeled_icon_button_width(ui, label) + s } else { icon };
         // One segmented control: equal segments as wide as the widest label.
-        let widest = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference].iter().map(|m| text_w(&mode_label(*m, true), body.clone())).fold(0.0, f32::max);
-        let modes_full = if pair { 4.0 * (widest + 24.0) + 4.0 + s } else { 0.0 };
-        let modes_compact = if pair { 4.0 * (text_w(I::COLUMNS, body.clone()) + 24.0) + 4.0 + s } else { 0.0 };
+        let widest = MODES.iter().map(|m| text_w(&mode_label(*m, true), body.clone())).fold(0.0, f32::max);
+        let n_modes = MODES.len() as f32;
+        let modes_full = if pair { n_modes * (widest + 24.0) + 4.0 + s } else { 0.0 };
+        let modes_compact = if pair { n_modes * (text_w(I::COLUMNS, body.clone()) + 24.0) + 4.0 + s } else { 0.0 };
         let title = text_w("Compare", text::title()) + s;
         let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(text::SMALL)) + s;
         let part = |b: BarPart, labels: bool| -> f32 {
@@ -1535,8 +1685,8 @@ impl Compare {
                     }
                 }
                 BarPart::Zoom => 2.0 * icon + 52.0 + s,
+                BarPart::Review => sep + button(MARKUP_LABEL, labels) + button(REVIEW_LABEL, labels),
                 BarPart::Extras => match self.mode {
-                    CmpMode::Flicker if pair => sep + text_w("Auto", body.clone()) + pad + s + if self.flicker_auto { 150.0 + s } else { 0.0 },
                     CmpMode::Difference if pair => sep + text_w("Amplify", FontId::proportional(12.0)) + s + 170.0 + s,
                     CmpMode::Split if pair => sep + text_w("Divider 100%", FontId::proportional(12.0)) + s,
                     _ => 0.0,
@@ -1613,27 +1763,25 @@ impl Compare {
             }
             // The view modes need exactly two images; with three or four there is
             // only side by side, so no control is shown.
-            const MODES: [CmpMode; 4] = [CmpMode::SideBySide, CmpMode::Split, CmpMode::Flicker, CmpMode::Difference];
             if pair && plan.modes_menu {
                 let r = ui.menu_button(format!("{}  {}", self.mode.icon(), I::CARET_DOWN), |ui| {
                     for m in MODES {
-                        if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).clicked() {
+                        if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).on_hover_text(mode_tip(m)).clicked() {
                             self.set_mode(m);
                             ui.close();
                         }
                     }
                 });
-                r.response.on_hover_text(format!("View: {}", self.mode.label()));
+                r.response.on_hover_text(format!("View: {} (click to change)", self.mode.label()));
             } else if pair {
                 let labels: Vec<String> = MODES.iter().map(|m| mode_label(*m, plan.labels)).collect();
                 let labels: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                let tips: Vec<String> = MODES.iter().map(|m| mode_tip(*m)).collect();
+                let tips: Vec<&str> = tips.iter().map(|s| s.as_str()).collect();
                 let mut idx = MODES.iter().position(|m| *m == self.mode).unwrap_or(0);
-                let r = ui.scope(|ui| widgets::segmented(ui, &mut idx, &labels));
-                if r.inner {
+                if widgets::segmented_with_tips(ui, &mut idx, &labels, &tips) {
                     self.set_mode(MODES[idx]);
                 }
-                let tips: Vec<String> = MODES.iter().map(|m| format!("{}  ({})", m.label(), m.key())).collect();
-                r.response.on_hover_text(tips.join("\n"));
             }
             if shown(BarPart::Sync) {
                 widgets::separator_v(ui);
@@ -1650,7 +1798,9 @@ impl Compare {
                         Basis::Relative => "Match framing",
                         Basis::Pixel => "Match pixels",
                     })
-                    .show_ui(ui, |ui| Self::basis_choices(ui, &mut basis));
+                    .show_ui(ui, |ui| Self::basis_choices(ui, &mut basis))
+                    .response
+                    .on_hover_text("How linked panes line up: the same field of view (framing) or the same pixel scale");
                 self.set_basis(basis);
             }
             widgets::separator_v(ui);
@@ -1663,7 +1813,7 @@ impl Compare {
                 }
                 let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
                 let zl = ui.add_sized([52.0, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
-                if zl.on_hover_text("Click: 100%  (1)").clicked() && !rects.is_empty() {
+                if zl.on_hover_text("Zoom of the selected image. Click for 100% (actual pixels)  (Z)").clicked() && !rects.is_empty() {
                     self.actual_size(&rects, ppp);
                 }
                 if widgets::icon_button(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in  (+)", false).clicked() && !rects.is_empty() {
@@ -1671,7 +1821,7 @@ impl Compare {
                 }
             }
             let fitted = self.views.iter().all(|v| v.fit);
-            if widgets::icon_button(ui, I::ARROWS_IN, "Fit  (0 / double-click)", fitted).clicked() {
+            if widgets::icon_button(ui, I::ARROWS_IN, "Fit the whole image in each pane  (/ or double-click)", fitted).clicked() {
                 self.fit_all();
             }
             if shown(BarPart::Views) {
@@ -1720,8 +1870,15 @@ impl Compare {
                 if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
                     self.help = !self.help;
                 }
-                if !plan.hidden.is_empty() {
-                    ui.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| self.overflow_menu(ui, core, &plan, sel));
+                ui.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| self.overflow_menu(ui, core, &plan, sel)).response.on_hover_text("More: export a report and the tools that do not fit here");
+                if shown(BarPart::Review) {
+                    if bar_button(ui, I::CHAT_TEXT, REVIEW_LABEL, "Review panel: comments, notes and report export  (C)", self.rv.panel, plan.icon_labels).clicked() {
+                        self.toggle_review(core);
+                    }
+                    let tip = if self.markup_allowed() { "Mark up: draw boxes, circles, arrows and details on the images  (M)" } else { "Mark up works in Side by side and Split  (M)" };
+                    if bar_button(ui, I::PENCIL_SIMPLE_LINE, MARKUP_LABEL, tip, self.rv.markup && self.markup_allowed(), plan.icon_labels).clicked() {
+                        self.toggle_markup(core);
+                    }
                 }
                 crate::analysis_ui::toolbar_button(ui, core);
                 widgets::separator_v(ui);
@@ -1730,25 +1887,20 @@ impl Compare {
     }
 
     fn basis_choices(ui: &mut Ui, basis: &mut Basis) {
-        ui.selectable_value(basis, Basis::Relative, "Match framing").on_hover_text("Same relative position/zoom: images of different sizes stay aligned");
+        ui.selectable_value(basis, Basis::Relative, "Match framing").on_hover_text("Same field of view: images of different sizes show the same part of the scene");
         ui.selectable_value(basis, Basis::Pixel, "Match pixels").on_hover_text("Same pixel scale: 100% in one pane is 100% in all");
     }
 
-    /// The flicker timer, the difference gain or the divider position.
+    /// The difference gain or the divider position.
     fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
         match self.mode {
-            CmpMode::Flicker => {
-                widgets::checkbox(ui, &mut self.flicker_auto, "Auto").on_hover_text("Switch between A and B on a timer");
-                if self.flicker_auto {
-                    ui.add(widgets::Slider::new(&mut self.flicker_secs, 0.2..=2.0).suffix(" s").fixed_decimals(1).default_value(0.6).width(90.0).value_width(52.0));
-                }
-            }
             CmpMode::Difference => {
-                ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted));
-                ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(110.0).value_width(52.0));
+                let tip = "Amplify: multiplies the difference so small changes become visible (does not change the numbers)";
+                ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted)).on_hover_text(tip);
+                ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(110.0).value_width(52.0)).on_hover_text(tip);
             }
             CmpMode::Split => {
-                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted));
+                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted)).on_hover_text("Where the divider is; drag it on the image  (Tab jumps it to one side)");
             }
             CmpMode::SideBySide => {}
         }
@@ -1765,13 +1917,26 @@ impl Compare {
             Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
-        for (n, part) in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)).enumerate() {
+        let exporting = self.rv.exporting();
+        let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, "Ctrl+Shift+E")).inner;
+        if r.on_hover_text("Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page").clicked() {
+            self.rv.open_export();
+            ui.close();
+        }
+        for part in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)) {
             let sep = |ui: &mut Ui| {
-                if n > 0 {
-                    ui.separator();
-                }
+                ui.separator();
             };
             match part {
+                BarPart::Review => {
+                    sep(ui);
+                    if item(ui, I::PENCIL_SIMPLE_LINE, "Mark up", "M", Some(self.rv.markup)) {
+                        self.toggle_markup(core);
+                    }
+                    if item(ui, I::CHAT_TEXT, "Review panel", "C", Some(self.rv.panel)) {
+                        self.toggle_review(core);
+                    }
+                }
                 BarPart::Sync => {
                     if item(ui, I::LINK, "Link zoom & pan", "L", Some(self.sync)) {
                         self.toggle_sync();
@@ -1836,7 +2001,7 @@ impl Compare {
                         if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", "-", None) {
                             self.zoom_step(src, &rects, ppp, 0.8, None);
                         }
-                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "1", None) {
+                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "Z", None) {
                             self.actual_size(&rects, ppp);
                         }
                     }
@@ -1847,26 +2012,31 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 17] = [
+        let rows: [(&str, &str); 22] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
-            ("Drag", "Pan"),
+            ("Drag", "Pan (mark up: draw; Space+drag pans)"),
             ("Double-click  or  /", "Fit"),
             ("Z", "100% (selected pane)"),
             ("+ / -  arrows", "Zoom / pan"),
-            ("B  W  F  D", "Side by side · Split · Flicker · Difference"),
-            ("Tab / Space", "Flicker A ↔ B (Split: jump divider)"),
+            ("B  W  D", "Side by side · Split · Difference"),
+            ("Tab / Space", "Split: jump the divider"),
+            ("M", "Mark up: boxes, arrows, pen, details"),
+            ("C", "Review panel: comments and notes"),
+            ("Ctrl+Z  /  Ctrl+Y", "Undo / redo marks"),
+            ("Del", "Delete the selected mark"),
+            ("Ctrl+Shift+E", "Export report (PowerPoint, PDF, web)"),
             ("X", "Swap A and B"),
             ("L", "Link / unlink zoom & pan"),
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),
             ("K", "Keep it, reject the others (red label)"),
-            ("Del", "Move it to the Recycle Bin"),
+            ("Del", "Move it to the Recycle Bin (no mark selected)"),
             ("H", "Camera info strip"),
             ("G", "Histograms"),
             ("?", "This help"),
             ("Esc", "Back"),
         ];
-        let r = Rect::from_center_size(area.center(), Vec2::new(460.0, 60.0 + rows.len() as f32 * 24.0));
+        let r = Rect::from_center_size(area.center(), Vec2::new(480.0, 60.0 + rows.len() as f32 * 24.0));
         let painter = ui.painter();
         painter.rect_filled(r, CornerRadius::same(14), Color32::from_rgba_unmultiplied(18, 19, 22, 240));
         painter.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, Color32::from_white_alpha(26)), egui::StrokeKind::Inside);
@@ -1876,6 +2046,13 @@ impl Compare {
             painter.text(Pos2::new(r.min.x + 22.0, y), Align2::LEFT_CENTER, *k, FontId::proportional(13.0), Color32::from_gray(150));
             painter.text(Pos2::new(r.min.x + 170.0, y), Align2::LEFT_CENTER, *v, FontId::proportional(13.0), Color32::from_gray(235));
         }
+    }
+}
+
+impl Drop for Compare {
+    /// Leaving compare writes the review at once.
+    fn drop(&mut self) {
+        self.rv.save_now();
     }
 }
 
@@ -2070,6 +2247,12 @@ mod tests {
         assert_eq!(pane_at(&rects, Pos2::new(10.0, 830.0)), Some(2));
         assert_eq!(pane_at(&rects, Pos2::new(1190.0, 830.0)), Some(3));
         assert_eq!(pane_at(&rects, Pos2::new(10.0, 10.0)), None);
+    }
+
+    #[test]
+    fn starts_side_by_side_linked_with_same_framing() {
+        assert_eq!(START, (CmpMode::SideBySide, true, Basis::Relative));
+        assert_eq!(MODES, [CmpMode::SideBySide, CmpMode::Split, CmpMode::Difference]);
     }
 
     #[test]
