@@ -1,15 +1,18 @@
-//! Video mode UI: playback, frame-accurate stepping, A/B comparison with
-//! metrics, scopes, frame index timeline and media info.
+//! Video mode UI: playback, frame-accurate stepping, compare of up to four
+//! videos (side by side, wipe, difference) with start points, metrics,
+//! scopes, frame index timeline and media info.
 
 use super::audio::AudioOut;
 use super::engine::{self, Cmd, Event, IndexEntry, MediaInfo, Player, VFrame};
-use super::metrics::{self, FrameMetrics, YuvFrame};
-use super::scopes::{self, Scope};
+use super::metrics::{self, FrameMetrics};
+use super::scopes::{self, HistMode, Scope};
+use super::sync::{self, Loop, View, LETTERS, MAX_VIDEOS};
 use crate::app::Core;
 use crate::ui::commands::Command;
 use crate::ui::icons as I;
 use crate::ui::theme::{self, size, Palette};
 use crate::ui::widgets;
+use crossbeam_channel::{Receiver, TryRecvError};
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use image::RgbaImage;
 use parking_lot::Mutex;
@@ -23,56 +26,109 @@ use std::time::{Duration, Instant};
 pub enum CompareMode {
     SideBySide,
     Wipe,
-    Flicker,
     Difference,
-    Overlay,
-    Checker,
 }
 
 impl CompareMode {
-    const ALL: [CompareMode; 6] = [CompareMode::SideBySide, CompareMode::Wipe, CompareMode::Flicker, CompareMode::Difference, CompareMode::Overlay, CompareMode::Checker];
+    const ALL: [CompareMode; 3] = [CompareMode::SideBySide, CompareMode::Wipe, CompareMode::Difference];
     fn label(self) -> &'static str {
         match self {
             CompareMode::SideBySide => "Side by side",
             CompareMode::Wipe => "Wipe",
-            CompareMode::Flicker => "Flicker A/B",
             CompareMode::Difference => "Difference",
-            CompareMode::Overlay => "Overlay 50%",
-            CompareMode::Checker => "Checkerboard",
-        }
-    }
-    /// The name in the top bar's segmented control.
-    fn short_label(self) -> &'static str {
-        match self {
-            CompareMode::SideBySide => "Side by side",
-            CompareMode::Wipe => "Wipe",
-            CompareMode::Flicker => "Flicker",
-            CompareMode::Difference => "Difference",
-            CompareMode::Overlay => "Overlay",
-            CompareMode::Checker => "Checker",
         }
     }
     fn icon(self) -> &'static str {
         match self {
             CompareMode::SideBySide => I::COLUMNS,
             CompareMode::Wipe => I::SPLIT_HORIZONTAL,
-            CompareMode::Flicker => I::SWAP,
             CompareMode::Difference => I::MINUS_CIRCLE,
-            CompareMode::Overlay => I::STACK_SIMPLE,
-            CompareMode::Checker => I::CHECKERBOARD,
         }
     }
     fn key(self) -> &'static str {
         match self {
             CompareMode::SideBySide => "S",
             CompareMode::Wipe => "W",
-            CompareMode::Flicker => "Tab",
             CompareMode::Difference => "D",
-            CompareMode::Overlay => "O",
-            CompareMode::Checker => "C",
+        }
+    }
+    fn tip(self) -> &'static str {
+        match self {
+            CompareMode::SideBySide => "Side by side: every video in its own pane, showing the same part of the picture; zoom and pan move all of them (S)",
+            CompareMode::Wipe => "Wipe: A left and B right of a divider that follows the mouse; F freezes it, Shift+drag moves it (W, two videos)",
+            CompareMode::Difference => "Difference: black where A and B match, bright where they differ; Gain makes small differences visible (D, two videos)",
         }
     }
 }
+
+/// How the videos move.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SyncMode {
+    /// All play, step and seek together, kept apart by their start points.
+    Linked,
+    /// Only the selected video moves (to find each video's start point).
+    Independent,
+}
+
+/// A result computed off the UI thread, one job at a time: a newer request
+/// waits until the running job is done, which also throttles the work.
+struct Bg<K, T> {
+    key: Option<K>,
+    running: Option<(K, Receiver<T>)>,
+    started: Option<Instant>,
+}
+
+impl<K: PartialEq + Clone + Send + 'static, T: Send + 'static> Bg<K, T> {
+    fn new() -> Self {
+        Bg { key: None, running: None, started: None }
+    }
+
+    /// A finished result, once.
+    fn poll(&mut self) -> Option<T> {
+        let (k, rx) = self.running.as_ref()?;
+        match rx.try_recv() {
+            Ok(v) => {
+                self.key = Some(k.clone());
+                self.running = None;
+                Some(v)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.running = None;
+                None
+            }
+        }
+    }
+
+    /// Start `job` for `key` unless that result is shown or being made, a job
+    /// is running, or the last one started less than `gap` ago.
+    fn request(&mut self, key: K, gap: Duration, ctx: &egui::Context, job: impl FnOnce() -> T + Send + 'static) {
+        if self.key.as_ref() == Some(&key) || self.running.is_some() {
+            return;
+        }
+        if let Some(t) = self.started {
+            if t.elapsed() < gap {
+                ctx.request_repaint_after(gap.saturating_sub(t.elapsed()));
+                return;
+            }
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+            ctx.request_repaint();
+        });
+        self.running = Some((key, rx));
+        self.started = Some(Instant::now());
+    }
+
+    fn reset(&mut self) {
+        self.key = None;
+    }
+}
+
+/// (frame pts, frame pixels, scope, histogram mode): what a scope image shows.
+type ScopeKey = (u64, usize, u8, u8);
 
 struct Source {
     path: PathBuf,
@@ -89,6 +145,10 @@ struct Source {
     index_cancel: Arc<AtomicBool>,
     eof: bool,
     out_size: (u32, u32),
+    /// A new decode size waiting for the window to settle.
+    out_wait: sync::Debounce<(u32, u32)>,
+    /// The decoder copies native planes (for metrics).
+    native_on: bool,
     error: Option<String>,
     /// A seek/step result is expected; when paused, only that frame becomes
     /// current (frames decoded ahead stay queued for stepping).
@@ -97,6 +157,10 @@ struct Source {
     playing_hint: bool,
     /// When the pending seek was sent (drives the "Seeking" badge).
     seek_started: Option<Instant>,
+    /// The start point: where the event being compared begins in this video.
+    start: Option<f64>,
+    scope_job: Bg<ScopeKey, egui::ColorImage>,
+    scope_tex: Option<egui::TextureHandle>,
 }
 
 impl Source {
@@ -134,11 +198,20 @@ impl Source {
             index_cancel: cancel,
             eof: false,
             out_size: out,
+            out_wait: sync::Debounce::default(),
+            native_on: false,
             error: None,
             awaiting: true,
             playing_hint: false,
             seek_started: None,
+            start: None,
+            scope_job: Bg::new(),
+            scope_tex: None,
         })
+    }
+
+    fn name(&self) -> String {
+        crate::ui::viewer::file_name(&self.path)
     }
 
     fn fps(&self) -> f64 {
@@ -165,11 +238,21 @@ impl Source {
                 return last.pts + self.frame_dur();
             }
         }
-        self.info.duration
+        self.info.duration.max(0.0)
+    }
+
+    /// The last moment a seek can target.
+    fn last_pts(&self) -> f64 {
+        (self.duration() - 0.001).max(0.0)
     }
 
     fn frame_count(&self) -> Option<usize> {
         self.index.lock().as_ref().map(|v| v.len())
+    }
+
+    /// The video has played to its end.
+    fn at_end(&self) -> bool {
+        self.eof && self.queue.is_empty()
     }
 
     /// Frame number (0-based) for a timestamp.
@@ -181,7 +264,12 @@ impl Source {
             let i = idx.partition_point(|e| e.pts <= pts + 1e-4);
             return i.saturating_sub(1);
         }
-        (pts * self.fps()).round().max(0.0) as usize
+        let f = (pts * self.fps()).round();
+        if f.is_finite() && f > 0.0 {
+            f as usize
+        } else {
+            0
+        }
     }
 
     fn pts_of(&self, frame: usize) -> f64 {
@@ -198,12 +286,20 @@ impl Source {
     }
 
     fn seek(&mut self, t: f64, exact: bool) {
+        let t = if t.is_finite() { t.clamp(0.0, self.last_pts()) } else { 0.0 };
         self.gen += 1;
         self.queue.clear();
         self.eof = false;
         self.awaiting = true;
         self.seek_started = Some(Instant::now());
         self.player.send(Cmd::Seek { t, exact, gen: self.gen });
+    }
+
+    fn set_native(&mut self, on: bool) {
+        if self.native_on != on {
+            self.native_on = on;
+            self.player.send(Cmd::Native(on));
+        }
     }
 
     fn set_current(&mut self, f: VFrame) {
@@ -237,12 +333,11 @@ impl Source {
         // cache of decoded frames for stepping further back).
         let bytes_per = self.history.front().map(|h| h.rgba.as_raw().len()).unwrap_or(1).max(1);
         let cap = ((160usize << 20) / bytes_per).clamp(8, 240);
+        let cur = self.pts();
         while self.history.len() > cap {
             // Drop the frame farthest from the current position.
-            let cur = self.pts();
-            let first = (self.history.front().unwrap().pts - cur).abs();
-            let last = (self.history.back().unwrap().pts - cur).abs();
-            if first > last {
+            let (Some(front), Some(back)) = (self.history.front(), self.history.back()) else { break };
+            if (front.pts - cur).abs() > (back.pts - cur).abs() {
                 self.history.pop_front();
             } else {
                 self.history.pop_back();
@@ -260,7 +355,7 @@ impl Source {
         // draining, the worker's channel fills and decoding pauses itself.
         const MAX_QUEUE: usize = 8;
         self.playing_hint = playing;
-        if playing && !self.history.is_empty() && self.history.len() > 16 {
+        if playing && self.history.len() > 16 {
             self.history.clear();
         }
         loop {
@@ -293,7 +388,11 @@ impl Source {
                         self.seek_started = None;
                     }
                 }
-                Event::Error(e) => self.error = Some(e),
+                Event::Error(e) => {
+                    self.error = Some(e);
+                    self.awaiting = false;
+                    self.seek_started = None;
+                }
             }
         }
     }
@@ -336,6 +435,40 @@ fn rgba_to_color_image(img: &RgbaImage) -> egui::ColorImage {
     egui::ColorImage::new([w as usize, h as usize], pixels)
 }
 
+/// |A - B| per channel times `gain`, with the mean and largest difference.
+fn diff_image(ia: &RgbaImage, ib: &RgbaImage, gain: f32) -> (egui::ColorImage, f64, f64) {
+    use rayon::prelude::*;
+    let (w, h) = (ia.width().min(ib.width()).max(1), ia.height().min(ib.height()).max(1));
+    if ia.width() == 0 || ib.width() == 0 || ia.height() == 0 || ib.height() == 0 {
+        return (egui::ColorImage::new([1, 1], vec![Color32::BLACK]), 0.0, 0.0);
+    }
+    let rows: Vec<(Vec<Color32>, f64, u8)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut out = Vec::with_capacity(w as usize);
+            let (mut sum, mut max) = (0f64, 0u8);
+            for x in 0..w {
+                let pa = ia.get_pixel(x, y).0;
+                let pb = ib.get_pixel(x, y).0;
+                let d = [pa[0].abs_diff(pb[0]), pa[1].abs_diff(pb[1]), pa[2].abs_diff(pb[2])];
+                max = max.max(d[0].max(d[1]).max(d[2]));
+                sum += (d[0] as f64 + d[1] as f64 + d[2] as f64) / 3.0;
+                let amp = |v: u8| ((v as f32 * gain).min(255.0)) as u8;
+                out.push(Color32::from_rgb(amp(d[0]), amp(d[1]), amp(d[2])));
+            }
+            (out, sum, max)
+        })
+        .collect();
+    let mut px = Vec::with_capacity((w * h) as usize);
+    let (mut sum, mut max) = (0f64, 0u8);
+    for (r, s, m) in rows {
+        px.extend(r);
+        sum += s;
+        max = max.max(m);
+    }
+    (egui::ColorImage::new([w as usize, h as usize], px), sum / (w as f64 * h as f64), max as f64)
+}
+
 struct Clock {
     base_pts: f64,
     started: Instant,
@@ -371,15 +504,49 @@ struct Analysis {
     bit_max: f64,
 }
 
-/// Radius of the A / B badges on the picture (20 pt circles).
-const BADGE_R: f32 = 10.0;
-
-/// A and B colors, the same as Compare's badges (so image and video compare match).
-fn ab_color(p: &Palette, i: usize) -> Color32 {
-    if i == 0 { p.accent } else { Color32::from_rgb(232, 120, 60) }
+/// What a frame save job does with the decoded frames.
+#[derive(Clone)]
+enum SaveTarget {
+    /// PNG files in a folder, with a side-by-side picture when `composite`.
+    Folder { dir: PathBuf, composite: bool },
+    /// The side-by-side picture (or the one frame) to the clipboard.
+    Clipboard,
+    /// PNG files in a review folder, then open them in image Compare.
+    Compare(PathBuf),
 }
 
-/// A round A / B badge: the letter in white on its color, with a soft dark
+/// A finished frame save job.
+struct SaveDone {
+    message: String,
+    /// Frames to open in Compare.
+    open: Option<Vec<PathBuf>>,
+}
+
+/// The Save frames dialog.
+struct SaveDialog {
+    dir: PathBuf,
+    composite: bool,
+}
+
+/// Radius of the letter badges on the picture (20 pt circles).
+const BADGE_R: f32 = 10.0;
+
+/// Gap between panes (points).
+const PANE_GAP: f32 = 2.0;
+
+/// Height of a pane's caption.
+const CAP_H: f32 = 28.0;
+
+/// A-D colors, the same as Compare's badges (so image and video compare match).
+fn letter_color(p: &Palette, i: usize) -> Color32 {
+    [p.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][i % MAX_VIDEOS]
+}
+
+fn letter(i: usize) -> &'static str {
+    LETTERS[i.min(MAX_VIDEOS - 1)]
+}
+
+/// A round letter badge: the letter in white on its color, with a soft dark
 /// ring so it stays visible on bright and dark pictures alike.
 fn paint_badge(painter: &egui::Painter, center: Pos2, label: &str, color: Color32, r: f32) {
     painter.circle_filled(center, r + 1.0, Color32::from_black_alpha(70));
@@ -415,9 +582,36 @@ fn shorten(name: &str, max: usize) -> String {
 /// Playback speeds offered in the transport bar.
 const SPEEDS: [f64; 7] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0];
 
-/// Names of the top bar's Save frame, Scopes and Info buttons (shown when
-/// there is room).
-const RIGHT_LABELS: [&str; 3] = ["Save frame", "Scopes", "Info"];
+/// Video mode's keys, for the keys menu in the top bar.
+const VIDEO_KEYS: [(&str, &str); 27] = [
+    ("Space / K", "Play or pause"),
+    (", / .", "Previous / next frame (the selected video when Independent)"),
+    ("← / →", "Previous / next frame while paused, 1 s while playing"),
+    ("Shift+← / →", "Back / forward 1 s"),
+    ("Ctrl+← / →", "Back / forward 10 s"),
+    ("↓ / ↑", "Back / forward 1 min"),
+    ("Home / End", "First / last frame"),
+    ("PgUp / PgDn", "Previous / next keyframe"),
+    ("G", "Go to a frame or time"),
+    ("[ / ]", "Slower / faster (Backspace: normal speed)"),
+    ("M", "Mute"),
+    ("Ctrl+L", "Repeat a section: start, end, clear"),
+    ("L", "Linked / Independent"),
+    ("Tab", "Select the next video (Independent)"),
+    ("P", "Set start point (selected video; all when Linked)"),
+    ("Shift+Home", "Go to the start points"),
+    ("S / W / D", "Side by side / Wipe / Difference"),
+    ("X", "Swap A and B (two videos)"),
+    ("F", "Freeze the wipe divider"),
+    ("Ctrl+S", "Save the frames of all videos"),
+    ("Ctrl+C", "Copy the frames side by side"),
+    ("0 / 1", "Fit / 100% (double-click toggles)"),
+    ("Wheel / drag", "Zoom at the mouse / pan"),
+    ("F2", "Scopes"),
+    ("I", "Info and metrics"),
+    ("Ctrl+Q", "Analysis panel"),
+    ("Esc", "Back to the browser"),
+];
 
 /// A monospace readout of the transport bar, centered on its digits: a
 /// label centers its line box, which leaves digits above the icons'
@@ -431,6 +625,17 @@ fn readout(ui: &mut Ui, text: String, color: Color32, sense: Sense) -> egui::Res
     }
     let y = rect.center().y - g.mesh_bounds.center().y;
     ui.painter().galley(Pos2::new(rect.min.x + pad, y), g, color);
+    resp
+}
+
+/// A small flat icon button drawn at `rect` (pane captions).
+fn cap_button(ui: &mut Ui, rect: Rect, id: egui::Id, icon: &str, tip: &str, on: bool, p: &Palette) -> egui::Response {
+    let resp = ui.interact(rect, id, Sense::click()).on_hover_text(tip);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(6), ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let color = if on { p.accent } else if resp.hovered() { p.text } else { p.muted };
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), color);
     resp
 }
 
@@ -531,43 +736,47 @@ pub struct VideoMode {
     sources: Vec<Source>,
     audio: Option<AudioOut>,
     audio_error: Option<String>,
+    /// The video whose sound plays.
+    audio_src: usize,
     playing: bool,
     clock: Clock,
     speed: f64,
-    zoom: f32,
-    center: Vec2,
-    auto_fit: bool,
+    view: View,
     mode: CompareMode,
-    offset_frames: i64,
+    sync: SyncMode,
+    /// The video Independent mode moves (and the timeline shows).
+    selected: usize,
     gain: f32,
     wipe_pos: f32,
     wipe_frozen: bool,
-    flicker_b: bool,
-    flicker_auto: bool,
-    flicker_at: Instant,
     show_info: bool,
     show_scopes: bool,
     scope: Scope,
-    scope_tex: Option<(u64, egui::TextureHandle)>,
-    diff_tex: Option<((u64, u64, u32), egui::TextureHandle)>,
+    hist_mode: HistMode,
+    diff: Bg<(u64, u64, u32, (u32, u32)), (egui::ColorImage, f64, f64)>,
+    diff_tex: Option<egui::TextureHandle>,
     diff_stats: Option<(f64, f64)>,
     metrics_now: Option<((u64, u64), FrameMetrics)>,
     metrics_rx: Option<crossbeam_channel::Receiver<((u64, u64), Option<FrameMetrics>)>>,
     analysis: Option<Analysis>,
-    loop_ab: (Option<f64>, Option<f64>),
+    loop_ab: Loop,
+    /// The video whose time the loop is in.
+    loop_lead: usize,
     goto: Option<String>,
-    pixel: Option<(u32, u32)>,
+    /// The hovered point as a fraction of the frame.
+    pixel: Option<(f32, f32)>,
     volume: f32,
     muted: bool,
     scrubbing: bool,
     hover_view: bool,
-    last_out_req: Instant,
     /// The last video that failed to open: (file name, short reason).
     open_error: Option<(String, String)>,
     /// "Close video" in the picture's menu: leave video mode this frame.
     close_requested: bool,
-    pending_swap: Option<(PathBuf, PathBuf, f64)>,
-    snap_rx: Option<crossbeam_channel::Receiver<Result<String, String>>>,
+    snap_rx: Option<Receiver<Result<SaveDone, String>>>,
+    save_dialog: Option<SaveDialog>,
+    /// Frames saved for image Compare, for the app to open.
+    compare_request: Option<Vec<PathBuf>>,
     /// (index entries, columns, per-column bars from `timeline_columns`, built at)
     timeline_cache: Option<(usize, usize, Vec<TimelineColumn>, Instant)>,
     /// Frame number most recently requested by stepping (until it arrives).
@@ -576,17 +785,15 @@ pub struct VideoMode {
     /// focus on Esc before this frame's widgets run, so Esc that only leaves a
     /// field must not also leave video mode.
     was_editing: bool,
-    /// Widget id of the B offset field (last frame), so + and - keep
-    /// shifting B while that field has keyboard focus.
-    offset_field: Option<egui::Id>,
-    /// The B offset field had keyboard focus at the end of the last frame.
-    offset_editing: bool,
-    /// Frames left in which the B offset field's change is ignored (Esc).
-    offset_cancel: u8,
     /// Dev hook only: start time and press count of the current step burst.
     dev_burst: Option<(Instant, u32)>,
     /// A alone decodes native planes for the Analysis panel's Metrics tab.
     metrics_native: bool,
+    /// A's pane in physical pixels (last frame), for 100% from the keyboard.
+    pane_px: Vec2,
+    /// The audio clock's last value and when it changed (a stalled clock
+    /// is ignored).
+    audio_seen: Option<(f64, Instant)>,
 }
 
 impl VideoMode {
@@ -599,112 +806,419 @@ impl VideoMode {
             sources: Vec::new(),
             audio,
             audio_error,
+            audio_src: 0,
             playing: false,
             clock: Clock { base_pts: 0.0, started: Instant::now(), running: false, speed: 1.0 },
             speed: 1.0,
-            zoom: 1.0,
-            center: Vec2::ZERO,
-            auto_fit: true,
-            mode: CompareMode::Wipe,
-            offset_frames: 0,
+            view: View::default(),
+            mode: CompareMode::SideBySide,
+            sync: SyncMode::Linked,
+            selected: 0,
             gain: 4.0,
             wipe_pos: 0.5,
             wipe_frozen: false,
-            flicker_b: false,
-            flicker_auto: false,
-            flicker_at: Instant::now(),
             show_info: false,
             show_scopes: false,
             scope: Scope::Waveform,
-            scope_tex: None,
+            hist_mode: HistMode::Both,
+            diff: Bg::new(),
             diff_tex: None,
             diff_stats: None,
             metrics_now: None,
             metrics_rx: None,
             analysis: None,
-            loop_ab: (None, None),
+            loop_ab: Loop::default(),
+            loop_lead: 0,
             goto: None,
             pixel: None,
             volume: 1.0,
             muted: false,
             scrubbing: false,
             hover_view: false,
-            last_out_req: Instant::now(),
             open_error: None,
             close_requested: false,
-            pending_swap: None,
             snap_rx: None,
+            save_dialog: None,
+            compare_request: None,
             timeline_cache: None,
             pending_step: None,
             was_editing: false,
-            offset_field: None,
-            offset_editing: false,
-            offset_cancel: 0,
             dev_burst: None,
             metrics_native: false,
+            pane_px: Vec2::new(1280.0, 720.0),
+            audio_seen: None,
         };
-        for p in paths.into_iter().take(2) {
+        for p in paths.into_iter().take(MAX_VIDEOS) {
             vm.add_source(&p, &core.ctx);
         }
         vm
     }
 
-    /// Open `path` as A (or as B when A is open). A failure is kept in
+    /// Frames saved by "Open frames in Compare", for the app to open in
+    /// image Compare (once).
+    pub fn take_compare_request(&mut self) -> Option<Vec<PathBuf>> {
+        self.compare_request.take()
+    }
+
+    /// Add `path` as the next video (A, B, C, D). A failure is kept in
     /// `open_error` for the empty view's card (or a toast, see `ui`).
-    fn add_source(&mut self, path: &Path, ctx: &egui::Context) {
-        if self.sources.len() >= 2 {
-            self.sources.truncate(1);
+    fn add_source(&mut self, path: &Path, ctx: &egui::Context) -> bool {
+        if self.sources.len() >= MAX_VIDEOS {
+            return false;
         }
-        let audio = if self.sources.is_empty() { self.audio.as_ref().map(|a| a.shared.clone()) } else { None };
+        let first = self.sources.is_empty();
+        let audio = if first { self.audio_shared() } else { None };
         match Source::open(path, audio, ctx) {
             Ok(mut s) => {
                 self.open_error = None;
-                if self.sources.len() == 1 {
-                    // B renders at A's output size so pixels line up.
-                    s.player.send(Cmd::Native(true));
-                    self.sources[0].player.send(Cmd::Native(true));
-                    let t = self.sources[0].pts() + self.offset_secs_for(&s);
+                if first {
+                    self.audio_src = 0;
+                } else {
+                    // A new video joins at A's moment (it has no start point yet).
+                    let t = self.sources[0].pts();
                     s.seek(t, true);
+                    if self.playing {
+                        self.pause();
+                    }
                 }
                 self.sources.push(s);
-                self.auto_fit = true;
+                if self.sources.len() != 2 {
+                    self.mode = CompareMode::SideBySide;
+                }
+                self.view = View::default();
+                self.update_native();
+                true
             }
             Err(e) => {
                 let name = crate::ui::viewer::file_name(path);
                 self.open_error = Some((if name.is_empty() { path.display().to_string() } else { name }, open_reason(&e)));
+                false
             }
         }
     }
 
-    fn offset_secs_for(&self, b: &Source) -> f64 {
-        self.offset_frames as f64 * b.frame_dur()
+    /// Add videos from a file dialog, up to four in all.
+    fn pick_videos(&mut self, ctx: &egui::Context) {
+        let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
+        if let Some(files) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_files() {
+            self.add_paths(files, ctx);
+        }
     }
 
-    fn offset_secs(&self) -> f64 {
-        self.sources.get(1).map(|b| self.offset_secs_for(b)).unwrap_or(0.0)
+    /// Add `paths` to the open videos; more than fit replace them.
+    fn add_paths(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.sources.len() + paths.len() > MAX_VIDEOS {
+            self.clear_sources();
+        }
+        for p in paths.into_iter().take(MAX_VIDEOS) {
+            self.add_source(&p, ctx);
+        }
+    }
+
+    fn clear_sources(&mut self) {
+        self.pause();
+        self.sources.clear();
+        self.audio_src = 0;
+        self.selected = 0;
+        self.loop_ab = Loop::default();
+        self.analysis = None;
+        self.metrics_now = None;
+        self.mode = CompareMode::SideBySide;
+        if let Some(a) = self.audio_shared() {
+            a.flush();
+        }
+    }
+
+    /// Close video `i`; the others keep their letters' order.
+    fn remove_source(&mut self, i: usize) {
+        if i >= self.sources.len() {
+            return;
+        }
+        self.pause();
+        self.sources.remove(i);
+        let n = self.sources.len();
+        if i == self.audio_src {
+            if let Some(a) = self.audio_shared() {
+                a.flush();
+            }
+            self.audio_src = 0;
+            if n > 0 {
+                if let Some(a) = self.audio_shared() {
+                    self.sources[0].player.send(Cmd::Audio(Some(a)));
+                    let t = self.sources[0].pts();
+                    self.sources[0].seek(t, true);
+                }
+            }
+        } else if i < self.audio_src {
+            self.audio_src -= 1;
+        }
+        if self.selected > i || self.selected >= n {
+            self.selected = self.selected.saturating_sub(1);
+        }
+        if self.loop_lead == i {
+            self.loop_ab = Loop::default();
+            self.loop_lead = 0;
+        } else if self.loop_lead > i {
+            self.loop_lead -= 1;
+        }
+        if i < 2 {
+            self.analysis = None;
+            self.metrics_now = None;
+        }
+        if n != 2 {
+            self.mode = CompareMode::SideBySide;
+        }
+        if n < 2 {
+            self.sync = SyncMode::Linked;
+        }
+        self.diff.reset();
+        self.update_native();
+    }
+
+    /// Native planes for metrics: A and B when comparing, A alone while the
+    /// Metrics tab is open.
+    fn update_native(&mut self) {
+        let n = self.sources.len();
+        let single = self.metrics_native;
+        for (i, s) in self.sources.iter_mut().enumerate() {
+            s.set_native(if n >= 2 { i < 2 } else { single });
+        }
+    }
+
+    /// Play the sound of video `k`.
+    fn set_audio_source(&mut self, k: usize) {
+        if k == self.audio_src || k >= self.sources.len() {
+            return;
+        }
+        let Some(a) = self.audio_shared() else { return };
+        let was = self.playing;
+        if was {
+            self.pause();
+        }
+        a.flush();
+        if let Some(old) = self.sources.get(self.audio_src) {
+            old.player.send(Cmd::Audio(None));
+        }
+        self.audio_src = k;
+        let s = &mut self.sources[k];
+        s.player.send(Cmd::Audio(Some(a)));
+        // Decode its current frame again so the sound starts there.
+        let t = s.pts();
+        s.seek(t, true);
+        if was {
+            self.play();
+        }
     }
 
     fn audio_shared(&self) -> Option<Arc<super::audio::AudioShared>> {
         self.audio.as_ref().map(|a| a.shared.clone())
     }
 
+    // ---------------------------------------------------------------- sync
+
+    /// The video whose time drives playback, the timeline and stepping.
+    fn lead(&self) -> usize {
+        if self.sync == SyncMode::Linked || self.sources.len() <= 1 {
+            0
+        } else {
+            self.selected.min(self.sources.len() - 1)
+        }
+    }
+
+    /// The videos that move: all when linked, else the selected one.
+    fn members(&self) -> Vec<usize> {
+        if self.sync == SyncMode::Linked {
+            (0..self.sources.len()).collect()
+        } else {
+            vec![self.lead()]
+        }
+    }
+
+    fn starts(&self) -> Vec<Option<f64>> {
+        self.sources.iter().map(|s| s.start).collect()
+    }
+
+    /// Seconds each video runs ahead of A when linked.
+    fn offsets(&self) -> Vec<f64> {
+        sync::offsets(&self.starts())
+    }
+
+    /// Where video `i` should be when the lead is at `t`.
+    fn target_of(&self, t: f64, i: usize) -> f64 {
+        if self.sync == SyncMode::Linked {
+            sync::target(t, self.lead(), i, &self.offsets())
+        } else {
+            t
+        }
+    }
+
+    /// B's offset in B frames (whole-file analysis, Metrics tab).
+    fn offset_frames_b(&self) -> i64 {
+        match self.sources.get(1) {
+            Some(b) => sync::offset_frames(self.offsets().get(1).copied().unwrap_or(0.0), b.fps()),
+            None => 0,
+        }
+    }
+
+    fn any_start(&self) -> bool {
+        self.sources.iter().any(|s| s.start.is_some())
+    }
+
+    fn set_sync(&mut self, sync: SyncMode, core: &mut Core) {
+        if sync == self.sync || self.sources.len() < 2 {
+            return;
+        }
+        self.pause();
+        self.pending_step = None;
+        match sync {
+            SyncMode::Linked => {
+                // A video without a start point starts at the frame it shows,
+                // so the alignment just made is kept.
+                for s in &mut self.sources {
+                    if s.start.is_none() {
+                        s.start = Some(s.pts());
+                    }
+                }
+                let sel = self.selected.min(self.sources.len() - 1);
+                let t_sel = self.sources[sel].pts();
+                self.sync = SyncMode::Linked;
+                // The selected video stays; the others line up with it.
+                let t = sync::target(t_sel, sel, 0, &self.offsets());
+                self.seek_all(t, true);
+                core.toasts.info("Linked: the videos play together from their start points");
+            }
+            SyncMode::Independent => {
+                self.sync = SyncMode::Independent;
+                core.toasts.info(format!("Independent: click a video, then step it with , and . (moving {} now)", letter(self.lead())));
+            }
+        }
+    }
+
+    fn toggle_sync(&mut self, core: &mut Core) {
+        let next = if self.sync == SyncMode::Linked { SyncMode::Independent } else { SyncMode::Linked };
+        self.set_sync(next, core);
+    }
+
+    /// Select video `i` (Independent mode moves it, the timeline shows it).
+    fn select(&mut self, i: usize) {
+        if i < self.sources.len() && i != self.selected {
+            self.selected = i;
+            self.pending_step = None;
+            if self.sync == SyncMode::Independent {
+                self.pause();
+                self.clock.base_pts = self.sources[i].pts();
+            }
+        }
+    }
+
+    /// Start point of video `i` at its current frame.
+    fn set_start(&mut self, i: usize, core: &mut Core) {
+        let Some(s) = self.sources.get_mut(i) else { return };
+        let t = s.pts();
+        s.start = Some(t);
+        let f = s.frame_of(t);
+        core.toasts.info(format!("{} starts at {} (frame {f})", letter(i), fmt_time(t)));
+        self.analysis = None;
+    }
+
+    /// The selected video's start point when Independent, every video's
+    /// when Linked (their frames on screen are already in step).
+    fn set_start_here(&mut self, core: &mut Core) {
+        if self.sources.len() <= 1 || self.sync == SyncMode::Linked {
+            self.set_all_starts(core);
+        } else {
+            self.set_start(self.lead(), core);
+        }
+    }
+
+    fn set_all_starts(&mut self, core: &mut Core) {
+        if self.sources.is_empty() {
+            return;
+        }
+        for s in &mut self.sources {
+            s.start = Some(s.pts());
+        }
+        self.analysis = None;
+        let list: Vec<String> = self.sources.iter().enumerate().map(|(i, s)| format!("{} {}", letter(i), fmt_time(s.pts()))).collect();
+        core.toasts.info(format!("Start points set: {}", list.join(", ")));
+    }
+
+    fn clear_starts(&mut self) {
+        for s in &mut self.sources {
+            s.start = None;
+        }
+        self.analysis = None;
+    }
+
+    /// Every video to its start point (its first frame without one).
+    fn go_to_starts(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        self.pause();
+        self.pending_step = None;
+        for s in &mut self.sources {
+            let t = s.start.unwrap_or(0.0);
+            s.seek(t, true);
+        }
+        let lead = self.lead();
+        self.clock.base_pts = self.sources[lead].start.unwrap_or(0.0);
+    }
+
+    // ---------------------------------------------------------------- playback
+
+    /// The loop in the lead's time (None when there is none or it belongs to
+    /// a video that is not moving).
+    fn loop_in_lead(&self) -> Option<Loop> {
+        self.loop_ab.a?;
+        let lead = self.lead();
+        if self.loop_lead == lead {
+            return Some(self.loop_ab);
+        }
+        if self.sync != SyncMode::Linked || self.loop_lead >= self.sources.len() {
+            return None;
+        }
+        let offs = self.offsets();
+        let conv = |x: Option<f64>| x.map(|x| sync::target(x, self.loop_lead, lead, &offs));
+        Some(Loop { a: conv(self.loop_ab.a), b: conv(self.loop_ab.b) })
+    }
+
     fn play(&mut self) {
         if self.sources.is_empty() {
             return;
         }
-        if self.sources[0].eof && self.sources[0].queue.is_empty() {
+        let lead = self.lead();
+        let members = self.members();
+        let mut at = if self.sources[lead].awaiting { self.clock.base_pts } else { self.sources[lead].pts() };
+        let fd = self.sources[lead].frame_dur();
+        let looped = self.loop_in_lead();
+        if let Some(a) = looped.and_then(|l| l.play_from(at, fd)) {
+            // Outside the repeated section: start at its beginning.
+            self.seek_all(a, true);
+            at = a;
+        } else if members.iter().all(|&i| self.sources[i].at_end()) {
             // Restart from the beginning when at the end.
-            self.seek_all(0.0, true);
+            let t = looped.and_then(|l| l.a).unwrap_or(0.0);
+            self.seek_all(t, true);
+            at = t;
         }
         self.playing = true;
-        let at = self.sources[0].pts();
         self.clock.speed = self.speed;
         self.clock.start(at);
-        for s in &mut self.sources {
-            s.player.send(Cmd::Play);
+        for &i in &members {
+            self.sources[i].player.send(Cmd::Play);
         }
+        self.update_audio_playing();
+    }
+
+    /// Sound plays at normal speed while its video moves.
+    fn update_audio_playing(&self) {
         if let Some(a) = self.audio_shared() {
-            a.playing.store((self.speed - 1.0).abs() < 1e-6, Ordering::Relaxed);
+            let on = self.playing && (self.speed - 1.0).abs() < 1e-6 && self.members().contains(&self.audio_src);
+            a.playing.store(on, Ordering::Relaxed);
         }
     }
 
@@ -737,40 +1251,43 @@ impl VideoMode {
             Command::NextFrame => self.step(1),
             Command::PrevFrame => self.step(-1),
             Command::ToggleInfo => self.show_info = !self.show_info,
-            Command::ZoomFit => self.auto_fit = true,
+            Command::ZoomFit => self.view = View::default(),
             Command::ZoomActual => {
-                self.auto_fit = false;
-                self.zoom = 1.0;
+                // One pixel of A per screen pixel.
+                if let Some(s) = self.sources.first() {
+                    self.view = self.view.actual(s.display_size(), self.pane_px);
+                }
             }
             _ => return false,
         }
         true
     }
 
+    /// Seek the moving videos so the lead is at `t`.
     fn seek_all(&mut self, t: f64, exact: bool) {
+        if self.sources.is_empty() {
+            return;
+        }
         self.pending_step = None;
         let was = self.playing;
         if was {
             self.pause();
         }
-        let off = self.offset_secs();
-        let dur = self.sources.first().map(|s| s.duration()).unwrap_or(0.0);
-        let t = t.clamp(0.0, (dur - 0.001).max(0.0));
-        for (i, s) in self.sources.iter_mut().enumerate() {
-            let target = if i == 0 { t } else { t + off };
-            s.seek(target.max(0.0), exact);
+        let lead = self.lead();
+        let t = if t.is_finite() { t.clamp(0.0, self.sources[lead].last_pts()) } else { 0.0 };
+        for i in self.members() {
+            let ti = self.target_of(t, i);
+            self.sources[i].seek(ti, exact);
         }
         self.clock.base_pts = t;
         if was && exact {
-            // Resume after the seek lands.
+            // Resume once the seek lands (the clock waits for it).
             self.playing = true;
             self.clock.start(t);
-            for s in &mut self.sources {
-                s.player.send(Cmd::Play);
+            for i in self.members() {
+                self.sources[i].player.send(Cmd::Play);
             }
-            if let Some(a) = self.audio_shared() {
-                a.playing.store(true, Ordering::Relaxed);
-            }
+            self.update_audio_playing();
         }
     }
 
@@ -788,19 +1305,23 @@ impl VideoMode {
             let b = self.dev_burst.get_or_insert((Instant::now(), 0));
             b.1 += 1;
         }
-        let cur = self.sources[0].pts();
+        let lead = self.lead();
+        let cur = self.sources[lead].pts();
         // Rapid key presses: step from the frame already requested, not from
         // the frame still on screen, so every press counts.
-        let cur_frame = self.pending_step.filter(|_| self.sources[0].awaiting).unwrap_or(self.sources[0].frame_of(cur)) as i64;
-        let target_frame = (cur_frame + delta).max(0) as usize;
+        let cur_frame = self.pending_step.filter(|_| self.sources[lead].awaiting).unwrap_or(self.sources[lead].frame_of(cur)) as i64;
+        let mut target_frame = (cur_frame + delta).max(0) as usize;
+        if let Some(n) = self.sources[lead].frame_count() {
+            target_frame = target_frame.min(n.saturating_sub(1));
+        }
         self.pending_step = Some(target_frame);
-        let target = self.sources[0].pts_of(target_frame);
-        let off = self.offset_secs();
-        for (i, s) in self.sources.iter_mut().enumerate() {
-            let t = if i == 0 { target } else { target + off };
+        let target = self.sources[lead].pts_of(target_frame);
+        for i in self.members() {
+            let t = self.target_of(target, i).max(0.0);
+            let s = &mut self.sources[i];
             if delta == 1 {
                 if let Some(next) = s.queue.pop_front() {
-                    if (next.pts - t).abs() < 1e-3 || i == 0 {
+                    if (next.pts - t).abs() < 1e-3 || i == lead {
                         s.set_current(next);
                         continue;
                     }
@@ -818,41 +1339,99 @@ impl VideoMode {
             }
             s.seek(t, true);
         }
+        self.clock.base_pts = target;
     }
 
-    /// Save (or copy) the displayed frame of A at native resolution. The decode
-    /// runs on a background thread; the result is reported by `poll_snapshot`.
-    fn snapshot(&mut self, copy: bool, _core: &mut Core) {
-        let Some(s) = self.sources.first() else { return };
-        let pts = s.pts();
-        let target = if copy {
-            None
-        } else {
-            let frame = s.frame_of(pts);
-            let stem = s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let mut dlg = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{stem}_frame{frame:06}.png"));
-            // Not the video's own folder: it is often read-only or a media library.
-            if let Some(d) = last_snapshot_dir().or_else(dirs::picture_dir) {
-                dlg = dlg.set_directory(d);
+    fn advance_playback(&mut self, ctx: &egui::Context) {
+        if !self.playing || self.sources.is_empty() {
+            return;
+        }
+        let lead = self.lead();
+        let members = self.members();
+        // While a moving video is still seeking (after a jump or a loop) the
+        // clock waits, so the frames it lands on are not already late.
+        let seeking = members.iter().any(|&i| {
+            let s = &self.sources[i];
+            s.awaiting && s.seek_started.map(|t| t.elapsed() < Duration::from_secs(2)).unwrap_or(false)
+        });
+        if seeking {
+            let at = self.clock.base_pts;
+            self.clock.start(at);
+            ctx.request_repaint_after(Duration::from_millis(5));
+            return;
+        }
+        let mut t = self.clock.now();
+        // Prefer the audio clock (keeps sound and picture in sync), else the
+        // system clock. Only while the sounding video moves and has not ended.
+        let k = self.audio_src;
+        let audio_ok = (self.speed - 1.0).abs() < 1e-6 && members.contains(&k) && k < self.sources.len() && !self.sources[k].at_end();
+        let raw = self.audio_shared().filter(|_| audio_ok).and_then(|a| a.clock());
+        // A sound track that ended before the picture stops its clock: the
+        // picture then follows the system clock instead of freezing.
+        let stalled = match (raw, self.audio_seen) {
+            (Some(v), Some((old, at))) if v == old => at.elapsed() > Duration::from_millis(150),
+            (Some(v), _) => {
+                self.audio_seen = Some((v, Instant::now()));
+                false
             }
-            match dlg.save_file() {
-                Some(p) => {
-                    if let Some(d) = p.parent() {
-                        remember_snapshot_dir(d);
-                    }
-                    Some(p)
-                }
-                None => return,
-            }
+            (None, _) => false,
         };
-        let path = s.path.clone();
+        if let Some(ac) = raw.filter(|_| !stalled) {
+            // The sound is in its own video's time.
+            let ac = ac - (self.target_of(0.0, k) - self.target_of(0.0, lead));
+            if ac.is_finite() && (ac - t).abs() < 1.0 {
+                t = ac;
+                // Keep the system clock aligned so a fallback is seamless.
+                self.clock.start(ac);
+            }
+        }
+        let ended = members.iter().all(|&i| self.sources[i].at_end());
+        // A-B loop: back to A after B's frame (or when the videos end).
+        if let Some(l) = self.loop_in_lead() {
+            if l.wrap_due(t, self.sources[lead].frame_dur(), ended || self.sources[lead].at_end()) {
+                if let Some(a) = l.a {
+                    self.seek_all(a, true);
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+        }
+        let mut next_due: Option<f64> = None;
+        for &i in &members {
+            let target = self.target_of(t, i);
+            let s = &mut self.sources[i];
+            let half = s.frame_dur() * 0.5;
+            while s.queue.front().map(|f| f.pts <= target + half).unwrap_or(false) {
+                if let Some(f) = s.queue.pop_front() {
+                    s.set_current(f);
+                }
+            }
+            if let Some(f) = s.queue.front() {
+                let due = f.pts - half - target;
+                next_due = Some(next_due.map(|d| d.min(due)).unwrap_or(due));
+            }
+        }
+        if ended {
+            self.pause();
+            return;
+        }
+        let wait = next_due.unwrap_or(0.005).clamp(0.001, 0.05) / self.speed.max(0.1);
+        ctx.request_repaint_after(Duration::from_secs_f64(if wait.is_finite() { wait } else { 0.005 }));
+    }
+
+    // ---------------------------------------------------------------- frames
+
+    /// Decode the frame on screen of every video at native resolution on a
+    /// background thread, then save, copy or hand it to Compare (see
+    /// `SaveTarget`); `poll_snapshot` reports the result.
+    fn save_frames(&mut self, target: SaveTarget) {
+        if self.sources.is_empty() || self.snap_rx.is_some() {
+            return;
+        }
+        let items: Vec<(PathBuf, f64, String)> = self.sources.iter().map(|s| (s.path.clone(), s.pts(), s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())).collect();
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            let res = engine::frame_at(&path, pts).map_err(|e| e.to_string()).and_then(|img| match &target {
-                Some(p) => img.save(p).map(|_| format!("Saved {}", p.display())).map_err(|e| e.to_string()),
-                None => crate::fileops::copy_image_to_clipboard(&img).map(|_| "Frame copied to clipboard".to_string()).map_err(|e| e.to_string()),
-            });
-            let _ = tx.send(res);
+            let _ = tx.send(save_frames_job(&items, &target));
         });
         self.snap_rx = Some(rx);
     }
@@ -860,17 +1439,92 @@ impl VideoMode {
     fn poll_snapshot(&mut self, core: &mut Core) {
         let Some(rx) = &self.snap_rx else { return };
         match rx.try_recv() {
-            Ok(Ok(msg)) => {
-                core.toasts.success(msg);
+            Ok(Ok(done)) => {
+                core.toasts.success(done.message);
                 self.snap_rx = None;
+                if let Some(paths) = done.open {
+                    self.pause();
+                    self.compare_request = Some(paths);
+                }
             }
             Ok(Err(e)) => {
                 core.toasts.error(e);
                 self.snap_rx = None;
             }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => self.snap_rx = None,
+            Err(TryRecvError::Disconnected) => self.snap_rx = None,
             Err(_) => core.ctx.request_repaint_after(Duration::from_millis(100)),
         }
+    }
+
+    /// Open the Save frames dialog (folder: the last one used, else next
+    /// to the videos, else Pictures).
+    fn open_save_dialog(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        let beside = self.sources[0].path.parent().map(Path::to_path_buf).filter(|d| dir_writable(d));
+        let dir = last_snapshot_dir().or(beside).or_else(dirs::picture_dir).unwrap_or_else(|| PathBuf::from("."));
+        self.save_dialog = Some(SaveDialog { dir, composite: self.sources.len() > 1 });
+    }
+
+    fn save_dialog_ui(&mut self, ctx: &egui::Context, core: &mut Core) {
+        let Some(dlg) = &mut self.save_dialog else { return };
+        let p = core.pal;
+        let names = sync::frame_file_names(&self.sources.iter().map(|s| (s.path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), s.pts())).collect::<Vec<_>>());
+        let n = self.sources.len();
+        let mut result = None;
+        let mut pick = false;
+        widgets::modal(ctx, egui::Id::unique("video-save-frames"), 460.0, |ui| {
+            widgets::modal_title(ui, if n == 1 { "Save frame" } else { "Save frames" });
+            widgets::modal_body(ui, if n == 1 { "Saves the frame on screen as a PNG at the video's full resolution." } else { "Saves the frame on screen of every video as a PNG at its full resolution." });
+            ui.add_space(8.0);
+            for (i, name) in names.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(letter(i)).strong().color(letter_color(&p, i)));
+                    ui.add(egui::Label::new(RichText::new(name).size(12.0)).truncate());
+                });
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Folder").color(p.muted));
+                let shown = widgets::elide_start(ui, &dlg.dir.display().to_string(), theme::text::body(), (ui.available_width() - 110.0).max(60.0));
+                ui.label(shown).on_hover_text(dlg.dir.display().to_string());
+                if widgets::secondary_button(ui, "Change...").on_hover_text("Choose the folder for the frames").clicked() {
+                    pick = true;
+                }
+            });
+            if n > 1 {
+                ui.add_space(4.0);
+                widgets::checkbox(ui, &mut dlg.composite, "Also save one picture with all videos side by side").on_hover_text("One PNG with the frames next to each other (2x2 for four videos), scaled to the same height");
+            }
+            if let Some(ok) = widgets::dialog_buttons(ui, &p, "Cancel", "Save", widgets::ButtonKind::Primary, true) {
+                result = Some(ok);
+            }
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                result = Some(false);
+            }
+        });
+        if pick {
+            if let Some(d) = rfd::FileDialog::new().set_directory(&dlg.dir).pick_folder() {
+                dlg.dir = d;
+            }
+        }
+        match result {
+            Some(true) => {
+                let dlg = self.save_dialog.take().unwrap();
+                remember_snapshot_dir(&dlg.dir);
+                self.save_frames(SaveTarget::Folder { dir: dlg.dir, composite: dlg.composite && n > 1 });
+            }
+            Some(false) => self.save_dialog = None,
+            None => {}
+        }
+    }
+
+    /// Save the frames for review and open them in image Compare (marking
+    /// up, notes and report export live there).
+    fn open_in_compare(&mut self) {
+        let dir = crate::settings::data_dir().join("frames").join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
+        self.save_frames(SaveTarget::Compare(dir));
     }
 
     fn start_analysis(&mut self) {
@@ -879,7 +1533,7 @@ impl VideoMode {
         }
         let a = self.sources[0].path.clone();
         let b = self.sources[1].path.clone();
-        let offset = self.offset_frames;
+        let offset = self.offset_frames_b();
         let rows = Arc::new(Mutex::new(Vec::new()));
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -919,15 +1573,13 @@ impl VideoMode {
         let ctx = ui.ctx().clone();
         let p = core.pal;
         ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(10, 10, 12));
-        // Drag & drop: first file → A, second → B.
+        // Dropped files join the open videos (up to four).
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if !dropped.is_empty() {
-            if self.sources.len() >= 2 || dropped.len() >= 2 {
-                self.sources.clear();
-            }
-            for d in dropped.into_iter().take(2) {
-                self.add_source(&d, &ctx);
-            }
+            self.add_paths(dropped, &ctx);
+        }
+        if dev_dir().is_some() {
+            self.dev_commands(core);
         }
 
         self.poll_snapshot(core);
@@ -947,13 +1599,6 @@ impl VideoMode {
         self.advance_playback(&ctx);
         self.metrics_hooks(core);
         self.dev_report_step();
-        if self.flicker_auto && self.flicker_at.elapsed() > Duration::from_millis(500) {
-            self.flicker_b = !self.flicker_b;
-            self.flicker_at = Instant::now();
-        }
-        if self.flicker_auto {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
 
         // A file that failed to open while another plays: say so (the
         // empty view shows a card instead).
@@ -962,8 +1607,8 @@ impl VideoMode {
                 core.toasts.error(format!("Cannot open {name}: {why}"));
             }
         }
-        // Keys first, so this frame already shows their effect (B offset,
-        // panels, compare mode) instead of the state before the press.
+        // Keys first, so this frame already shows their effect (panels,
+        // compare mode) instead of the state before the press.
         let mut keep = self.keys(&ctx, core);
         egui::Panel::top("video-top")
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(8, 6)))
@@ -992,6 +1637,9 @@ impl VideoMode {
         if self.goto.is_some() {
             self.goto_dialog(&ctx);
         }
+        if self.save_dialog.is_some() {
+            self.save_dialog_ui(&ctx, core);
+        }
         keep &= !std::mem::take(&mut self.close_requested);
         if !keep {
             self.pause();
@@ -1000,565 +1648,602 @@ impl VideoMode {
         keep
     }
 
-    fn advance_playback(&mut self, ctx: &egui::Context) {
-        if !self.playing || self.sources.is_empty() {
-            return;
-        }
-        // Prefer the audio clock (keeps A/V in sync), else the system clock.
-        let audio_clock = if (self.speed - 1.0).abs() < 1e-6 { self.audio_shared().and_then(|a| a.clock()) } else { None };
-        let mut t = self.clock.now();
-        if let Some(ac) = audio_clock {
-            if (ac - t).abs() < 1.0 {
-                t = ac;
-                // Keep the system clock aligned so a fallback is seamless.
-                self.clock.start(ac);
-            }
-        }
-        // A-B loop
-        if let (Some(a), Some(b)) = self.loop_ab {
-            if t >= b {
-                self.seek_all(a, true);
-                return;
-            }
-        }
-        let off = self.offset_secs();
-        let mut next_due: Option<f64> = None;
-        for (i, s) in self.sources.iter_mut().enumerate() {
-            let target = if i == 0 { t } else { t + off };
-            let half = s.frame_dur() * 0.5;
-            while s.queue.front().map(|f| f.pts <= target + half).unwrap_or(false) {
-                let f = s.queue.pop_front().unwrap();
-                s.set_current(f);
-            }
-            if let Some(f) = s.queue.front() {
-                let due = f.pts - half - target;
-                next_due = Some(next_due.map(|d| d.min(due)).unwrap_or(due));
-            }
-        }
-        let a = &self.sources[0];
-        if a.eof && a.queue.is_empty() {
-            self.pause();
-            return;
-        }
-        let wait = next_due.unwrap_or(0.005).clamp(0.001, 0.05) / self.speed.max(0.1);
-        ctx.request_repaint_after(Duration::from_secs_f64(wait));
-    }
-
     fn top_bar(&mut self, ui: &mut Ui, core: &mut Core) -> bool {
         let p = core.pal;
         let mut keep = true;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if widgets::icon_button(ui, I::ARROW_LEFT, "Back to browser (Esc)", false).clicked() {
+            if widgets::icon_button(ui, I::ARROW_LEFT, "Back to the browser (Esc)", false).clicked() {
                 keep = false;
             }
-            // In a narrow window (a large UI scale, the Analysis panel open)
-            // the title shrinks, the compare modes lose their labels and then
-            // move into a menu, and long file names are shortened, so nothing
-            // runs under the buttons on the right.
             let avail = ui.available_width();
-            let narrow = avail < 900.0;
-            let pair = self.sources.len() == 2;
-            // Very narrow: the names become A / B badges; with two videos
-            // Remove B, Scopes and Save frame join the compare menu.
-            let tiny = avail < 560.0;
-            if !tiny {
-                let title = if narrow { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
+            let n = self.sources.len();
+            // Wide: names on the buttons. Narrow: icons, then the compare and
+            // sync controls move into a menu.
+            let pair_extra = if n == 2 { if self.mode == CompareMode::Difference { 650.0 } else { 400.0 } } else { 0.0 };
+            let labels = avail >= 1250.0 + pair_extra;
+            let inline_need = 760.0 + pair_extra * 0.6;
+            let inline = n < 2 || avail >= inline_need;
+            if avail >= 620.0 {
+                let title = if avail < 900.0 { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
                 ui.label(RichText::new(title).font(theme::text::title()));
                 widgets::separator_v(ui);
             }
-            // Points: back, title, the four buttons on the right, the badges and name buttons' padding.
-            let fixed = 34.0 + if narrow { 30.0 } else { 80.0 } + 13.0 + 4.0 * 34.0 + 12.0 + 2.0 * 48.0 + if pair { 34.0 } else { 0.0 };
-            // Mode names from 1200 points of room (and while they fit), then icons,
-            // then the compare menu.
-            let min_names = 2.0 * 12.0 * 7.5;
-            let room = avail - fixed - min_names;
-            let labels = avail >= 1200.0 && self.compare_controls_width(ui, true) <= room;
-            let controls = if pair { self.compare_controls_width(ui, labels) } else { 0.0 };
-            let compact = pair && room < controls;
-            let controls = if compact { 50.0 } else { controls };
-            // Save frame, Scopes and Info show their names while the file
-            // names keep room for about 24 characters each.
-            let label_extra = RIGHT_LABELS.iter().map(|l| widgets::labeled_icon_button_width(ui, l) + 4.0).sum::<f32>() - 3.0 * 34.0;
-            let icon_labels = !narrow && avail - fixed - controls - label_extra >= 2.0 * 24.0 * 7.5;
-            let fixed = fixed + if icon_labels { label_extra } else { 0.0 };
-            let name_chars = ((avail - fixed - controls) / 2.0 / 7.5).clamp(8.0, 48.0) as usize;
-            for (i, label) in ["A", "B"].iter().enumerate() {
-                let name = self.sources.get(i).map(|s| shorten(&crate::ui::viewer::file_name(&s.path), name_chars));
-                let full = self.sources.get(i).map(|s| crate::ui::viewer::file_name(&s.path)).unwrap_or_default();
-                let name = name.unwrap_or_else(|| match (i, avail < 700.0) {
-                    (0, _) => "Open video...".into(),
-                    (_, true) => "Add B...".into(),
-                    _ => "Add B to compare...".into(),
-                });
-                // One chip per side: the round A / B badge (Compare's colors),
-                // then the file name (muted while it only invites to open one).
-                let mut job = egui::text::LayoutJob::default();
-                if !tiny {
-                    let format = egui::TextFormat { font_id: theme::text::body(), color: if full.is_empty() { p.muted } else { p.text }, valign: egui::Align::Center, ..Default::default() };
-                    job.append(&name, BADGE_R * 2.0 + 6.0, format);
-                }
-                let tip = match (full.is_empty(), tiny || full != name) {
-                    (true, _) => name.clone(),
-                    (false, true) => format!("{full}\nChoose a file"),
-                    (false, false) => "Choose a file".into(),
-                };
-                let resp = ui.add(egui::Button::new(job).min_size(Vec2::new(if tiny { size::CONTROL } else { 60.0 }, size::CONTROL))).on_hover_text(tip);
-                let pad = ui.spacing().button_padding.x;
-                let c = if tiny { resp.rect.center() } else { Pos2::new(resp.rect.left() + pad + BADGE_R, resp.rect.center().y) };
-                paint_badge(ui.painter(), c, label, ab_color(&p, i), BADGE_R - 1.0);
-                if resp.clicked() {
-                    let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
-                    if let Some(f) = rfd::FileDialog::new().add_filter("Videos", &exts).add_filter("All files", &["*"]).pick_file() {
-                        if i == 0 {
-                            self.sources.clear();
-                        } else {
-                            self.sources.truncate(1);
-                        }
-                        self.add_source(&f, &core.ctx);
-                    }
-                }
-                if i == 1 && self.sources.len() == 2 && !tiny && widgets::icon_button(ui, I::X, "Remove B", false).clicked() {
-                    self.remove_b();
+            if n < MAX_VIDEOS {
+                let tip = if n == 0 { "Open one video to play it, or up to four to compare them (or drop files here)" } else { "Add another video to compare, up to four (or drop files here)" };
+                let label = if n == 0 { "Open video" } else { "Add video" };
+                let r = if avail >= 760.0 { widgets::labeled_icon_button(ui, I::PLUS, label, tip, false) } else { widgets::icon_button(ui, I::PLUS, tip, false) };
+                if r.clicked() {
+                    self.pick_videos(&core.ctx);
                 }
             }
-            if pair {
+            if n >= 2 {
                 widgets::separator_v(ui);
-                if compact || tiny {
-                    let r = ui.menu_button(RichText::new(format!("{}  {}", self.mode.icon(), I::CARET_DOWN)).size(15.0), |ui| {
-                        ui.set_min_width(220.0);
-                        self.compare_controls(ui, &p, true, false);
-                        if tiny {
-                            ui.separator();
-                            if widgets::menu_toggle(ui, self.show_scopes, "Scopes", "F2").clicked() {
-                                self.show_scopes = !self.show_scopes;
-                                ui.close();
-                            }
-                            if widgets::menu_item(ui, I::CAMERA, "Save frame as PNG", "Ctrl+S").clicked() {
-                                ui.close();
-                                self.snapshot(false, core);
-                            }
-                            if widgets::menu_item(ui, I::X, "Remove B", "").clicked() {
-                                ui.close();
-                                self.remove_b();
-                            }
-                        }
-                    });
-                    r.response.on_hover_text(format!("{}: compare mode, B offset", self.mode.label()));
+                if inline {
+                    self.compare_controls(ui, core, false, labels);
                 } else {
-                    self.compare_controls(ui, &p, false, labels);
+                    let label = match self.sync {
+                        SyncMode::Linked => I::LINK,
+                        SyncMode::Independent => I::LINK_BREAK,
+                    };
+                    let r = ui.menu_button(RichText::new(format!("{}  {label}  {}", self.mode.icon(), I::CARET_DOWN)).size(15.0), |ui| {
+                        ui.set_min_width(260.0);
+                        self.compare_controls(ui, core, true, true);
+                    });
+                    r.response.on_hover_text(format!("{} · {}: compare view and how the videos move", self.mode.label(), self.sync_label()));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // With the compare controls on the left, names only on very wide windows.
+                let labels = n > 0 && avail >= if n > 1 { 1500.0 + pair_extra } else { 1280.0 };
                 let button = |ui: &mut Ui, icon: &str, label: &str, tip: &str, on: bool| {
-                    if icon_labels { widgets::labeled_icon_button(ui, icon, label, tip, on) } else { widgets::icon_button(ui, icon, tip, on) }
+                    if labels { widgets::labeled_icon_button(ui, icon, label, tip, on) } else { widgets::icon_button(ui, icon, tip, on) }
                 };
                 crate::analysis_ui::toolbar_button(ui, core);
-                if button(ui, I::INFO, RIGHT_LABELS[2], "Info & metrics (I)", self.show_info).clicked() {
+                if n == 0 {
+                    return;
+                }
+                if button(ui, I::INFO, "Info", "Info and metrics: the current frame, start points, quality of B against A and media details (I)", self.show_info).clicked() {
                     self.show_info = !self.show_info;
                 }
-                if !(tiny && pair) && button(ui, I::WAVEFORM, RIGHT_LABELS[1], "Scopes (F2)", self.show_scopes).clicked() {
+                let scopes_tip = if n > 1 { "Scopes for every video (F2): waveform, RGB parade, vectorscope and histogram show brightness and color levels" } else { "Scopes (F2): waveform, RGB parade, vectorscope and histogram show brightness and color levels" };
+                if button(ui, I::WAVEFORM, "Scopes", scopes_tip, self.show_scopes).clicked() {
                     self.show_scopes = !self.show_scopes;
                 }
-                if !(tiny && pair) && button(ui, I::CAMERA, RIGHT_LABELS[0], "Save frame as PNG (Ctrl+S)", false).clicked() {
-                    self.snapshot(false, core);
+                let save_tip = if n > 1 { "Save the frame on screen of every video as PNG, at full resolution, with an optional side-by-side picture (Ctrl+S)" } else { "Save the frame on screen as PNG at full resolution (Ctrl+S)" };
+                if button(ui, I::CAMERA, if n > 1 { "Save frames" } else { "Save frame" }, save_tip, false).clicked() {
+                    self.open_save_dialog();
                 }
+                if n > 1 && button(ui, I::IMAGES, "Open in Compare", "Open the frames on screen in image Compare, to mark areas, add notes and export a report", false).clicked() {
+                    self.open_in_compare();
+                }
+                let keys = ui.menu_button(RichText::new(I::KEYBOARD).size(16.0), |ui| {
+                    ui.set_min_width(360.0);
+                    ui.label(RichText::new("Video shortcuts").font(theme::text::subtitle()));
+                    ui.add_space(4.0);
+                    egui::Grid::new("video-keys").num_columns(2).spacing([16.0, 3.0]).show(ui, |ui| {
+                        for (k, what) in VIDEO_KEYS {
+                            ui.label(RichText::new(k).monospace().size(11.5).color(p.text));
+                            ui.label(RichText::new(what).size(12.0).color(p.muted));
+                            ui.end_row();
+                        }
+                    });
+                });
+                keys.response.on_hover_text("Keyboard shortcuts of video mode");
             });
         });
         keep
     }
 
-    fn remove_b(&mut self) {
-        if self.sources.len() == 2 {
-            self.sources.truncate(1);
-            self.sources[0].player.send(Cmd::Native(false));
+    fn sync_label(&self) -> &'static str {
+        match self.sync {
+            SyncMode::Linked => "Linked",
+            SyncMode::Independent => "Independent",
         }
     }
 
-    /// The compare mode segments' labels: names when there is room, else icons.
-    fn mode_labels(labels: bool) -> Vec<&'static str> {
-        CompareMode::ALL.iter().map(|m| if labels { m.short_label() } else { m.icon() }).collect()
-    }
-
-    /// Points the compare controls take in the top bar.
-    fn compare_controls_width(&self, ui: &Ui, labels: bool) -> f32 {
-        let widest = Self::mode_labels(labels).iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), theme::text::body(), Color32::WHITE).size().x).fold(0.0, f32::max);
-        let modes = CompareMode::ALL.len() as f32 * (widest + 24.0) + 4.0 + 4.0;
-        let gain = if self.mode == CompareMode::Difference { 50.0 + 90.0 + 4.0 + size::VALUE_W } else { 0.0 };
-        // The separator, "B offset", its box, Swap and the gaps between them.
-        modes + gain + 13.0 + 48.0 + size::VALUE_W + 30.0 + 16.0
-    }
-
-    /// Compare modes, the difference gain and B's offset: in the top bar (as
-    /// one segmented control, with names when `labels`), or listed in its
-    /// menu (`menu`) when the bar is narrow.
-    fn compare_controls(&mut self, ui: &mut Ui, p: &Palette, menu: bool, labels: bool) {
-        let p = *p;
-        if menu {
-            for m in CompareMode::ALL {
-                if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).clicked() {
-                    self.mode = m;
+    /// Compare view (two videos), difference gain, sync and start points: in
+    /// the top bar, or listed in its menu (`menu`) when the bar is narrow.
+    fn compare_controls(&mut self, ui: &mut Ui, core: &mut Core, menu: bool, labels: bool) {
+        let p = core.pal;
+        let n = self.sources.len();
+        if n == 2 {
+            if menu {
+                ui.label(RichText::new("View").color(p.muted).size(theme::text::SMALL));
+                for m in CompareMode::ALL {
+                    if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).on_hover_text(m.tip()).clicked() {
+                        self.mode = m;
+                    }
+                }
+            } else {
+                let mut idx = CompareMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
+                let names: Vec<&str> = CompareMode::ALL.iter().map(|m| if labels { m.label() } else { m.icon() }).collect();
+                let tips: Vec<&str> = CompareMode::ALL.iter().map(|m| m.tip()).collect();
+                if widgets::segmented_with_tips(ui, &mut idx, &names, &tips) {
+                    self.mode = CompareMode::ALL[idx];
                 }
             }
-            ui.separator();
-        } else {
-            let mut idx = CompareMode::ALL.iter().position(|m| *m == self.mode).unwrap_or(0);
-            let tips: Vec<String> = CompareMode::ALL.iter().map(|m| format!("{} ({})", m.label(), m.key())).collect();
-            let tips: Vec<&str> = tips.iter().map(|t| t.as_str()).collect();
-            if widgets::segmented_with_tips(ui, &mut idx, &Self::mode_labels(labels), &tips) {
-                self.mode = CompareMode::ALL[idx];
-            }
-        }
-        let mut rest = |ui: &mut Ui| {
             if self.mode == CompareMode::Difference {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Gain").color(p.muted).size(theme::text::SMALL));
-                ui.add(widgets::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×").fixed_decimals(1).width(90.0).default_value(4.0));
+                let mut gain = |ui: &mut Ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Gain").color(p.muted).size(theme::text::SMALL)).on_hover_text("How much the differences are brightened");
+                    ui.add(widgets::Slider::new(&mut self.gain, 1.0..=64.0).logarithmic(true).suffix("×").fixed_decimals(1).width(90.0).default_value(4.0))
+                        .on_hover_text("Difference gain: multiplies |A - B| so small differences become visible (double-click: 4×)");
+                };
+                if menu {
+                    ui.horizontal(|ui| gain(ui));
+                } else {
+                    gain(ui);
+                }
             }
-            if !menu {
+            if menu {
+                ui.separator();
+            } else {
                 widgets::separator_v(ui);
             }
-            ui.label(RichText::new("B offset").color(p.muted).size(theme::text::SMALL));
-            let mut off = self.offset_frames;
-            // Typed values apply on Enter (or when the field loses focus);
-            // Esc goes back to the offset in use. egui reports the lost
-            // focus for two frames and applies the typed text on the second,
-            // after the Esc press is gone, so that change is dropped here.
-            if self.offset_editing && ui.input(|i| i.key_pressed(Key::Escape)) {
-                self.offset_cancel = 2;
-            }
-            let r = widgets::value_box(ui, egui::DragValue::new(&mut off).suffix(" f").speed(0.2).update_while_editing(false)).on_hover_text("Shift B in frames (+ / - keys; Ctrl x10)");
-            self.offset_field = Some(r.id);
-            self.offset_editing = ui.memory(|m| m.has_focus(r.id));
-            if self.offset_cancel > 0 {
-                self.offset_cancel -= 1;
-            } else if r.changed() {
-                self.set_offset(off);
-            }
-            if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
-                self.swap();
-            }
+        }
+        // Sync: Linked / Independent.
+        let sync_tips = [
+            "Linked: all videos play, step and seek together, kept apart by their start points (L)",
+            "Independent: click a video, then move only it with the timeline and , / . to find where the event starts in it (L)",
+        ];
+        let mut idx = if self.sync == SyncMode::Linked { 0 } else { 1 };
+        let names = if labels || menu { [format!("{}  Linked", I::LINK), format!("{}  Independent", I::LINK_BREAK)] } else { [I::LINK.to_string(), I::LINK_BREAK.to_string()] };
+        let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        if widgets::segmented_with_tips(ui, &mut idx, &names, &sync_tips) {
+            self.set_sync(if idx == 0 { SyncMode::Linked } else { SyncMode::Independent }, core);
+        }
+        let any = self.any_start();
+        let set_tip = match self.sync {
+            SyncMode::Linked => "Use the frame each video shows now as its start point (P)".to_string(),
+            SyncMode::Independent => format!("Set {}'s start point at its current frame (P); then select the next video", letter(self.lead())),
         };
+        let go_tip = "Move every video to its start point (Shift+Home)";
+        let clear_tip = "Clear the start points (all videos then play from the same time)";
         if menu {
-            ui.horizontal(|ui| rest(ui));
+            if widgets::menu_item(ui, I::FLAG, if self.sync == SyncMode::Linked { "Set start points here" } else { "Set start point here" }, "P").on_hover_text(set_tip).clicked() {
+                self.set_start_here(core);
+                ui.close();
+            }
+            if ui.add_enabled(any, egui::Button::new(format!("{}  Go to start points", I::ARROW_U_UP_LEFT)).frame(false)).on_hover_text(go_tip).clicked() {
+                self.go_to_starts();
+                ui.close();
+            }
+            if any && widgets::menu_item(ui, I::X, "Clear start points", "").on_hover_text(clear_tip).clicked() {
+                self.clear_starts();
+                ui.close();
+            }
+            if n == 2 {
+                ui.separator();
+                if widgets::menu_item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X").clicked() {
+                    self.swap();
+                    ui.close();
+                }
+            }
         } else {
-            rest(ui);
+            let set_label = if self.sync == SyncMode::Linked { "Set start points" } else { "Set start" };
+            let r = if labels { widgets::labeled_icon_button(ui, I::FLAG, set_label, &set_tip, false) } else { widgets::icon_button(ui, I::FLAG, &set_tip, false) };
+            if r.clicked() {
+                self.set_start_here(core);
+            }
+            let r = ui.add_enabled_ui(any, |ui| if labels { widgets::labeled_icon_button(ui, I::ARROW_U_UP_LEFT, "Go to start", go_tip, false) } else { widgets::icon_button(ui, I::ARROW_U_UP_LEFT, go_tip, false) }).inner;
+            if r.on_disabled_hover_text("No start points yet: set them with the flag button (P)").clicked() {
+                self.go_to_starts();
+            }
+            if any && widgets::icon_button(ui, I::X, clear_tip, false).clicked() {
+                self.clear_starts();
+            }
+            if n == 2 {
+                widgets::separator_v(ui);
+                if widgets::icon_button(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B (X)", false).clicked() {
+                    self.swap();
+                }
+            }
         }
     }
 
-    fn set_offset(&mut self, off: i64) {
-        self.offset_frames = off;
-        if self.sources.len() == 2 {
-            let t = self.sources[0].pts() + self.offset_secs();
-            self.sources[1].seek(t.max(0.0), true);
-            self.metrics_now = None;
-        }
-    }
-
+    /// A and B trade places (with their start points and sound).
     fn swap(&mut self) {
-        if self.sources.len() == 2 {
-            let t = self.sources[0].pts();
-            let b = self.sources.pop().unwrap();
-            let a = self.sources.pop().unwrap();
-            let pa = a.path.clone();
-            let pb = b.path.clone();
-            drop(a);
-            drop(b);
-            self.offset_frames = -self.offset_frames;
-            self.pending_swap = Some((pb, pa, t));
+        if self.sources.len() != 2 {
+            return;
         }
+        self.sources.swap(0, 1);
+        let flip = |i: usize| if i < 2 { 1 - i } else { i };
+        self.audio_src = flip(self.audio_src);
+        self.selected = flip(self.selected);
+        self.loop_lead = flip(self.loop_lead);
+        self.analysis = None;
+        self.metrics_now = None;
+        self.diff.reset();
+        self.update_native();
     }
 
     // ---------------------------------------------------------------- viewport
 
-    fn viewport(&mut self, ui: &mut Ui, core: &mut Core) {
-        if let Some((a, b, t)) = self.pending_swap.take() {
-            self.add_source(&a, &core.ctx);
-            self.add_source(&b, &core.ctx);
-            self.seek_all(t, true);
+    /// Panes (points) for the views: one for each video side by side, or
+    /// one shared pane for wipe and difference.
+    fn pane_rects(&self, view: Rect) -> Vec<Rect> {
+        let n = self.sources.len();
+        if self.shared_pane() {
+            vec![view; n]
+        } else {
+            sync::pane_rects(n, view, PANE_GAP)
         }
+    }
+
+    /// Wipe and difference draw A and B in one pane.
+    fn shared_pane(&self) -> bool {
+        self.sources.len() == 2 && self.mode != CompareMode::SideBySide
+    }
+
+    fn viewport(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
         let view = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(view, Sense::click_and_drag());
         self.hover_view = resp.hovered();
         if self.sources.is_empty() {
-            // The hero (icon and hints), the error card when a file failed to
-            // open, then the button: one column centered in the view.
-            let painter = ui.painter().with_clip_rect(view);
-            let wrap = (view.width() - 32.0).max(40.0);
-            let line = |text: &str, size: f32, color: Color32| {
-                let mut job = egui::text::LayoutJob::simple(text.to_string(), FontId::proportional(size), color, wrap);
-                job.halign = egui::Align::Center;
-                painter.layout_job(job)
-            };
-            let hint = line("Drop one video to play it, or two videos to compare them", 15.0, p.text);
-            let sub = line("Frame-accurate stepping · wipe / flicker / difference · PSNR & SSIM · scopes", 12.5, p.muted);
-            let card = self.open_error.as_ref().map(|(name, why)| ErrorCard::layout(&painter, &p, name, why, wrap.min(440.0)));
-            let icon_h = 64.0;
-            let card_h = card.as_ref().map(|c| c.size.y + 20.0).unwrap_or(0.0);
-            let total = icon_h + 14.0 + hint.size().y + 8.0 + sub.size().y + 20.0 + card_h + 34.0;
-            let mut y = (view.center().y - total / 2.0).max(view.min.y + 16.0);
-            let cx = view.center().x;
-            painter.text(Pos2::new(cx, y + icon_h / 2.0), Align2::CENTER_CENTER, I::FILM_STRIP, FontId::proportional(56.0), p.faint);
-            y += icon_h + 14.0;
-            let (hint_h, sub_h) = (hint.size().y, sub.size().y);
-            painter.galley(Pos2::new(cx, y), hint, p.text);
-            y += hint_h + 8.0;
-            painter.galley(Pos2::new(cx, y), sub, p.muted);
-            y += sub_h + 20.0;
-            if let Some(card) = card {
-                let size = card.size;
-                card.paint(&painter, &p, Pos2::new(cx - size.x / 2.0, y));
-                y += size.y + 20.0;
-            }
-            let br = Rect::from_min_size(Pos2::new(cx - 100.0, y), Vec2::new(200.0, 34.0));
-            let open = ui.scope_builder(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::top_down_justified(egui::Align::Center)), |ui| widgets::primary_button(ui, &p, &format!("{}  Open video...", I::FOLDER_OPEN))).inner;
-            if open.clicked() {
-                let exts: Vec<&str> = super::VIDEO_EXTS.to_vec();
-                if let Some(files) = rfd::FileDialog::new().add_filter("Videos", &exts).pick_files() {
-                    for f in files.into_iter().take(2) {
-                        self.add_source(&f, &core.ctx);
-                    }
-                }
-            }
+            self.empty_view(ui, view, core);
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
-        let (dw, dh) = self.sources[0].display_size();
-        let compare = self.sources.len() == 2;
-        let sbs = compare && self.mode == CompareMode::SideBySide;
-        let pane_w = if sbs { view.width() / 2.0 } else { view.width() };
-        let fit = ((pane_w * ppp) / dw as f32).min(view.height() * ppp / dh as f32);
-        if self.auto_fit {
-            self.zoom = fit;
-            self.center = Vec2::new(dw as f32 / 2.0, dh as f32 / 2.0);
+        // A minimized window or a monitor / DPI change can leave the view
+        // without area for a frame or two: draw nothing then.
+        if !(ppp.is_finite() && ppp > 0.0 && view.width() >= 1.0 && view.height() >= 1.0) {
+            return;
         }
-        // Zoom with wheel at cursor, drag to pan.
+        let n = self.sources.len();
+        let shared = self.shared_pane();
+        let panes = self.pane_rects(view);
+        let px = |r: Rect| r.size() * ppp;
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let hovered = pointer.filter(|p| view.contains(*p)).map(|pos| {
+            if shared {
+                // Wipe: the side of the divider; difference: A.
+                let x = view.min.x + view.width() * self.wipe_pos;
+                if self.mode == CompareMode::Wipe && pos.x > x {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                panes.iter().position(|r| r.contains(pos)).unwrap_or(0)
+            }
+        });
+        // Zoom with the wheel at the cursor, drag to pan (all panes follow).
         let wheel = ui.input(|i| crate::ui::wheel_delta(i));
-        if resp.hovered() && wheel != 0.0 {
-            let f = (1.0 + wheel.clamp(-200.0, 200.0) * 0.0045).max(0.2);
-            let anchor = ui.input(|i| i.pointer.hover_pos()).unwrap_or(view.center());
-            let pane_center = if sbs && anchor.x > view.center().x { Pos2::new(view.min.x + pane_w * 1.5, view.center().y) } else if sbs { Pos2::new(view.min.x + pane_w * 0.5, view.center().y) } else { view.center() };
-            let new = (self.zoom * f).clamp(0.02, 64.0);
-            let img_pt = self.center + (anchor - pane_center) * ppp / self.zoom;
-            self.center = img_pt - (anchor - pane_center) * ppp / new;
-            self.zoom = new;
-            self.auto_fit = false;
+        if resp.hovered() && wheel != 0.0 && wheel.is_finite() {
+            if let (Some(k), Some(pos)) = (hovered, pointer) {
+                let k = if shared { 0 } else { k };
+                let f = (1.0 + wheel.clamp(-200.0, 200.0) * 0.0045).max(0.2);
+                self.view = self.view.zoom_at(self.sources[k].display_size(), px(panes[k]), f, (pos - panes[k].center()) * ppp);
+            }
         }
-        if resp.dragged_by(egui::PointerButton::Primary) && !(compare && self.mode == CompareMode::Wipe && ui.input(|i| i.modifiers.shift)) {
-            self.center -= resp.drag_delta() * ppp / self.zoom;
-            self.auto_fit = false;
+        if resp.dragged_by(egui::PointerButton::Primary) && !(shared && self.mode == CompareMode::Wipe && ui.input(|i| i.modifiers.shift)) {
+            let k = if shared { 0 } else { hovered.unwrap_or(0) };
+            self.view = self.view.pan_by(self.sources[k].display_size(), px(panes[k]), resp.drag_delta() * ppp);
         }
         if resp.double_clicked() {
-            self.auto_fit = !self.auto_fit;
-            if !self.auto_fit {
-                self.zoom = 1.0;
-            }
+            let k = if shared { 0 } else { hovered.unwrap_or(0) };
+            self.view = if self.view.fit { View::default().actual(self.sources[k].display_size(), px(panes[k])) } else { View::default() };
         }
         // A click that only dismisses the picture's menu (or another popup)
-        // does not also play or pause.
-        if resp.clicked() && !compare && !egui::Popup::is_any_open(ui.ctx()) {
-            self.toggle_play();
-        }
-        // Request an output size matching the on-screen size (saves decode→upload bandwidth).
-        let scale = (self.zoom).clamp(0.05, 1.0);
-        let q = ((scale * 16.0).ceil() / 16.0).min(1.0);
-        let (nw, nh) = (self.sources[0].info.width, self.sources[0].info.height);
-        let want = (((nw as f32 * q) as u32) & !1, ((nh as f32 * q) as u32) & !1);
-        if want != self.sources[0].out_size && self.last_out_req.elapsed() > Duration::from_millis(150) {
-            self.last_out_req = Instant::now();
-            for i in 0..self.sources.len() {
-                self.sources[i].out_size = want;
-                self.sources[i].player.send(Cmd::OutputSize(want.0.max(2), want.1.max(2)));
-            }
-            if !self.playing {
-                let t = self.sources[0].pts();
-                let off = self.offset_secs();
-                for (i, s) in self.sources.iter_mut().enumerate() {
-                    s.history.clear();
-                    s.seek(if i == 0 { t } else { t + off }, true);
+        // does nothing else. One video: play / pause; Independent: select.
+        if resp.clicked() && !egui::Popup::is_any_open(ui.ctx()) {
+            if n == 1 {
+                self.toggle_play();
+            } else if self.sync == SyncMode::Independent {
+                if let Some(k) = hovered {
+                    self.select(k);
                 }
             }
         }
-        let nearest = self.zoom >= 2.0;
-        for s in &mut self.sources {
-            s.upload(ui.ctx(), nearest);
+        // Each video's zoom and frame point at its pane's center.
+        self.pane_px = px(panes[0]);
+        let eff: Vec<(f32, Vec2)> = match (0..n).map(|i| self.view.effective(self.sources[i].display_size(), px(panes[i]))).collect::<Option<Vec<_>>>() {
+            Some(e) => e,
+            None => return,
+        };
+        self.negotiate_sizes(&eff, ui.ctx());
+        for (s, (z, _)) in self.sources.iter_mut().zip(&eff) {
+            s.upload(ui.ctx(), *z >= 2.0);
         }
-        let draw_w = dw as f32 * self.zoom / ppp;
-        let draw_h = dh as f32 * self.zoom / ppp;
         let painter = ui.painter().with_clip_rect(view);
-        let pane = |idx: usize| -> Rect {
-            if sbs {
-                Rect::from_min_size(Pos2::new(view.min.x + pane_w * idx as f32, view.min.y), Vec2::new(pane_w, view.height()))
-            } else {
-                view
+        if !shared && n > 1 {
+            // Thin lines between the panes.
+            painter.rect_filled(view, 0.0, Color32::from_gray(44));
+            for r in &panes {
+                painter.rect_filled(*r, 0.0, Color32::from_rgb(10, 10, 12));
             }
-        };
-        let dest_in = |r: Rect, center: Vec2, zoom: f32| -> Rect {
-            let min = r.center() - Vec2::new(center.x * zoom / ppp, center.y * zoom / ppp);
-            Rect::from_min_size(Pos2::new((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp), Vec2::new(draw_w, draw_h))
-        };
+        }
+        let dests: Vec<Rect> = (0..n).map(|i| sync::dest_rect(panes[i], ppp, self.sources[i].display_size(), eff[i].0, eff[i].1)).collect();
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        let draw_tex = |painter: &egui::Painter, s: &Source, dest: Rect, clip: Rect, tint: Color32| {
+        let draw_tex = |painter: &egui::Painter, s: &Source, dest: Rect, clip: Rect| {
             if let Some(t) = &s.tex {
-                let p2 = painter.with_clip_rect(clip);
+                let p2 = painter.with_clip_rect(clip.intersect(view));
                 let mut mesh = egui::Mesh::with_texture(t.id());
-                mesh.add_rect_with_uv(dest, full_uv, tint);
+                mesh.add_rect_with_uv(dest, full_uv, Color32::WHITE);
                 rotate_mesh(&mut mesh, dest, s.info.rotation);
                 p2.add(egui::Shape::mesh(mesh));
             }
         };
         // Where A and B are drawn, for the Analysis panel's overlays.
-        let publish = |slot, dest: Rect, clip: Rect| crate::analysis_ui::canvas::publish(ui.ctx(), slot, dest, (dw, dh), clip);
         use crate::analysis_ui::canvas::Slot;
-        if !compare {
-            let dest = dest_in(view, self.center, self.zoom);
-            publish(Slot::A, dest, view);
-            draw_tex(&painter, &self.sources[0], dest, view, Color32::WHITE);
-            self.pixel_probe(ui, dest, (dw, dh));
+        let publish = |slot, i: usize, clip: Rect| crate::analysis_ui::canvas::publish(ui.ctx(), slot, dests[i], self.sources[i].display_size(), clip);
+        if !shared {
+            for i in 0..n {
+                if i < 2 {
+                    publish(if i == 0 { Slot::A } else { Slot::B }, i, panes[i]);
+                }
+                draw_tex(&painter, &self.sources[i], dests[i], panes[i]);
+            }
+        } else if self.mode == CompareMode::Wipe {
+            // Not while the pointer is over a menu above the picture.
+            let shift = ui.input(|i| i.modifiers.shift);
+            let dragging = resp.dragged() && shift;
+            if (!self.wipe_frozen && !shift && self.hover_view) || dragging {
+                if let Some(pos) = pointer.filter(|p| view.contains(*p)) {
+                    self.wipe_pos = ((pos.x - view.min.x) / view.width()).clamp(0.0, 1.0);
+                }
+            }
+            let x = view.min.x + view.width() * self.wipe_pos;
+            let left = Rect::from_min_max(view.min, Pos2::new(x, view.max.y));
+            let right = Rect::from_min_max(Pos2::new(x, view.min.y), view.max);
+            publish(Slot::A, 0, left);
+            publish(Slot::B, 1, right);
+            draw_tex(&painter, &self.sources[0], dests[0], left);
+            draw_tex(&painter, &self.sources[1], dests[1], right);
+            painter.line_segment([Pos2::new(x, view.min.y), Pos2::new(x, view.max.y)], Stroke::new(1.5, Color32::from_white_alpha(200)));
+            painter.circle_filled(Pos2::new(x, view.center().y), 12.0, Color32::from_black_alpha(160));
+            painter.text(Pos2::new(x, view.center().y), Align2::CENTER_CENTER, I::ARROWS_LEFT_RIGHT, FontId::proportional(13.0), Color32::WHITE);
         } else {
-            let a = &self.sources[0];
-            let b = &self.sources[1];
-            match self.mode {
-                CompareMode::SideBySide => {
-                    for (i, s) in [a, b].iter().enumerate() {
-                        let r = pane(i);
-                        let dest = dest_in(r, self.center, self.zoom);
-                        publish(if i == 0 { Slot::A } else { Slot::B }, dest, r);
-                        draw_tex(&painter, s, dest, r, Color32::WHITE);
-                    }
-                    painter.line_segment([Pos2::new(view.center().x, view.min.y), Pos2::new(view.center().x, view.max.y)], Stroke::new(1.0, Color32::from_gray(60)));
-                }
-                CompareMode::Wipe => {
-                    let dest = dest_in(view, self.center, self.zoom);
-                    // Not while the pointer is over a menu above the picture.
-                    if !self.wipe_frozen && !ui.input(|i| i.modifiers.shift) && self.hover_view {
-                        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                            if view.contains(pos) {
-                                self.wipe_pos = ((pos.x - view.min.x) / view.width()).clamp(0.0, 1.0);
-                            }
-                        }
-                    }
-                    let x = view.min.x + view.width() * self.wipe_pos;
-                    publish(Slot::A, dest, Rect::from_min_max(view.min, Pos2::new(x, view.max.y)));
-                    publish(Slot::B, dest, Rect::from_min_max(Pos2::new(x, view.min.y), view.max));
-                    draw_tex(&painter, a, dest, Rect::from_min_max(view.min, Pos2::new(x, view.max.y)), Color32::WHITE);
-                    draw_tex(&painter, b, dest, Rect::from_min_max(Pos2::new(x, view.min.y), view.max), Color32::WHITE);
-                    painter.line_segment([Pos2::new(x, view.min.y), Pos2::new(x, view.max.y)], Stroke::new(1.5, Color32::from_white_alpha(200)));
-                    painter.circle_filled(Pos2::new(x, view.center().y), 12.0, Color32::from_black_alpha(160));
-                    painter.text(Pos2::new(x, view.center().y), Align2::CENTER_CENTER, I::ARROWS_LEFT_RIGHT, FontId::proportional(13.0), Color32::WHITE);
-                    self.pixel_probe(ui, dest, (dw, dh));
-                }
-                CompareMode::Flicker => {
-                    let dest = dest_in(view, self.center, self.zoom);
-                    let held = ui.input(|i| i.key_down(Key::Tab));
-                    let show_b = self.flicker_b ^ held;
-                    publish(if show_b { Slot::B } else { Slot::A }, dest, view);
-                    draw_tex(&painter, if show_b { b } else { a }, dest, view, Color32::WHITE);
-                    let (label, i) = if show_b { ("B", 1) } else { ("A", 0) };
-                    paint_badge(&painter, view.min + Vec2::splat(12.0 + BADGE_R), label, ab_color(&p, i), BADGE_R);
-                    self.pixel_probe(ui, dest, (dw, dh));
-                }
-                CompareMode::Overlay => {
-                    let dest = dest_in(view, self.center, self.zoom);
-                    publish(Slot::A, dest, view);
-                    draw_tex(&painter, a, dest, view, Color32::WHITE);
-                    draw_tex(&painter, b, dest, view, Color32::from_white_alpha(128));
-                    self.pixel_probe(ui, dest, (dw, dh));
-                }
-                CompareMode::Checker => {
-                    let dest = dest_in(view, self.center, self.zoom);
-                    publish(Slot::A, dest, view);
-                    draw_tex(&painter, a, dest, view, Color32::WHITE);
-                    let cell = 64.0;
-                    let mut y = dest.min.y.max(view.min.y - cell) - ((dest.min.y.max(view.min.y - cell) - dest.min.y) % cell);
-                    let mut row = ((y - dest.min.y) / cell).round() as i64;
-                    while y < dest.max.y.min(view.max.y) {
-                        let mut x = dest.min.x;
-                        let mut col = 0i64;
-                        while x < dest.max.x.min(view.max.x) {
-                            if (row + col) % 2 == 1 {
-                                let r = Rect::from_min_size(Pos2::new(x, y), Vec2::splat(cell)).intersect(dest).intersect(view);
-                                if r.is_positive() {
-                                    draw_tex(&painter, b, dest, r, Color32::WHITE);
-                                }
-                            }
-                            x += cell;
-                            col += 1;
-                        }
-                        y += cell;
-                        row += 1;
-                    }
-                    self.pixel_probe(ui, dest, (dw, dh));
-                }
-                CompareMode::Difference => {
-                    let dest = dest_in(view, self.center, self.zoom);
-                    publish(Slot::A, dest, view);
-                    self.update_diff(ui.ctx());
-                    if let Some((_, t)) = &self.diff_tex {
-                        let mut mesh = egui::Mesh::with_texture(t.id());
-                        mesh.add_rect_with_uv(dest, full_uv, Color32::WHITE);
-                        rotate_mesh(&mut mesh, dest, self.sources[0].info.rotation);
-                        painter.add(egui::Shape::mesh(mesh));
-                    }
-                    if let Some((mean, max)) = self.diff_stats {
-                        let txt = format!("|A-B| × {:.0}  ·  mean {:.2}  ·  max {:.0}", self.gain, mean, max);
-                        let g = painter.layout_no_wrap(txt, theme::text::small(), p.text);
-                        osd_pill(&painter, &p, view.min + Vec2::splat(12.0), Align2::LEFT_TOP, g);
-                    }
-                    self.pixel_probe(ui, dest, (dw, dh));
-                }
+            publish(Slot::A, 0, view);
+            self.update_diff(ui.ctx());
+            if let Some(t) = &self.diff_tex {
+                let mut mesh = egui::Mesh::with_texture(t.id());
+                mesh.add_rect_with_uv(dests[0], full_uv, Color32::WHITE);
+                rotate_mesh(&mut mesh, dests[0], self.sources[0].info.rotation);
+                painter.add(egui::Shape::mesh(mesh));
             }
-            // Pane badges: A top left, B top left of its pane (side by side)
-            // or top right (wipe).
-            let inset = 12.0 + BADGE_R;
-            let badges: Vec<(Pos2, usize)> = match self.mode {
-                CompareMode::SideBySide => vec![(pane(0).left_top() + Vec2::splat(inset), 0), (pane(1).left_top() + Vec2::splat(inset), 1)],
-                CompareMode::Wipe => vec![(view.left_top() + Vec2::splat(inset), 0), (view.right_top() + Vec2::new(-inset, inset), 1)],
-                _ => vec![],
-            };
-            for (c, i) in badges {
-                paint_badge(&painter, c, ["A", "B"][i], ab_color(&p, i), BADGE_R);
+            if let Some((mean, max)) = self.diff_stats {
+                let txt = format!("|A-B| × {:.0}  ·  mean {:.2}  ·  max {:.0}", self.gain, mean, max);
+                let g = painter.layout_no_wrap(txt, theme::text::small(), p.text);
+                osd_pill(&painter, &p, Pos2::new(view.center().x, view.max.y - 12.0), Align2::CENTER_BOTTOM, g);
             }
+        }
+        // The pixel under the pointer, as a fraction of its frame.
+        self.pixel = hovered.and_then(|k| {
+            let pos = pointer?;
+            let d = dests[k];
+            (d.contains(pos) && d.width() > 0.0 && d.height() > 0.0).then(|| (((pos.x - d.min.x) / d.width()).clamp(0.0, 1.0), ((pos.y - d.min.y) / d.height()).clamp(0.0, 1.0)))
+        });
+        if n >= 2 {
             self.maybe_metrics();
         }
-        // Clamp pan.
-        let half_w = pane_w * ppp / self.zoom / 2.0;
-        let half_h = view.height() * ppp / self.zoom / 2.0;
-        self.center.x = if dw as f32 <= half_w * 2.0 { dw as f32 / 2.0 } else { self.center.x.clamp(half_w, dw as f32 - half_w) };
-        self.center.y = if dh as f32 <= half_h * 2.0 { dh as f32 / 2.0 } else { self.center.y.clamp(half_h, dh as f32 - half_h) };
-
-        // HUD: frame / time / zoom
-        let a = &self.sources[0];
-        let f = a.frame_of(a.pts());
-        let kind = a.current.as_ref().map(|c| c.kind as char).unwrap_or('?');
-        // One pill: the timecode (monospace), then frame, type and zoom.
-        let mut rest = format!("Frame {f}  ·  {}  ·  {:.0}%", kind_name(kind), self.zoom * 100.0);
-        if let Some(e) = &a.error {
-            rest = format!("{rest}  ·  {} {e}", I::WARNING);
+        // The selected video when Independent.
+        if n > 1 && self.sync == SyncMode::Independent && !shared {
+            let r = panes[self.lead()];
+            painter.rect_stroke(r.shrink(1.0), 0.0, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
         }
-        let job = |time: bool, rest: &str| {
-            let mut job = egui::text::LayoutJob::default();
-            let fmt = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
-            if time {
-                job.append(&fmt_time(a.pts()), 0.0, fmt(theme::text::mono(), p.text));
-                job.append("  ·  ", 0.0, fmt(theme::text::small(), p.muted));
+        // Captions: every video's letter, name and own time.
+        for i in 0..n {
+            // A caption's close button removes its video at once.
+            if i >= self.sources.len() || self.sources.len() != n {
+                break;
             }
-            job.append(rest, 0.0, fmt(theme::text::small(), p.text));
-            job
+            let (area, right) = if shared { (view, i == 1) } else { (panes[i], false) };
+            self.caption(ui, &p, i, area.shrink(8.0), right, core);
+        }
+        self.hud(ui, &painter, &p, view, &eff);
+        resp.context_menu(|ui| self.canvas_menu(ui, core));
+    }
+
+    /// The hero (icon and hints), the error card when a file failed to
+    /// open, then the button: one column centered in the view.
+    fn empty_view(&mut self, ui: &mut Ui, view: Rect, core: &mut Core) {
+        let p = core.pal;
+        let painter = ui.painter().with_clip_rect(view);
+        let wrap = (view.width() - 32.0).max(40.0);
+        let line = |text: &str, size: f32, color: Color32| {
+            let mut job = egui::text::LayoutJob::simple(text.to_string(), FontId::proportional(size), color, wrap);
+            job.halign = egui::Align::Center;
+            painter.layout_job(job)
         };
-        // In a narrow view the readout shortens (the transport bar has the
-        // same numbers), down to nothing, rather than running off the left.
-        let fits = |job: egui::text::LayoutJob| {
-            let g = painter.layout_job(job);
-            (g.size().x + 2.0 * OSD_PAD + 24.0 <= view.width()).then_some(g)
-        };
-        if let Some(g) = fits(job(true, &rest)).or_else(|| fits(job(false, &format!("Frame {f}  ·  {}", kind_name(kind))))) {
-            osd_pill(&painter, &p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
+        let hint = line("Drop one video to play it, or up to four videos to compare them", 15.0, p.text);
+        let sub = line("Frame-accurate stepping · side by side, wipe and difference · start points · PSNR & SSIM · scopes", 12.5, p.muted);
+        let card = self.open_error.as_ref().map(|(name, why)| ErrorCard::layout(&painter, &p, name, why, wrap.min(440.0)));
+        let icon_h = 64.0;
+        let card_h = card.as_ref().map(|c| c.size.y + 20.0).unwrap_or(0.0);
+        let total = icon_h + 14.0 + hint.size().y + 8.0 + sub.size().y + 20.0 + card_h + 34.0;
+        let mut y = (view.center().y - total / 2.0).max(view.min.y + 16.0);
+        let cx = view.center().x;
+        painter.text(Pos2::new(cx, y + icon_h / 2.0), Align2::CENTER_CENTER, I::FILM_STRIP, FontId::proportional(56.0), p.faint);
+        y += icon_h + 14.0;
+        let (hint_h, sub_h) = (hint.size().y, sub.size().y);
+        painter.galley(Pos2::new(cx, y), hint, p.text);
+        y += hint_h + 8.0;
+        painter.galley(Pos2::new(cx, y), sub, p.muted);
+        y += sub_h + 20.0;
+        if let Some(card) = card {
+            let size = card.size;
+            card.paint(&painter, &p, Pos2::new(cx - size.x / 2.0, y));
+            y += size.y + 20.0;
+        }
+        let br = Rect::from_min_size(Pos2::new(cx - 100.0, y), Vec2::new(200.0, 34.0));
+        let open = ui.scope_builder(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::top_down_justified(egui::Align::Center)), |ui| widgets::primary_button(ui, &p, &format!("{}  Open video...", I::FOLDER_OPEN))).inner;
+        if open.on_hover_text("Choose one video to play, or up to four to compare").clicked() {
+            self.pick_videos(&core.ctx);
+        }
+    }
+
+    /// Ask each decoder for frames the size they are shown at (saves decode
+    /// and upload bandwidth), once the window has settled: resizing, moving
+    /// to another monitor or a DPI change would otherwise re-decode the
+    /// frame many times a second.
+    fn negotiate_sizes(&mut self, eff: &[(f32, Vec2)], ctx: &egui::Context) {
+        let now = Instant::now();
+        let settle = Duration::from_millis(250);
+        let diff = self.shared_pane() && self.mode == CompareMode::Difference;
+        let a_out = self.sources.first().map(|s| s.out_size);
+        let moving: Vec<bool> = (0..self.sources.len()).map(|i| self.playing && self.members().contains(&i)).collect();
+        for (i, s) in self.sources.iter_mut().enumerate() {
+            let native = (s.info.width.max(2), s.info.height.max(2));
+            // Difference compares pixels: B decodes at A's size.
+            let (want, need) = match (diff && i == 1, a_out) {
+                (true, Some(a)) => (a, s.out_size != a),
+                _ => {
+                    let w = sync::wanted_size(native, eff.get(i).map(|e| e.0).unwrap_or(1.0));
+                    (w, sync::needs_resize(s.out_size, w))
+                }
+            };
+            if !need {
+                s.out_wait.clear();
+                continue;
+            }
+            if s.awaiting {
+                continue;
+            }
+            match s.out_wait.update(want, now, settle) {
+                Some(w) => {
+                    s.out_size = w;
+                    s.player.send(Cmd::OutputSize(w.0, w.1));
+                    if !moving[i] || s.at_end() {
+                        // No new frames are coming: decode the frame on screen again at the new size.
+                        let t = s.pts();
+                        s.seek(t, true);
+                        if moving[i] {
+                            // The decoder paused itself at the end; it reports the end again.
+                            s.player.send(Cmd::Play);
+                        }
+                    }
+                }
+                None => ctx.request_repaint_after(settle + Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// A video's caption at the top of its pane (`right`: at the top right):
+    /// its letter, name, own time and frame, start point, and buttons for
+    /// its sound, start point and closing it.
+    fn caption(&mut self, ui: &mut Ui, p: &Palette, i: usize, area: Rect, right: bool, core: &mut Core) {
+        if area.width() < 40.0 || area.height() < CAP_H {
+            return;
+        }
+        let n = self.sources.len();
+        let s = &self.sources[i];
+        let f = s.frame_of(s.pts());
+        let independent = self.sync == SyncMode::Independent && n > 1;
+        let sound = n > 1 && self.audio.is_some() && s.info.has_audio;
+        let start_btn = independent;
+        let buttons = sound as usize + start_btn as usize + (n > 1) as usize;
+        let btn_w = 24.0;
+        let font = theme::text::small();
+        let fixed = 8.0 + 2.0 * BADGE_R + 6.0 + 8.0 + buttons as f32 * btn_w + if buttons > 0 { 4.0 } else { 0.0 };
+        let max_text = (area.width() - fixed).max(0.0);
+        let time = format!("{}  ·  frame {f}", fmt_time(s.pts()));
+        let start = s.start.map(|t| format!("  ·  {} {}", I::FLAG, fmt_time(t))).unwrap_or_default();
+        let name = s.name();
+        let painter = ui.painter().clone();
+        let layout = |t: String| painter.layout_no_wrap(t, font.clone(), p.text);
+        let mut g = layout(format!("{}  ·  {time}{start}", shorten(&name, 28)));
+        if g.size().x > max_text {
+            g = layout(format!("{time}{start}"));
+        }
+        if g.size().x > max_text {
+            g = layout(fmt_time(s.pts()));
+        }
+        let text_w = if g.size().x > max_text { 0.0 } else { g.size().x };
+        let w = (fixed + text_w).min(area.width());
+        let min = if right { Pos2::new(area.max.x - w, area.min.y) } else { area.min };
+        let r = Rect::from_min_size(min, Vec2::new(w, CAP_H));
+        let sel = independent && self.lead() == i;
+        let stroke = if sel { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
+        painter.add(theme::popover_shadow(p).as_shape(r, CornerRadius::same(theme::radius::CARD)));
+        painter.rect(r, CornerRadius::same(theme::radius::CARD), p.overlay, stroke, egui::StrokeKind::Inside);
+        paint_badge(&painter, Pos2::new(r.min.x + 8.0 + BADGE_R, r.center().y), letter(i), letter_color(p, i), BADGE_R - 1.0);
+        let text_rect = Rect::from_min_max(r.min, Pos2::new(r.min.x + 8.0 + 2.0 * BADGE_R + 6.0 + text_w + 4.0, r.max.y));
+        if text_w > 0.0 {
+            painter.galley(Pos2::new(r.min.x + 8.0 + 2.0 * BADGE_R + 6.0, r.center().y - g.size().y / 2.0), g, p.text);
+        }
+        let mut tip = format!("{}: {name}\n{} / {}  ·  frame {f}", letter(i), fmt_time(s.pts()), fmt_time(s.duration()));
+        if let Some(t) = s.start {
+            tip += &format!("\nStart point {} (frame {})", fmt_time(t), s.frame_of(t));
+        }
+        if independent {
+            tip += "\nClick to select it: the timeline and , / . then move this video";
+        }
+        let id = egui::Id::unique(("video-caption", i));
+        if ui.interact(text_rect, id, Sense::click()).on_hover_text(tip).clicked() && independent {
+            self.select(i);
+        }
+        // Buttons, right to left.
+        let mut x = r.max.x - 4.0 - btn_w;
+        let btn = |x: f32| Rect::from_min_size(Pos2::new(x, r.center().y - btn_w / 2.0), Vec2::splat(btn_w));
+        if n > 1 {
+            if cap_button(ui, btn(x), id.with("close"), I::X, &format!("Close {} ({name})", letter(i)), false, p).clicked() {
+                self.remove_source(i);
+                return;
+            }
+            x -= btn_w;
+        }
+        if start_btn {
+            let tip = format!("Set {}'s start point at this frame: where the event begins in this video (P)", letter(i));
+            if cap_button(ui, btn(x), id.with("start"), I::FLAG, &tip, self.sources[i].start.is_some(), p).clicked() {
+                self.set_start(i, core);
+            }
+            x -= btn_w;
+        }
+        if sound {
+            let on = self.audio_src == i;
+            let tip = if on { format!("You hear {}'s sound", letter(i)) } else { format!("Play {}'s sound instead", letter(i)) };
+            if cap_button(ui, btn(x), id.with("sound"), if on { I::SPEAKER_HIGH } else { I::SPEAKER_SLASH }, &tip, on, p).clicked() {
+                self.set_audio_source(i);
+            }
+        }
+    }
+
+    /// Readouts over the picture: zoom (and for one video its frame), a
+    /// "Seeking" badge for slow seeks, and audio output errors.
+    fn hud(&mut self, ui: &Ui, painter: &egui::Painter, p: &Palette, view: Rect, eff: &[(f32, Vec2)]) {
+        let lead = self.lead();
+        let a = &self.sources[lead];
+        let zoom = if self.view.fit { "Fit".to_string() } else { format!("{:.0}%", eff.get(lead).map(|e| e.0).unwrap_or(1.0) * 100.0) };
+        if self.sources.len() == 1 {
+            let f = a.frame_of(a.pts());
+            let kind = a.current.as_ref().map(|c| c.kind as char).unwrap_or('?');
+            // One pill: the timecode (monospace), then frame, type and zoom.
+            let mut rest = format!("Frame {f}  ·  {}  ·  {zoom}", kind_name(kind));
+            if let Some(e) = &a.error {
+                rest = format!("{rest}  ·  {} {e}", I::WARNING);
+            }
+            let job = |time: bool, rest: &str| {
+                let mut job = egui::text::LayoutJob::default();
+                let fmt = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
+                if time {
+                    job.append(&fmt_time(a.pts()), 0.0, fmt(theme::text::mono(), p.text));
+                    job.append("  ·  ", 0.0, fmt(theme::text::small(), p.muted));
+                }
+                job.append(rest, 0.0, fmt(theme::text::small(), p.text));
+                job
+            };
+            // In a narrow view the readout shortens (the transport bar has the
+            // same numbers), down to nothing, rather than running off the left.
+            let fits = |job: egui::text::LayoutJob| {
+                let g = painter.layout_job(job);
+                (g.size().x + 2.0 * OSD_PAD + 24.0 <= view.width()).then_some(g)
+            };
+            if let Some(g) = fits(job(true, &rest)).or_else(|| fits(job(false, &format!("Frame {f}  ·  {}", kind_name(kind))))) {
+                osd_pill(painter, p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
+            }
+        } else if !(self.shared_pane() && self.mode == CompareMode::Difference) {
+            let g = painter.layout_no_wrap(format!("{} {zoom}", I::MAGNIFYING_GLASS), theme::text::small(), p.text);
+            if g.size().x + 60.0 < view.width() {
+                osd_pill(painter, p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
+            }
         }
         // A slow seek (long GOP) keeps the last frame on screen with a badge,
         // so stepping never looks frozen.
-        if let Some(t0) = a.seek_started {
+        let t0 = self.members().iter().filter_map(|&i| self.sources[i].seek_started).min();
+        if let Some(t0) = t0 {
             let delay = Duration::from_millis(150);
             if t0.elapsed() >= delay {
                 let txt = match self.pending_step {
@@ -1566,9 +2251,9 @@ impl VideoMode {
                     None => "Seeking...".to_string(),
                 };
                 let g = painter.layout_no_wrap(txt, theme::text::body(), p.text);
-                osd_pill(&painter, &p, Pos2::new(view.center().x, view.min.y + 20.0), Align2::CENTER_TOP, g);
+                osd_pill(painter, p, Pos2::new(view.center().x, view.min.y + 44.0), Align2::CENTER_TOP, g);
             } else {
-                ui.ctx().request_repaint_after(delay - t0.elapsed());
+                ui.ctx().request_repaint_after(delay.saturating_sub(t0.elapsed()));
             }
         }
         if self.audio.is_none() {
@@ -1576,14 +2261,14 @@ impl VideoMode {
                 painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  No audio output: {e}", I::SPEAKER_SLASH), FontId::proportional(11.5), p.muted);
             }
         }
-        resp.context_menu(|ui| self.canvas_menu(ui, core));
     }
 
     /// The picture's right-click menu, laid out like the viewer's: the
-    /// transport, snapshots, compare modes (two videos), panels and leaving.
+    /// transport, frames, compare views (two videos), panels and leaving.
     /// Esc closes only the menu (see `keys`).
     fn canvas_menu(&mut self, ui: &mut Ui, core: &mut Core) {
-        ui.set_min_width(230.0);
+        ui.set_min_width(240.0);
+        let n = self.sources.len();
         let item = |ui: &mut Ui, icon: &str, label: &str, key: &str| widgets::menu_item(ui, icon, label, key).clicked();
         // On / off rows show a check mark instead of their icon while on.
         let check = |ui: &mut Ui, icon: &str, label: &str, key: &str, on: bool| widgets::menu_check(ui, on, icon, label, key).clicked();
@@ -1605,30 +2290,49 @@ impl VideoMode {
             ui.close();
         }
         ui.separator();
-        if item(ui, I::CAMERA, "Save frame as PNG...", "Ctrl+S") {
+        if item(ui, I::CAMERA, if n > 1 { "Save frames as PNG..." } else { "Save frame as PNG..." }, "Ctrl+S") {
             ui.close();
-            self.snapshot(false, core);
+            self.open_save_dialog();
         }
-        if item(ui, I::COPY, "Copy frame", "Ctrl+C") {
+        if item(ui, I::COPY, if n > 1 { "Copy frames side by side" } else { "Copy frame" }, "Ctrl+C") {
             ui.close();
-            self.snapshot(true, core);
+            self.save_frames(SaveTarget::Clipboard);
         }
-        if self.sources.len() == 2 {
+        if n > 1 && item(ui, I::IMAGES, "Open frames in Compare", "") {
+            ui.close();
+            self.open_in_compare();
+        }
+        if n > 1 {
             ui.separator();
-            widgets::submenu(ui, self.mode.icon(), "Compare", |ui| {
-                ui.set_min_width(210.0);
-                for m in CompareMode::ALL {
-                    if check(ui, m.icon(), m.label(), m.key(), self.mode == m) {
-                        self.mode = m;
+            if n == 2 {
+                widgets::submenu(ui, self.mode.icon(), "View", |ui| {
+                    ui.set_min_width(210.0);
+                    for m in CompareMode::ALL {
+                        if check(ui, m.icon(), m.label(), m.key(), self.mode == m) {
+                            self.mode = m;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
+                        self.swap();
                         ui.close();
                     }
-                }
-                ui.separator();
-                if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
-                    self.swap();
-                    ui.close();
-                }
-            });
+                });
+            }
+            let linked = self.sync == SyncMode::Linked;
+            if check(ui, I::LINK, "Linked (play together)", "L", linked) {
+                self.toggle_sync(core);
+                ui.close();
+            }
+            if item(ui, I::FLAG, if linked { "Set start points here" } else { "Set start point here" }, "P") {
+                self.set_start_here(core);
+                ui.close();
+            }
+            if self.any_start() && item(ui, I::ARROW_U_UP_LEFT, "Go to start points", "Shift+Home") {
+                self.go_to_starts();
+                ui.close();
+            }
         }
         ui.separator();
         // Opens the Analysis panel (never closes it, unlike Ctrl+Q).
@@ -1646,7 +2350,7 @@ impl VideoMode {
             ui.close();
         }
         ui.separator();
-        if item(ui, I::X, "Close video", "Esc") {
+        if item(ui, I::X, if n > 1 { "Close videos" } else { "Close video" }, "Esc") {
             self.close_requested = true;
             ui.close();
         }
@@ -1674,57 +2378,31 @@ impl VideoMode {
     pub fn zoom_to_region(&mut self, r: [f32; 4], pane: Vec2, ppp: f32) {
         let Some(s) = self.sources.first() else { return };
         let (w, h) = s.display_size();
+        let pane_px = pane * if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+        let Some(fit) = sync::fit_zoom((w, h), pane_px) else { return };
         let (w, h) = (w as f32, h as f32);
         let (rw, rh) = (((r[2] - r[0]) * w).max(16.0), ((r[3] - r[1]) * h).max(16.0));
-        self.zoom = ((pane.x * ppp / rw).min(pane.y * ppp / rh) * 0.6).clamp(0.02, 8.0);
-        self.center = Vec2::new((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
-        self.auto_fit = false;
+        let z = sync::sane_zoom((pane_px.x / rw).min(pane_px.y / rh) * 0.6);
+        let rel = sync::safe_clamp(z / fit, 0.05, 256.0);
+        self.view = View { fit: false, zoom: rel, center: Vec2::new(sync::safe_clamp((r[0] + r[2]) / 2.0, 0.0, 1.0), sync::safe_clamp((r[1] + r[3]) / 2.0, 0.0, 1.0)) };
     }
 
-    fn pixel_probe(&mut self, ui: &Ui, dest: Rect, (dw, dh): (u32, u32)) {
-        self.pixel = None;
-        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            if dest.contains(pos) {
-                let x = ((pos.x - dest.min.x) / dest.width() * dw as f32) as u32;
-                let y = ((pos.y - dest.min.y) / dest.height() * dh as f32) as u32;
-                self.pixel = Some((x.min(dw - 1), y.min(dh - 1)));
-            }
-        }
-    }
-
+    /// Start the difference image of the frames on screen (off the UI
+    /// thread) and show the latest finished one.
     fn update_diff(&mut self, ctx: &egui::Context) {
+        if let Some((ci, mean, max)) = self.diff.poll() {
+            self.diff_stats = Some((mean, max));
+            match &mut self.diff_tex {
+                Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
+                None => self.diff_tex = Some(ctx.load_texture("video-diff", ci, egui::TextureOptions::NEAREST)),
+            }
+        }
         let (Some(a), Some(b)) = (self.sources[0].current.as_ref(), self.sources[1].current.as_ref()) else { return };
-        let key = (a.pts.to_bits(), b.pts.to_bits(), self.gain.to_bits());
-        if self.diff_tex.as_ref().map(|(k, _)| *k == key).unwrap_or(false) {
-            return;
-        }
-        let (ia, ib) = (&a.rgba, &b.rgba);
-        let (w, h) = (ia.width().min(ib.width()), ia.height().min(ib.height()));
-        let gain = self.gain;
-        let mut out = vec![Color32::BLACK; (w * h) as usize];
-        let mut sum = 0f64;
-        let mut max = 0u8;
-        for y in 0..h {
-            for x in 0..w {
-                let pa = ia.get_pixel(x, y).0;
-                let pb = ib.get_pixel(x, y).0;
-                let d = [pa[0].abs_diff(pb[0]), pa[1].abs_diff(pb[1]), pa[2].abs_diff(pb[2])];
-                let m = d[0].max(d[1]).max(d[2]);
-                max = max.max(m);
-                sum += (d[0] as f64 + d[1] as f64 + d[2] as f64) / 3.0;
-                let amp = |v: u8| ((v as f32 * gain).min(255.0)) as u8;
-                out[(y * w + x) as usize] = Color32::from_rgb(amp(d[0]), amp(d[1]), amp(d[2]));
-            }
-        }
-        self.diff_stats = Some((sum / (w as f64 * h as f64).max(1.0), max as f64));
-        let ci = egui::ColorImage::new([w as usize, h as usize], out);
-        match &mut self.diff_tex {
-            Some((k, t)) => {
-                t.set(ci, egui::TextureOptions::NEAREST);
-                *k = key;
-            }
-            None => self.diff_tex = Some((key, ctx.load_texture("video-diff", ci, egui::TextureOptions::NEAREST))),
-        }
+        let key = (a.pts.to_bits(), b.pts.to_bits(), self.gain.to_bits(), b.rgba.dimensions());
+        let (ia, ib, gain) = (a.rgba.clone(), b.rgba.clone(), self.gain);
+        // While playing at most about 15 a second; paused at once.
+        let gap = if self.playing { Duration::from_millis(60) } else { Duration::ZERO };
+        self.diff.request(key, gap, ctx, move || diff_image(&ia, &ib, gain));
     }
 
     fn maybe_metrics(&mut self) {
@@ -1755,15 +2433,17 @@ impl VideoMode {
             return;
         };
         let side = |s: &Source| VideoSideCtx::new(&s.path, &s.info, &s.index, s.current.as_ref().and_then(|f| f.native.clone()));
-        let loop_ab = match self.loop_ab {
-            (Some(x), Some(y)) => Some((a.frame_of(x), a.frame_of(y))),
+        let loop_ab = match (self.loop_lead, self.loop_ab.range()) {
+            (0, Some((x, y))) => Some((a.frame_of(x), a.frame_of(y))),
             _ => None,
         };
         let current = a.current.as_ref().map(|f| a.frame_of(f.pts));
-        core.metrics.set_video(Some(VideoSubject { a: side(a), b: self.sources.get(1).map(side), offset: self.offset_frames, current, loop_ab }));
+        core.metrics.set_video(Some(VideoSubject { a: side(a), b: self.sources.get(1).map(side), offset: self.offset_frames_b(), current, loop_ab }));
         if let Some(f) = core.metrics.take_seek() {
-            let t = a.pts_of(f as usize);
+            let t = self.sources[0].pts_of(f as usize);
             self.pause();
+            let lead = self.lead();
+            let t = if lead == 0 { t } else { sync::target(t, 0, lead, &self.offsets()) };
             self.seek_all(t, true);
         }
         // With B loaded both players already copy native planes.
@@ -1771,7 +2451,7 @@ impl VideoMode {
             self.metrics_native = false;
         } else if core.metrics.visible() != self.metrics_native {
             self.metrics_native = !self.metrics_native;
-            self.sources[0].player.send(Cmd::Native(self.metrics_native));
+            self.update_native();
             if self.metrics_native && !self.playing {
                 // Decode the paused frame again, now with its planes.
                 let t = self.sources[0].pts();
@@ -1798,6 +2478,8 @@ impl VideoMode {
         // As tall as the play button, so the readouts and the right-hand
         // controls center on the icons.
         let row = Vec2::new(ui.available_width(), 34.0);
+        let lead = self.lead();
+        let n = self.sources.len();
         ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let fit = self.transport_fit(ui);
@@ -1806,7 +2488,7 @@ impl VideoMode {
                 self.seek_all(0.0, true);
             }
             if fit.skip_secs && b(ui, I::CARET_DOUBLE_LEFT, "Back 1 s (Shift+←)") {
-                let t = self.sources[0].pts() - 1.0;
+                let t = self.sources[lead].pts() - 1.0;
                 self.seek_all(t, true);
             }
             if b(ui, I::CARET_LEFT, "Previous frame (, or ← while paused)") {
@@ -1820,23 +2502,33 @@ impl VideoMode {
                 self.step(1);
             }
             if fit.skip_secs && b(ui, I::CARET_DOUBLE_RIGHT, "Forward 1 s (Shift+→)") {
-                let t = self.sources[0].pts() + 1.0;
+                let t = self.sources[lead].pts() + 1.0;
                 self.seek_all(t, true);
             }
             if fit.first_last && b(ui, I::SKIP_FORWARD, "Last frame (End)") {
-                let n = self.sources[0].frame_count().unwrap_or(1);
-                let t = self.sources[0].pts_of(n.saturating_sub(1));
+                let n = self.sources[lead].frame_count().unwrap_or(1);
+                let t = self.sources[lead].pts_of(n.saturating_sub(1));
                 self.seek_all(t, true);
             }
             widgets::separator_v(ui);
-            let a = &self.sources[0];
+            if n > 1 {
+                // Which video the timeline and the counters show.
+                let (r, _) = ui.allocate_exact_size(Vec2::new(2.0 * BADGE_R + 6.0, 26.0), Sense::hover());
+                paint_badge(ui.painter(), r.center(), letter(lead), letter_color(&p, lead), BADGE_R - 1.0);
+                let tip = match self.sync {
+                    SyncMode::Linked => "The timeline shows A; all videos move together (Linked)".to_string(),
+                    SyncMode::Independent => format!("The timeline and frame keys move only {} (Independent: click a video or press Tab to choose)", letter(lead)),
+                };
+                ui.interact(r, ui.scope_id().with("lead-badge"), Sense::hover()).on_hover_text(tip);
+            }
+            let s = &self.sources[lead];
             let (time, frame) = self.position_text(fit.duration, fit.frame_word);
             if fit.time {
                 ui.add_space(4.0);
-                readout(ui, time, p.text, Sense::hover()).on_hover_text(format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())));
+                readout(ui, time, p.text, Sense::hover()).on_hover_text(format!("Time: {} / {}", fmt_time(s.pts()), fmt_time(s.duration())));
                 ui.add_space(2.0);
             }
-            let fr = readout(ui, frame, p.muted, Sense::click()).on_hover_text("Go to frame or time (G)");
+            let fr = readout(ui, frame, p.muted, Sense::click()).on_hover_text("Frame number. Click to go to a frame or time (G)");
             if fr.clicked() {
                 self.goto = Some(String::new());
             }
@@ -1845,7 +2537,12 @@ impl VideoMode {
                 widgets::separator_v(ui);
                 let lab = self.loop_label();
                 let text = if fit.loop_label { format!("{} {lab}", I::REPEAT) } else { I::REPEAT.to_string() };
-                if ui.add(egui::Button::new(RichText::new(text).size(12.5)).selected(self.loop_ab.1.is_some()).min_size(Vec2::new(0.0, 26.0))).on_hover_text(format!("{lab} (Ctrl+L)")).clicked() {
+                let tip = match self.loop_ab.range() {
+                    None if self.loop_ab.a.is_some() => "Repeat a section: now go to its last frame and press again to set the end (Ctrl+L)".to_string(),
+                    None => "Repeat a section: press to set its start here, again to set its end, a third time to clear (Ctrl+L)".to_string(),
+                    Some((a, b)) => format!("Repeating {} - {} while playing. Press to clear (Ctrl+L)", fmt_time(a), fmt_time(b)),
+                };
+                if ui.add(egui::Button::new(RichText::new(text).size(12.5)).selected(self.loop_ab.a.is_some()).min_size(Vec2::new(0.0, 26.0))).on_hover_text(tip).clicked() {
                     self.toggle_loop();
                 }
             }
@@ -1857,19 +2554,22 @@ impl VideoMode {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Volume: a slim slider (a smaller knob than the default).
                 ui.spacing_mut().slider_width = 90.0;
-                if self.audio.is_some() && self.sources[0].info.has_audio {
+                let k = self.audio_src.min(n - 1);
+                let who = if n > 1 { format!(" of {}", letter(k)) } else { String::new() };
+                if self.audio.is_some() && self.sources[k].info.has_audio {
                     let slim = |ui: &mut Ui, v: &mut f32| ui.add(widgets::Slider::new(v, 0.0..=1.5).show_value(false).width(90.0).default_value(1.0));
-                    if fit.volume && slim(ui, &mut self.volume).on_hover_text("Volume (double-click: 100%)").changed() {
+                    if fit.volume && slim(ui, &mut self.volume).on_hover_text(format!("Volume{who} (double-click: 100%)")).changed() {
                         if let Some(a) = self.audio_shared() {
                             a.set_volume(self.volume);
                         }
                     }
                     let vi = if self.muted || self.volume == 0.0 { I::SPEAKER_SLASH } else { I::SPEAKER_HIGH };
-                    if widgets::icon_button(ui, vi, "Mute (M)", self.muted).clicked() {
+                    let tip = if n > 1 { format!("Mute (M). You hear {}; the speaker on a video's caption picks another", letter(k)) } else { "Mute (M)".to_string() };
+                    if widgets::icon_button(ui, vi, &tip, self.muted).clicked() {
                         self.toggle_mute();
                     }
                 } else if fit.volume {
-                    ui.label(RichText::new(format!("{} no audio", I::SPEAKER_SLASH)).size(11.5).color(p.faint));
+                    ui.label(RichText::new(format!("{} no audio", I::SPEAKER_SLASH)).size(11.5).color(p.faint)).on_hover_text(format!("No sound{who}"));
                 } else {
                     ui.label(RichText::new(I::SPEAKER_SLASH).size(11.5).color(p.faint)).on_hover_text("No audio");
                 }
@@ -1883,7 +2583,7 @@ impl VideoMode {
                         }
                     }
                 });
-                speed.response.on_hover_text("Playback speed ([ and ]; Backspace: 1×)");
+                speed.response.on_hover_text("Playback speed ([ and ]; Backspace: 1×). Sound plays at 1× only");
                 if fit.speed_label {
                     ui.label(RichText::new("Speed").size(12.5).color(p.muted));
                 }
@@ -1892,9 +2592,9 @@ impl VideoMode {
     }
 
     fn loop_label(&self) -> &'static str {
-        match self.loop_ab {
+        match (self.loop_ab.a, self.loop_ab.b) {
             (None, _) => "Loop A-B",
-            (Some(_), None) => "Set B",
+            (Some(_), None) => "Set end",
             _ => "Clear loop",
         }
     }
@@ -1904,7 +2604,7 @@ impl VideoMode {
     /// The counter is padded on the left to its width on the last frame, so
     /// in the monospace readout nothing after it moves while the video plays.
     fn position_text(&self, duration: bool, word: bool) -> (String, String) {
-        let a = &self.sources[0];
+        let a = &self.sources[self.lead()];
         let total = a.frame_count().map(|n| n.to_string()).unwrap_or_else(|| "...".into());
         let time = if duration { format!("{} / {}", fmt_time(a.pts()), fmt_time(a.duration())) } else { fmt_time(a.pts()) };
         let word = if word { "frame " } else { "" };
@@ -1925,10 +2625,13 @@ impl VideoMode {
         let small = FontId::proportional(12.5);
         let icon = 30.0 + s;
         let sep = 9.0 + s;
-        let audio = self.audio.is_some() && self.sources[0].info.has_audio;
+        let n = self.sources.len();
+        let k = self.audio_src.min(n.saturating_sub(1));
+        let audio = self.audio.is_some() && self.sources.get(k).map(|s| s.info.has_audio).unwrap_or(false);
+        let badge = if n > 1 { 2.0 * BADGE_R + 6.0 + s } else { 0.0 };
         let width = |f: &TransportFit| -> f32 {
             let (time, frame) = self.position_text(f.duration, f.frame_word);
-            let mut w = 2.0 * icon + 34.0 + s + sep;
+            let mut w = 2.0 * icon + 34.0 + s + sep + badge;
             w += if f.first_last { 2.0 * icon } else { 0.0 } + if f.skip_secs { 2.0 * icon } else { 0.0 };
             w += if f.time { text_w(&time, mono.clone()) + 2.0 * s + 6.0 } else { 0.0 } + text_w(&frame, mono.clone()) + 8.0 + s;
             if f.loop_button {
@@ -1937,7 +2640,7 @@ impl VideoMode {
             if f.legend {
                 let cap = FontId::proportional(theme::text::CAPTION);
                 let psnr = if self.analysis.is_some() { 26.0 + text_w("PSNR-Y (20-60 dB)", cap.clone()) } else { 0.0 };
-                w += sep + 6.0 + 22.0 + text_w("Frame size", cap.clone()) + 20.0 + text_w("I-frame", cap) + psnr;
+                w += sep + 6.0 + 22.0 + text_w("Frame size", cap.clone()) + 20.0 + text_w("I-frame", cap.clone()) + 26.0 + text_w("Start point", cap) + psnr;
             }
             // Right: volume or "no audio", speed.
             w += match (audio, f.volume) {
@@ -1978,7 +2681,7 @@ impl VideoMode {
         }
         self.speed = s;
         // Re-seek so queued audio/video from the old speed is discarded and A/V stays in sync.
-        if let Some(t) = self.sources.first().map(|x| x.pts()) {
+        if let Some(t) = self.sources.get(self.lead()).map(|x| x.pts()) {
             self.seek_all(t, true);
         }
         if was {
@@ -1993,30 +2696,41 @@ impl VideoMode {
         }
     }
 
+    /// Ctrl+L: set the repeated section's start, then its end, then clear
+    /// it (in the lead video's time).
     fn toggle_loop(&mut self) {
-        let t = self.sources.first().map(|s| s.pts()).unwrap_or(0.0);
-        self.loop_ab = match self.loop_ab {
-            (None, _) => (Some(t), None),
-            (Some(a), None) if t > a => (Some(a), Some(t)),
-            (Some(_), None) => (Some(t), None),
-            _ => (None, None),
+        let Some(s) = self.sources.get(self.lead()) else { return };
+        let t = if s.awaiting { self.clock.base_pts } else { s.pts() };
+        let lead = self.lead();
+        let current = if self.loop_ab.a.is_some() && self.loop_lead != lead {
+            // Set in another video's time: carry it over, or start again.
+            self.loop_in_lead().unwrap_or_default()
+        } else {
+            self.loop_ab
         };
+        self.loop_ab = current.press(t);
+        self.loop_lead = lead;
     }
 
     fn timeline(&mut self, ui: &mut Ui, p: &Palette) {
         // Tick to label: half the playhead's head (5 pt) plus a 4 pt gap.
         const LABEL_GAP: f32 = 9.0;
         let h = 60.0;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.0), h), Sense::click_and_drag());
+        if rect.width() < 20.0 {
+            return;
+        }
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, CornerRadius::same(theme::radius::CONTROL), ui.visuals().extreme_bg_color);
-        let a = &self.sources[0];
+        let lead = self.lead();
+        let looped = self.loop_in_lead();
+        let a = &self.sources[lead];
         let dur = a.duration().max(0.001);
         // The time axis is inset so the playhead's 10 pt head stays whole at
         // either end.
         let track = rect.shrink2(Vec2::new(6.0, 0.0));
-        let x_of = |t: f64| track.min.x + (t / dur) as f32 * track.width();
-        let t_of = |x: f32| (((x - track.min.x) / track.width()) as f64 * dur).clamp(0.0, dur);
+        let x_of = |t: f64| track.min.x + (t / dur).clamp(-0.01, 1.01) as f32 * track.width();
+        let t_of = |x: f32| (((x - track.min.x) / track.width().max(1.0)) as f64 * dur).clamp(0.0, dur);
         // A time ruler along the top, the frame-size bars in the middle and a
         // strip at the bottom with the frame types (I ticks; P and B dots once
         // frames are far enough apart to tell them apart).
@@ -2025,15 +2739,17 @@ impl VideoMode {
         let base = rect.max.y - strip_h;
         let bar_h = base - (rect.min.y + ruler_h) - 2.0;
         // Loop region
-        if let (Some(la), lb) = self.loop_ab {
-            let lb = lb.unwrap_or(a.pts());
-            painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(la), rect.min.y), Pos2::new(x_of(lb), rect.max.y)), 0.0, p.accent.gamma_multiply(0.18));
+        if let Some(l) = looped {
+            if let Some(la) = l.a {
+                let lb = l.b.unwrap_or(a.pts());
+                painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(la.min(lb)), rect.min.y), Pos2::new(x_of(la.max(lb)), rect.max.y)), 0.0, p.accent.gamma_multiply(0.18));
+            }
         }
         let step = tick_step(dur, track.width(), 84.0);
         let label_font = FontId::proportional(theme::text::CAPTION);
         for k in 0.. {
             let t = k as f64 * step;
-            if t > dur {
+            if t > dur || k > 10_000 {
                 break;
             }
             let x = x_of(t).round() + 0.5;
@@ -2062,30 +2778,31 @@ impl VideoMode {
             if stale {
                 self.timeline_cache = Some((idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
             }
-            let (_, _, columns, _) = self.timeline_cache.as_ref().unwrap();
             let tints = timeline_tints(p);
             let mut mesh = egui::Mesh::default();
             let mut last_tick = f32::NEG_INFINITY;
             let tick = p.muted.gamma_multiply(0.8);
-            for (c, col) in columns.iter().enumerate() {
-                let x = track.min.x + c as f32;
-                // An I tick per column with a keyframe, at least 3 points apart.
-                if col.key && x - last_tick >= 3.0 {
-                    mesh.add_colored_rect(Rect::from_min_size(Pos2::new(x, base + 2.0), Vec2::new(1.0, 6.0)), tick);
-                    last_tick = x;
-                }
-                if col.height <= 0.0 {
-                    continue;
-                }
-                // Stack the frame types bottom-up by their share of the column's bytes.
-                let mut y = base;
-                for (share, color) in col.shares.iter().zip(tints) {
-                    if *share <= 0.0 {
+            if let Some((_, _, columns, _)) = self.timeline_cache.as_ref() {
+                for (c, col) in columns.iter().enumerate() {
+                    let x = track.min.x + c as f32;
+                    // An I tick per column with a keyframe, at least 3 points apart.
+                    if col.key && x - last_tick >= 3.0 {
+                        mesh.add_colored_rect(Rect::from_min_size(Pos2::new(x, base + 2.0), Vec2::new(1.0, 6.0)), tick);
+                        last_tick = x;
+                    }
+                    if col.height <= 0.0 {
                         continue;
                     }
-                    let top = y - share * col.height * bar_h;
-                    mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + 1.0, y)), color);
-                    y = top;
+                    // Stack the frame types bottom-up by their share of the column's bytes.
+                    let mut y = base;
+                    for (share, color) in col.shares.iter().zip(tints) {
+                        if *share <= 0.0 {
+                            continue;
+                        }
+                        let top = y - share * col.height * bar_h;
+                        mesh.add_colored_rect(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + 1.0, y)), color);
+                        y = top;
+                    }
                 }
             }
             // P and B frames as dots when there are at least 6 points per frame.
@@ -2106,8 +2823,8 @@ impl VideoMode {
             }
         }
         drop(idx_guard);
-        // Metric graph (PSNR-Y) from analysis.
-        if let Some(an) = &self.analysis {
+        // Metric graph (PSNR-Y) from analysis (in A's frames).
+        if let (Some(an), 0) = (&self.analysis, lead) {
             let rows = an.rows.lock();
             if rows.len() > 1 {
                 let pts: Vec<Pos2> = rows
@@ -2122,7 +2839,13 @@ impl VideoMode {
                 painter.add(egui::Shape::line(pts, Stroke::new(1.5, PSNR_COLOR)));
             }
         }
-        // Playhead (A): a 2 pt accent line with a 10 pt head on the ruler.
+        // The lead's start point: a flag on the ruler.
+        if let Some(st) = a.start {
+            let x = x_of(st).round() + 0.5;
+            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(1.0, START_COLOR));
+            painter.text(Pos2::new(x + 1.0, rect.min.y + 1.0), Align2::LEFT_TOP, I::FLAG, FontId::proportional(11.0), START_COLOR);
+        }
+        // Playhead: a 2 pt accent line with a 10 pt head on the ruler.
         let x = x_of(a.pts()).round();
         painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(2.0, p.accent));
         painter.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y), Pos2::new(x + 5.0, rect.min.y + 5.0), Pos2::new(x, rect.min.y + 10.0), Pos2::new(x - 5.0, rect.min.y + 5.0)], p.accent, Stroke::NONE));
@@ -2136,10 +2859,13 @@ impl VideoMode {
             if let Some(e) = e {
                 tip += &format!("  ·  {}  ·  {}", kind_name(e.kind as char), crate::catalog::human_size(e.size as u64));
             }
-            if let Some(an) = &self.analysis {
+            if let (Some(an), 0) = (&self.analysis, lead) {
                 if let Some((_, m)) = an.rows.lock().iter().find(|(i, _)| *i == f) {
                     tip += &format!("  ·  PSNR {:.2} dB  SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y);
                 }
+            }
+            if self.sources.len() > 1 {
+                tip = format!("{}: {tip}", letter(lead));
             }
             resp.clone().on_hover_text_at_pointer(tip);
         }
@@ -2174,12 +2900,13 @@ impl VideoMode {
             ui.spacing_mut().item_spacing.x = 0.0;
             item(ui, Vec2::new(8.0, 10.0), timeline_tints(p)[1], false, "Frame size");
             item(ui, Vec2::new(1.0, 6.0), p.muted.gamma_multiply(0.8), false, "I-frame");
+            item(ui, Vec2::new(1.0, 10.0), START_COLOR, false, "Start point");
             if self.analysis.is_some() {
                 item(ui, Vec2::new(12.0, 2.0), PSNR_COLOR, false, "PSNR-Y (20-60 dB)");
             }
         })
         .response
-        .on_hover_text("Timeline: frame sizes (keyframes lighter), I-frame ticks below; P and B frames show as dots once frames are far enough apart");
+        .on_hover_text("Timeline: frame sizes (keyframes lighter), I-frame ticks below, the start point as a flag; P and B frames show as dots once frames are far enough apart");
     }
 
     // ---------------------------------------------------------------- panels
@@ -2187,41 +2914,61 @@ impl VideoMode {
     fn info_panel(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let compare = self.sources.len() == 2;
+            let n = self.sources.len();
+            let compare = n > 1;
             // Current frame
             widgets::section_title(ui, &p, "Current frame");
             for (i, s) in self.sources.iter().enumerate() {
                 let f = s.frame_of(s.pts());
                 let e = s.entry(f);
                 let kind = s.current.as_ref().map(|c| c.kind as char).unwrap_or('?');
-                let label = if i == 0 { "A" } else { "B" };
                 let size = e.map(|e| crate::catalog::human_size(e.size as u64)).unwrap_or_default();
-                widgets::kv_row(ui, &p, label, &format!("#{f}  {}  {}  {}", fmt_time(s.pts()), kind_name(kind), size));
+                widgets::kv_row(ui, &p, letter(i), &format!("#{f}  {}  {}  {}", fmt_time(s.pts()), kind_name(kind), size));
             }
-            if let Some((x, y)) = self.pixel {
-                let mut line = format!("({x}, {y})");
-                for s in &self.sources {
+            if let Some((fx, fy)) = self.pixel {
+                for (i, s) in self.sources.iter().enumerate() {
                     if let Some(c) = &s.current {
                         let (dw, dh) = s.display_size();
-                        let sx = (x as f32 / dw as f32 * c.rgba.width() as f32) as u32;
-                        let sy = (y as f32 / dh as f32 * c.rgba.height() as f32) as u32;
-                        if s.info.rotation == 0 && sx < c.rgba.width() && sy < c.rgba.height() {
+                        let (x, y) = (((fx * dw as f32) as u32).min(dw - 1), ((fy * dh as f32) as u32).min(dh - 1));
+                        let sx = ((fx * c.rgba.width() as f32) as u32).min(c.rgba.width().saturating_sub(1));
+                        let sy = ((fy * c.rgba.height() as f32) as u32).min(c.rgba.height().saturating_sub(1));
+                        let mut line = format!("({x}, {y})");
+                        if s.info.rotation == 0 && c.rgba.width() > 0 && c.rgba.height() > 0 {
                             let px = c.rgba.get_pixel(sx, sy).0;
                             line += &format!("   RGB {},{},{}", px[0], px[1], px[2]);
                         }
+                        widgets::kv_row(ui, &p, &if compare { format!("Pixel {}", letter(i)) } else { "Pixel".into() }, &line);
                     }
                 }
-                widgets::kv_row(ui, &p, "Pixel", &line);
             }
             if compare {
                 ui.add_space(8.0);
-                widgets::section_title(ui, &p, "Quality (A = reference)");
+                widgets::section_title(ui, &p, "Start points");
+                ui.label(RichText::new(match self.sync {
+                    SyncMode::Linked => "Linked: the videos play together, this far apart.",
+                    SyncMode::Independent => "Independent: only the selected video moves. Step each one to where the event begins and set its start point.",
+                }).size(11.5).color(p.muted));
+                let offs = self.offsets();
+                for (i, s) in self.sources.iter().enumerate() {
+                    let text = match s.start {
+                        Some(t) => {
+                            let off = offs.get(i).copied().unwrap_or(0.0);
+                            let rel = if i == 0 { String::new() } else if off.abs() < 5e-4 { "  ·  with A".into() } else { format!("  ·  A {} {:.3} s", if off > 0.0 { "+" } else { "-" }, off.abs()) };
+                            format!("{} (frame {}){rel}", fmt_time(t), s.frame_of(t))
+                        }
+                        None => "not set (runs with A)".into(),
+                    };
+                    widgets::kv_row(ui, &p, letter(i), &if i == 0 && s.start.is_none() { "not set (from the first frame)".into() } else { text });
+                }
+                ui.add_space(8.0);
+                widgets::section_title(ui, &p, "Quality: B compared with A");
                 match &self.metrics_now {
                     Some((_, m)) => {
                         widgets::kv_row(ui, &p, "PSNR Y", &fmt_db(m.psnr_y));
                         widgets::kv_row(ui, &p, "PSNR U / V", &format!("{} / {}", fmt_db(m.psnr_u), fmt_db(m.psnr_v)));
                         widgets::kv_row(ui, &p, "PSNR avg", &fmt_db(m.psnr_avg));
                         widgets::kv_row(ui, &p, "SSIM Y", &fmt_ssim(m.ssim_y));
+                        ui.label(RichText::new("A is the reference. Higher is closer to A (PSNR above 40 dB and SSIM above 0.98 look the same to most people).").size(11.0).color(p.faint));
                     }
                     None => {
                         let mismatch = self.sources[0].info.width != self.sources[1].info.width || self.sources[0].info.height != self.sources[1].info.height;
@@ -2231,7 +2978,11 @@ impl VideoMode {
                 ui.add_space(6.0);
                 match &self.analysis {
                     None => {
-                        if ui.add(egui::Button::new(format!("{}  Analyze whole video (PSNR & SSIM per frame)", I::CHART_LINE)).min_size(Vec2::new(ui.available_width(), 28.0))).clicked() {
+                        if ui
+                            .add(egui::Button::new(format!("{}  Analyze whole video (PSNR & SSIM per frame)", I::CHART_LINE)).min_size(Vec2::new(ui.available_width(), 28.0)))
+                            .on_hover_text("Measure every frame of B against A (using the start points), then list the worst frames and draw PSNR on the timeline")
+                            .clicked()
+                        {
                             self.start_analysis();
                         }
                     }
@@ -2243,7 +2994,7 @@ impl VideoMode {
                         }
                         if !done {
                             ui.add(egui::ProgressBar::new(prog).show_percentage().text(format!("Analyzing... {:.0}%", prog * 100.0)));
-                            if ui.button("Cancel").clicked() {
+                            if ui.button("Cancel").on_hover_text("Stop the analysis (the frames measured so far stay)").clicked() {
                                 an.cancel.store(true, Ordering::Relaxed);
                             }
                             ui.ctx().request_repaint_after(Duration::from_millis(200));
@@ -2263,19 +3014,25 @@ impl VideoMode {
                             worst.sort_by(|a, b| a.1.psnr_y.partial_cmp(&b.1.psnr_y).unwrap_or(std::cmp::Ordering::Equal));
                             let mut jump = None;
                             for (i, m) in worst.iter().take(8) {
-                                if ui.add(egui::Button::new(RichText::new(format!("#{i:<7} PSNR {:>6.2} dB   SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y)).monospace().size(11.5)).frame(false)).clicked() {
+                                if ui
+                                    .add(egui::Button::new(RichText::new(format!("#{i:<7} PSNR {:>6.2} dB   SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y)).monospace().size(11.5)).frame(false))
+                                    .on_hover_text(format!("Show A's frame {i} (and the matching frame of B)"))
+                                    .clicked()
+                                {
                                     jump = Some(*i);
                                 }
                             }
                             if let Some(i) = jump {
                                 let t = self.sources[0].pts_of(i);
+                                let lead = self.lead();
+                                let t = if lead == 0 { t } else { sync::target(t, 0, lead, &self.offsets()) };
                                 self.seek_all(t, true);
                             }
                             ui.horizontal(|ui| {
-                                if ui.button(format!("{}  Export CSV", I::EXPORT)).clicked() {
+                                if ui.button(format!("{}  Export CSV", I::EXPORT)).on_hover_text("Save the per-frame PSNR and SSIM as a CSV file (for Excel)").clicked() {
                                     self.export_csv(core);
                                 }
-                                if done && ui.button("Re-run").clicked() {
+                                if done && ui.button("Re-run").on_hover_text("Clear these results and analyze again (e.g. after changing start points)").clicked() {
                                     self.analysis = None;
                                 }
                             });
@@ -2287,97 +3044,125 @@ impl VideoMode {
             widgets::section_title(ui, &p, "Media info");
             let durations: Vec<f64> = self.sources.iter().map(|s| s.duration()).collect();
             let rows = media_rows(&self.sources.iter().map(|s| &s.info).collect::<Vec<_>>(), &durations);
-            media_table(ui, &p, compare, rows);
+            media_table(ui, &p, n, rows);
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Decoder: FFmpeg {}", engine::ffmpeg_version())).size(10.5).color(p.faint));
         });
     }
 
     fn scopes_panel(&mut self, ui: &mut Ui, p: &Palette) {
+        let n = self.sources.len();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Scopes").font(theme::text::subtitle()));
+            ui.label(RichText::new(I::QUESTION).color(p.muted)).on_hover_text(
+                "Scopes measure the picture instead of showing it:\n\
+                 • Waveform: brightness of each column of the picture, from black (bottom) to white (top).\n\
+                 • RGB parade: the same for red, green and blue side by side; uneven heights mean a color cast.\n\
+                 • Vectorscope: the colors; distance from the center is saturation, direction is hue. The line marks skin tones.\n\
+                 • Histogram: how many pixels have each brightness, from black (left) to white (right).",
+            );
+            if n > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("All {n} videos")).size(theme::text::SMALL).color(p.muted));
+                });
+            }
+        });
+        ui.add_space(4.0);
         // Short names so the four segments fit the panel; the full ones on hover.
         let names = ["Waveform", "Parade", "Vector", "Histogram"];
-        let tips: Vec<&str> = Scope::ALL.iter().map(|s| s.label()).collect();
+        let tips = [
+            "Waveform: brightness (luma) of every picture column, black at the bottom, white at the top",
+            "RGB parade: red, green and blue waveforms side by side",
+            "Vectorscope: hue and saturation of the colors (BT.709); boxes are 75% color targets, the line is skin tone",
+            "Histogram: how many pixels have each level, black on the left, white on the right",
+        ];
         let mut idx = Scope::ALL.iter().position(|s| *s == self.scope).unwrap_or(0);
         if widgets::segmented_with_tips(ui, &mut idx, &names, &tips) {
             self.scope = Scope::ALL[idx];
-            self.scope_tex = None;
+        }
+        if self.scope == Scope::Histogram {
+            ui.add_space(4.0);
+            let mut h = HistMode::ALL.iter().position(|m| *m == self.hist_mode).unwrap_or(2);
+            let labels: Vec<&str> = HistMode::ALL.iter().map(|m| m.label()).collect();
+            let tips = ["Luminance: the brightness of the pixels only", "RGB: red, green and blue separately", "Both: red, green, blue and brightness together"];
+            if widgets::segmented_with_tips(ui, &mut h, &labels, &tips) {
+                self.hist_mode = HistMode::ALL[h];
+            }
         }
         ui.add_space(theme::space::M);
-        let Some(cur) = self.sources[0].current.clone() else { return };
-        let key = cur.pts.to_bits() ^ (self.scope as u64) << 60;
-        // Throttle recomputation during playback.
-        let stale = self.scope_tex.as_ref().map(|(k, _)| *k != key).unwrap_or(true);
-        if stale {
-            let img = scopes::render(self.scope, &cur.rgba);
-            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-            match &mut self.scope_tex {
-                Some((k, t)) => {
-                    t.set(ci, egui::TextureOptions::LINEAR);
-                    *k = key;
-                }
-                None => self.scope_tex = Some((key, ui.ctx().load_texture("scope", ci, egui::TextureOptions::LINEAR))),
-            }
-        }
-        if let Some((_, t)) = &self.scope_tex {
-            // The plot fills the panel's width at 16:10 (the vectorscope is square),
-            // with a graticule at 0 / 25 / 50 / 75 / 100%.
-            let w = ui.available_width();
-            let hgt = if self.scope == Scope::Vectorscope { w } else { w * 10.0 / 16.0 };
-            let (r, _) = ui.allocate_exact_size(Vec2::new(w, hgt), Sense::hover());
-            let cr = CornerRadius::same(theme::radius::CONTROL);
-            let painter = ui.painter();
-            painter.add(egui::epaint::RectShape::filled(r, cr, Color32::WHITE).with_texture(t.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
-            // The plots are always black, so the graticule is a dim white in both themes.
-            let line = Stroke::new(1.0, Color32::from_white_alpha(38));
-            let font = FontId::proportional(10.0);
-            let label = Color32::from_white_alpha(150);
-            match self.scope {
-                Scope::Waveform | Scope::Parade => {
-                    // Level 0..255 maps to the 256 image rows, top = 100%.
-                    for pct in [0u32, 25, 50, 75, 100] {
-                        let y = (r.top() + (1.0 - pct as f32 / 100.0) * (255.0 / 256.0) * r.height() + r.height() / 512.0).round() + 0.5;
-                        painter.hline(r.x_range(), y, line);
-                        let (pos, align) = if pct == 100 { (Pos2::new(r.left() + 4.0, y + 1.0), Align2::LEFT_TOP) } else { (Pos2::new(r.left() + 4.0, y - 1.0), Align2::LEFT_BOTTOM) };
-                        painter.text(pos, align, pct.to_string(), font.clone(), label);
+        let ctx = ui.ctx().clone();
+        let (scope, hist, playing) = (self.scope, self.hist_mode, self.playing);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for i in 0..n {
+                let s = &mut self.sources[i];
+                // The latest finished scope image, then the next one.
+                if let Some(ci) = s.scope_job.poll() {
+                    match &mut s.scope_tex {
+                        Some(t) => t.set(ci, egui::TextureOptions::LINEAR),
+                        None => s.scope_tex = Some(ctx.load_texture(format!("scope:{i}"), ci, egui::TextureOptions::LINEAR)),
                     }
                 }
-                Scope::Histogram => {
-                    for pct in [0u32, 25, 50, 75, 100] {
-                        let x = (r.left() + pct as f32 / 100.0 * r.width()).round() + 0.5;
-                        painter.vline(x, r.y_range(), line);
-                        let (pos, align) = match pct {
-                            0 => (Pos2::new(x + 3.0, r.bottom() - 2.0), Align2::LEFT_BOTTOM),
-                            100 => (Pos2::new(x - 3.0, r.bottom() - 2.0), Align2::RIGHT_BOTTOM),
-                            _ => (Pos2::new(x, r.bottom() - 2.0), Align2::CENTER_BOTTOM),
-                        };
-                        painter.text(pos, align, pct.to_string(), font.clone(), label);
-                    }
+                if let Some(cur) = &s.current {
+                    let key: ScopeKey = (cur.pts.to_bits(), Arc::as_ptr(&cur.rgba) as usize, scope as u8, hist as u8);
+                    let rgba = cur.rgba.clone();
+                    // While playing at most about 12 a second per video.
+                    let gap = if playing { Duration::from_millis(80) } else { Duration::ZERO };
+                    s.scope_job.request(key, gap, &ctx, move || {
+                        let img = scopes::render_with(scope, &rgba, hist);
+                        egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+                    });
                 }
-                Scope::Vectorscope => {}
+                if n > 1 {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(2.0 * BADGE_R), Sense::hover());
+                        paint_badge(ui.painter(), r.center(), letter(i), letter_color(p, i), BADGE_R - 1.0);
+                        ui.add(egui::Label::new(RichText::new(format!("{}  ·  {}", s.name(), fmt_time(s.pts()))).size(theme::text::SMALL)).truncate());
+                    });
+                    ui.add_space(2.0);
+                }
+                let Some(t) = &s.scope_tex else {
+                    ui.label(RichText::new("Measuring...").size(theme::text::SMALL).color(p.faint));
+                    continue;
+                };
+                // The plot fills the panel's width at 16:10 (the vectorscope is
+                // square, smaller when several are stacked), with a graticule
+                // at 0 / 25 / 50 / 75 / 100%.
+                let w = ui.available_width().max(40.0);
+                let hgt = if scope == Scope::Vectorscope { if n > 1 { w * 0.7 } else { w } } else { w * 10.0 / 16.0 };
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, hgt), Sense::hover());
+                let r = if scope == Scope::Vectorscope { Rect::from_center_size(r.center(), Vec2::splat(hgt)) } else { r };
+                scope_plot(ui, p, r, t.id(), scope);
+                ui.add_space(if n > 1 { theme::space::M } else { theme::space::S });
             }
-            painter.rect_stroke(r, cr, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
-        }
-        ui.add_space(theme::space::S);
-        ui.label(RichText::new(match self.scope {
-            Scope::Waveform => "Luma level (bottom 0%, top 100%) per image column.",
-            Scope::Parade => "R, G, B waveforms side by side.",
-            Scope::Vectorscope => "Chroma (BT.709). Boxes: 75% color targets; line: skin tone.",
-            Scope::Histogram => "R, G, B and luma distribution.",
-        }).size(theme::text::SMALL).color(p.muted));
+            ui.label(RichText::new(match scope {
+                Scope::Waveform => "Luma level (bottom 0%, top 100%) per image column.",
+                Scope::Parade => "R, G, B waveforms side by side.",
+                Scope::Vectorscope => "Chroma (BT.709). Boxes: 75% color targets; line: skin tone.",
+                Scope::Histogram => match hist {
+                    HistMode::Luminance => "Brightness distribution (black left, white right).",
+                    HistMode::Rgb => "R, G and B distribution (black left, white right).",
+                    HistMode::Both => "R, G, B and brightness distribution (black left, white right).",
+                },
+            }).size(theme::text::SMALL).color(p.muted));
+        });
     }
 
     fn goto_dialog(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let mut target: Option<f64> = None;
+        let lead = self.lead();
+        let who = if self.sources.len() > 1 { format!(" ({})", letter(lead)) } else { String::new() };
         egui::Modal::new(egui::Id::unique("video-goto")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.heading("Go to");
+            ui.heading(format!("Go to{who}"));
             ui.label(RichText::new("Frame number (1234), time (01:02.5 or 62.5s), or relative (+10f, -2s)").size(11.5));
-            let s = self.goto.as_mut().unwrap();
+            let Some(s) = self.goto.as_mut() else { return };
             let r = ui.add(egui::TextEdit::singleline(s).desired_width(f32::INFINITY));
             r.request_focus();
             if ui.input(|i| i.key_pressed(Key::Enter)) {
-                target = parse_goto(s, &self.sources[0]);
+                if let Some(src) = self.sources.get(lead) {
+                    target = parse_goto(s, src);
+                }
                 close = true;
             }
             if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -2395,35 +3180,7 @@ impl VideoMode {
     // ---------------------------------------------------------------- keys
 
     fn keys(&mut self, ctx: &egui::Context, core: &mut Core) -> bool {
-        // A click on the B offset field starts editing it as text; + and -
-        // still shift B then (typing them would only leave an unparsable
-        // value behind, and the field would keep showing the old offset).
-        if self.sources.len() == 2 && self.offset_field.is_some_and(|id| ctx.memory(|m| m.has_focus(id))) {
-            let steps: Vec<i64> = ctx.input_mut(|i| {
-                let mut steps = Vec::new();
-                i.events.retain(|e| match e {
-                    egui::Event::Key { key: Key::Plus | Key::Equals, pressed, modifiers, .. } => {
-                        if *pressed {
-                            steps.push(if modifiers.ctrl { 10 } else { 1 });
-                        }
-                        false
-                    }
-                    egui::Event::Key { key: Key::Minus, pressed, modifiers, .. } => {
-                        if *pressed {
-                            steps.push(if modifiers.ctrl { -10 } else { -1 });
-                        }
-                        false
-                    }
-                    egui::Event::Text(t) => !matches!(t.as_str(), "+" | "-" | "="),
-                    _ => true,
-                });
-                steps
-            });
-            for d in steps {
-                self.set_offset(self.offset_frames + d);
-            }
-        }
-        if self.goto.is_some() || ctx.text_edit_focused() {
+        if self.goto.is_some() || self.save_dialog.is_some() || ctx.text_edit_focused() {
             return true;
         }
         let mut keep = true;
@@ -2436,7 +3193,8 @@ impl VideoMode {
                 })
                 .collect()
         });
-        let compare = self.sources.len() == 2;
+        let n = self.sources.len();
+        let pair = n == 2;
         for (k, m) in events {
             if self.sources.is_empty() {
                 if k == Key::Escape {
@@ -2444,6 +3202,8 @@ impl VideoMode {
                 }
                 continue;
             }
+            let lead = self.lead();
+            let now = self.sources[lead].pts();
             match k {
                 Key::Escape if self.was_editing => {}
                 // Esc with a menu or a list open only closes it (egui does).
@@ -2452,36 +3212,19 @@ impl VideoMode {
                 Key::Space | Key::K if !m.ctrl => _ = self.run_command(Command::PlayPause),
                 Key::Period => _ = self.run_command(Command::NextFrame),
                 Key::Comma => _ = self.run_command(Command::PrevFrame),
-                Key::ArrowRight if m.ctrl => {
-                    let t = self.sources[0].pts() + 10.0;
-                    self.seek_all(t, true)
-                }
-                Key::ArrowLeft if m.ctrl => {
-                    let t = self.sources[0].pts() - 10.0;
-                    self.seek_all(t, true)
-                }
-                Key::ArrowRight if m.shift || self.playing => {
-                    let t = self.sources[0].pts() + 1.0;
-                    self.seek_all(t, true)
-                }
-                Key::ArrowLeft if m.shift || self.playing => {
-                    let t = self.sources[0].pts() - 1.0;
-                    self.seek_all(t, true)
-                }
+                Key::ArrowRight if m.ctrl => self.seek_all(now + 10.0, true),
+                Key::ArrowLeft if m.ctrl => self.seek_all(now - 10.0, true),
+                Key::ArrowRight if m.shift || self.playing => self.seek_all(now + 1.0, true),
+                Key::ArrowLeft if m.shift || self.playing => self.seek_all(now - 1.0, true),
                 Key::ArrowRight => self.step(1),
                 Key::ArrowLeft => self.step(-1),
-                Key::ArrowUp => {
-                    let t = self.sources[0].pts() + 60.0;
-                    self.seek_all(t, true)
-                }
-                Key::ArrowDown => {
-                    let t = self.sources[0].pts() - 60.0;
-                    self.seek_all(t, true)
-                }
+                Key::ArrowUp => self.seek_all(now + 60.0, true),
+                Key::ArrowDown => self.seek_all(now - 60.0, true),
+                Key::Home if m.shift => self.go_to_starts(),
                 Key::Home => self.seek_all(0.0, true),
                 Key::End => {
-                    let n = self.sources[0].frame_count().unwrap_or(1);
-                    let t = self.sources[0].pts_of(n.saturating_sub(1));
+                    let c = self.sources[lead].frame_count().unwrap_or(1);
+                    let t = self.sources[lead].pts_of(c.saturating_sub(1));
                     self.seek_all(t, true)
                 }
                 Key::PageDown | Key::PageUp => self.jump_keyframe(k == Key::PageDown),
@@ -2490,54 +3233,118 @@ impl VideoMode {
                 Key::F2 => self.show_scopes = !self.show_scopes,
                 Key::M => self.toggle_mute(),
                 Key::L if m.ctrl => self.toggle_loop(),
-                Key::S if m.ctrl => self.snapshot(false, core),
-                Key::C if m.ctrl => self.snapshot(true, core),
+                Key::L if n > 1 => self.toggle_sync(core),
+                Key::P if n > 1 && !m.ctrl => self.set_start_here(core),
+                Key::S if m.ctrl => self.open_save_dialog(),
+                Key::C if m.ctrl => self.save_frames(SaveTarget::Clipboard),
                 Key::OpenBracket => self.set_speed((self.speed / 2.0).max(0.1)),
                 Key::CloseBracket => self.set_speed((self.speed * 2.0).min(4.0)),
                 Key::Backspace => self.set_speed(1.0),
                 Key::Num0 => _ = self.run_command(Command::ZoomFit),
                 Key::Num1 => _ = self.run_command(Command::ZoomActual),
-                Key::S if compare => self.mode = CompareMode::SideBySide,
-                Key::W if compare => self.mode = CompareMode::Wipe,
-                Key::D if compare => self.mode = CompareMode::Difference,
-                Key::O if compare => self.mode = CompareMode::Overlay,
-                Key::C if compare => self.mode = CompareMode::Checker,
+                Key::S if n > 1 && !m.ctrl => self.mode = CompareMode::SideBySide,
+                Key::W if pair => self.mode = CompareMode::Wipe,
+                Key::D if pair => self.mode = CompareMode::Difference,
                 // Tab out of a text field (the Metrics tab's range) moves the
-                // keyboard focus; it is not the flicker key then.
-                Key::Tab if compare && !self.was_editing && ctx.memory(|m| m.focused().is_none()) => {
-                    if self.mode != CompareMode::Flicker {
-                        self.mode = CompareMode::Flicker;
-                    }
+                // keyboard focus; it does not change the selected video then.
+                Key::Tab if n > 1 && !self.was_editing && ctx.memory(|mm| mm.focused().is_none()) => {
+                    let next = if m.shift { (self.selected + n - 1) % n } else { (self.selected + 1) % n };
+                    self.select(next);
                 }
-                Key::Backtick if compare => {
-                    self.mode = CompareMode::Flicker;
-                    self.flicker_b = !self.flicker_b;
-                }
-                Key::A if compare && m.shift => {
-                    self.mode = CompareMode::Flicker;
-                    self.flicker_auto = !self.flicker_auto;
-                }
-                Key::X if compare => self.swap(),
-                Key::F if compare => self.wipe_frozen = !self.wipe_frozen,
-                Key::Plus | Key::Equals if compare => {
-                    let d = if m.ctrl { 10 } else { 1 };
-                    self.set_offset(self.offset_frames + d)
-                }
-                Key::Minus if compare => {
-                    let d = if m.ctrl { 10 } else { 1 };
-                    self.set_offset(self.offset_frames - d)
-                }
+                Key::X if pair => self.swap(),
+                Key::F if pair => self.wipe_frozen = !self.wipe_frozen,
                 _ => {}
             }
         }
         keep
     }
 
+    /// Dev hook only: commands for video mode in `video_cmd.txt` of the dev
+    /// folder (one per line): `add <path>`, `remove <i>`, `select <i>`,
+    /// `sync linked|independent`, `start [<i>]`, `starts`, `gotostarts`,
+    /// `audio <i>`, `mode sbs|wipe|diff`, `loop`, `play`, `pause`,
+    /// `step <n>`, `seek <secs>`, `save <dir> [composite]`, `copy`,
+    /// `compare`, `scope <0-3>`, `hist lum|rgb|both`, `scopes`, `vstate`.
+    fn dev_commands(&mut self, core: &mut Core) {
+        let Some(dir) = dev_dir() else { return };
+        let f = dir.join("video_cmd.txt");
+        let Ok(text) = std::fs::read_to_string(&f) else { return };
+        let _ = std::fs::remove_file(&f);
+        for line in text.lines() {
+            let (cmd, arg) = line.trim().split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((line.trim(), ""));
+            let num = arg.parse::<usize>().unwrap_or(0);
+            match cmd {
+                "add" => _ = self.add_source(Path::new(arg), &core.ctx),
+                "remove" => self.remove_source(num),
+                "select" => self.select(num),
+                "sync" => self.set_sync(if arg == "independent" { SyncMode::Independent } else { SyncMode::Linked }, core),
+                "start" if arg.is_empty() => self.set_start_here(core),
+                "start" => self.set_start(num, core),
+                "starts" => self.set_all_starts(core),
+                "gotostarts" => self.go_to_starts(),
+                "audio" => self.set_audio_source(num),
+                "mode" => {
+                    self.mode = match arg {
+                        "wipe" if self.sources.len() == 2 => CompareMode::Wipe,
+                        "diff" if self.sources.len() == 2 => CompareMode::Difference,
+                        _ => CompareMode::SideBySide,
+                    }
+                }
+                "loop" => self.toggle_loop(),
+                "play" => self.play(),
+                "pause" => self.pause(),
+                "step" => self.step(arg.parse::<i64>().unwrap_or(1)),
+                "seek" => self.seek_all(arg.parse::<f64>().unwrap_or(0.0), true),
+                "save" => {
+                    let (d, comp) = match arg.strip_suffix(" composite") {
+                        Some(d) => (d, true),
+                        None => (arg, false),
+                    };
+                    self.save_frames(SaveTarget::Folder { dir: PathBuf::from(d), composite: comp });
+                }
+                "copy" => self.save_frames(SaveTarget::Clipboard),
+                "compare" => self.open_in_compare(),
+                "scope" => self.scope = Scope::ALL[num.min(3)],
+                "hist" => {
+                    self.hist_mode = match arg {
+                        "lum" => HistMode::Luminance,
+                        "rgb" => HistMode::Rgb,
+                        _ => HistMode::Both,
+                    }
+                }
+                "scopes" => self.show_scopes = !self.show_scopes,
+                "info" => self.show_info = !self.show_info,
+                "vstate" => {
+                    let list: Vec<String> = self
+                        .sources
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("{}:{} pts={:.3} frame={} start={:?} out={:?} eof={} awaiting={}", letter(i), s.name(), s.pts(), s.frame_of(s.pts()), s.start.map(|t| (t * 1000.0).round() / 1000.0), s.out_size, s.eof, s.awaiting))
+                        .collect();
+                    dev_log(&format!(
+                        "vstate playing={} sync={:?} lead={} audio={} mode={:?} loop={:?}/{} view={:?} {}",
+                        self.playing,
+                        self.sync,
+                        self.lead(),
+                        self.audio_src,
+                        self.mode,
+                        self.loop_ab,
+                        self.loop_lead,
+                        self.view,
+                        list.join(" | ")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        core.ctx.request_repaint();
+    }
+
     /// Dev hook: log how long a burst of steps took to land, with a hash of
     /// the landed frame so tests can check frame accuracy.
     fn dev_report_step(&mut self) {
         let Some((t0, n)) = self.dev_burst else { return };
-        let Some(a) = self.sources.first() else { return };
+        let Some(a) = self.sources.get(self.lead()) else { return };
         let Some(cur) = &a.current else { return };
         let landed = a.frame_of(cur.pts);
         // Done when the requested frame is on screen (or the decoder settled elsewhere).
@@ -2553,7 +3360,7 @@ impl VideoMode {
     }
 
     fn jump_keyframe(&mut self, forward: bool) {
-        let a = &self.sources[0];
+        let a = &self.sources[self.lead()];
         let cur = a.pts();
         let t = {
             let idx = a.index.lock();
@@ -2581,6 +3388,106 @@ impl Drop for VideoMode {
         }
     }
 }
+
+/// A scope image in `r` with its graticule.
+fn scope_plot(ui: &Ui, p: &Palette, r: Rect, tex: egui::TextureId, scope: Scope) {
+    let cr = CornerRadius::same(theme::radius::CONTROL);
+    let painter = ui.painter();
+    painter.add(egui::epaint::RectShape::filled(r, cr, Color32::WHITE).with_texture(tex, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
+    // The plots are always black, so the graticule is a dim white in both themes.
+    let line = Stroke::new(1.0, Color32::from_white_alpha(38));
+    let font = FontId::proportional(10.0);
+    let label = Color32::from_white_alpha(150);
+    match scope {
+        Scope::Waveform | Scope::Parade => {
+            // Level 0..255 maps to the 256 image rows, top = 100%.
+            for pct in [0u32, 25, 50, 75, 100] {
+                let y = (r.top() + (1.0 - pct as f32 / 100.0) * (255.0 / 256.0) * r.height() + r.height() / 512.0).round() + 0.5;
+                painter.hline(r.x_range(), y, line);
+                let (pos, align) = if pct == 100 { (Pos2::new(r.left() + 4.0, y + 1.0), Align2::LEFT_TOP) } else { (Pos2::new(r.left() + 4.0, y - 1.0), Align2::LEFT_BOTTOM) };
+                painter.text(pos, align, pct.to_string(), font.clone(), label);
+            }
+        }
+        Scope::Histogram => {
+            for pct in [0u32, 25, 50, 75, 100] {
+                let x = (r.left() + pct as f32 / 100.0 * r.width()).round() + 0.5;
+                painter.vline(x, r.y_range(), line);
+                let (pos, align) = match pct {
+                    0 => (Pos2::new(x + 3.0, r.bottom() - 2.0), Align2::LEFT_BOTTOM),
+                    100 => (Pos2::new(x - 3.0, r.bottom() - 2.0), Align2::RIGHT_BOTTOM),
+                    _ => (Pos2::new(x, r.bottom() - 2.0), Align2::CENTER_BOTTOM),
+                };
+                painter.text(pos, align, pct.to_string(), font.clone(), label);
+            }
+        }
+        Scope::Vectorscope => {}
+    }
+    painter.rect_stroke(r, cr, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+}
+
+/// Decode each video's frame at `pts` at native resolution and save, copy
+/// or prepare it for Compare.
+fn save_frames_job(items: &[(PathBuf, f64, String)], target: &SaveTarget) -> Result<SaveDone, String> {
+    let mut frames = Vec::with_capacity(items.len());
+    for (i, (path, pts, _)) in items.iter().enumerate() {
+        let img = engine::frame_at(path, *pts).map_err(|e| format!("Cannot decode {}'s frame: {e}", letter(i)))?;
+        frames.push(img);
+    }
+    let names = sync::frame_file_names(&items.iter().map(|(_, t, stem)| (stem.clone(), *t)).collect::<Vec<_>>());
+    let save_all = |dir: &Path| -> Result<Vec<PathBuf>, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+        let mut out = Vec::new();
+        for (img, name) in frames.iter().zip(&names) {
+            let p = dir.join(name);
+            img.save(&p).map_err(|e| format!("Cannot save {}: {e}", p.display()))?;
+            out.push(p);
+        }
+        Ok(out)
+    };
+    let n = frames.len();
+    match target {
+        SaveTarget::Folder { dir, composite } => {
+            let saved = save_all(dir)?;
+            let mut msg = if n == 1 { format!("Saved {}", saved[0].display()) } else { format!("Saved {n} frames ({}) to {}", (0..n).map(letter).collect::<Vec<_>>().join(", "), dir.display()) };
+            if *composite && n > 1 {
+                if let Some(c) = sync::composite(&frames) {
+                    let name = format!("{}_side-by-side_{}.png", sync::safe_stem(&items[0].2), sync::file_timecode(items[0].1));
+                    let p = dir.join(name);
+                    c.save(&p).map_err(|e| format!("Cannot save {}: {e}", p.display()))?;
+                    msg += " and a side-by-side picture";
+                }
+            }
+            Ok(SaveDone { message: msg, open: None })
+        }
+        SaveTarget::Clipboard => {
+            let img = if n == 1 { frames.into_iter().next() } else { sync::composite(&frames) };
+            let img = img.ok_or("Nothing to copy")?;
+            crate::fileops::copy_image_to_clipboard(&img).map_err(|e| e.to_string())?;
+            let msg = if n == 1 { "Frame copied to the clipboard".to_string() } else { format!("Copied {} side by side to the clipboard", (0..n).map(letter).collect::<Vec<_>>().join(", ")) };
+            Ok(SaveDone { message: msg, open: None })
+        }
+        SaveTarget::Compare(dir) => {
+            let saved = save_all(dir)?;
+            Ok(SaveDone { message: format!("Opened {n} frames in Compare (saved in {})", dir.display()), open: Some(saved) })
+        }
+    }
+}
+
+/// Whether files can be created in `dir` (a media library or a read-only
+/// share cannot take snapshots).
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".lumen-write-test-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The start point marker's color on the timeline.
+const START_COLOR: Color32 = Color32::from_rgb(80, 200, 120);
 
 fn snapshot_dir_file() -> PathBuf {
     crate::settings::data_dir().join("video-snapshot-dir.txt")
@@ -2673,12 +3580,13 @@ fn media_rows(infos: &[&MediaInfo], durations: &[f64]) -> Vec<(&'static str, Vec
 }
 
 /// Media info as a striped table: a fixed label column and equal value
-/// columns (A and B), so a long value never squeezes the other column.
+/// columns (one per video), so a long value never squeezes another column.
 /// File names stay on one line, ellipsized, with the full name on hover.
-fn media_table(ui: &mut Ui, p: &Palette, compare: bool, rows: Vec<(&'static str, Vec<String>)>) {
+fn media_table(ui: &mut Ui, p: &Palette, cols: usize, rows: Vec<(&'static str, Vec<String>)>) {
     const LABEL_W: f32 = 96.0;
     const GAP: f32 = 8.0;
-    let cols = if compare { 2 } else { 1 };
+    let cols = cols.max(1);
+    let compare = cols > 1;
     let width = ui.available_width();
     let value_w = ((width - LABEL_W - GAP * cols as f32) / cols as f32).max(40.0);
     let cell = |ui: &mut Ui, w: f32, add: &mut dyn FnMut(&mut Ui)| {
@@ -2704,16 +3612,15 @@ fn media_table(ui: &mut Ui, p: &Palette, compare: bool, rows: Vec<(&'static str,
     if compare {
         row(ui, false, &mut |ui| {
             cell(ui, LABEL_W, &mut |_| {});
-            cell(ui, value_w, &mut |ui| {
-                ui.label(RichText::new("A").strong().color(ab_color(p, 0)));
-            });
-            cell(ui, value_w, &mut |ui| {
-                ui.label(RichText::new("B").strong().color(ab_color(p, 1)));
-            });
+            for i in 0..cols {
+                cell(ui, value_w, &mut |ui| {
+                    ui.label(RichText::new(letter(i)).strong().color(letter_color(p, i)));
+                });
+            }
         });
     }
     for (n, (k, vals)) in rows.into_iter().enumerate() {
-        let mismatch = compare && vals.len() == 2 && vals[0] != vals[1];
+        let mismatch = compare && vals.len() > 1 && vals.iter().any(|v| *v != vals[0]);
         let one_line = k == "File";
         row(ui, n % 2 == 0, &mut |ui| {
             cell(ui, LABEL_W, &mut |ui| {
@@ -2895,9 +3802,6 @@ fn parse_goto(s: &str, src: &Source) -> Option<f64> {
     };
     Some(if rel != 0.0 { cur + rel * secs } else { secs })
 }
-
-#[allow(dead_code)]
-fn _yuv(_: &YuvFrame) {}
 
 #[cfg(test)]
 mod tests {

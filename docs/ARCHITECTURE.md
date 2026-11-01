@@ -50,9 +50,9 @@ dependency versions are in `[workspace.dependencies]`.
 | Editing (pixels) | `lumen-core` | `edit/mod.rs`, `edit/{ops,filters,effects,geom,tone,text,mask,raster,retouch}.rs` | Undo session, histogram data, filters, effects, geometry, tone curves, text, draw board rasterization, retouch |
 | Editing (UI) | `lumen` | `edit/mod.rs`, `edit/tools.rs`, `edit/tools/*` | `EditTool` trait, tool contexts, histogram painting, every adjustment dialog |
 | Batch and tools | `lumen` | `ui/batch*`, `ui/tools*` | Batch convert pipeline, batch rename, contact sheet, duplicates, output tools, printing |
-| Modes | `lumen` | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and A/B analysis |
+| Modes | `lumen` | `ui/slideshow.rs`, `ui/compare.rs`, `video/*` | Slideshow with GPU transitions, 2-4 image compare, video playback and compare of up to four videos |
 | Video (pure) | `lumen-core` | `video/mod.rs`, `video/metrics.rs`, `video/scopes.rs` | Video extensions, PSNR/SSIM, scopes, thumbnailer hook |
-| Video (FFmpeg) | `lumen` | `video/engine.rs`, `video/audio.rs`, `video/analyze.rs`, `video/mode.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, whole-file analysis, UI |
+| Video (FFmpeg) | `lumen` | `video/engine.rs`, `video/audio.rs`, `video/analyze.rs`, `video/mode.rs`, `video/sync.rs` | FFmpeg demux/decode worker, WASAPI audio master clock, whole-file analysis, UI; `sync.rs` holds the pure start point, loop, pane layout and view math |
 | Analysis panel | `lumen` | `analysis_ui/*` | Right-side panel of the viewer, compare and video modes (Ctrl+Q): Metrics tab (`metrics_view.rs`, state in `Core::metrics`, Shift+Q runs it; `heatmap_view.rs` overlays, `plots.rs` graphs under the video timeline, `adapters.rs` from decoded pixels and `SeqDecoder` ranges to `lumen_analysis` jobs), AI tab, send preview, ROI (R) and finding overlays. Modes only publish where they draw images (`analysis_ui::canvas::publish`); video mode also hands the Metrics tab its streams each frame |
 
 Paths in the `lumen-core` rows are relative to `crates/lumen-core/src/`, the
