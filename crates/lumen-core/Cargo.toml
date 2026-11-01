@@ -51,6 +51,10 @@ features = [
     "Storage",
     "Storage_Streams",
     "Foundation",
+    # Text recognition (ocr.rs).
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Globalization",
 ]
 
 [dev-dependencies]
