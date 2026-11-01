@@ -696,7 +696,7 @@ mod tests {
         let content = b["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content[1]["type"], "image_url");
         assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
-        assert!(content.last().unwrap()["text"].as_str().unwrap().ends_with("Task: Assess the technical quality of image A and return the quality report."));
+        assert!(content.last().unwrap()["text"].as_str().unwrap().ends_with("Task: Assess the technical quality of image A and return the quality report: a one-sentence verdict, then only the significant problems."));
         // Fallbacks: schema in the prompt, no vLLM extensions.
         let f = body(&r, BodyMode { response_format: false, extensions: false, stream: true });
         assert!(f.get("response_format").is_none() && f.get("chat_template_kwargs").is_none());

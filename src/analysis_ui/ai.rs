@@ -142,6 +142,9 @@ pub struct AiState {
     /// (a finished run proves the connection; an unreachable one disproves
     /// it). With the message for the status dot.
     reach: Option<(bool, String)>,
+    /// The last test or run was refused only because the server's address
+    /// is not private: offer "Trust this server".
+    trust_offer: bool,
     /// `settings` changed and must be copied into `Settings::ai`.
     pub dirty: bool,
     /// The copy in `Settings::ai` was written (a settings reset clears it).
@@ -180,6 +183,7 @@ impl AiState {
             history: HashMap::new(),
             shown: None,
             reach: None,
+            trust_offer: false,
             dirty: false,
             written: !settings.ai.is_null(),
             repaint,
@@ -210,8 +214,26 @@ impl AiState {
         self.key_target = None;
         self.report = None;
         self.reach = None;
+        self.trust_offer = false;
         self.steps.clear();
         self.models.clear();
+    }
+
+    /// The last test or run failed only because the address is not private.
+    pub fn trust_offer(&self) -> bool {
+        self.trust_offer
+    }
+
+    /// "Trust this server": treat the current host as local (a company
+    /// server on a public range), then test again when `retest`.
+    pub fn trust_server(&mut self, retest: bool) {
+        let Some(host) = self.settings.trust_current_host() else { return };
+        self.dirty = true;
+        self.trust_offer = false;
+        self.notes.push((false, format!("{host} is now treated as a local server (Settings > AI > Connection to undo)")));
+        if retest {
+            self.test_connection();
+        }
     }
 
     /// The Port field was edited by hand: a bare host keeps it from now on.
@@ -595,6 +617,7 @@ impl AiState {
         if let (Some(v), Some(m)) = (r.vision.clone(), r.picked_model.clone()) {
             self.remember_verdict(&m, v);
         }
+        self.trust_offer = r.steps.iter().any(|s| s.can_trust && s.status == lumen_ai::StepStatus::Failed);
         self.reach = Some(if r.ok() {
             (true, "Connected (last Test connection succeeded)".to_string())
         } else {
@@ -673,6 +696,7 @@ impl AiState {
                         }
                         Err(AiError::Cancelled) => Outcome::Cancelled { partial: std::mem::take(&mut self.live.text) },
                         Err(e) => {
+                            self.trust_offer = e.can_trust();
                             self.reach = Some(if reached(&e) {
                                 // The server answered (another HTTP error): it is reachable.
                                 (true, format!("Connected; the last run failed: {e}"))

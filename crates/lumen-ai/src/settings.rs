@@ -101,6 +101,10 @@ pub struct AiSettings {
     pub lan_only: bool,
     /// Also treat 100.64.0.0/10 (CGNAT, Tailscale) as local.
     pub allow_cgnat: bool,
+    /// Hosts (`Endpoint::host`) the user said are on their own network
+    /// though their address is not private, such as a company server on a
+    /// public range: allowed like a LAN address, over plain HTTP too.
+    pub local_hosts: Vec<String>,
     /// Show the send preview for every request (except to servers in
     /// `trusted_servers`); off: only for the first request to each server.
     pub always_confirm: bool,
@@ -144,6 +148,7 @@ impl Default for AiSettings {
             custom_ca_pem: None,
             lan_only: true,
             allow_cgnat: false,
+            local_hosts: Vec::new(),
             always_confirm: true,
             include_filename: false,
             include_exif: false,
@@ -214,7 +219,28 @@ impl AiSettings {
     }
 
     pub fn net_policy(&self) -> NetPolicy {
-        NetPolicy { lan_only: self.lan_only, allow_cgnat: self.allow_cgnat }
+        let trusted = self.endpoint().map(|e| self.is_local_host(&e.host)).unwrap_or(false);
+        NetPolicy { lan_only: self.lan_only, allow_cgnat: self.allow_cgnat, trusted }
+    }
+
+    /// The user marked `host` as a server on their own network.
+    pub fn is_local_host(&self, host: &str) -> bool {
+        self.local_hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    /// "Trust this server": the current server's host is treated as local
+    /// from now on. Returns the host, or None without a valid address.
+    pub fn trust_current_host(&mut self) -> Option<String> {
+        let host = self.endpoint().ok()?.host;
+        if !self.is_local_host(&host) {
+            self.local_hosts.push(host.clone());
+        }
+        Some(host)
+    }
+
+    /// Stops treating `host` as local.
+    pub fn untrust_host(&mut self, host: &str) {
+        self.local_hosts.retain(|h| !h.eq_ignore_ascii_case(host));
     }
 
     /// The image limit to plan for: the setting, capped by what this server
@@ -534,11 +560,14 @@ fn v4_scope(ip: Ipv4Addr) -> IpScope {
 pub struct NetPolicy {
     pub lan_only: bool,
     pub allow_cgnat: bool,
+    /// The server this policy is for is in `AiSettings::local_hosts`: any
+    /// usable address it resolves to counts as local.
+    pub trusted: bool,
 }
 
 impl Default for NetPolicy {
     fn default() -> Self {
-        NetPolicy { lan_only: true, allow_cgnat: false }
+        NetPolicy { lan_only: true, allow_cgnat: false, trusted: false }
     }
 }
 
@@ -553,7 +582,7 @@ impl NetPolicy {
 
     /// Checks one address. Public addresses need `lan_only` off and HTTPS.
     pub fn check(&self, ip: IpAddr, https: bool) -> Result<(), AiError> {
-        if self.is_local(ip) {
+        if self.is_local(ip) || (self.trusted && ip_scope(ip) != IpScope::Invalid) {
             return Ok(());
         }
         if ip_scope(ip) == IpScope::Invalid || self.lan_only {
@@ -736,6 +765,47 @@ mod tests {
     }
 
     #[test]
+    fn trusted_company_server_is_allowed_over_http() {
+        let mut s = AiSettings::default();
+        let e = s.apply_server_input("http://107.99.236.113:8000/v1").unwrap();
+        assert_eq!(e.base_url(), "http://107.99.236.113:8000/v1");
+        assert_eq!(e.api("/models"), "http://107.99.236.113:8000/v1/models");
+        assert_eq!(e.api("/chat/completions"), "http://107.99.236.113:8000/v1/chat/completions");
+        assert_eq!(e.route("/health"), "http://107.99.236.113:8000/health");
+        assert_eq!(s.endpoint().unwrap(), e);
+        let ip: IpAddr = "107.99.236.113".parse().unwrap();
+        let addr = [SocketAddr::new(ip, 8000)];
+        // Not private: blocked by default, and over HTTP even without LAN-only.
+        let err = s.net_policy().check_host(&e.host, &addr, false).unwrap_err();
+        assert!(matches!(err, AiError::NotLocal { .. }) && err.can_trust(), "{err:?}");
+        assert!(err.to_string().contains("company"), "{err}");
+        s.lan_only = false;
+        let err = s.net_policy().check_host(&e.host, &addr, false).unwrap_err();
+        assert!(matches!(err, AiError::PublicNeedsHttps { .. }) && err.can_trust());
+        s.lan_only = true;
+        // Trusted: allowed over plain HTTP, with LAN-only still on.
+        assert_eq!(s.trust_current_host().as_deref(), Some("107.99.236.113"));
+        assert!(s.net_policy().trusted);
+        assert!(s.net_policy().check_host(&e.host, &addr, false).is_ok());
+        assert!(resolve_checked(&e, &s.net_policy()).is_ok());
+        // Trusting twice keeps one entry; other public servers stay blocked.
+        s.trust_current_host();
+        assert_eq!(s.local_hosts.len(), 1);
+        s.apply_server_input("8.8.8.8").unwrap();
+        assert!(!s.net_policy().trusted);
+        assert!(matches!(resolve_checked(&s.endpoint().unwrap(), &s.net_policy()), Err(AiError::NotLocal { .. })));
+        // Never an unusable address, trusted or not.
+        let p = NetPolicy { trusted: true, ..Default::default() };
+        assert!(p.check("0.0.0.0".parse().unwrap(), false).is_err());
+        assert!(!AiError::NotLocal { addr: "0.0.0.0".parse().unwrap() }.can_trust());
+        s.untrust_host("107.99.236.113");
+        assert!(s.local_hosts.is_empty());
+        // Old settings files have no list.
+        let old: AiSettings = serde_json::from_str(r#"{"host":"10.0.0.2"}"#).unwrap();
+        assert!(old.local_hosts.is_empty());
+    }
+
+    #[test]
     fn temperature_is_stored_rounded() {
         let j = serde_json::to_value(AiSettings::default()).unwrap();
         assert_eq!(j["temperature"].to_string(), "0.2");
@@ -790,7 +860,7 @@ mod tests {
         ] {
             assert!(!local(no), "{no} is not local");
         }
-        let cg = NetPolicy { lan_only: true, allow_cgnat: true };
+        let cg = NetPolicy { allow_cgnat: true, ..Default::default() };
         assert!(cg.is_local("100.64.0.1".parse().unwrap()));
         assert!(cg.is_local("100.127.255.254".parse().unwrap()));
         assert!(!cg.is_local("100.128.0.1".parse().unwrap()));
@@ -801,7 +871,7 @@ mod tests {
     fn public_policy() {
         let ip: IpAddr = "8.8.8.8".parse().unwrap();
         assert_eq!(NetPolicy::default().check(ip, true), Err(AiError::NotLocal { addr: ip }));
-        let open = NetPolicy { lan_only: false, allow_cgnat: false };
+        let open = NetPolicy { lan_only: false, ..Default::default() };
         assert_eq!(open.check(ip, false), Err(AiError::PublicNeedsHttps { addr: ip }));
         assert!(open.check(ip, true).is_ok());
         // Never a server, whatever the policy.

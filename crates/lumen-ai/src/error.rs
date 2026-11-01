@@ -84,6 +84,17 @@ impl AiError {
         )
     }
 
+    /// Refused only because the address is not private, so "Trust this
+    /// server" (`AiSettings::trust_current_host`) would let it through.
+    pub fn can_trust(&self) -> bool {
+        use crate::settings::{ip_scope, IpScope};
+        match self {
+            AiError::NotLocal { addr } | AiError::PublicNeedsHttps { addr } => ip_scope(*addr) != IpScope::Invalid,
+            AiError::HostNotLocal { addrs, .. } => addrs.iter().all(|a| ip_scope(*a) != IpScope::Invalid),
+            _ => false,
+        }
+    }
+
     /// The server's own words, when they add something to `Display`.
     pub fn detail(&self) -> Option<&str> {
         match self {
@@ -112,21 +123,28 @@ impl fmt::Display for AiError {
         match self {
             AiError::Address(m) => write!(f, "Invalid server address: {m}"),
             AiError::Dns { host, .. } => write!(f, "Server not reachable: could not resolve '{host}'"),
+            AiError::NotLocal { addr } if crate::settings::ip_scope(*addr) == crate::settings::IpScope::Invalid => {
+                write!(f, "{addr} cannot be a server address")
+            }
             AiError::NotLocal { addr } => write!(
                 f,
-                "{addr} is not a local network address. Untick 'Only allow local network servers' to allow it (HTTPS required)"
+                "{addr} isn't a private network address. If this is your company's internal server, trust it (Trust this server, in Settings > AI)"
             ),
-            AiError::PublicNeedsHttps { addr } => {
-                write!(f, "{addr} is a public address: turn on HTTPS to send images to it")
-            }
+            AiError::PublicNeedsHttps { addr } => write!(
+                f,
+                "{addr} is a public address: turn on HTTPS, or if this is your company's internal server, trust it (Trust this server, in Settings > AI)"
+            ),
             AiError::HostNotLocal { host, addrs, needs_https } => {
                 let list = addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
                 if *needs_https {
-                    write!(f, "{host} ({list}) is a public server: turn on HTTPS to send images to it")
+                    write!(
+                        f,
+                        "{host} ({list}) is a public server: turn on HTTPS, or if this is your company's internal server, trust it (Trust this server, in Settings > AI)"
+                    )
                 } else {
                     write!(
                         f,
-                        "{host} resolves to {list}, outside the local network. Untick 'Only allow local network servers' to allow it (HTTPS required)"
+                        "{host} resolves to {list}, not a private network address. If this is your company's internal server, trust it (Trust this server, in Settings > AI)"
                     )
                 }
             }
