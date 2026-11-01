@@ -89,6 +89,15 @@ The optional AI analysis is the only network feature. It is off until you set it
 2. In Lumen: press Ctrl+Q, choose AI review, type the server's IP (port 8000 is assumed, `host:port` or a full `http://host:port/v1` URL also work) and press Test & connect. The model list is fetched and a vision model is picked; change it there or in Settings, AI review (API key, HTTPS, timeouts).
 3. Open an image, compare pair or video: the mode fits what is on screen (critique, A vs B, video frame). Press Run AI review.
 
+## Troubleshooting
+
+Lumen keeps two small text files next to its settings (`%APPDATA%\Lumen`, or `LumenData` beside the exe in portable mode). They hold no image data (file names can appear) and are never sent anywhere:
+
+- `lumen.log`: warnings and errors from Lumen and the window / graphics libraries (OpenGL, display changes, files that could not be read). It is moved to `lumen.old.log` at 1 MB. Start Lumen with the environment variable `LUMEN_LOG=info` (or `debug`) for more detail.
+- `crash.log`: what happened when Lumen closed unexpectedly: a panic with its call stack, or a native crash with the exception code, address and module (for example a graphics driver DLL). New entries are added at the end; the file is moved to `crash.old.log` at 512 KB.
+
+If Lumen closes unexpectedly, attach both files to a bug report. Crashes inside a graphics driver (`nvoglv64.dll`, `ig*icd64.dll`, `atio6axx.dll`) are usually fixed by updating the driver.
+
 ## License
 
 MIT, see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (FFmpeg is LGPL-2.1+).

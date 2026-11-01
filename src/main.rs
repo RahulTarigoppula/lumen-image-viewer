@@ -8,6 +8,7 @@ mod devhook;
 mod edit;
 mod fileops;
 mod loader;
+mod logging;
 mod render;
 mod shell;
 mod thumbs;
@@ -24,13 +25,9 @@ fn main() -> eframe::Result {
     devhook::mark("main");
     #[cfg(feature = "video")]
     lumen_core::video::set_thumbnailer(video::engine::thumbnail);
-    std::panic::set_hook(Box::new(|info| {
-        let msg = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
-        let dir = settings::data_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("crash.log"), &msg);
-        eprintln!("{msg}");
-    }));
+    logging::init();
+    // Rayon runs decoders, resizing and histograms: below the UI thread.
+    let _ = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("lumen-rayon-{i}")).start_handler(|_| bg::background_priority()).build_global();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial: Option<PathBuf> = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
@@ -88,9 +85,17 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     devhook::mark("run_native");
-    eframe::run_native(
+    let res = eframe::run_native(
         "Lumen",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, settings, initial)))),
-    )
+    );
+    if let Err(e) = &res {
+        // Usually no usable OpenGL driver: keep the reason for troubleshooting.
+        log::error!("could not start the window: {e}");
+        logging::write_crash(&format!("{} could not start the window: {e}
+
+", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    }
+    res
 }
