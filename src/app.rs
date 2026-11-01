@@ -2839,6 +2839,9 @@ impl eframe::App for App {
                 let mut keep = true;
                 egui::CentralPanel::no_frame().show(ui, |ui| {
                     if let Some(c) = &mut self.compare {
+                        // The report's measurements page: the Analysis panel's
+                        // per-image checks and text checks, when they have run.
+                        c.set_metrics_table(merge_tables(self.core.metrics.report_table(), self.analysis.text.report_table()));
                         let t = Instant::now();
                         keep = c.ui(ui, &mut self.core);
                         crate::devhook::prof("compare", t);
@@ -3256,5 +3259,26 @@ mod tests {
                 assert_eq!(compose_orientation(compose_orientation(o, t), inverse(t)), o, "{t:?} from {o}");
             }
         }
+    }
+}
+
+/// Join the image checks and the text checks into one report table; text
+/// rows are added under their own heading row when both exist.
+fn merge_tables(a: Option<lumen_core::report::Table>, b: Option<lumen_core::report::Table>) -> Option<lumen_core::report::Table> {
+    match (a, b) {
+        (Some(mut a), Some(b)) => {
+            let cols = a.header.len().max(b.header.len());
+            if !b.rows.is_empty() {
+                let mut head = vec!["Text".to_string()];
+                head.resize(cols, String::new());
+                a.rows.push(head);
+                a.rows.extend(b.rows);
+            }
+            if !b.note.is_empty() {
+                a.note = if a.note.is_empty() { b.note } else { format!("{} {}", a.note, b.note) };
+            }
+            Some(a)
+        }
+        (a, b) => a.or(b),
     }
 }

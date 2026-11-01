@@ -1473,7 +1473,6 @@ impl MetricsTab {
     /// The per-image no-reference results as a report table: one column
     /// per image of a compare ("A", "B"...), or the one image; each cell the
     /// value and its verdict word, with a note on which way is better.
-    #[allow(dead_code)] // The review report (compare) takes it; wired at integration.
     pub fn report_table(&self) -> Option<lumen_core::report::Table> {
         match self.kind {
             Kind::Compare => self.each.table(),

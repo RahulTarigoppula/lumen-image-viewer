@@ -520,7 +520,6 @@ impl Compare {
     }
 
     /// The metrics table for the report (from the Analysis panel), or `None`.
-    #[allow(dead_code)] // Fed by the Analysis panel integration.
     pub fn set_metrics_table(&mut self, t: Option<lumen_core::report::Table>) {
         self.rv.metrics = t;
     }

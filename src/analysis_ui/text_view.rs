@@ -760,7 +760,6 @@ impl TextView {
     }
 
     /// The per-image table for the review report.
-    #[allow(dead_code)] // For the review report.
     pub fn report_table(&self) -> Option<lumen_core::report::Table> {
         let reports: Vec<(usize, &PathBuf, &Arc<TextReport>, &Option<Key>)> =
             self.shown.iter().enumerate().filter_map(|(i, (path, key))| self.report(key).map(|r| (i, path, r, key))).collect();
