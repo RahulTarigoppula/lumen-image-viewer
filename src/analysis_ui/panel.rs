@@ -26,6 +26,8 @@ pub enum PanelAction {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Tab {
     Metrics,
+    /// OCR and document checks (`text_view.rs`).
+    Text,
     #[cfg(feature = "ai")]
     Ai,
 }
@@ -48,6 +50,7 @@ pub struct AnalysisPanel {
     run_metrics: bool,
     #[cfg(feature = "ai")]
     pub ai: super::ai_view::AiView,
+    pub text: super::text_view::TextView,
 }
 
 impl Default for AnalysisPanel {
@@ -66,6 +69,7 @@ impl Default for AnalysisPanel {
             run_metrics: false,
             #[cfg(feature = "ai")]
             ai: Default::default(),
+            text: Default::default(),
         }
     }
 }
@@ -191,6 +195,7 @@ impl AnalysisPanel {
             ui.add_space(4.0);
             let tabs: &[(&str, Tab, &str)] = &[
                 ("Metrics", Tab::Metrics, "Measure the picture on this computer"),
+                ("Text", Tab::Text, "Read the text in documents and screenshots, and check how well it reads"),
                 #[cfg(feature = "ai")]
                 ("AI review", Tab::Ai, "Ask your own vision model server for an opinion"),
             ];
@@ -212,6 +217,7 @@ impl AnalysisPanel {
                 ui.set_width(ui.available_width());
                 match self.tab {
                     Tab::Metrics => self.metrics_tab(ui, core, subject),
+                    Tab::Text => self.text.ui(ui, core, subject, out),
                     #[cfg(feature = "ai")]
                     Tab::Ai => {
                         let roi = self.roi_pixels();
@@ -311,6 +317,9 @@ impl AnalysisPanel {
         #[cfg(feature = "ai")]
         if self.tab == Tab::Ai {
             self.ai.overlay(ui, core, subject, &panes);
+        }
+        if self.tab == Tab::Text {
+            self.text.overlay(ui, core, &panes);
         }
         #[cfg(not(feature = "ai"))]
         let _ = subject;
