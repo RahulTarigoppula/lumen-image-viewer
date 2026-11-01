@@ -2863,7 +2863,12 @@ impl eframe::App for App {
                         keep = v.ui(ui, &mut self.core);
                     }
                 });
-                if !keep {
+                // "Open frames in Compare": the saved frames open in image Compare.
+                if let Some(frames) = self.video.as_mut().and_then(|v| v.take_compare_request()) {
+                    self.video = None;
+                    self.compare = Some(crate::ui::compare::Compare::new(frames, &self.core));
+                    self.mode = Mode::Compare;
+                } else if !keep {
                     self.video = None;
                     self.mode = Mode::Browser;
                     if self.fullscreen {

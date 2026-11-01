@@ -266,6 +266,9 @@ pub enum Cmd {
     Seek { t: f64, exact: bool, gen: u64 },
     OutputSize(u32, u32),
     Native(bool),
+    /// Play this file's sound into `Some` output, or none (follow with a
+    /// seek so the sound starts at the current frame).
+    Audio(Option<Arc<AudioShared>>),
     Quit,
 }
 
@@ -507,6 +510,7 @@ impl Worker {
                     },
                     Cmd::OutputSize(w, h) => self.out_size = (w.max(2), h.max(2)),
                     Cmd::Native(on) => self.want_native = on,
+                    Cmd::Audio(a) => self.set_audio(a),
                 }
                 continue;
             }
@@ -549,6 +553,7 @@ impl Worker {
                 Ok(Cmd::Seek { t, exact, gen }) => latest = Some((t, exact, gen)),
                 Ok(Cmd::OutputSize(w, h)) => self.out_size = (w.max(2), h.max(2)),
                 Ok(Cmd::Native(on)) => self.want_native = on,
+                Ok(Cmd::Audio(a)) => self.set_audio(a),
                 Ok(Cmd::Quit) => self.quit = true,
                 Ok(other) => self.backlog.push_back(other),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -559,6 +564,24 @@ impl Worker {
             }
         }
         latest
+    }
+
+    /// Switch this file's sound on (opening its audio decoder the first
+    /// time) or off.
+    fn set_audio(&mut self, audio: Option<Arc<AudioShared>>) {
+        if audio.is_some() && self.adec.is_none() {
+            if let Some(a) = self.input.streams().best(ff::media::Type::Audio) {
+                if let Ok(actx) = ff::codec::context::Context::from_parameters(a.parameters()) {
+                    if let Ok(d) = actx.decoder().audio() {
+                        self.aidx = Some(a.index());
+                        self.atb = q2f(a.time_base());
+                        self.adec = Some(d);
+                    }
+                }
+            }
+        }
+        self.resampler = None;
+        self.audio = audio;
     }
 
     fn frame_pts(&self, f: &ff::frame::Video) -> f64 {

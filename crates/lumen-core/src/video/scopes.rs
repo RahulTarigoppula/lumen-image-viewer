@@ -24,6 +24,29 @@ impl Scope {
     }
 }
 
+/// What the histogram shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HistMode {
+    /// Brightness (luma) only.
+    Luminance,
+    /// Red, green and blue.
+    Rgb,
+    /// Red, green, blue and luma together.
+    #[default]
+    Both,
+}
+
+impl HistMode {
+    pub const ALL: [HistMode; 3] = [HistMode::Luminance, HistMode::Rgb, HistMode::Both];
+    pub fn label(self) -> &'static str {
+        match self {
+            HistMode::Luminance => "Luminance",
+            HistMode::Rgb => "RGB",
+            HistMode::Both => "Both",
+        }
+    }
+}
+
 fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8) as u8
 }
@@ -44,11 +67,16 @@ fn intensity(count: u32, scale: f32) -> u8 {
 }
 
 pub fn render(scope: Scope, frame: &RgbaImage) -> RgbaImage {
+    render_with(scope, frame, HistMode::Both)
+}
+
+/// `render`, with the channels the histogram shows.
+pub fn render_with(scope: Scope, frame: &RgbaImage, hist: HistMode) -> RgbaImage {
     match scope {
         Scope::Waveform => waveform(frame, false),
         Scope::Parade => waveform(frame, true),
         Scope::Vectorscope => vectorscope(frame),
-        Scope::Histogram => histogram(frame),
+        Scope::Histogram => histogram(frame, hist),
     }
 }
 
@@ -190,7 +218,8 @@ fn vectorscope(frame: &RgbaImage) -> RgbaImage {
     out
 }
 
-fn histogram(frame: &RgbaImage) -> RgbaImage {
+/// Counts per level (0..=255) of R, G, B and luma, from a sample grid.
+pub fn histogram_counts(frame: &RgbaImage) -> [[u32; 256]; 4] {
     let (w, h) = frame.dimensions();
     let (sx, sy) = sample_grid(w, h);
     let mut hist = [[0u32; 256]; 4];
@@ -208,17 +237,33 @@ fn histogram(frame: &RgbaImage) -> RgbaImage {
         }
         y += sy;
     }
-    let max = (0..4).flat_map(|c| hist[c][1..255].iter().copied()).max().unwrap_or(1).max(1) as f32;
+    hist
+}
+
+fn histogram(frame: &RgbaImage, mode: HistMode) -> RgbaImage {
+    let hist = histogram_counts(frame);
+    // Channels drawn: R, G, B (0..3) and luma (3).
+    let chans: &[usize] = match mode {
+        HistMode::Luminance => &[3],
+        HistMode::Rgb => &[0, 1, 2],
+        HistMode::Both => &[0, 1, 2, 3],
+    };
+    // Scaled to the tallest bar away from pure black and white (clipped
+    // pixels would flatten everything else).
+    let max = chans.iter().flat_map(|&c| hist[c][1..255].iter().copied()).max().unwrap_or(1).max(1) as f32;
     let (ow, oh) = (256u32, 140u32);
     let mut out = RgbaImage::from_pixel(ow, oh, image::Rgba([0, 0, 0, 255]));
     let colors = [[255u32, 70, 70], [70, 230, 110], [90, 140, 255], [220, 220, 220]];
+    // Luma alone is drawn at full strength; overlapping channels add up.
+    let div = if chans.len() == 1 { 1 } else { 3 };
     for x in 0..256usize {
-        for (c, color) in colors.iter().enumerate() {
+        for &c in chans {
+            let color = colors[c];
             let hh = ((hist[c][x] as f32 / max).sqrt().min(1.0) * (oh - 1) as f32) as u32;
             for yy in 0..hh {
                 let p = out.get_pixel_mut(x as u32, oh - 1 - yy);
                 for k in 0..3 {
-                    p.0[k] = (p.0[k] as u32 + color[k] / 3).min(255) as u8;
+                    p.0[k] = (p.0[k] as u32 + color[k] / div).min(255) as u8;
                 }
             }
         }
@@ -237,5 +282,30 @@ mod tests {
             assert!(out.width() > 0 && out.height() > 0);
         }
         assert_eq!(render(Scope::Parade, &img).width() % 3, 0);
+    }
+
+    #[test]
+    fn histogram_modes() {
+        // A pure mid-gray frame: one bar at level 128 in every channel.
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([128, 128, 128, 255]));
+        let counts = histogram_counts(&img);
+        for c in 0..4 {
+            assert_eq!(counts[c][128], 64 * 64);
+        }
+        let px = |m| render_with(Scope::Histogram, &img, m).get_pixel(128, 139).0;
+        // Luminance: gray bar only; RGB: the three colors add up to near white.
+        let l = px(HistMode::Luminance);
+        assert_eq!((l[0], l[1], l[2]), (220, 220, 220));
+        let rgb = px(HistMode::Rgb);
+        assert!(rgb[0] > 100 && rgb[1] > 100 && rgb[2] > 100);
+        let both = px(HistMode::Both);
+        assert!(both[0] >= rgb[0] && both[1] >= rgb[1]);
+        // A pure red frame: RGB shows red at 255, luminance a dark level.
+        let red = RgbaImage::from_pixel(32, 32, image::Rgba([255, 0, 0, 255]));
+        let counts = histogram_counts(&red);
+        assert_eq!(counts[0][255], 32 * 32);
+        assert_eq!(counts[3][53], 32 * 32);
+        let lum = render_with(Scope::Histogram, &red, HistMode::Luminance);
+        assert_eq!(lum.get_pixel(255, 139).0[0], 0);
     }
 }

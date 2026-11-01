@@ -17,6 +17,8 @@ mod audio;
 pub mod engine;
 #[cfg(feature = "video")]
 mod mode;
+#[cfg(feature = "video")]
+mod sync;
 
 #[cfg(feature = "video")]
 pub use mode::VideoMode;
@@ -35,6 +37,9 @@ impl VideoMode {
     pub fn zoom_to_region(&mut self, _r: [f32; 4], _pane: egui::Vec2, _ppp: f32) {}
     pub fn run_command(&mut self, _cmd: crate::ui::commands::Command) -> bool {
         false
+    }
+    pub fn take_compare_request(&mut self) -> Option<Vec<std::path::PathBuf>> {
+        None
     }
     pub fn ui(&mut self, ui: &mut egui::Ui, _core: &mut crate::app::Core) -> bool {
         ui.centered_and_justified(|ui| ui.label("This build of Lumen was compiled without video support."));
