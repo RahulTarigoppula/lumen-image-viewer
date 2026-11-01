@@ -8,6 +8,8 @@
 //!   ai <args>            drive the Analysis panel's AI tab (see `analysis_ui::dev`)
 //!   key <shortcut>       press a key as the window would get it, e.g. `key Ctrl+Q`
 //!   click <x> <y> [right]  click at window point (x, y) (points, not pixels)
+//!   drag <x0> <y0> <x1> <y1>  left-drag between two points (over several frames)
+//!   type <text>          type text into the focused field
 //! and writes `done.txt` when the batch has been processed.
 
 use std::path::PathBuf;
@@ -83,6 +85,8 @@ pub enum DevAction {
     Key(String),
     /// `click x y [right]`: pointer press (`true`) or release at a point.
     Pointer { pos: egui::Pos2, secondary: bool, pressed: bool },
+    /// Raw input events for this frame (`drag` steps, `type`).
+    Events(Vec<egui::Event>),
     State,
 }
 
@@ -182,6 +186,39 @@ impl DevHook {
                         // Release on the next frame, as a real click does.
                         self.queue.insert(0, format!("__release {arg}"));
                     }
+                    break;
+                }
+                "drag" => {
+                    let v: Vec<f32> = arg.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    if v.len() == 4 {
+                        let (a, b) = (egui::Pos2::new(v[0], v[1]), egui::Pos2::new(v[2], v[3]));
+                        let steps = 12;
+                        let mut lines = vec![format!("__ev press {} {}", a.x, a.y)];
+                        for k in 1..=steps {
+                            let p = a + (b - a) * (k as f32 / steps as f32);
+                            lines.push(format!("__ev move {} {}", p.x, p.y));
+                        }
+                        lines.push(format!("__ev release {} {}", b.x, b.y));
+                        for (k, l) in lines.into_iter().enumerate() {
+                            self.queue.insert(k, l);
+                        }
+                    }
+                }
+                "__ev" => {
+                    let v: Vec<&str> = arg.split_whitespace().collect();
+                    let num = |i: usize| v.get(i).and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.0);
+                    let pos = egui::Pos2::new(num(1), num(2));
+                    let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                    let ev = match v.first() {
+                        Some(&"press") => vec![egui::Event::PointerMoved(pos), button(true)],
+                        Some(&"release") => vec![egui::Event::PointerMoved(pos), button(false)],
+                        _ => vec![egui::Event::PointerMoved(pos)],
+                    };
+                    out.push(DevAction::Events(ev));
+                    break;
+                }
+                "type" => {
+                    out.push(DevAction::Events(vec![egui::Event::Text(arg.to_string())]));
                     break;
                 }
                 "ai" => out.push(DevAction::Analysis(arg.to_string())),

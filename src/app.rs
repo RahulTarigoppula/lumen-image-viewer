@@ -2962,6 +2962,10 @@ impl App {
                     self.dev_input.push(egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE });
                     ctx.request_repaint();
                 }
+                crate::devhook::DevAction::Events(mut ev) => {
+                    self.dev_input.append(&mut ev);
+                    ctx.request_repaint();
+                }
                 crate::devhook::DevAction::Open(p) => {
                     if p.is_dir() {
                         self.navigate(p)
