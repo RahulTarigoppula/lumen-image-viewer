@@ -3,6 +3,18 @@
 
 use crossbeam_channel::Receiver;
 
+/// Run the calling worker thread just below normal priority, so decoding and
+/// thumbnail work never delays a frame of the UI thread (scrolling, zooming
+/// and stepping stay smooth while all cores are busy).
+pub fn background_priority() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        // SAFETY: changes only the calling thread's priority.
+        let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    }
+}
+
 /// Holds the latest value for a key and recomputes it in the background when
 /// the key changes. The previous value stays visible until the new one lands,
 /// which avoids flicker while stepping through images.
