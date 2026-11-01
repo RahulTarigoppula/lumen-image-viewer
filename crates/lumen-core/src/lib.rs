@@ -13,6 +13,7 @@ pub mod formats;
 pub mod imaging;
 pub mod meta;
 pub mod metaedit;
+pub mod report;
 pub mod settings;
 pub mod tags;
 pub mod video;
