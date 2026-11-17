@@ -18,7 +18,6 @@ not one comparison at a time.
 - Round report: one PowerPoint, PDF or web page for the whole project (summary with Win / Par / Lose bars,
   scorecard by attribute, flagged artifacts, blind test ranking, every scene and its details). CSV of all scores.
 - Project reviews (marks, comments, details) are stored with the project and survive moving the folder.
-
 - Measure: objective sharpness, noise, visual noise, clipping, white balance and banding of every capture, each scaled
   to the same size so devices are compared fairly; means per device in the side panel, grid, CSV and report.
 - Previous round: pick last round's project to see score changes per device and every score that went down.
