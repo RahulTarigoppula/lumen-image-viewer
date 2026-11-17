@@ -1089,6 +1089,7 @@ impl App {
             ToggleInfo => self.viewer.show_info = !self.viewer.show_info,
             ToggleHistogram => self.viewer.show_histogram = !self.viewer.show_histogram,
             ToggleMagnifier => self.viewer.magnifier_locked = !self.viewer.magnifier_locked,
+            TogglePixelValues => self.viewer.show_pixel = !self.viewer.show_pixel,
             ToggleFilmstrip => self.viewer.show_filmstrip = !self.viewer.show_filmstrip,
             PlayPause => self.viewer.toggle_animation(),
             NextFrame => self.viewer.step_frame(&self.core, 1),

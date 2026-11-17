@@ -179,6 +179,7 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("R", RotateRight),
             ("H", FlipHorizontal),
             ("V", FlipVertical),
+            ("Shift+V", TogglePixelValues),
             ("X", Crop),
             ("Ctrl+R", Resize),
             ("Ctrl+Shift+R", CanvasSize),

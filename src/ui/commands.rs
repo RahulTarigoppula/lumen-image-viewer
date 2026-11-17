@@ -136,6 +136,8 @@ pub enum Command {
     ShowExif,
     /// Capture features and all other metadata of the image(s).
     ShowMetadata,
+    /// Pixel values under the pointer in the viewer.
+    TogglePixelValues,
 }
 
 use Command::*;
@@ -260,6 +262,7 @@ impl Command {
             MeasureProject => "Measure every capture (project)".into(),
             ShowExif => "EXIF data".into(),
             ShowMetadata => "Metadata and capture features".into(),
+            TogglePixelValues => "Pixel values under the pointer".into(),
         }
     }
 
@@ -386,6 +389,7 @@ impl Command {
             MeasureProject => I::GAUGE,
             ShowExif => I::APERTURE,
             ShowMetadata => I::FILE_MAGNIFYING_GLASS,
+            TogglePixelValues => I::EYEDROPPER,
         }
     }
 
@@ -415,7 +419,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -450,7 +454,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

@@ -300,6 +300,8 @@ pub struct Viewer {
     pub crop: Option<CropState>,
     pub show_info: bool,
     pub show_histogram: bool,
+    /// Pixel values under the pointer (Shift+V).
+    pub show_pixel: bool,
     pub show_filmstrip: bool,
     pub magnifier_locked: bool,
     magnifier_active: bool,
@@ -352,6 +354,7 @@ impl Viewer {
             crop: None,
             show_info: false,
             show_histogram: false,
+            show_pixel: false,
             show_filmstrip: false,
             magnifier_locked: false,
             magnifier_active: false,
@@ -998,6 +1001,9 @@ impl Viewer {
             if (self.magnifier_active || self.magnifier_locked) && self.crop.is_none() {
                 self.paint_magnifier(ui, core, dest, sz, view);
             }
+            if self.show_pixel && self.crop.is_none() {
+                self.paint_pixel_values(ui, core, dest, view);
+            }
         } else {
             // Not decoded yet (or failed): show the cached thumbnail / quick preview.
             match core.loader.state(&path) {
@@ -1341,6 +1347,43 @@ impl Viewer {
         let frames = loaded.decoded.frames.as_ref()?;
         let a = self.anim.as_ref()?;
         Some((a.frame, frames.len(), a.playing))
+    }
+
+    /// RGB, hex, CIE L*a*b* and luma of the pixel under the pointer, next to it.
+    fn paint_pixel_values(&self, ui: &Ui, core: &Core, dest: Rect, view: Rect) {
+        let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
+        if !view.contains(pos) || !dest.contains(pos) {
+            return;
+        }
+        let Some(img) = self.loaded(core).map(|l| l.decoded.image.clone()) else { return };
+        let u = ((pos.x - dest.min.x) / dest.width()).clamp(0.0, 0.9999);
+        let v = ((pos.y - dest.min.y) / dest.height()).clamp(0.0, 0.9999);
+        let (x, y) = ((u * img.width() as f32) as u32, (v * img.height() as f32) as u32);
+        let Some(c) = img.get_pixel_checked(x, y).map(|p| p.0) else { return };
+        let lab = lumen_analysis::color::srgb8_to_lab([c[0], c[1], c[2]]);
+        let luma = 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+        let text = format!(
+            "x {x}  y {y}
+RGB {} {} {}   #{:02X}{:02X}{:02X}
+L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
+            c[0], c[1], c[2], c[0], c[1], c[2], lab[0], lab[1], lab[2], luma,
+            if c[3] < 255 { format!("   alpha {}", c[3]) } else { String::new() }
+        );
+        let painter = ui.painter().with_clip_rect(view);
+        let gal = painter.layout_no_wrap(text, FontId::monospace(11.5), Color32::WHITE);
+        let size = gal.size() + Vec2::new(38.0, 10.0);
+        let mut r = Rect::from_min_size(pos + Vec2::new(18.0, 18.0), size);
+        if r.max.x > view.max.x - 4.0 {
+            r = r.translate(Vec2::new(-(size.x + 36.0), 0.0));
+        }
+        if r.max.y > view.max.y - 4.0 {
+            r = r.translate(Vec2::new(0.0, -(size.y + 36.0)));
+        }
+        painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(200));
+        let sw = Rect::from_min_size(r.min + Vec2::new(6.0, 5.0), Vec2::new(20.0, gal.size().y));
+        painter.rect_filled(sw, CornerRadius::same(3), Color32::from_rgb(c[0], c[1], c[2]));
+        painter.rect_stroke(sw, CornerRadius::same(3), Stroke::new(1.0, Color32::from_white_alpha(120)), egui::StrokeKind::Inside);
+        painter.galley(r.min + Vec2::new(32.0, 5.0), gal, Color32::WHITE);
     }
 
     fn paint_magnifier(&mut self, ui: &mut Ui, core: &Core, dest: Rect, img: (u32, u32), view: Rect) {

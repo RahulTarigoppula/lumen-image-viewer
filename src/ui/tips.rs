@@ -97,6 +97,7 @@ pub fn describe(c: Command) -> &'static str {
         MeasureProject => "Measure sharpness, noise, clipping and color of every capture in the project",
         ShowExif => "Every EXIF tag of the image; in Compare all images side by side with differences marked",
         ShowMetadata => "Which camera features fired (HDR, night, zoom, lens), encoding, color profile, XMP and more",
+        TogglePixelValues => "Show RGB, hex, L*a*b* and luma of the pixel under the pointer (in Compare: V)",
         _ => "",
     }
 }
