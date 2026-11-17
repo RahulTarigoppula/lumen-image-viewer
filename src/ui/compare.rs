@@ -286,6 +286,8 @@ fn mode_label(m: CmpMode, with_name: bool) -> String {
 const SYNC_LABEL: &str = "Sync";
 const HIST_LABEL: &str = "Histogram";
 const EXIF_LABEL: &str = "Camera";
+const TAGS_LABEL: &str = "EXIF";
+const META_LABEL: &str = "Metadata";
 const SWAP_LABEL: &str = "Swap";
 const MARKUP_LABEL: &str = "Mark up";
 const REVIEW_LABEL: &str = "Review";
@@ -465,6 +467,13 @@ pub struct SceneLink {
     pub done: bool,
 }
 
+/// The EXIF or Metadata window was asked for (the app opens it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoRequest {
+    Exif,
+    Metadata,
+}
+
 /// What a linked compare asks the workbench to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LinkRequest {
@@ -486,6 +495,10 @@ pub struct Compare {
     pub link_requests: Vec<LinkRequest>,
     /// The workbench scorecard panel is shown (the app draws it).
     pub scorecard: bool,
+    /// The toolbar asked for the EXIF or Metadata window.
+    pub info_request: Option<InfoRequest>,
+    /// Pixel values under the pointer, at the same spot in every pane (V).
+    probe: bool,
     /// "Align to A" is on (panes B-D show their aligned images).
     align_on: bool,
     align_job: Option<Receiver<AlignMsg>>,
@@ -569,6 +582,8 @@ impl Compare {
             link: None,
             link_requests: Vec::new(),
             scorecard: true,
+            info_request: None,
+            probe: false,
             align_on: false,
             align_job: None,
             pending_fov: None,
@@ -1139,6 +1154,21 @@ impl Compare {
         self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, c));
     }
 
+    /// The files for the EXIF / Metadata window: (label, path, badge color).
+    pub fn info_files(&self, core: &Core) -> Vec<(String, PathBuf, Color32)> {
+        self.panes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let label = match self.pane_label(i) {
+                    Some(l) => format!("{}  {l}", LETTERS[i.min(3)]),
+                    None => LETTERS[i.min(3)].to_string(),
+                };
+                (label, p.path.clone(), self.pane_color(core, i))
+            })
+            .collect()
+    }
+
     /// Pane `i` (and linked panes) fit region `r` (fractions) exactly.
     fn zoom_to_region_exact(&mut self, i: usize, r: [f32; 4], ppp: f32) {
         let rects = self.layout(self.last_area);
@@ -1320,6 +1350,9 @@ impl Compare {
         }
         if take(Key::A) {
             self.toggle_alignment(core);
+        }
+        if take(Key::V) {
+            self.probe = !self.probe;
         }
         if take(Key::M) {
             self.toggle_markup(core);
@@ -1833,6 +1866,9 @@ impl Compare {
                 ui.painter().rect_stroke(rect.shrink(1.0), CornerRadius::ZERO, Stroke::new(2.0, p.accent.gamma_multiply(0.8)), egui::StrokeKind::Inside);
             }
         }
+        if self.probe {
+            self.paint_probe(ui, &geos);
+        }
         // Thin separators.
         for (i, r) in rects.iter().enumerate() {
             if i > 0 {
@@ -1849,6 +1885,50 @@ impl Compare {
         }
         if let Some(i) = remove {
             self.remove_pane(i);
+        }
+    }
+
+    /// The pixel inspector: the pointer's spot in the pane under it, the same
+    /// spot (same fraction of the image) in every other pane, each with its
+    /// RGB, hex, CIE L*a*b* and luma.
+    fn paint_probe(&self, ui: &Ui, geos: &[Option<PaneGeo>]) {
+        let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
+        let Some(gh) = geos.iter().find_map(|g| g.as_ref().filter(|g| g.clip.contains(pos))) else { return };
+        let px = super::review::to_image(gh.dest, gh.dims, pos);
+        let rel = [px[0] / gh.dims.0.max(1) as f32, px[1] / gh.dims.1.max(1) as f32];
+        if !(0.0..1.0).contains(&rel[0]) || !(0.0..1.0).contains(&rel[1]) {
+            return;
+        }
+        for (i, g) in geos.iter().enumerate() {
+            let Some(g) = g else { continue };
+            let pane = &self.panes[i];
+            let img = if pane.showing_aligned { pane.aligned.clone() } else { pane.loaded.as_ref().map(|l| l.decoded.image.clone()) };
+            let Some(img) = img else { continue };
+            let (x, y) = ((rel[0] * img.width() as f32) as u32, (rel[1] * img.height() as f32) as u32);
+            let Some(c) = img.get_pixel_checked(x, y).map(|p| p.0) else { continue };
+            let sp = super::review::to_screen(g.dest, g.dims, [rel[0] * g.dims.0 as f32, rel[1] * g.dims.1 as f32]);
+            let painter = ui.painter().with_clip_rect(g.clip);
+            for (col, w) in [(Color32::from_black_alpha(200), 3.0), (Color32::WHITE, 1.2)] {
+                painter.line_segment([sp - Vec2::new(10.0, 0.0), sp - Vec2::new(3.0, 0.0)], Stroke::new(w, col));
+                painter.line_segment([sp + Vec2::new(3.0, 0.0), sp + Vec2::new(10.0, 0.0)], Stroke::new(w, col));
+                painter.line_segment([sp - Vec2::new(0.0, 10.0), sp - Vec2::new(0.0, 3.0)], Stroke::new(w, col));
+                painter.line_segment([sp + Vec2::new(0.0, 3.0), sp + Vec2::new(0.0, 10.0)], Stroke::new(w, col));
+            }
+            let lab = lumen_analysis::color::srgb8_to_lab([c[0], c[1], c[2]]);
+            let luma = 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+            let text = format!(
+                "x {x}  y {y}   RGB {} {} {}   #{:02X}{:02X}{:02X}   L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
+                c[0], c[1], c[2], c[0], c[1], c[2], lab[0], lab[1], lab[2], luma,
+                if c[3] < 255 { format!("   alpha {}", c[3]) } else { String::new() }
+            );
+            let font = FontId::monospace(11.5);
+            let gal = painter.layout_no_wrap(text, font, Color32::WHITE);
+            let r = Rect::from_min_size(Pos2::new(g.clip.min.x + 10.0, g.clip.max.y - 34.0 - gal.size().y), gal.size() + Vec2::new(36.0, 8.0));
+            painter.rect_filled(r, CornerRadius::same(6), Color32::from_black_alpha(190));
+            let sw = Rect::from_min_size(r.min + Vec2::new(6.0, 4.0), Vec2::splat(gal.size().y));
+            painter.rect_filled(sw, CornerRadius::same(2), Color32::from_rgb(c[0], c[1], c[2]));
+            painter.rect_stroke(sw, CornerRadius::same(2), Stroke::new(1.0, Color32::from_white_alpha(120)), egui::StrokeKind::Inside);
+            painter.galley(r.min + Vec2::new(12.0 + gal.size().y, 4.0), gal, Color32::WHITE);
         }
     }
 
@@ -2115,7 +2195,7 @@ impl Compare {
         let part = |b: BarPart, labels: bool| -> f32 {
             match b {
                 BarPart::Help => icon,
-                BarPart::Views => sep + button(HIST_LABEL, labels) + button(EXIF_LABEL, labels),
+                BarPart::Views => sep + button(HIST_LABEL, labels) + button(EXIF_LABEL, labels) + button(TAGS_LABEL, labels) + button(META_LABEL, labels),
                 BarPart::Basis => 126.0 + s,
                 BarPart::Sync => sep + button(SYNC_LABEL, labels),
                 BarPart::Cull => {
@@ -2277,6 +2357,12 @@ impl Compare {
                 if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
                     self.show_exif = !self.show_exif;
                 }
+                if bar_button(ui, I::APERTURE, TAGS_LABEL, "EXIF of every image side by side, differences marked  (Ctrl+Shift+X)", false, plan.icon_labels).clicked() {
+                    self.info_request = Some(InfoRequest::Exif);
+                }
+                if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, "Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP  (Ctrl+Shift+I)", false, plan.icon_labels).clicked() {
+                    self.info_request = Some(InfoRequest::Metadata);
+                }
             }
             // Culling on the selected pane (keys act on the pane under the pointer).
             let sel = self.selected.min(self.panes.len().saturating_sub(1));
@@ -2362,6 +2448,10 @@ impl Compare {
             Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
+        if widgets::menu_check(ui, self.probe, I::EYEDROPPER, "Pixel values", "V").on_hover_text("Show RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane").clicked() {
+            self.probe = !self.probe;
+            ui.close();
+        }
         let busy = self.align_job.is_some();
         let label = if busy { "Aligning..." } else { "Align to A (match field of view)" };
         if widgets::menu_check(ui, self.align_on, I::FRAME_CORNERS, label, "A")
@@ -2416,6 +2506,12 @@ impl Compare {
                     if item(ui, I::CAMERA, "Camera info strip", "H", Some(self.show_exif)) {
                         self.show_exif = !self.show_exif;
                     }
+                    if item(ui, I::APERTURE, "EXIF of every image", "Ctrl+Shift+X", None) {
+                        self.info_request = Some(InfoRequest::Exif);
+                    }
+                    if item(ui, I::FILE_MAGNIFYING_GLASS, "Metadata of every image", "Ctrl+Shift+I", None) {
+                        self.info_request = Some(InfoRequest::Metadata);
+                    }
                 }
                 BarPart::Cull if !self.panes.is_empty() => {
                     sep(ui);
@@ -2467,7 +2563,7 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 23] = [
+        let rows: [(&str, &str); 24] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
             ("Drag", "Pan (mark up: draw; Space+drag pans)"),
             ("Double-click  or  /", "Fit"),
@@ -2482,6 +2578,7 @@ impl Compare {
             ("Ctrl+Shift+E", "Export report (PowerPoint, PDF, web)"),
             ("X", "Swap A and B"),
             ("A", "Align to A: match the field of view"),
+            ("V", "Pixel values at the same spot in every pane"),
             ("L", "Link / unlink zoom & pan"),
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),
@@ -2505,7 +2602,7 @@ impl Compare {
             }
             None => {}
         }
-        let r = Rect::from_center_size(area.center(), Vec2::new(480.0, 60.0 + rows.len() as f32 * 24.0));
+        let r = Rect::from_center_size(area.center(), Vec2::new(480.0, 60.0 + rows.len() as f32 * 24.0).min(area.size() - Vec2::splat(8.0)));
         let painter = ui.painter();
         painter.rect_filled(r, CornerRadius::same(14), Color32::from_rgba_unmultiplied(18, 19, 22, 240));
         painter.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, Color32::from_white_alpha(26)), egui::StrokeKind::Inside);

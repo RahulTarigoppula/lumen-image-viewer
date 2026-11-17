@@ -1669,6 +1669,8 @@ impl Viewer {
             B::Film => Command::ToggleFilmstrip,
             B::Fullscreen => Command::ToggleFullscreen,
             B::Analysis => Command::ToggleAnalysis,
+            B::Exif => Command::ShowExif,
+            B::Meta => Command::ShowMetadata,
             B::Sep | B::ZoomPct | B::Edit | B::More => return None,
         })
     }
@@ -1690,6 +1692,8 @@ impl Viewer {
             B::Info => (I::INFO, tip("Info panel: file details, camera settings and histogram"), self.show_info),
             B::Film => (I::FILM_STRIP, tip("Filmstrip: thumbnails of the folder"), self.show_filmstrip),
             B::Analysis => (cmd.icon(), tip("Analysis: quality metrics and AI review"), false),
+            B::Exif => (cmd.icon(), tip("EXIF: every tag the camera stored"), false),
+            B::Meta => (cmd.icon(), tip("Metadata: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP and more"), false),
             B::Fullscreen => (if self.is_fullscreen { I::CORNERS_IN } else { I::CORNERS_OUT }, tip(if self.is_fullscreen { "Leave full screen" } else { "Full screen" }), false),
             B::Sep | B::ZoomPct | B::Edit | B::More => (I::DOTS_THREE, String::new(), false),
         }
@@ -2285,6 +2289,8 @@ enum BarItem {
     Crop,
     Edit,
     Info,
+    Exif,
+    Meta,
     Analysis,
     Film,
     Fullscreen,
@@ -2313,14 +2319,14 @@ impl BarItem {
 /// commands (lock zoom, histogram, save, delete, slideshow...).
 fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     use BarItem as B;
-    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Analysis, B::Film, B::Fullscreen, B::More];
+    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Exif, B::Meta, B::Analysis, B::Film, B::Fullscreen, B::More];
     let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
     if width(&full) <= avail {
         return (full.to_vec(), Vec::new());
     }
     let mut items: Vec<BarItem> = full.iter().copied().filter(|i| *i != B::Sep).collect();
     // Least important first; Prev / Next / the zoom figure / Fit / Edit / More always stay.
-    let drop_order = [B::Fullscreen, B::Film, B::Info, B::Analysis, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
+    let drop_order = [B::Fullscreen, B::Film, B::Meta, B::Exif, B::Info, B::Analysis, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
     let mut hidden = Vec::new();
     for d in drop_order {
         if width(&items) <= avail {
@@ -2637,12 +2643,12 @@ mod tests {
                 assert!(items.contains(&keep), "{avail}: {keep:?}");
             }
             // Nothing is lost: what does not fit is in the More menu.
-            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Analysis, BarItem::Film, BarItem::Fullscreen] {
+            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Exif, BarItem::Meta, BarItem::Analysis, BarItem::Film, BarItem::Fullscreen] {
                 assert!(items.contains(&b) != hidden.contains(&b), "{avail}: {b:?}");
             }
         }
-        // About 16 items at full width.
-        assert!(all.iter().filter(|i| **i != BarItem::Sep).count() <= 16);
+        // About 18 items at full width.
+        assert!(all.iter().filter(|i| **i != BarItem::Sep).count() <= 18);
     }
 
     #[test]

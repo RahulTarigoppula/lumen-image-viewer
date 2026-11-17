@@ -142,6 +142,8 @@ pub struct App {
     compare: Option<crate::ui::compare::Compare>,
     /// The open camera comparison project.
     workbench: Option<crate::ui::workbench::WorkbenchUi>,
+    /// The EXIF / Metadata window (viewer, compare and browser).
+    meta_window: crate::ui::metadata_view::MetadataWindow,
     video: Option<crate::video::VideoMode>,
     /// The Analysis panel of the viewer, compare and video modes.
     analysis: crate::analysis_ui::AnalysisPanel,
@@ -290,6 +292,7 @@ impl App {
             slideshow: None,
             compare: None,
             workbench: None,
+            meta_window: Default::default(),
             video: None,
             analysis: Default::default(),
             batch_convert: None,
@@ -566,6 +569,35 @@ impl App {
                 }
                 None => self.core.toasts.info("Open a camera comparison project first (Tools, Workbench)"),
             },
+            ShowExif | ShowMetadata => {
+                use crate::ui::metadata_view::MetaTab;
+                let tab = if cmd == ShowExif { MetaTab::Exif } else { MetaTab::Capture };
+                let blind = self.compare.as_ref().is_some_and(|c| c.link.as_ref().is_some_and(|l| l.blind));
+                if self.mode == Mode::Compare && blind {
+                    self.core.toasts.info("Metadata is hidden during a blind test");
+                    return;
+                }
+                let accent = self.core.pal.accent;
+                let files: Vec<(String, PathBuf, egui::Color32)> = match self.mode {
+                    Mode::Compare => self.compare.as_ref().map(|c| c.info_files(&self.core)).unwrap_or_default(),
+                    Mode::Viewer => self.viewer.current().map(|p| vec![(String::new(), p.clone(), accent)]).unwrap_or_default(),
+                    _ => {
+                        let sel: Vec<PathBuf> = self.browser.media_targets().into_iter().filter(|p| crate::formats::is_image_path(p)).take(4).collect();
+                        let letters = ["A", "B", "C", "D"];
+                        if sel.len() == 1 {
+                            vec![(String::new(), sel[0].clone(), accent)]
+                        } else {
+                            sel.into_iter().enumerate().map(|(i, p)| (letters[i].to_string(), p, accent)).collect()
+                        }
+                    }
+                };
+                if files.is_empty() {
+                    self.core.toasts.info("Open or select an image first");
+                    return;
+                }
+                let ctx = self.core.ctx.clone();
+                self.meta_window.show_for(files, tab, &ctx);
+            }
             MeasureProject => match &mut self.workbench {
                 Some(w) => {
                     w.start_measure(&mut self.core, false);
@@ -3095,6 +3127,12 @@ impl eframe::App for App {
                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                 }
                 self.compare_link_requests();
+                if let Some(r) = self.compare.as_mut().and_then(|c| c.info_request.take()) {
+                    self.run(match r {
+                        crate::ui::compare::InfoRequest::Exif => Command::ShowExif,
+                        crate::ui::compare::InfoRequest::Metadata => Command::ShowMetadata,
+                    });
+                }
                 if !keep {
                     let linked = self.compare.as_ref().and_then(|c| c.link.clone());
                     match linked {
@@ -3169,6 +3207,16 @@ impl eframe::App for App {
             Some(crate::analysis_ui::PanelRequest::Open) if !self.analysis.open => self.run(Command::ToggleAnalysis),
             _ => {}
         }
+        // The metadata window follows the viewer to the next image.
+        if self.meta_window.open && self.mode == Mode::Viewer {
+            if let Some(cur) = self.viewer.current().cloned() {
+                if self.meta_window.paths() != [cur.clone()] {
+                    let tab = self.meta_window.tab;
+                    self.meta_window.show_for(vec![(String::new(), cur, p.accent)], tab, &ctx);
+                }
+            }
+        }
+        self.meta_window.ui(&ctx, &p);
         self.dialogs(&ctx);
         self.guard_dialog(&ctx);
         // Leaving video mode by any route stops playback.

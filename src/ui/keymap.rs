@@ -96,6 +96,8 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("F1", ShortcutsHelp),
             ("Ctrl+Shift+O", OpenFolder),
             ("Ctrl+Shift+W", Workbench),
+            ("Ctrl+Shift+X", ShowExif),
+            ("Ctrl+Shift+I", ShowMetadata),
             ("Ctrl+O", OpenFile),
             ("Ctrl+Shift+T", ToggleTheme),
             ("Ctrl+Shift+V", OpenVideoMode),

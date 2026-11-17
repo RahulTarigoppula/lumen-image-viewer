@@ -95,6 +95,8 @@ pub fn describe(c: Command) -> &'static str {
         Workbench => "Treat this folder as a camera comparison project: devices and scenes are found automatically",
         BlindTest => "Judge random pairs of the project with names hidden; devices are ranked from the votes",
         MeasureProject => "Measure sharpness, noise, clipping and color of every capture in the project",
+        ShowExif => "Every EXIF tag of the image; in Compare all images side by side with differences marked",
+        ShowMetadata => "Which camera features fired (HDR, night, zoom, lens), encoding, color profile, XMP and more",
         _ => "",
     }
 }

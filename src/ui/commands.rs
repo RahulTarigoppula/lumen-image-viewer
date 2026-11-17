@@ -132,6 +132,10 @@ pub enum Command {
     BlindTest,
     /// Measure the open project's captures.
     MeasureProject,
+    /// Every EXIF tag of the image (or of every image in Compare).
+    ShowExif,
+    /// Capture features and all other metadata of the image(s).
+    ShowMetadata,
 }
 
 use Command::*;
@@ -254,6 +258,8 @@ impl Command {
             Workbench => "Workbench: compare devices in this folder".into(),
             BlindTest => "Blind test (project)".into(),
             MeasureProject => "Measure every capture (project)".into(),
+            ShowExif => "EXIF data".into(),
+            ShowMetadata => "Metadata and capture features".into(),
         }
     }
 
@@ -378,6 +384,8 @@ impl Command {
             Workbench => I::FLASK,
             BlindTest => I::EYE_SLASH,
             MeasureProject => I::GAUGE,
+            ShowExif => I::APERTURE,
+            ShowMetadata => I::FILE_MAGNIFYING_GLASS,
         }
     }
 
@@ -407,7 +415,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -442,7 +450,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v
