@@ -2062,10 +2062,10 @@ impl Compare {
         if data.is_empty() {
             return;
         }
-        let plot = Rect::from_min_size(Pos2::new(area.min.x + 16.0, area.max.y - 236.0), Vec2::new((area.width() - 32.0).min(760.0), 170.0));
+        let plot = Rect::from_min_size(Pos2::new(area.min.x + 16.0, area.max.y - 252.0), Vec2::new((area.width() - 32.0).min(760.0), 186.0));
         let painter = ui.painter();
         painter.rect_filled(plot, CornerRadius::same(10), Color32::from_black_alpha(205));
-        let inner = plot.shrink2(Vec2::new(14.0, 26.0)).translate(Vec2::new(0.0, 8.0));
+        let inner = Rect::from_min_max(plot.min + Vec2::new(14.0, 30.0), plot.max - Vec2::new(14.0, 26.0));
         painter.text(plot.min + Vec2::new(14.0, 8.0), Align2::LEFT_TOP, "Brightness along the line", super::theme::semibold(12.0), Color32::WHITE);
         for frac in [0.0f32, 0.5, 1.0] {
             let y = inner.max.y - frac * inner.height();
@@ -2090,8 +2090,7 @@ impl Compare {
             painter.galley(Pos2::new(x, plot.min.y + 8.0), g, *col);
             x -= 14.0;
         }
-        let tip = Rect::from_min_size(Pos2::new(plot.min.x, plot.max.y + 4.0), Vec2::new(plot.width(), 16.0));
-        painter.text(tip.min, Align2::LEFT_TOP, "Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper). P to leave.", FontId::proportional(10.5), Color32::from_white_alpha(200));
+        painter.text(Pos2::new(plot.min.x + 14.0, plot.max.y - 8.0), Align2::LEFT_BOTTOM, "Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper). P to leave.", FontId::proportional(10.5), Color32::from_white_alpha(200));
     }
 
     /// "Keep, reject others" shows on the pane under the pointer only.

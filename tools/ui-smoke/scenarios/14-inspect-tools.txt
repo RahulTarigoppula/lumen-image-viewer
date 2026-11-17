@@ -30,6 +30,11 @@ wait 3500
 run ShowMetadata
 wait 3000
 shot compare_metadata.png
+click 268 148
+wait 1500
+shot compare_metadata_other.png
+run ShowMetadata
+wait 500
 run ShowMetadata
 wait 800
 key V

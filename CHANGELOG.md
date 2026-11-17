@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Metadata and EXIF
+- EXIF and Metadata buttons in the viewer toolbar and in compare (Ctrl+Shift+X, Ctrl+Shift+I; also in the browser for up
+  to four selected files). One window shows every open image side by side, with differences marked, a filter, "only
+  differences" and copy as TSV.
+- Capture summary: camera and firmware, lens and a camera-module guess (ultra wide, main, tele, front), exposure and
+  exposure value, metering, white balance, flash, and which phone features were used: multi-frame / HDR (with the
+  source of each clue), HDR gain map (Ultra HDR, ISO 21496-1, Apple), night mode, portrait / depth, motion photo,
+  Live Photo, panorama, burst, Single Take.
+- Every EXIF tag grouped by IFD, with units and hover notes.
+- Encoding: estimated JPEG quality from the quantization tables, chroma subsampling, progressive or baseline,
+  optimized or standard Huffman tables, restart interval, C2PA, data after the image; PNG, WebP, HEIF/AVIF, GIF, BMP,
+  JPEG XL and TIFF/DNG header facts.
+- ICC profile, XMP (Google, Adobe and Samsung namespaces), Samsung trailer entries, multi-picture (MPF) images, maker
+  note, PNG text chunks (including generation parameters) and comments. Damaged files give warnings, never a crash.
+
+### Viewer and compare
+- Pixel values under the pointer: RGB, hex, luma and Lab (Shift+V in the viewer; V in compare reads the same spot in
+  every pane).
+- Inspect views (Shift+O in the viewer, O in compare): clipping warnings, false color exposure, focus peaking, luma,
+  red, green and blue channels.
+- Line profile (P in compare): drag a line to plot brightness along it in every pane, with the 10-90% edge width of
+  each.
+
 ## 2.0.0 (17 November 2026)
 
 Lumen becomes an image quality workbench: whole camera comparison rounds,

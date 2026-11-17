@@ -83,6 +83,16 @@ impl Row {
     }
 }
 
+/// A table cell of a fixed width with its label aligned left (`add_sized`
+/// centers, which reads badly in a column of names and values).
+fn cell(ui: &mut egui::Ui, w: f32, h: f32, label: egui::Label) -> egui::Response {
+    ui.allocate_ui_with_layout(Vec2::new(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_width(w);
+        ui.add(label)
+    })
+    .inner
+}
+
 /// Rows of one group across files, in the order fields first appear.
 fn merge_rows(groups: &[Option<&Vec<Field>>]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
@@ -226,11 +236,11 @@ impl MetadataWindow {
         let col_w = ((avail - name_w - 16.0) / n as f32).max(120.0);
         // Column headers.
         ui.horizontal(|ui| {
-            ui.add_sized(Vec2::new(name_w, 22.0), egui::Label::new(RichText::new("").size(text::SMALL)));
+            cell(ui, name_w, 22.0, egui::Label::new(RichText::new("").size(text::SMALL)));
             for it in &self.items {
                 let name = it.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let head = if it.label.is_empty() { name.clone() } else { format!("{}  {}", it.label, name) };
-                ui.add_sized(Vec2::new(col_w, 22.0), egui::Label::new(RichText::new(head).font(text::body_strong()).color(it.color)).truncate()).on_hover_text(it.path.display().to_string());
+                cell(ui, col_w, 22.0, egui::Label::new(RichText::new(head).font(text::body_strong()).color(it.color)).truncate()).on_hover_text(it.path.display().to_string());
             }
         });
         ui.separator();
@@ -263,7 +273,7 @@ impl MetadataWindow {
                         egui::Frame::new().fill(bg).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let name = RichText::new(&r.name).size(text::SMALL).color(if differs { p.accent_text } else { p.muted });
-                                let resp = ui.add_sized(Vec2::new(name_w, 20.0), egui::Label::new(if differs { name.strong() } else { name }).truncate());
+                                let resp = cell(ui, name_w, 20.0, egui::Label::new(if differs { name.strong() } else { name }).truncate());
                                 let tip = match (r.note.is_empty(), differs) {
                                     (true, false) => String::new(),
                                     (true, true) => "The images differ here".to_string(),
@@ -279,7 +289,7 @@ impl MetadataWindow {
                                         None => ("-".to_string(), p.faint),
                                     };
                                     let short: String = if t.chars().count() > 160 { t.chars().take(160).collect::<String>() + "..." } else { t.clone() };
-                                    let resp = ui.add_sized(Vec2::new(col_w, 20.0), egui::Label::new(RichText::new(short).size(text::SMALL).color(c)).truncate().selectable(true));
+                                    let resp = cell(ui, col_w, 20.0, egui::Label::new(RichText::new(short).size(text::SMALL).color(c)).truncate().selectable(true));
                                     if t.chars().count() > 30 {
                                         resp.on_hover_text(t);
                                     }
