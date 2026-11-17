@@ -326,7 +326,12 @@ fn single(f: &Facts) -> Summary {
     // that value existed have the whole-frame variance only.
     if let Some((key, x)) = f.first_key(&["sharpness.laplacian.p90", "sharpness.laplacian.var"]) {
         let overall = f.get("sharpness.laplacian.var").filter(|_| key.ends_with("p90"));
-        let (level, label) = if x >= SHARP_GOOD {
+        // Strong noise is fine detail to a Laplacian: a soft but grainy
+        // night shot would read as sharp.
+        let noisy = f.get("noise.y").is_some_and(|n| n >= NOISE_POOR);
+        let (level, label) = if noisy && x >= SHARP_SOFT {
+            (Level::Fair, "Detail hard to judge (noise)")
+        } else if x >= SHARP_GOOD {
             (Level::Good, "Sharp detail")
         } else if x >= SHARP_SOFT {
             (Level::Fair, "Moderate detail")
@@ -341,7 +346,7 @@ fn single(f: &Facts) -> Summary {
             level,
             label: label.into(),
             value: format!("{x:.0}"),
-            tip: format!("Edge contrast (Laplacian variance): {basis}. Above {SHARP_GOOD:.0} edges are crisp, below {SHARP_SOFT:.0} the picture looks soft. Smooth subjects such as sky or walls also score low, so this does not prove the focus is off."),
+            tip: format!("Edge contrast (Laplacian variance): {basis}. Above {SHARP_GOOD:.0} edges are crisp, below {SHARP_SOFT:.0} the picture looks soft. Smooth subjects such as sky or walls also score low, so this does not prove the focus is off.{}", if noisy { " Strong noise raises this number, so it overstates the real detail here." } else { "" }),
             key: key.into(),
         });
     }
@@ -740,6 +745,14 @@ mod tests {
 
     fn line<'a>(s: &'a Summary, label: &str) -> &'a Line {
         s.lines.iter().find(|l| l.label.contains(label)).unwrap_or_else(|| panic!("no line {label:?} in {:?}", s.lines))
+    }
+
+    #[test]
+    fn noise_does_not_pass_for_detail() {
+        let s = summarize(&facts(&[("sharpness.laplacian.var", 1800.0), ("noise.y", 6.8)]));
+        let l = line(&s, "Detail hard to judge");
+        assert_eq!(l.level, Level::Fair);
+        assert!(l.tip.contains("overstates"));
     }
 
     #[test]
