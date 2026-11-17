@@ -28,6 +28,7 @@ webp.workspace = true
 ab_glyph.workspace = true
 fast_image_resize = { version = "6", features = ["rayon", "image"] }
 kamadak-exif = "0.6"
+flate2 = "1"
 qcms = "0.3.0"
 img-parts = "0.4.1"
 epaint_default_fonts = "0.37"
