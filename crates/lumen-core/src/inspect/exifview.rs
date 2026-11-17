@@ -284,8 +284,8 @@ pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote) -> Option<Group> {
         format!("{} bytes", super::thousands(m.len() as u64)),
         "Maker notes hold the manufacturer's private data (processing settings, focus, face detection...). Their layout is proprietary and is not decoded here.",
     ));
-    let format = [
-        (&b"Apple iOS\0"[..], "Apple"),
+    let sigs: [(&[u8], &str); 12] = [
+        (b"Apple iOS\0", "Apple"),
         (b"Nikon\0", "Nikon"),
         (b"OLYMPUS\0", "Olympus"),
         (b"OM SYSTEM", "OM System"),
