@@ -50,7 +50,14 @@ pub struct Mark {
     pub width: f32,
     #[serde(default)]
     pub note: String,
+    /// Artifact tag from `lumen_core::workbench::ARTIFACT_TAGS` ("Halo").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub severity: Severity,
 }
+
+pub use lumen_core::workbench::Severity;
 
 /// A region of interest shown on every image: fractions 0..1 of each image.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,7 +112,7 @@ impl Review {
         let mut old = std::mem::take(&mut self.images);
         self.images = paths
             .iter()
-            .map(|p| match old.iter().position(|i| same_file(&i.path, p)) {
+            .map(|p| match old.iter().position(|i| same_file(&i.path, p)).or_else(|| old.iter().position(|i| same_name(&i.path, p))) {
                 Some(k) => {
                     let mut im = old.remove(k);
                     im.path = p.clone();
@@ -121,6 +128,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
+/// Same file name and parent folder name: the folder was moved or copied
+/// (project reviews keep their data then).
+fn same_name(a: &Path, b: &Path) -> bool {
+    let tail = |p: &Path| {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        let parent = p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_lowercase());
+        (parent, name)
+    };
+    let (ta, tb) = (tail(a), tail(b));
+    ta.1.is_some() && ta == tb
+}
+
 // ---------------------------------------------------------------- persistence
 
 pub fn reviews_dir() -> PathBuf {
@@ -130,7 +149,19 @@ pub fn reviews_dir() -> PathBuf {
 /// File name for a set of images: the same set in any order gives the same
 /// name (so swapping A and B keeps the review).
 pub fn review_key(paths: &[PathBuf]) -> String {
-    let mut names: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
+    review_key_in(None, paths)
+}
+
+/// Like [`review_key`], with paths inside `root` taken relative to it, so a
+/// project's reviews keep their names when the project folder moves.
+pub fn review_key_in(root: Option<&Path>, paths: &[PathBuf]) -> String {
+    let mut names: Vec<String> = paths
+        .iter()
+        .map(|p| match root.and_then(|r| lumen_core::workbench::detect::relative(r, p)) {
+            Some(rel) => rel.to_lowercase(),
+            None => p.to_string_lossy().to_lowercase(),
+        })
+        .collect();
     names.sort();
     // FNV-1a: stable across builds, unlike the std hasher.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -144,12 +175,25 @@ pub fn review_key(paths: &[PathBuf]) -> String {
 }
 
 pub fn review_file(dir: &Path, paths: &[PathBuf]) -> PathBuf {
-    dir.join(format!("{}.json", review_key(paths)))
+    review_file_in(dir, None, paths)
+}
+
+pub fn review_file_in(dir: &Path, root: Option<&Path>, paths: &[PathBuf]) -> PathBuf {
+    dir.join(format!("{}.json", review_key_in(root, paths)))
+}
+
+/// Where a project keeps its reviews: beside the project file.
+pub fn project_reviews_dir(root: &Path) -> PathBuf {
+    root.join("lumen-reviews")
 }
 
 /// The saved review for `paths` (empty when there is none or it is unreadable).
 pub fn load(dir: &Path, paths: &[PathBuf]) -> Review {
-    let mut r = std::fs::read_to_string(review_file(dir, paths)).ok().and_then(|t| serde_json::from_str::<Review>(&t).ok()).unwrap_or_default();
+    load_in(dir, None, paths)
+}
+
+pub fn load_in(dir: &Path, root: Option<&Path>, paths: &[PathBuf]) -> Review {
+    let mut r = std::fs::read_to_string(review_file_in(dir, root, paths)).ok().and_then(|t| serde_json::from_str::<Review>(&t).ok()).unwrap_or_default();
     r.align(paths);
     r
 }
@@ -157,8 +201,12 @@ pub fn load(dir: &Path, paths: &[PathBuf]) -> Review {
 /// Write `r` for its images. An empty review is written only to replace an
 /// earlier file (so clearing everything sticks).
 pub fn save(dir: &Path, r: &Review) -> Result<()> {
+    save_in(dir, None, r)
+}
+
+pub fn save_in(dir: &Path, root: Option<&Path>, r: &Review) -> Result<()> {
     let paths: Vec<PathBuf> = r.images.iter().map(|i| i.path.clone()).collect();
-    let file = review_file(dir, &paths);
+    let file = review_file_in(dir, root, &paths);
     if r.is_empty() && !file.exists() {
         return Ok(());
     }
@@ -317,6 +365,21 @@ pub fn crop_box(r: [f32; 4], dims: (u32, u32)) -> (u32, u32, u32, u32) {
 }
 
 impl Mark {
+    /// A new mark with no note or tag.
+    pub fn new(shape: Shape, pts: Vec<[f32; 2]>, color: [u8; 3], width: f32) -> Mark {
+        Mark { shape, pts, color, width, note: String::new(), tag: None, severity: Severity::default() }
+    }
+
+    /// The mark's line in a report: "Halo (severe): roof edge".
+    pub fn report_note(&self) -> String {
+        let note = self.note.trim();
+        match &self.tag {
+            Some(t) if note.is_empty() => format!("{t} ({})", self.severity.label().to_lowercase()),
+            Some(t) => format!("{t} ({}): {note}", self.severity.label().to_lowercase()),
+            None => note.to_string(),
+        }
+    }
+
     pub fn draw_obj(&self) -> DrawObj {
         let kind = match self.shape {
             Shape::Rect => Kind::Rect,
@@ -504,7 +567,7 @@ pub fn build_report(job: &ExportJob) -> Result<report::Report> {
                 details,
                 picture: pic,
                 comment: im.comment.trim().to_string(),
-                notes: im.marks.iter().filter(|m| m.is_valid()).map(|m| m.note.trim().to_string()).collect(),
+                notes: im.marks.iter().filter(|m| m.is_valid()).map(|m| m.report_note()).collect(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -567,7 +630,7 @@ mod tests {
     use egui::Vec2;
 
     fn mark(shape: Shape, pts: Vec<[f32; 2]>) -> Mark {
-        Mark { shape, pts, color: COLORS[0].1, width: 4.0, note: String::new() }
+        Mark::new(shape, pts, COLORS[0].1, 4.0)
     }
 
     #[test]

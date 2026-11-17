@@ -20,6 +20,8 @@ pub mod save_dialog;
 pub mod settings_window;
 pub mod slideshow;
 pub mod tools;
+pub mod workbench;
+pub mod workbench_export;
 
 /// Tooltip delay set by the theme (seconds).
 pub const TOOLTIP_DELAY: f32 = 0.35;

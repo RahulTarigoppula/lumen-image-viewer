@@ -129,6 +129,8 @@ pub struct ReviewUi {
     redo: Vec<Snap>,
     dirty: Option<Instant>,
     dir: PathBuf,
+    /// Project folder: review files are keyed on paths relative to it.
+    root: Option<PathBuf>,
     pub prefs: Prefs,
     export: Option<ExportForm>,
     job: Option<Receiver<Result<PathBuf, String>>>,
@@ -144,8 +146,12 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 
 impl ReviewUi {
     pub fn new(paths: &[PathBuf]) -> ReviewUi {
-        let dir = review::reviews_dir();
-        let review = review::load(&dir, paths);
+        Self::new_in(paths, review::reviews_dir(), None)
+    }
+
+    /// A review stored in `dir`, keyed on paths relative to `root` (projects).
+    pub fn new_in(paths: &[PathBuf], dir: PathBuf, root: Option<PathBuf>) -> ReviewUi {
+        let review = review::load_in(&dir, root.as_deref(), paths);
         let restored = !review.is_empty();
         ReviewUi {
             review,
@@ -160,6 +166,7 @@ impl ReviewUi {
             redo: Vec::new(),
             dirty: None,
             dir,
+            root,
             prefs: Prefs::load(),
             export: None,
             job: None,
@@ -277,9 +284,9 @@ impl ReviewUi {
         if let Some(t) = self.dirty {
             if t.elapsed() >= SAVE_DELAY && self.drag.is_none() {
                 self.dirty = None;
-                let (dir, r) = (self.dir.clone(), self.review.clone());
+                let (dir, root, r) = (self.dir.clone(), self.root.clone(), self.review.clone());
                 std::thread::spawn(move || {
-                    if let Err(e) = review::save(&dir, &r) {
+                    if let Err(e) = review::save_in(&dir, root.as_deref(), &r) {
                         log::warn!("saving the review failed: {e}");
                     }
                 });
@@ -314,7 +321,7 @@ impl ReviewUi {
     /// Write now (leaving compare).
     pub fn save_now(&mut self) {
         if self.dirty.take().is_some() {
-            if let Err(e) = review::save(&self.dir, &self.review) {
+            if let Err(e) = review::save_in(&self.dir, self.root.as_deref(), &self.review) {
                 log::warn!("saving the review failed: {e}");
             }
         }
@@ -502,7 +509,7 @@ impl ReviewUi {
             Some(Drag::Draw { pane, shape, pts }) => {
                 let Some(g) = geos.get(pane).copied().flatten() else { return };
                 let width = review::stroke_px(shape, self.width, g.dims);
-                let m = Mark { shape, pts, color: COLORS[self.color].1, width, note: String::new() };
+                let m = Mark::new(shape, pts, COLORS[self.color].1, width);
                 // Too small to mean anything on screen (a click).
                 let b = m.bounds();
                 let span = (b[2] - b[0]).max(b[3] - b[1]) * review::scale_of(g.dest, g.dims);
@@ -586,7 +593,7 @@ impl ReviewUi {
         // The shape being drawn.
         match &self.drag {
             Some(Drag::Draw { pane, shape, pts }) if *pane == i && pts.len() >= 2 => {
-                let m = Mark { shape: *shape, pts: pts.clone(), color: COLORS[self.color].1, width: review::stroke_px(*shape, self.width, g.dims), note: String::new() };
+                let m = Mark::new(*shape, pts.clone(), COLORS[self.color].1, review::stroke_px(*shape, self.width, g.dims));
                 paint_mark(&painter, g, &m);
             }
             Some(Drag::Snip { start, end, .. }) => {
@@ -737,6 +744,37 @@ impl ReviewUi {
                         changed |= te.changed();
                         if widgets::icon_button_sized(ui, I::X, "Delete this mark", false, 22.0, 12.0).clicked() {
                             delete = Some(k);
+                        }
+                    });
+                    // Artifact tag and severity: counted per device in project reports.
+                    ui.horizontal(|ui| {
+                        ui.add_space(26.0);
+                        let shown = m.tag.clone().unwrap_or_else(|| "No artifact tag".into());
+                        let tip = m.tag.as_deref().and_then(|t| lumen_core::workbench::ARTIFACT_TAGS.iter().find(|(n, _)| *n == t)).map(|(_, d)| *d).unwrap_or("Tag what this mark shows (halo, noise, flare...); project reports count tags per device");
+                        widgets::combo(("mark-tag", pi, k))
+                            .selected_text(RichText::new(shown).size(text::SMALL))
+                            .width(130.0)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(m.tag.is_none(), "No artifact tag").clicked() {
+                                    m.tag = None;
+                                    changed = true;
+                                }
+                                for (name, desc) in lumen_core::workbench::ARTIFACT_TAGS {
+                                    if ui.selectable_label(m.tag.as_deref() == Some(name), name).on_hover_text(desc).clicked() {
+                                        m.tag = Some(name.to_string());
+                                        changed = true;
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(tip);
+                        if m.tag.is_some() {
+                            for sv in review::Severity::ALL {
+                                if ui.selectable_label(m.severity == sv, RichText::new(sv.label()).size(text::SMALL)).on_hover_text(sv.hint()).clicked() {
+                                    m.severity = sv;
+                                    changed = true;
+                                }
+                            }
                         }
                     });
                 }

@@ -54,6 +54,8 @@ pub enum Mode {
     Slideshow,
     Compare,
     Video,
+    /// A camera comparison project (`ui::workbench`).
+    Workbench,
 }
 
 enum PendingPrompt {
@@ -138,6 +140,8 @@ pub struct App {
     pub viewer: Viewer,
     slideshow: Option<crate::ui::slideshow::Slideshow>,
     compare: Option<crate::ui::compare::Compare>,
+    /// The open camera comparison project.
+    workbench: Option<crate::ui::workbench::WorkbenchUi>,
     video: Option<crate::video::VideoMode>,
     /// The Analysis panel of the viewer, compare and video modes.
     analysis: crate::analysis_ui::AnalysisPanel,
@@ -285,6 +289,7 @@ impl App {
             viewer: Viewer::new(),
             slideshow: None,
             compare: None,
+            workbench: None,
             video: None,
             analysis: Default::default(),
             batch_convert: None,
@@ -541,6 +546,21 @@ impl App {
             OpenFolder => {
                 if let Some(p) = rfd::FileDialog::new().set_directory(&self.browser.folder).pick_folder() {
                     self.navigate(p);
+                }
+            }
+            OpenProject => {
+                let start = self.workbench.as_ref().map(|w| w.ws.root.clone()).unwrap_or_else(|| self.browser.folder.clone());
+                if let Some(p) = rfd::FileDialog::new().set_title("Folder with the captures of every device").set_directory(&start).pick_folder() {
+                    self.open_project(&p);
+                }
+            }
+            Workbench => {
+                let folder = self.browser.folder.clone();
+                let root = lumen_core::workbench::find_root(&folder, 3).unwrap_or(folder);
+                if self.workbench.as_ref().is_some_and(|w| w.ws.root == root) {
+                    self.mode = Mode::Workbench;
+                } else {
+                    self.open_project(&root);
                 }
             }
             CommandPalette => self.palette.toggle(),
@@ -1057,6 +1077,10 @@ impl App {
                 }
             }
             ToggleAnalysis | RunMetrics | RunAi => {
+                if self.mode == Mode::Compare && self.compare.as_ref().is_some_and(|c| c.link.as_ref().is_some_and(|l| l.blind)) {
+                    self.core.toasts.info("Analysis is off during a blind test (it would show the file names)");
+                    return;
+                }
                 // In the browser: open the focused image or video, with the panel.
                 let from_browser = self.mode == Mode::Browser;
                 if let Some(i) = self.browser.focus.filter(|&i| from_browser && self.browser.item(i).is_some_and(|e| e.kind != EntryKind::Folder)) {
@@ -2515,6 +2539,10 @@ impl App {
                 }
             });
             submenu(ui, I::WRENCH, "Tools", |ui| {
+                for c in [Command::Workbench, Command::OpenProject] {
+                    item(ui, c, &mut fire);
+                }
+                ui.separator();
                 for c in [Command::BatchConvert, Command::BatchRename, Command::ContactSheet, Command::FindDuplicates, Command::CreateMultiPage, Command::ImageStrip, Command::CreateZip, Command::Slideshow, Command::Compare, Command::OpenVideoMode] {
                     item(ui, c, &mut fire);
                 }
@@ -2584,6 +2612,117 @@ impl App {
         self.viewer.open(images, 0, self.core.settings.fit_mode);
     }
 
+    /// Open (or create) the project in `root` and show the workbench.
+    fn open_project(&mut self, root: &Path) {
+        if let Some(w) = &mut self.workbench {
+            w.save_now(&mut self.core.toasts);
+        }
+        match crate::ui::workbench::WorkbenchUi::open(root) {
+            Ok((w, created)) => {
+                if created {
+                    let p = &w.ws.project;
+                    self.core.toasts.success(format!("Found {} devices and {} scenes ({}). Saved as {}.", p.devices.len(), p.scenes.len(), p.detected_by, lumen_core::workbench::PROJECT_FILE));
+                }
+                self.workbench = Some(w);
+                self.compare = None;
+                self.mode = Mode::Workbench;
+            }
+            Err(e) => self.core.toasts.error(format!("Could not open the project: {e:#}")),
+        }
+    }
+
+    /// Show scene `k` of the project in Compare.
+    fn open_scene(&mut self, k: usize) {
+        let Some(w) = &self.workbench else { return };
+        let (files, link) = w.link_for(k);
+        if files.len() < 2 {
+            self.core.toasts.info("This scene has a capture from one device only");
+            return;
+        }
+        let scorecard = self.compare.as_ref().map(|c| c.scorecard).unwrap_or(true);
+        let mut c = crate::ui::compare::Compare::new_scene(files, &self.core, link, &w.ws.root);
+        c.scorecard = scorecard;
+        self.compare = Some(c);
+        if let Some(w) = &mut self.workbench {
+            w.selected = k;
+        }
+        self.mode = Mode::Compare;
+    }
+
+    /// Show the current blind trial in Compare (or end the test).
+    fn open_blind_trial(&mut self) {
+        let Some(w) = &self.workbench else { return };
+        match w.blind_link() {
+            Some((files, link)) => {
+                let c = crate::ui::compare::Compare::new_scene(files, &self.core, link, &w.ws.root);
+                self.compare = Some(c);
+                // The Analysis panel would show file names.
+                self.analysis.open = false;
+                self.mode = Mode::Compare;
+            }
+            None => self.end_blind(),
+        }
+    }
+
+    fn end_blind(&mut self) {
+        if let Some(w) = &mut self.workbench {
+            let n = w.blind.as_ref().map(|b| b.count).unwrap_or(0);
+            w.blind = None;
+            w.save_now(&mut self.core.toasts);
+            if n > 0 {
+                self.core.toasts.success(format!("Blind test: {n} vote{} recorded. The ranking is in the project's side panel.", if n == 1 { "" } else { "s" }));
+            }
+        }
+        self.compare = None;
+        self.mode = if self.workbench.is_some() { Mode::Workbench } else { Mode::Browser };
+    }
+
+    /// Requests from a compare opened from the project.
+    fn compare_link_requests(&mut self) {
+        let Some(c) = &mut self.compare else { return };
+        let reqs = std::mem::take(&mut c.link_requests);
+        let Some(link) = c.link.clone() else { return };
+        for r in reqs {
+            use crate::ui::compare::LinkRequest as L;
+            match r {
+                L::Step(d) => {
+                    let next = self.workbench.as_ref().and_then(|w| w.step_scene(link.scene, d));
+                    match next {
+                        Some(k) => {
+                            if let Some(w) = &mut self.workbench {
+                                w.save_now(&mut self.core.toasts);
+                            }
+                            self.open_scene(k);
+                        }
+                        None => self.core.toasts.info(if d > 0 { "This is the last scene" } else { "This is the first scene" }),
+                    }
+                    return;
+                }
+                L::ToggleScorecard => {
+                    if let Some(c) = &mut self.compare {
+                        c.scorecard = !c.scorecard;
+                    }
+                }
+                L::SetDone(done) => {
+                    if let Some(w) = &mut self.workbench {
+                        w.set_done(link.scene, done);
+                    }
+                }
+                L::Vote(v) => {
+                    if let Some(w) = &mut self.workbench {
+                        w.vote(v);
+                    }
+                    self.open_blind_trial();
+                    return;
+                }
+                L::EndBlind => {
+                    self.end_blind();
+                    return;
+                }
+            }
+        }
+    }
+
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match self.mode {
             Mode::Viewer => match self.viewer.current() {
@@ -2591,6 +2730,11 @@ impl App {
                 None => "Lumen".into(),
             },
             Mode::Video => "Video - Lumen".into(),
+            Mode::Workbench => match &self.workbench {
+                Some(w) => format!("{} - Workbench - Lumen", w.ws.project.name),
+                None => "Workbench - Lumen".into(),
+            },
+            Mode::Compare if self.compare.as_ref().is_some_and(|c| c.link.as_ref().is_some_and(|l| l.blind)) => "Blind test - Lumen".into(),
             _ => format!("{} - Lumen", self.browser.folder.display()),
         };
         if title != self.last_title {
@@ -2837,6 +2981,36 @@ impl eframe::App for App {
             }
             Mode::Compare => {
                 let mut keep = true;
+                // A project scene: the scorecard panel beside the images.
+                let card = match (&self.compare, &self.workbench) {
+                    (Some(c), Some(w)) if c.scorecard => c.link.as_ref().filter(|l| !l.blind).map(|l| {
+                        let files = w.ws.scene_files(l.scene);
+                        let mut devs: Vec<String> = Vec::new();
+                        for (d, _) in files.into_iter().take(4) {
+                            if !devs.contains(&d) {
+                                devs.push(d);
+                            }
+                        }
+                        (l.scene, devs)
+                    }),
+                    _ => None,
+                };
+                if let (Some((scene, devs)), Some(w)) = (card, self.workbench.as_mut()) {
+                    w.tick(&mut self.core);
+                    let max = (ctx.content_rect().width() * 0.4).clamp(280.0, 520.0);
+                    let close = egui::Panel::right("wb-scorecard")
+                        .resizable(true)
+                        .default_size(320.0_f32.min(max))
+                        .size_range(260.0..=max)
+                        .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin { left: 12, right: 4, top: 10, bottom: 8 }))
+                        .show(ui, |ui| w.scorecard(ui, &p, scene, &devs))
+                        .inner;
+                    if close {
+                        if let Some(c) = &mut self.compare {
+                            c.scorecard = false;
+                        }
+                    }
+                }
                 egui::CentralPanel::no_frame().show(ui, |ui| {
                     if let Some(c) = &mut self.compare {
                         // The report's measurements page: the Analysis panel's
@@ -2858,9 +3032,48 @@ impl eframe::App for App {
                     }
                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                 }
+                self.compare_link_requests();
                 if !keep {
-                    self.compare = None;
-                    self.mode = Mode::Browser;
+                    let linked = self.compare.as_ref().and_then(|c| c.link.clone());
+                    match linked {
+                        Some(l) if l.blind => self.end_blind(),
+                        Some(_) if self.workbench.is_some() => {
+                            self.compare = None;
+                            if let Some(w) = &mut self.workbench {
+                                w.save_now(&mut self.core.toasts);
+                            }
+                            self.mode = Mode::Workbench;
+                        }
+                        _ => {
+                            self.compare = None;
+                            self.mode = Mode::Browser;
+                        }
+                    }
+                }
+            }
+            Mode::Workbench => {
+                let mut reqs = Vec::new();
+                match &mut self.workbench {
+                    Some(w) => {
+                        let t = Instant::now();
+                        w.ui(ui, &mut self.core);
+                        crate::devhook::prof("workbench", t);
+                        reqs = std::mem::take(&mut w.requests);
+                    }
+                    None => self.mode = Mode::Browser,
+                }
+                for r in reqs {
+                    use crate::ui::workbench::WbRequest as R;
+                    match r {
+                        R::OpenScene(k) => self.open_scene(k),
+                        R::BlindTrial => self.open_blind_trial(),
+                        R::Back => {
+                            if let Some(w) = &mut self.workbench {
+                                w.save_now(&mut self.core.toasts);
+                            }
+                            self.mode = Mode::Browser;
+                        }
+                    }
                 }
             }
             Mode::Video => {

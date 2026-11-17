@@ -123,6 +123,11 @@ pub enum Command {
     /// Start a remote AI analysis (feature `ai`).
     #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     RunAi,
+    // Workbench (camera comparison projects)
+    /// Pick a folder of captures and open it as a project.
+    OpenProject,
+    /// Open the browser's folder as a project, or go back to the open one.
+    Workbench,
 }
 
 use Command::*;
@@ -241,6 +246,8 @@ impl Command {
             ToggleAnalysis => "Toggle analysis panel".into(),
             RunMetrics => "Run analysis metrics".into(),
             RunAi => "Run AI review".into(),
+            OpenProject => "Open camera comparison project...".into(),
+            Workbench => "Workbench: compare devices in this folder".into(),
         }
     }
 
@@ -361,6 +368,8 @@ impl Command {
             ToggleAnalysis => I::CHART_LINE,
             RunMetrics => I::GAUGE,
             RunAi => I::SPARKLE,
+            OpenProject => I::FLASK,
+            Workbench => I::FLASK,
         }
     }
 
@@ -390,7 +399,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -425,7 +434,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

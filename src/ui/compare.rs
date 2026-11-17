@@ -432,8 +432,44 @@ impl Pane {
     }
 }
 
+/// A compare opened from a workbench project scene (see `ui::workbench`).
+#[derive(Clone, Debug, Default)]
+pub struct SceneLink {
+    /// Scene index in the project and the number of scenes.
+    pub scene: usize,
+    pub count: usize,
+    pub name: String,
+    /// Device name per pane (shown instead of the file name).
+    pub labels: Vec<String>,
+    pub colors: Vec<[u8; 3]>,
+    /// Blind test: names, files and camera data are hidden.
+    pub blind: bool,
+    /// Blind test progress line ("Trial 7").
+    pub progress: String,
+    pub done: bool,
+}
+
+/// What a linked compare asks the workbench to do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LinkRequest {
+    /// Previous (-1) or next (+1) scene.
+    Step(i32),
+    ToggleScorecard,
+    /// Blind vote: the left pane (0), the right pane (1) or the same (2).
+    Vote(u8),
+    SetDone(bool),
+    /// Leave the blind test.
+    EndBlind,
+}
+
 pub struct Compare {
     pub paths: Vec<PathBuf>,
+    /// Set when the compare shows a project scene.
+    pub link: Option<SceneLink>,
+    /// Requests for the workbench, taken by the app each frame.
+    pub link_requests: Vec<LinkRequest>,
+    /// The workbench scorecard panel is shown (the app draws it).
+    pub scorecard: bool,
     panes: Vec<Pane>,
     views: Vec<View>,
     mode: CmpMode,
@@ -494,6 +530,9 @@ impl Compare {
         let rv = ReviewUi::new(&paths);
         Compare {
             paths,
+            link: None,
+            link_requests: Vec::new(),
+            scorecard: true,
             panes,
             views,
             mode,
@@ -517,6 +556,15 @@ impl Compare {
             rv,
             analysis_was_open: false,
         }
+    }
+
+    /// A compare of a workbench project scene: device names on the panes,
+    /// the scene bar, and the review kept in the project folder.
+    pub fn new_scene(paths: Vec<PathBuf>, core: &Core, link: SceneLink, root: &std::path::Path) -> Self {
+        let mut c = Self::new(paths, core);
+        c.rv = ReviewUi::new_in(&c.paths, super::review::project_reviews_dir(root), Some(root.to_path_buf()));
+        c.link = Some(link);
+        c
     }
 
     /// The metrics table for the report (from the Analysis panel), or `None`.
@@ -609,7 +657,14 @@ impl Compare {
         !(self.pair_mode() && self.mode == CmpMode::Difference)
     }
 
+    fn blind(&self) -> bool {
+        self.link.as_ref().is_some_and(|l| l.blind)
+    }
+
     fn toggle_markup(&mut self, core: &mut Core) {
+        if self.blind() {
+            return;
+        }
         if !self.rv.markup && !self.markup_allowed() {
             core.toasts.info("Mark up works in Side by side and Split");
             return;
@@ -619,6 +674,9 @@ impl Compare {
 
     /// The Review panel; it replaces the Analysis panel (one right panel at a time).
     fn toggle_review(&mut self, core: &mut Core) {
+        if self.blind() {
+            return;
+        }
         self.rv.panel = !self.rv.panel;
         if self.rv.panel && core.analysis_open {
             core.analysis_request = Some(crate::analysis_ui::PanelRequest::Toggle);
@@ -912,6 +970,28 @@ impl Compare {
                 self.exit = true;
             }
         }
+        // Project scenes: page through them, show the scorecard, vote.
+        if let Some(link) = &self.link {
+            if take(Key::PageDown) {
+                self.link_requests.push(LinkRequest::Step(1));
+            }
+            if take(Key::PageUp) {
+                self.link_requests.push(LinkRequest::Step(-1));
+            }
+            if link.blind {
+                for (k, v) in [(Key::ArrowLeft, 0u8), (Key::ArrowRight, 1), (Key::ArrowDown, 2), (Key::Space, 2)] {
+                    if take(k) {
+                        self.link_requests.push(LinkRequest::Vote(v));
+                    }
+                }
+                // No culling, ratings or mark up in a blind test.
+                for k in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Q, Key::K, Key::Delete, Key::M, Key::C, Key::H] {
+                    take(k);
+                }
+            } else if take(Key::S) {
+                self.link_requests.push(LinkRequest::ToggleScorecard);
+            }
+        }
         // Culling: act on the pane under the pointer (else the selected one).
         if let Some(t) = self.action_pane() {
             for (r, k) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
@@ -1004,6 +1084,18 @@ impl Compare {
             .exact_size(size::TOOLBAR)
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 0)))
             .show(ui, |ui| self.toolbar(ui, core));
+        if self.link.is_some() {
+            egui::Panel::top("compare-scene")
+                .resizable(false)
+                .exact_size(36.0)
+                .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 0)))
+                .show(ui, |ui| self.scene_bar(ui, &p));
+        }
+        if self.blind() {
+            self.show_exif = false;
+            self.rv.panel = false;
+            self.rv.markup = false;
+        }
 
         // One right panel at a time: the Analysis panel opening closes Review.
         if core.analysis_open && !self.analysis_was_open {
@@ -1015,7 +1107,7 @@ impl Compare {
         }
         self.rv.tick(ui.ctx(), &mut core.toasts);
         if self.rv.panel {
-            let infos: Vec<review_ui::PaneInfo> = (0..self.panes.len()).map(|i| review_ui::PaneInfo { letter: LETTERS[i.min(3)], name: name_of(&self.panes[i].path), color: Self::badge_color(core, i) }).collect();
+            let infos: Vec<review_ui::PaneInfo> = (0..self.panes.len()).map(|i| review_ui::PaneInfo { letter: LETTERS[i.min(3)], name: self.pane_label(i).unwrap_or_else(|| name_of(&self.panes[i].path)), color: self.pane_color(core, i) }).collect();
             // At most 40% of the window, like the Analysis panel.
             let max = (ui.ctx().content_rect().width() * 0.4).clamp(280.0, 560.0);
             let out = egui::Panel::right("compare-review")
@@ -1161,7 +1253,9 @@ impl Compare {
             self.menu_pane = self.hover_pane.unwrap_or(src);
         }
         let menu_pane = self.menu_pane;
-        resp.context_menu(|ui| self.pane_menu(ui, core, menu_pane));
+        if !self.blind() {
+            resp.context_menu(|ui| self.pane_menu(ui, core, menu_pane));
+        }
     }
 
     /// Right-click menu of the panes.
@@ -1318,9 +1412,85 @@ impl Compare {
         r
     }
 
+    /// The device name of pane `i` in a project scene ("Left" / "Right" in a blind test).
+    fn pane_label(&self, i: usize) -> Option<String> {
+        let link = self.link.as_ref()?;
+        if link.blind {
+            return Some(if i == 0 { "Left".into() } else { "Right".into() });
+        }
+        link.labels.get(i).cloned()
+    }
+
+    fn pane_color(&self, core: &Core, i: usize) -> Color32 {
+        match &self.link {
+            Some(l) if l.blind => Color32::from_rgb(110, 116, 128),
+            Some(l) => l.colors.get(i).map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or_else(|| Self::badge_color(core, i)),
+            None => Self::badge_color(core, i),
+        }
+    }
+
+    /// The scene bar of a project compare: scene name and position, previous
+    /// and next, the scorecard toggle; in a blind test the vote buttons.
+    fn scene_bar(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
+        let Some(link) = self.link.clone() else { return };
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if link.blind {
+                ui.label(RichText::new(format!("{}  Blind test", I::EYE_SLASH)).font(text::body_strong()).color(p.text))
+                    .on_hover_text("Names, files and camera data are hidden and the sides are random. Pick the image that looks better overall.");
+                if !link.progress.is_empty() {
+                    ui.label(RichText::new(&link.progress).size(text::SMALL).color(p.muted));
+                }
+                ui.add_space(12.0);
+                if widgets::secondary_button(ui, &format!("{}  Left is better", I::ARROW_LEFT)).on_hover_text("The left image looks better  (Left arrow)").clicked() {
+                    self.link_requests.push(LinkRequest::Vote(0));
+                }
+                if widgets::secondary_button(ui, "About the same").on_hover_text("No clear difference  (Down arrow or Space)").clicked() {
+                    self.link_requests.push(LinkRequest::Vote(2));
+                }
+                if widgets::secondary_button(ui, &format!("Right is better  {}", I::ARROW_RIGHT)).on_hover_text("The right image looks better  (Right arrow)").clicked() {
+                    self.link_requests.push(LinkRequest::Vote(1));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::secondary_button(ui, "End test").on_hover_text("Stop the blind test and see the ranking").clicked() {
+                        self.link_requests.push(LinkRequest::EndBlind);
+                    }
+                });
+                return;
+            }
+            if widgets::icon_button(ui, I::CARET_LEFT, "Previous scene  (Page Up)", false).clicked() {
+                self.link_requests.push(LinkRequest::Step(-1));
+            }
+            ui.label(RichText::new(&link.name).font(text::body_strong()).color(p.text));
+            ui.label(RichText::new(format!("Scene {} of {}", link.scene + 1, link.count.max(1))).size(text::SMALL).color(p.muted));
+            if widgets::icon_button(ui, I::CARET_RIGHT, "Next scene  (Page Down)", false).clicked() {
+                self.link_requests.push(LinkRequest::Step(1));
+            }
+            ui.add_space(8.0);
+            let mut done = link.done;
+            if widgets::checkbox(ui, &mut done, "Reviewed").on_hover_text("Mark this scene as reviewed; the project overview shows which scenes are left").changed() {
+                self.link_requests.push(LinkRequest::SetDone(done));
+                if let Some(l) = &mut self.link {
+                    l.done = done;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::labeled_icon_button(ui, I::LIST_CHECKS, "Scorecard", "Show or hide the scorecard: verdicts and attribute scores per device  (S)", self.scorecard).clicked() {
+                    self.link_requests.push(LinkRequest::ToggleScorecard);
+                }
+            });
+        });
+    }
+
     fn caption_text(&self, i: usize, zoom: Option<f32>) -> String {
         let pane = &self.panes[i];
-        let mut parts = vec![name_of(&pane.path)];
+        if self.blind() {
+            return match zoom {
+                Some(z) => format!("{}{CAPTION_SEP}{:.0}%", self.pane_label(i).unwrap_or_default(), z * 100.0),
+                None => self.pane_label(i).unwrap_or_default(),
+            };
+        }
+        let mut parts = vec![self.pane_label(i).map(|l| format!("{l}{CAPTION_SEP}{}", name_of(&pane.path))).unwrap_or_else(|| name_of(&pane.path))];
         if let Some((w, h)) = pane.dims() {
             parts.push(format!("{w} × {h}"));
         }
@@ -1368,7 +1538,7 @@ impl Compare {
             let text = self.caption_text(i, zoom);
             let reserve = if self.panes.len() > 2 { 34.0 } else { 0.0 };
             let keep = if self.shows_keep(i, rect) { Self::keep_size(ui).x + 8.0 } else { 0.0 };
-            let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], Self::badge_color(core, i))), rect.width() - 20.0 - reserve - keep);
+            let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], self.pane_color(core, i))), rect.width() - 20.0 - reserve - keep);
             if self.show_hist {
                 let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
                 self.paint_hist(ui, core, i, hr);
@@ -1422,7 +1592,7 @@ impl Compare {
     /// the caption row (`caption` is the caption pill, `reserve` the points
     /// kept free at the row's right end for the remove button).
     fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect, caption: Rect, reserve: f32) {
-        if i >= self.panes.len() || !rect.is_positive() {
+        if i >= self.panes.len() || !rect.is_positive() || self.blind() {
             return;
         }
         let path = self.panes[i].path.clone();
@@ -1585,8 +1755,8 @@ impl Compare {
                 let tb = self.caption_text(1, zb);
                 // Each caption keeps to its half, wherever the divider is.
                 let half = (area.width() - 30.0) / 2.0;
-                let cap_a = Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", Self::badge_color(core, 0))), half);
-                let cap_b = Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", Self::badge_color(core, 1))), half);
+                let cap_a = Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &ta, Some(("A", self.pane_color(core, 0))), half);
+                let cap_b = Self::pill(ui, Pos2::new(area.max.x - 10.0, area.min.y + 10.0), Align2::RIGHT_TOP, &tb, Some(("B", self.pane_color(core, 1))), half);
                 if self.show_hist {
                     let ha = if self.show_exif { Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 30.0)) } else { area };
                     self.paint_hist(ui, core, 1, ha);
