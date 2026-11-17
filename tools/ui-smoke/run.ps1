@@ -160,6 +160,8 @@ foreach ($file in Get-ChildItem $Scenarios -Filter *.txt | Sort-Object Name) {
     $data = Join-Path $app "LumenData"
     if (Test-Path $data) { Remove-Item -Recurse -Force $data }
     $env:LUMEN_DEV_DIR = $dev
+    # Park the real mouse pointer on the desktop right of the window so it does not hover it (tooltips).
+    try { [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($vs.Right - 80), 300) } catch {}
     $stdout = Join-Path $slog "stdout.txt"
     $stderr = Join-Path $slog "stderr.txt"
     $p = Start-Process -FilePath (Join-Path $app "lumen.exe") -WorkingDirectory $app -PassThru -NoNewWindow `
