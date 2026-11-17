@@ -65,9 +65,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-dev-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: cargo-dev-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-dev-${{ hashFiles('Cargo.lock') }}-
             cargo-dev-
 
       - name: Locate libclang
