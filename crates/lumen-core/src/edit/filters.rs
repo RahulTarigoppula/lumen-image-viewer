@@ -294,26 +294,16 @@ fn box_h<P: Px>(src: &[P], dst: &mut [P], w: usize, _h: usize, r: usize) {
                 s[c] += row[i + c].get();
             }
         }
-        // In [a, b) both ends of the window move inside the row: no clamping.
-        let a = (r as usize).min(w);
-        let b = w.saturating_sub(r as usize + 1).max(a);
-        let mut step = |x: usize, add: usize, sub: usize| {
-            let o = x * 4;
+        for x in 0..w as i64 {
+            let o = x as usize * 4;
             for c in 0..4 {
                 out[o + c] = div_round(s[c], inv);
             }
+            let add = clampi(x + r + 1, w) * 4;
+            let sub = clampi(x - r, w) * 4;
             for c in 0..4 {
-                s[c] = s[c] + row[add * 4 + c].get() - row[sub * 4 + c].get();
+                s[c] = s[c] + row[add + c].get() - row[sub + c].get();
             }
-        };
-        for x in 0..a {
-            step(x, clampi(x as i64 + r + 1, w), clampi(x as i64 - r, w));
-        }
-        for x in a..b {
-            step(x, x + r as usize + 1, x - r as usize);
-        }
-        for x in b..w {
-            step(x, clampi(x as i64 + r + 1, w), clampi(x as i64 - r, w));
         }
     });
 }
@@ -763,35 +753,6 @@ mod tests {
         out
     }
 
-    /// `box_h` before the unclamped interior loop (the reference).
-    fn old_box_h<P: Px>(src: &[P], w: usize, r: usize) -> Vec<P> {
-        let mut dst = vec![P::default(); src.len()];
-        let d = (2 * r + 1) as u64;
-        let inv = ((1u64 << 32) + d / 2) / d;
-        let r = r as i64;
-        for (out, row) in dst.chunks_mut(w * 4).zip(src.chunks(w * 4)) {
-            let mut s = [0u32; 4];
-            for k in -r..=r {
-                let i = clampi(k, w) * 4;
-                for c in 0..4 {
-                    s[c] += row[i + c].get();
-                }
-            }
-            for x in 0..w as i64 {
-                let o = x as usize * 4;
-                for c in 0..4 {
-                    out[o + c] = div_round(s[c], inv);
-                }
-                let add = clampi(x + r + 1, w) * 4;
-                let sub = clampi(x - r, w) * 4;
-                for c in 0..4 {
-                    s[c] = s[c] + row[add + c].get() - row[sub + c].get();
-                }
-            }
-        }
-        dst
-    }
-
     /// Old against new kernels on one thread, in the same process (less
     /// sensitive to the machine than the parallel timings):
     /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
@@ -814,29 +775,9 @@ mod tests {
             let pair = |name: &str, old: &dyn Fn(), new: &dyn Fn()| eprintln!("1 thread 12 MP {name:>10}: old {:8.1} ms, new {:8.1} ms", time(old), time(new));
             pair("motion 40", &|| drop(old_motion_blur(&img, 30.0, 40.0)), &|| drop(motion_blur(&img, 30.0, 40.0)));
             pair("gauss 2", &|| drop(old_gauss_small(img.as_raw(), w, h, 2.0)), &|| drop(gaussian_raw(img.as_raw(), w, h, 2.0)));
-            pair("box_h 20", &|| drop(old_box_h(img.as_raw(), w, 20)), &|| {
-                let mut out = vec![0u8; img.as_raw().len()];
-                box_h(img.as_raw(), &mut out, w, h, 20);
-            });
             pair("median 3", &|| drop(tiled(&img, 1, |t| median_tile_scalar(t, 1))), &|| drop(median(&img, 1)));
             pair("median 5", &|| drop(tiled(&img, 2, |t| median_tile_scalar(t, 2))), &|| drop(median(&img, 2)));
         });
-    }
-
-    #[test]
-    fn box_h_matches_reference() {
-        for (w, h) in [(1usize, 3usize), (5, 4), (40, 6), (257, 3)] {
-            let img = noisy(w as u32, h as u32);
-            let pre = premultiply16(&img);
-            for r in [1usize, 2, 7, 30, 300] {
-                let mut out = vec![0u8; img.as_raw().len()];
-                box_h(img.as_raw(), &mut out, w, h, r);
-                assert!(out == old_box_h(img.as_raw(), w, r), "u8 {w}x{h} r {r}");
-                let mut out16 = vec![0u16; pre.len()];
-                box_h(&pre, &mut out16, w, h, r);
-                assert!(out16 == old_box_h(&pre, w, r), "u16 {w}x{h} r {r}");
-            }
-        }
     }
 
     #[test]
