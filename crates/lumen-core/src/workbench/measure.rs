@@ -14,13 +14,12 @@ pub const MEASURE_SIDE: u32 = 2000;
 
 /// The metrics measured, in display order: (metric id, short name). Ids
 /// the analysis library does not know are skipped.
-pub const MEASURES: [(&str, &str); 7] = [
+pub const MEASURES: [(&str, &str); 6] = [
     ("sharpness.laplacian", "Sharpness"),
     ("noise", "Noise"),
     ("visual_noise", "Visual noise"),
     ("exposure", "Clipping"),
-    ("color_cast", "Color cast"),
-    ("white_balance", "White balance"),
+    ("color_cast", "White balance"),
     ("banding", "Banding"),
 ];
 
@@ -48,7 +47,7 @@ pub fn unit_of(id: &str) -> &'static str {
     match id {
         "exposure" => "%",
         "noise" => "levels",
-        "color_cast" | "white_balance" => "dE",
+        "color_cast" => "dE",
         _ => "",
     }
 }

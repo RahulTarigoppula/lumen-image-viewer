@@ -104,6 +104,7 @@ pub fn threshold(key: &str) -> Option<Threshold> {
         ("butteraugli", "score") => Threshold::lo(1.0, 2.0),
         ("flip", "mean") => Threshold::lo(0.05, 0.15),
         ("noise", "y") => Threshold::lo(2.0, 5.0),
+        ("visual_noise", "index") => Threshold::lo(1.0, 3.0),
         ("exposure", "clip_pct" | "clip_lo_pct" | "clip_hi_pct") => Threshold::lo(0.5, 2.0),
         ("color_cast", "delta_e") => Threshold::lo(2.0, 5.0),
         ("blockiness", "score") => Threshold::lo(0.1, 0.3),
@@ -476,7 +477,7 @@ impl Prefs {
 fn default_metrics(k: Kind) -> Vec<String> {
     let ids: &[&str] = match k {
         Kind::None => &[],
-        Kind::Image | Kind::Compare => &["sharpness.laplacian", "noise", "exposure", "color_cast", "blockiness", "banding"],
+        Kind::Image | Kind::Compare => &["sharpness.laplacian", "noise", "visual_noise", "exposure", "color_cast", "blockiness", "banding"],
         Kind::Video => &["sharpness.laplacian", "noise", "exposure", "blockiness", "banding", "temporal.freeze", "temporal.scene"],
         Kind::VideoPair => &["psnr", "ssim.fast"],
     };
@@ -613,6 +614,15 @@ pub fn key_label(id: &str, key: &str) -> String {
         ("color_cast", "delta_e") => "Cast strength",
         ("color_cast", "hue") => "Hue",
         ("color_cast", "neutral_pct") => "Near-neutral pixels",
+        ("color_cast", "gray_world") => "Gray-world fallback",
+        ("visual_noise", "index") => "Visual noise",
+        ("visual_noise", "l") => "Lightness noise (L*)",
+        ("visual_noise", "chroma") => "Color noise",
+        ("visual_noise", "a") => "a* noise (green-red)",
+        ("visual_noise", "b") => "b* noise (blue-yellow)",
+        ("visual_noise", "flat_pct") => "Flat area measured",
+        (_, "clip_lo_any_pct") => "Shadows clipped in any channel",
+        (_, "clip_hi_all_pct") => "Highlights clipped in all channels",
         ("sharpness.laplacian", "p90") => "Sharpest areas",
         ("sharpness.laplacian", "var") => "Whole picture",
         (_, "y" | "u" | "v" | "r" | "g" | "b") if id.starts_with("psnr") || id.starts_with("ssim") || id == "ms_ssim" || id == "noise" => return plane(key),
