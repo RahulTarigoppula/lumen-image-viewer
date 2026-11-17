@@ -91,7 +91,7 @@ pub fn describe(c: Command) -> &'static str {
         ToggleAnalysis => "Quality measurements (sharpness, noise, exposure) and AI review",
         RunMetrics => "Measure sharpness, noise, exposure and other quality numbers",
         RunAi => "Ask your AI server to describe the image's problems",
-        OpenProject => "Pick a folder of captures from several phones or cameras: pair them by scene to compare, score, report",
+        OpenProject => "Pick a folder of captures from several phones or cameras: pair them by scene to compare and score",
         Workbench => "Treat this folder as a camera comparison project: devices and scenes are found automatically",
         _ => "",
     }
