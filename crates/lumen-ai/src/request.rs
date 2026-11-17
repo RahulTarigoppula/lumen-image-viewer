@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::AiError;
-use crate::images::{self, ImageLabel, ImageRole, Roi, SentImage, SentLayout};
+use crate::images::{self, ImageLabel, ImageRole, RectF, Roi, SentImage, SentLayout};
 use crate::models::{context_warning, estimate_prompt_tokens, ModelCard};
 use crate::prompts::{self, Arity, FrameRef, OutputKind, Preset};
 use crate::settings::{AiSettings, CoordConvention, ImageEncoding};
@@ -62,6 +62,9 @@ pub struct RequestInput {
     pub preset: Preset,
     pub a: InputImage,
     pub b: Option<InputImage>,
+    /// C and D, for presets that take up to four images (`Arity::Many`);
+    /// ignored by the others, and beyond two.
+    pub extra: Vec<InputImage>,
     /// Region of interest in A's pixels (mapped proportionally onto B).
     pub roi: Option<Roi>,
     /// Send the full view as well as the ROI tiles (default on).
@@ -81,6 +84,7 @@ impl RequestInput {
             preset,
             a,
             b: None,
+            extra: Vec::new(),
             roi: None,
             include_overview: true,
             layout: AbLayout::Separate,
@@ -91,6 +95,11 @@ impl RequestInput {
     }
     pub fn with_b(mut self, b: InputImage) -> Self {
         self.b = Some(b);
+        self
+    }
+    /// Adds C (then D) for a ranking of up to four images.
+    pub fn with_extra(mut self, img: InputImage) -> Self {
+        self.extra.push(img);
         self
     }
     pub fn with_roi(mut self, roi: Roi) -> Self {
@@ -201,6 +210,14 @@ impl PreparedRequest {
         self.images.len()
     }
 
+    /// The images this request shows (A, then B, C, D), in order.
+    pub fn labels(&self) -> Vec<ImageLabel> {
+        let mut v: Vec<ImageLabel> = self.layout.iter().flat_map(|l| l.regions.iter().map(|r| r.label)).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// True when this request asks for JSON.
     pub fn structured(&self) -> bool {
         self.schema.is_some()
@@ -274,7 +291,11 @@ impl PreparedRequest {
                 b["stream_options"] = if mode.extensions { json!({"include_usage": true, "continuous_usage_stats": true}) } else { json!({"include_usage": true}) };
             }
             if let (true, Some(schema)) = (mode.response_format, &self.schema) {
-                let name = if self.output == OutputKind::ComparisonJson { "lumen_comparison_report" } else { "lumen_quality_report" };
+                let name = match self.output {
+                    OutputKind::ComparisonJson => "lumen_comparison_report",
+                    OutputKind::RankingJson => "lumen_ranking_report",
+                    _ => "lumen_quality_report",
+                };
                 b["response_format"] = prompts::response_format(name, schema);
             }
             b
@@ -342,8 +363,13 @@ pub fn prepare(settings: &AiSettings, model: &str, input: RequestInput) -> Resul
         return Err(AiError::Invalid("Pick a model first (Test connection lists them)".into()));
     }
     let p = &input.preset;
-    if p.arity == Arity::Two && input.b.is_none() {
-        return Err(AiError::Invalid(format!("{} needs two images: open A and B in compare mode", p.name)));
+    match p.arity {
+        Arity::Two if input.b.is_none() => return Err(AiError::Invalid(format!("{} needs two images: open A and B in compare mode", p.name))),
+        Arity::Many if input.b.is_none() => return Err(AiError::Invalid(format!("{} needs two to four images: open them in compare mode", p.name))),
+        _ => {}
+    }
+    if input.b.iter().chain(&input.extra).any(|i| i.pixels.width() == 0 || i.pixels.height() == 0) {
+        return Err(AiError::Invalid("One of the images is empty".into()));
     }
     if p.output == OutputKind::Markdown && p.builtin.is_some() && input.question.trim().is_empty() {
         return Err(AiError::Invalid("Type a question for the free-form preset".into()));
@@ -401,6 +427,7 @@ fn part_text(img: &SentImage, roles: (Option<&str>, Option<&str>)) -> String {
             let role = match l {
                 ImageLabel::A => roles.0,
                 ImageLabel::B => roles.1,
+                ImageLabel::C | ImageLabel::D => None,
             };
             let rest = img.description.strip_prefix(&format!("{} ", l.as_str())).unwrap_or(&img.description);
             match role {
@@ -413,10 +440,23 @@ fn part_text(img: &SentImage, roles: (Option<&str>, Option<&str>)) -> String {
     }
 }
 
+/// Most images one request compares (A to D).
+pub const MAX_IMAGES: usize = 4;
+
+/// "A, B and C".
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, max_images: u32, swapped: bool) -> Result<PreparedRequest, AiError> {
     let preset = &input.preset;
     let quick = preset.output == OutputKind::QuickScore;
-    let has_pair = input.b.is_some() && (preset.arity == Arity::Two || preset.output == OutputKind::Markdown);
+    let several = matches!(preset.arity, Arity::Two | Arity::Many) || preset.output == OutputKind::Markdown;
+    let has_pair = input.b.is_some() && several;
     let pair = has_pair && !quick;
     let max_images = max_images.max(1);
     let a_size = input.a.pixels.dimensions();
@@ -425,9 +465,17 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
         (Some(b), true) => (b, Some(&input.a)),
         (b, _) => (&input.a, if pair { b.as_ref() } else { None }),
     };
+    // Every image as presented: A, B, then C and D for presets that take
+    // up to four (never in a swapped pass, which only pairs have).
+    let mut sides: Vec<&InputImage> = std::iter::once(first).chain(second).collect();
+    if pair && !swapped && (preset.arity == Arity::Many || preset.output == OutputKind::Markdown) {
+        sides.extend(input.extra.iter().take(MAX_IMAGES - 2));
+    }
+    let label_of = |i: usize| ImageLabel::from_index(i).unwrap_or(ImageLabel::D);
+    let n = sides.len() as u32;
     let mut notes = Vec::new();
     let roi_first = roi_for(input.roi, a_size, &first.pixels);
-    let composite = pair && (input.layout == AbLayout::Composite || max_images < 2);
+    let composite = pair && (input.layout == AbLayout::Composite || max_images < n);
 
     let sent: Vec<SentImage> = if quick {
         match roi_first {
@@ -435,27 +483,29 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
             None => vec![images::overview(&first.pixels, ImageLabel::A, cfg.max_side)],
         }
     } else if composite {
-        let second = second.expect("pair");
         let full = |i: &InputImage| Roi::full(i.pixels.width(), i.pixels.height());
-        let ra = roi_first.unwrap_or_else(|| full(first)).to_f();
-        let rb = roi_for(input.roi, a_size, &second.pixels).unwrap_or_else(|| full(second)).to_f();
         // Labels are as presented; a swapped report is unswapped later.
-        let c = images::composite(&first.pixels, ra, &second.pixels, rb, cfg.max_side);
+        let regions: Vec<RectF> = sides.iter().map(|s| roi_for(input.roi, a_size, &s.pixels).unwrap_or_else(|| full(*s)).to_f()).collect();
+        let cells: Vec<(&RgbaImage, RectF, ImageLabel)> = sides.iter().zip(&regions).enumerate().map(|(i, (s, r))| (&*s.pixels, *r, label_of(i))).collect();
+        let c = images::composite_grid(&cells, cfg.max_side);
         if input.layout != AbLayout::Composite {
-            notes.push(format!("The server accepts {max_images} image(s) per request, so A and B are sent as one side-by-side composite (half resolution each)."));
+            notes.push(if n == 2 {
+                format!("The server accepts {max_images} image(s) per request, so A and B are sent as one side-by-side composite (half resolution each).")
+            } else {
+                format!("The server accepts {max_images} image(s) per request, so the {n} images are sent as one composite in a 2x2 grid (about half resolution each).")
+            });
         }
         vec![c]
     } else {
-        let sides = if pair { 2 } else { 1 };
         let mut with_overview = input.include_overview || roi_first.is_none();
         let mut per_side = match roi_first {
-            Some(_) => max_images.saturating_sub(if with_overview { sides } else { 0 }) / sides,
+            Some(_) => max_images.saturating_sub(if with_overview { n } else { 0 }) / n,
             None => 0,
         };
         if roi_first.is_some() && per_side == 0 {
             // Not enough images for both: the ROI matters more.
             with_overview = false;
-            per_side = (max_images / sides).max(1);
+            per_side = (max_images / n).max(1);
             notes.push("The full view was left out to fit the server's image limit.".into());
         }
         let mut a_list = Vec::new();
@@ -465,23 +515,28 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
         if let Some(r) = roi_first {
             a_list.extend(images::roi_tiles(&first.pixels, ImageLabel::A, r, cfg.tile_side, per_side));
         }
-        match second {
-            Some(b) => {
-                if b.pixels.dimensions() != first.pixels.dimensions() {
-                    notes.push(format!(
-                        "A is {}x{} and B is {}x{}: B is resampled to A's sent sizes over the same relative region.",
-                        first.pixels.width(),
-                        first.pixels.height(),
-                        b.pixels.width(),
-                        b.pixels.height()
-                    ));
-                }
-                let b_list = images::matching(&b.pixels, &a_list, first.pixels.dimensions());
-                // Interleave: A1, B1, A2, B2... so each pair is adjacent.
-                a_list.into_iter().zip(b_list).flat_map(|(x, y)| [x, y]).collect()
+        let mut others = Vec::new();
+        for (i, s) in sides.iter().enumerate().skip(1) {
+            let l = label_of(i).as_str();
+            if s.pixels.dimensions() != first.pixels.dimensions() {
+                notes.push(format!(
+                    "A is {}x{} and {l} is {}x{}: {l} is resampled to A's sent sizes over the same relative region.",
+                    first.pixels.width(),
+                    first.pixels.height(),
+                    s.pixels.width(),
+                    s.pixels.height()
+                ));
             }
-            None => a_list,
+            others.push(images::matching_as(&s.pixels, &a_list, first.pixels.dimensions(), label_of(i)).into_iter());
         }
+        // Interleave: A1, B1, (C1, D1,) A2, B2... so the same view of every
+        // image is adjacent.
+        let mut out = Vec::new();
+        for a in a_list {
+            out.push(a);
+            out.extend(others.iter_mut().filter_map(|o| o.next()));
+        }
+        out
     };
     if sent.is_empty() {
         return Err(AiError::Invalid("Nothing to send: the ROI is empty".into()));
@@ -510,8 +565,8 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
 
     // Text before the first image: file names and capture settings.
     let mut intro = Vec::new();
-    for (img, label) in [(Some(first), "A"), (second, "B")] {
-        let Some(img) = img else { continue };
+    for (i, img) in sides.iter().enumerate() {
+        let label = label_of(i).as_str();
         if cfg.include_filename {
             if let Some(n) = &img.file_name {
                 intro.push(format!("Image {label} file name: {n}."));
@@ -565,8 +620,15 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
                 "Image A is a still frame from a video.".to_string()
             });
         }
+        if n > 2 {
+            tail.push(format!("{n} images are compared: {}.", and_list(&(0..n as usize).map(|i| label_of(i).as_str()).collect::<Vec<_>>())));
+        }
         if composite {
-            tail.push("A and B are shown side by side in one composite image: A on the left, B on the right.".into());
+            tail.push(match n {
+                2 => "A and B are shown side by side in one composite image: A on the left, B on the right.".to_string(),
+                3 => "A, B and C are shown in one composite image as a grid: A top left, B top right, C bottom left.".to_string(),
+                _ => "A, B, C and D are shown in one composite image as a 2x2 grid: A top left, B top right, C bottom left, D bottom right.".to_string(),
+            });
         }
         if roles == (None, None) && pair && preset.supports_swap_check() {
             tail.push("Neither image is a reference here: judge A and B as two candidates.".into());
@@ -616,9 +678,11 @@ pub(crate) fn build(cfg: &BuildConfig, model: &str, input: &Arc<RequestInput>, m
         CoordConvention::Relative1000 => 1000,
         CoordConvention::AbsolutePixels => max_sent_side,
     };
+    let labels: Vec<&str> = (0..sides.len()).map(|i| label_of(i).as_str()).collect();
     let schema = match preset.output {
         OutputKind::QualityJson => Some(prompts::quality_schema(if pair { &["A", "B"] } else { &["A"] }, max_coord)),
         OutputKind::ComparisonJson => Some(prompts::comparison_schema(max_coord)),
+        OutputKind::RankingJson => Some(prompts::ranking_schema(&labels, max_coord)),
         _ => None,
     };
     if !cfg.disable_thinking && !quick {
@@ -797,10 +861,75 @@ mod tests {
         assert_eq!(m[0]["content"][1]["text"], "How would you rate the quality of this image?");
     }
 
+    fn rank_input(n: usize) -> RequestInput {
+        let mut input = RequestInput::new(Preset::builtin(PresetId::Rank), InputImage::new(img(1600, 1200, 0))).with_b(InputImage::new(img(1600, 1200, 40)));
+        for k in 2..n {
+            input = input.with_extra(InputImage::new(img(1600, 1200, 80 + k as u8)));
+        }
+        input
+    }
+
+    #[test]
+    fn ranking_sends_four_labeled_images() {
+        let r = prepare(&settings(), "m", rank_input(4)).unwrap();
+        let d: Vec<&str> = r.images.iter().map(|i| i.description.as_str()).collect();
+        assert_eq!(r.images.len(), 4, "{d:?}");
+        assert!(d[0].starts_with("A full view") && d[1].starts_with("B full view") && d[2].starts_with("C full view") && d[3].starts_with("D full view"), "{d:?}");
+        assert_eq!(r.labels(), vec![ImageLabel::A, ImageLabel::B, ImageLabel::C, ImageLabel::D]);
+        assert!(r.user_prompt.contains("Image C: full view") && r.user_prompt.contains("Image D: full view"), "{}", r.user_prompt);
+        assert!(r.user_prompt.contains("4 images are compared: A, B, C and D."), "{}", r.user_prompt);
+        assert!(r.user_prompt.contains("Task: Rank the images from best to worst"));
+        let b = body(&r, r.default_mode());
+        assert_eq!(b["response_format"]["json_schema"]["name"], "lumen_ranking_report");
+        let schema = &b["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["properties"]["ranking"]["items"]["properties"]["image"]["enum"], json!(["A", "B", "C", "D"]));
+        assert_eq!(schema["properties"]["ranking"]["minItems"], 4);
+        // Pixels only: re-encoded PNGs, no names unless asked for.
+        assert!(r.images.iter().all(|i| i.mime == "image/png"));
+        // Three images and two images.
+        let three = prepare(&settings(), "m", rank_input(3)).unwrap();
+        assert_eq!(three.images.len(), 3);
+        assert_eq!(body(&three, three.default_mode())["response_format"]["json_schema"]["schema"]["properties"]["ranking"]["maxItems"], 3);
+        let two = prepare(&settings(), "m", rank_input(2)).unwrap();
+        assert_eq!(two.labels(), vec![ImageLabel::A, ImageLabel::B]);
+        assert!(!two.user_prompt.contains("images are compared"));
+        // More than four: the rest is ignored.
+        let five = rank_input(4).with_extra(InputImage::new(img(64, 64, 1)));
+        assert_eq!(prepare(&settings(), "m", five).unwrap().images.len(), 4);
+        // Other presets ignore C and D.
+        let mut compare = rank_input(4);
+        compare.preset = Preset::builtin(PresetId::Compare);
+        assert_eq!(prepare(&settings(), "m", compare).unwrap().images.len(), 2);
+    }
+
+    #[test]
+    fn ranking_fits_image_limits() {
+        // A ROI with six images allowed: no room for overviews, one tile each.
+        let r = prepare(&settings(), "m", rank_input(4).with_roi(Roi { x: 100, y: 100, w: 600, h: 400 })).unwrap();
+        let d: Vec<&str> = r.images.iter().map(|i| i.description.as_str()).collect();
+        assert_eq!(d.len(), 4, "{d:?}");
+        assert!(d[0].starts_with("A ROI tile 1/1") && d[3].starts_with("D ROI tile 1/1: same region"), "{d:?}");
+        // A server limited to fewer images than are ranked: one 2x2 composite.
+        let c = r.with_max_images(3).unwrap();
+        assert_eq!(c.images.len(), 1);
+        assert_eq!(c.layout[0].regions.len(), 4);
+        assert!(c.images[0].description.contains("2x2 grid"), "{}", c.images[0].description);
+        assert!(c.user_prompt.contains("D bottom right"));
+        assert_eq!(c.labels().len(), 4);
+        // Different sizes are named.
+        let odd = rank_input(2).with_extra(InputImage::new(img(800, 600, 3)));
+        let r = prepare(&settings(), "m", odd).unwrap();
+        assert!(r.notes.iter().any(|n| n.contains("C is 800x600: C is resampled")), "{:?}", r.notes);
+    }
+
     #[test]
     fn rejects_bad_input() {
         let compare = RequestInput::new(Preset::builtin(PresetId::Compare), InputImage::new(img(64, 64, 0)));
         assert!(prepare(&settings(), "m", compare).is_err(), "needs B");
+        let rank = RequestInput::new(Preset::builtin(PresetId::Rank), InputImage::new(img(64, 64, 0)));
+        assert!(prepare(&settings(), "m", rank).unwrap_err().to_string().contains("two to four images"));
+        let empty = rank_input(2).with_extra(InputImage::new(Arc::new(RgbaImage::new(0, 0))));
+        assert!(prepare(&settings(), "m", empty).is_err());
         let q = RequestInput::new(Preset::builtin(PresetId::Quality), InputImage::new(img(64, 64, 0)));
         assert!(prepare(&settings(), " ", q.clone()).is_err(), "needs a model");
         assert!(prepare(&settings(), "m", q.with_roi(Roi { x: 100, y: 100, w: 5, h: 5 })).is_err());

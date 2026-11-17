@@ -98,9 +98,16 @@ Other tasks: `spawn_list_models(client, repaint)` ends with
 `all_presets(&settings.custom_presets)` lists built-ins then custom ones;
 `find_preset(&settings.preset, &settings.custom_presets)` resolves the
 stored id. Built-in ids (`PresetId`): `quality`, `compare`, `encode`,
-`photo`, `freeform`, `quick_score`, `video_frame`, `video_compare`.
-`preset.arity` (One or Two) says whether an A/B pair is required;
-`preset.output` is QualityJson, ComparisonJson, Markdown or QuickScore.
+`photo`, `freeform`, `quick_score`, `video_frame`, `video_compare`, `rank`.
+`preset.arity` is One, Two (an A/B pair is required) or Many (two to four
+images: A and B required, C and D optional; `arity.max_images()`);
+`preset.output` is QualityJson, ComparisonJson, RankingJson, Markdown or
+QuickScore.
+
+"Rank devices" (`rank`) ranks 2 to 4 captures of the same scene (compare
+panes A to D) in one request: no reference, every image scored 1..10 with
+short strengths and weaknesses, best first, plus the usual findings with
+image labels A to D.
 
 ## 5. Build the request and show the preview
 
@@ -111,13 +118,22 @@ let a = InputImage::new(Arc::new(rgba_a))          // decoded sRGB, as displayed
     .with_frame(FrameRef { timestamp_s: Some(83.456), frame_index: Some(2001) }); // video
 let input = RequestInput::new(preset, a)
     .with_b(b)                                     // pair presets
+    .with_extra(c).with_extra(d)                   // C, D: only `Arity::Many` presets send them (at most 4 images)
     .with_roi(Roi { x, y, w, h })                  // A's pixels; mapped onto B proportionally
     .with_metrics("B vs A, ROI", [("PSNR-Y", 38.2, "dB"), ("SSIM", 0.962, "")])
     .with_question("Is the sky banded?");           // Free-form question or extra instructions
 let req: PreparedRequest = prepare(&settings, &model, input)?;   // CPU work: run off the UI thread
 ```
 
-`input.layout = AbLayout::Composite` forces the side-by-side composite;
+Every image after A is sent like B: re-encoded pixels only, at A's sent
+sizes over the same relative region (ROI tiles on the same grid), labeled
+in the text parts ("Image C: full view, same scaling."), interleaved
+A1, B1, C1, D1, A2... A ranking adds "4 images are compared: A, B, C and
+D." and a schema whose `image` enums are exactly the labels sent. A server
+that takes fewer images than are compared gets one composite: A | B side by
+side for two, a 2x2 grid (A B over C D, burned-in labels) for three or four.
+
+`input.layout = AbLayout::Composite` forces the composite;
 `input.include_overview = false` sends ROI tiles only. Metrics are left out
 when `settings.blind` is on.
 
@@ -180,15 +196,24 @@ mapped back to real labels), `sent: SentRecord` (what was sent, for the card
 footer and history), `layout`, `elapsed_ms`, `warnings`. It is serde, so it
 can be stored in the analysis history as is.
 
-`AiReport`: `overall`, `categories: Vec<CategoryScore { key, label, score, rationale }>`
+`AiReport`: `verdict`, `overall`, `categories: Vec<CategoryScore { key, label, score, rationale }>`
 (six categories in schema order), `comparison: Option<Comparison { preferred, confidence, overall_a, overall_b, scores_a, scores_b }>`,
+`ranking: Vec<RankEntry { image, overall, strengths, weaknesses }>` (ranking
+presets, best first; `report.best()`; `overall` is the best image's score),
 `findings: Vec<Finding { category, severity, image, tile, bbox, description, source }>`,
 `summary`, `partial` (truncated JSON was repaired), `warnings`.
 
+Ranking parsing is tolerant: scores are clamped to 1..10, entries naming
+no image A to D and repeated images are dropped, and after the run the
+ranking is checked against the images sent (entries for images not sent
+are dropped, missing ones noted in `warnings`). `ImageLabel` is A to D
+(`index()`, `from_index`, `parse`).
+
 `finding.source: Option<SourceBox { label, x0, y0, x1, y1 }>` is the box in
-source pixels of image `label` (A or B), already mapped through tiles,
-downscaling, padding and composite halves: draw it directly on the viewer,
-compare pane or video frame. Use `report.to_markdown(&run.preset_name, pair)` for
+source pixels of image `label` (A to D), already mapped through tiles,
+downscaling, padding and composite cells: draw it directly on the viewer,
+compare pane or video frame. The app also turns these boxes into review
+marks in compare mode ("Add findings as marks", `analysis_ui::ai_view::finding_marks`). Use `report.to_markdown(&run.preset_name, pair)` for
 "Copy as Markdown" and `serde_json::to_string_pretty(&run)` for "Export JSON".
 
 ## 8. Batch and blocking use

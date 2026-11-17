@@ -14,13 +14,13 @@ use std::time::Instant;
 use crossbeam_channel::Receiver;
 use image::RgbaImage;
 use lumen_ai::{
-    prepare, spawn_list_models, spawn_run, spawn_test_connection, spawn_vision_probe, AiError, AiEvent, AiSettings, ApiKey, Client,
-    ConnectionReport, Endpoint, FrameRef, InputImage, ModelCard, OutputKind, PreparedRequest, Preset, ProbeCache, Repaint, RequestInput,
-    RunResult, SecretStore, StepResult, Task, Usage, VisionVerdict,
+    prepare, spawn_list_models, spawn_run, spawn_test_connection, spawn_vision_probe, AiError, AiEvent, AiSettings, ApiKey, Arity, Client,
+    ConnectionReport, Endpoint, FrameRef, ImageLabel, InputImage, ModelCard, OutputKind, PreparedRequest, Preset, ProbeCache, Repaint,
+    RequestInput, RunResult, SecretStore, StepResult, Task, Usage, VisionVerdict,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{FrameInfo, Pixels, Subject, SubjectImage};
+use super::{FrameInfo, Pixels, Subject, SubjectImage, SubjectKind};
 use crate::app::Core;
 
 /// Results kept per file (oldest dropped first).
@@ -34,6 +34,8 @@ pub struct RunMeta {
     pub frame: Option<FrameInfo>,
     /// Pixel size of A and B as sent (finding boxes are in these pixels).
     pub dims: [Option<(u32, u32)>; 2],
+    /// The same for C and D of a ranking.
+    pub extra_dims: Vec<Option<(u32, u32)>>,
     pub preset: String,
 }
 
@@ -41,6 +43,7 @@ pub struct RunMeta {
 pub struct Prepared {
     pub req: PreparedRequest,
     pub dims: [Option<(u32, u32)>; 2],
+    pub extra_dims: Vec<Option<(u32, u32)>>,
 }
 
 pub enum Phase {
@@ -86,6 +89,9 @@ pub struct RunRecord {
     pub label: String,
     pub frame: Option<FrameInfo>,
     pub dims: [Option<(u32, u32)>; 2],
+    /// C and D of a ranking (absent in older history).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_dims: Vec<Option<(u32, u32)>>,
     pub preset: String,
     pub outcome: Outcome,
 }
@@ -97,11 +103,27 @@ impl RunRecord {
             _ => None,
         }
     }
+
+    /// Pixel size of image `label` as sent (its finding boxes are in these pixels).
+    pub fn dims_of(&self, label: ImageLabel) -> Option<(u32, u32)> {
+        match label.index() {
+            i @ 0..=1 => self.dims[i],
+            i => self.extra_dims.get(i - 2).copied().flatten(),
+        }
+    }
+
+    /// More than one image was sent, so findings name the image.
+    pub fn multi(&self) -> bool {
+        self.dims[1].is_some()
+    }
 }
 
 /// What the AI tab asks for when Run is pressed.
 pub struct RunRequest {
     pub subject: Subject,
+    /// Compare panes C and D (see [`extra_images`]): sent by ranking presets,
+    /// and part of the history key.
+    pub extra: Vec<SubjectImage>,
     pub preset: Preset,
     /// Region in A's pixels (`subject.a.size`): x, y, w, h.
     pub roi: Option<(u32, u32, u32, u32)>,
@@ -482,15 +504,23 @@ impl AiState {
             self.error = Some("Pick a model first (Test lists the models the server has).".into());
             return;
         };
-        let (Some(file_key), Some(a)) = (r.subject.file_key(), r.subject.a.as_ref()) else {
+        let (Some(file_key), Some(a)) = (history_key(&r.subject, &r.extra), r.subject.a.as_ref()) else {
             self.error = Some("Nothing to analyze: open an image first.".into());
             return;
         };
-        if matches!(a.pixels, Pixels::Pending) || r.subject.b.as_ref().is_some_and(|b| matches!(b.pixels, Pixels::Pending)) {
+        let ranking = r.preset.arity == Arity::Many;
+        let pending = |i: &SubjectImage| matches!(i.pixels, Pixels::Pending);
+        if pending(a) || r.subject.b.as_ref().is_some_and(pending) || (ranking && r.extra.iter().any(pending)) {
             self.error = Some("The image is still loading.".into());
             return;
         }
-        let meta = RunMeta { file_key, label: r.subject.label(), frame: r.subject.frame(), dims: [None, None], preset: r.preset.name.clone() };
+        let mut label = r.subject.label();
+        if ranking {
+            for e in &r.extra {
+                label.push_str(&format!(" vs {}", e.file_name()));
+            }
+        }
+        let meta = RunMeta { file_key, label, frame: r.subject.frame(), dims: [None, None], extra_dims: Vec::new(), preset: r.preset.name.clone() };
         let settings = self.settings.clone();
         let repaint = self.repaint.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -647,6 +677,7 @@ impl AiState {
                 Ok(Ok(p)) => {
                     let mut meta = meta.clone();
                     meta.dims = p.dims;
+                    meta.extra_dims = p.extra_dims;
                     if self.settings.needs_confirmation(&p.req.server_key) {
                         self.phase = Phase::Preview { req: Box::new(p.req), meta, thumbs: Vec::new() };
                     } else {
@@ -770,6 +801,7 @@ impl AiState {
             label: meta.label,
             frame: meta.frame,
             dims: meta.dims,
+            extra_dims: meta.extra_dims,
             preset: meta.preset,
             outcome,
         });
@@ -845,6 +877,15 @@ fn build_request(settings: &AiSettings, model: &str, r: RunRequest) -> Result<Pr
         dims[1] = Some(pb.dimensions());
         input = input.with_b(input_image(settings, b, pb));
     }
+    // C and D only go to presets that rank several images.
+    let mut extra_dims = Vec::new();
+    if input.preset.arity == Arity::Many && input.b.is_some() {
+        for e in r.extra.iter().take(lumen_ai::MAX_IMAGES - 2) {
+            let pe = pixels(e)?;
+            extra_dims.push(Some(pe.dimensions()));
+            input = input.with_extra(input_image(settings, e, pe));
+        }
+    }
     if let Some(roi) = r.roi {
         let shown = a.size.unwrap_or(pa.dimensions());
         input = input.with_roi(scale_roi(roi, shown, pa.dimensions()));
@@ -856,7 +897,36 @@ fn build_request(settings: &AiSettings, model: &str, r: RunRequest) -> Result<Pr
         input = input.with_question(r.question.trim());
     }
     let req = prepare(settings, model, input).map_err(|e| e.to_string())?;
-    Ok(Prepared { req, dims })
+    Ok(Prepared { req, dims, extra_dims })
+}
+
+/// Compare panes C and D when compare shows three or four images (the
+/// Analysis subject itself is A and B); empty elsewhere.
+pub fn extra_images(core: &Core, subject: &Subject) -> Vec<SubjectImage> {
+    let panes = core.metrics.compare_panes();
+    let Some(a) = subject.a.as_ref() else { return Vec::new() };
+    if subject.kind != SubjectKind::Pair || panes.len() <= 2 || panes.first() != Some(&a.path) {
+        return Vec::new();
+    }
+    panes[2..]
+        .iter()
+        .take(lumen_ai::MAX_IMAGES - 2)
+        .map(|p| {
+            let image = core.loader.get_ready(p).map(|l| l.decoded.image.clone());
+            SubjectImage { path: p.clone(), size: image.as_ref().map(|i| i.dimensions()), pixels: image.map(Pixels::Ready).unwrap_or(Pixels::Pending), frame: None }
+        })
+        .collect()
+}
+
+/// Where results are kept: the subject's files, then C and D of a 3 or 4
+/// image compare (results belong to that set of panes, in that order).
+pub fn history_key(subject: &Subject, extra: &[SubjectImage]) -> Option<String> {
+    let mut key = subject.file_key()?;
+    for e in extra {
+        key.push('|');
+        key.push_str(&e.path.to_string_lossy().replace('/', "\\").to_lowercase());
+    }
+    Some(key)
 }
 
 fn pixels(img: &SubjectImage) -> Result<Arc<RgbaImage>, String> {
@@ -986,12 +1056,30 @@ mod tests {
             label: "x.jpg".into(),
             frame: Some(FrameInfo { timestamp_s: 1.5, index: 36 }),
             dims: [Some((10, 20)), None],
+            extra_dims: Vec::new(),
             preset: "Quality critique".into(),
             outcome: Outcome::Failed { message: "Server not reachable".into(), detail: None, partial: String::new() },
         };
         let j = serde_json::to_string(&r).unwrap();
+        assert!(!j.contains("extra_dims"), "only rankings store C and D");
         let back: RunRecord = serde_json::from_str(&j).unwrap();
         assert_eq!(back.frame, r.frame);
         assert!(back.result().is_none());
+        assert!(!back.multi());
+        // A ranking keeps C and D.
+        let rank = RunRecord { dims: [Some((10, 20)), Some((30, 40))], extra_dims: vec![Some((50, 60)), None], ..r };
+        let back: RunRecord = serde_json::from_str(&serde_json::to_string(&rank).unwrap()).unwrap();
+        assert_eq!(back.dims_of(ImageLabel::B), Some((30, 40)));
+        assert_eq!(back.dims_of(ImageLabel::C), Some((50, 60)));
+        assert_eq!(back.dims_of(ImageLabel::D), None);
+        assert!(back.multi());
+    }
+
+    #[test]
+    fn history_keys_add_c_and_d() {
+        let img = |p: &str| SubjectImage { path: std::path::PathBuf::from(p), pixels: Pixels::Pending, size: None, frame: None };
+        let s = Subject { kind: SubjectKind::Pair, a: Some(img("C:/x/A.jpg")), b: Some(img("C:/x/b.jpg")) };
+        assert_eq!(history_key(&s, &[]), s.file_key());
+        assert_eq!(history_key(&s, &[img("C:/x/C.jpg"), img("C:/x/d.jpg")]).unwrap(), "c:\\x\\a.jpg|c:\\x\\b.jpg|c:\\x\\c.jpg|c:\\x\\d.jpg");
     }
 }

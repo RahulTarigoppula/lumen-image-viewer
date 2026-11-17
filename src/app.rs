@@ -1138,6 +1138,17 @@ impl App {
                     self.show_settings = true;
                 }
                 PanelAction::Toast(t) => self.core.toasts.success(t),
+                PanelAction::AddMarks(marks) => {
+                    let n = match (&mut self.compare, self.mode) {
+                        (Some(c), Mode::Compare) => c.add_marks(marks),
+                        _ => 0,
+                    };
+                    if n > 0 {
+                        self.core.toasts.success(format!("Added {n} mark{} (Review panel lists them)", if n == 1 { "" } else { "s" }));
+                    } else {
+                        self.core.toasts.info("No marks added: they are there already, or marks are off here");
+                    }
+                }
                 PanelAction::ExportJson(text) => {
                     if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("lumen_ai_result.json").save_file() {
                         match std::fs::write(&p, text) {

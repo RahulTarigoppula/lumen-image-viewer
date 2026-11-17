@@ -22,6 +22,9 @@ pub enum PanelAction {
     Toast(String),
     /// Save this JSON where the user picks.
     ExportJson(String),
+    /// Add review marks (compare pane index, mark in that image's pixels):
+    /// the AI result's "Add findings as marks". Compare mode only.
+    AddMarks(Vec<(usize, crate::ui::review::Mark)>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -246,6 +249,16 @@ impl AnalysisPanel {
             k if k.is_pair() && self.tab == Tab::Metrics => "Whole image, every image".to_string(),
             k if k.is_pair() => format!("Whole image, {} against A", core.metrics.pair_letter()),
             _ => "Whole image".to_string(),
+        };
+        // The AI tab's ranking sends every compare pane.
+        #[cfg(feature = "ai")]
+        let whole = match self.tab == Tab::Ai && subject.kind == super::SubjectKind::Pair {
+            true => {
+                let extra = super::ai::extra_images(core, subject).len().min(2);
+                let ranks = extra > 0 && self.ai.preset(subject.kind, true, core).arity == lumen_ai::Arity::Many;
+                if ranks { format!("Whole image, all {} images ranked", 2 + extra) } else { whole }
+            }
+            false => whole,
         };
         let rect = self.roi.pixel_rect().filter(|_| self.use_roi && !self.drawing);
         ui.horizontal(|ui| {

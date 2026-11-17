@@ -10,8 +10,9 @@
 //!   grid needs more tiles than the budget allows, the ROI is downscaled by
 //!   the smallest factor that fits. Padding to a multiple of 32 always
 //!   replicates edge pixels; it never resamples.
-//! - Composite: A | B side by side with a 16 px gap and burned-in labels,
-//!   only for servers limited to one image (or when chosen).
+//! - Composite: A | B side by side (three or four images of a ranking in a
+//!   2x2 grid) with a 16 px gap and burned-in labels, only for servers
+//!   limited to fewer images than are compared (or when chosen).
 //! - Encoding: PNG or JPEG q95 4:4:4 from raw pixels, so no EXIF, XMP, GPS,
 //!   ICC or text chunks can leak.
 //!
@@ -43,19 +44,44 @@ pub const THUMB_SIDE: u32 = 256;
 pub enum ImageLabel {
     A,
     B,
+    /// The third and fourth images of a ranking (compare panes C and D).
+    C,
+    D,
 }
 
 impl ImageLabel {
+    pub const ALL: [ImageLabel; 4] = [ImageLabel::A, ImageLabel::B, ImageLabel::C, ImageLabel::D];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ImageLabel::A => "A",
             ImageLabel::B => "B",
+            ImageLabel::C => "C",
+            ImageLabel::D => "D",
         }
     }
+
+    /// Position in the request (and compare pane index): A is 0.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<ImageLabel> {
+        ImageLabel::ALL.get(i).copied()
+    }
+
+    /// "A".."D", any case, surrounding spaces ignored.
+    pub fn parse(s: &str) -> Option<ImageLabel> {
+        let s = s.trim();
+        ImageLabel::ALL.into_iter().find(|l| l.as_str().eq_ignore_ascii_case(s))
+    }
+
+    /// A and B exchanged (the swap-check of a pair); C and D stay.
     pub fn other(self) -> ImageLabel {
         match self {
             ImageLabel::A => ImageLabel::B,
             ImageLabel::B => ImageLabel::A,
+            l => l,
         }
     }
 }
@@ -463,41 +489,47 @@ pub fn roi_tiles(img: &RgbaImage, label: ImageLabel, roi: Roi, side: u32, max_ti
 /// B's counterpart of A's images: the same grid and sent sizes over the
 /// same relative region (identical when A and B have equal dimensions).
 pub fn matching(b: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32)) -> Vec<SentImage> {
-    let same = b.dimensions() == a_size;
+    matching_as(b, a_images, a_size, ImageLabel::B)
+}
+
+/// Like [`matching`], for any image after A (B, C or D of a ranking).
+pub fn matching_as(img: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32), label: ImageLabel) -> Vec<SentImage> {
+    let same = img.dimensions() == a_size;
+    let l = label.as_str();
     a_images
         .iter()
         .map(|ai| {
             let pa = ai.regions[0];
-            let src = pa.src.rescaled(a_size, b.dimensions());
-            let content = extract(b, src, pa.content_w, pa.content_h);
+            let src = pa.src.rescaled(a_size, img.dimensions());
+            let content = extract(img, src, pa.content_w, pa.content_h);
             let pixels = pad_to_multiple(&content, ALIGN);
             let pad = pad_note((pa.content_w, pa.content_h), pixels.dimensions());
             let description = match ai.role {
-                ImageRole::RoiTile { index, count } if same => format!("B ROI tile {index}/{count}: same region"),
+                ImageRole::RoiTile { index, count } if same => format!("{l} ROI tile {index}/{count}: same region"),
                 ImageRole::RoiTile { index, count } => format!(
-                    "B ROI tile {index}/{count}: same relative region, source pixels x={}..{}, y={}..{} of {}x{}{pad}",
+                    "{l} ROI tile {index}/{count}: same relative region, source pixels x={}..{}, y={}..{} of {}x{}{pad}",
                     src.x.round(),
                     (src.x + src.w).round(),
                     src.y.round(),
                     (src.y + src.h).round(),
-                    b.width(),
-                    b.height()
+                    img.width(),
+                    img.height()
                 ),
-                _ if same => format!("B full view, same scaling{pad}"),
+                _ if same => format!("{l} full view, same scaling{pad}"),
                 _ => format!(
-                    "B full view, {}x{}, resampled from {}x{} to match A{pad}",
+                    "{l} full view, {}x{}, resampled from {}x{} to match A{pad}",
                     pa.content_w,
                     pa.content_h,
-                    b.width(),
-                    b.height()
+                    img.width(),
+                    img.height()
                 ),
             };
             SentImage {
                 role: ai.role,
-                label: Some(ImageLabel::B),
+                label: Some(label),
                 tile: ai.tile,
                 pixels,
-                regions: vec![Placement { label: ImageLabel::B, src, ..pa }],
+                regions: vec![Placement { label, src, ..pa }],
                 description,
             }
         })
@@ -508,48 +540,69 @@ pub fn matching(b: &RgbaImage, a_images: &[SentImage], a_size: (u32, u32)) -> Ve
 /// source rectangles to show (full image or ROI). The whole composite
 /// fits `max_side`, so each half gets about half the resolution.
 pub fn composite(a: &RgbaImage, region_a: RectF, b: &RgbaImage, region_b: RectF, max_side: u32) -> SentImage {
+    composite_grid(&[(a, region_a, ImageLabel::A), (b, region_b, ImageLabel::B)], max_side)
+}
+
+/// Cell names of a 2x2 composite, in label order.
+const GRID_PLACES: [&str; 4] = ["top left", "top right", "bottom left", "bottom right"];
+
+/// Two to four images in one: two side by side (A | B), three or four in a
+/// 2x2 grid (A B over C D), with gaps and burned-in labels. Each cell gets
+/// about half of `max_side` per side.
+pub fn composite_grid(cells: &[(&RgbaImage, RectF, ImageLabel)], max_side: u32) -> SentImage {
     let max_side = (max_side / ALIGN * ALIGN).max(4 * ALIGN);
-    let half_w = (max_side - COMPOSITE_GAP) / 2;
+    let n = cells.len().max(1);
+    let cols = if n == 1 { 1 } else { 2 };
+    let rows = n.div_ceil(cols);
+    let cell_w = (max_side - COMPOSITE_GAP * (cols as u32 - 1)) / cols as u32;
+    let cell_h = (max_side - COMPOSITE_GAP * (rows as u32 - 1)) / rows as u32;
     let fit = |r: RectF| {
-        let s = (half_w as f64 / r.w).min(max_side as f64 / r.h).min(1.0);
+        let s = (cell_w as f64 / r.w).min(cell_h as f64 / r.h).min(1.0);
         (((r.w * s).round() as u32).max(1), ((r.h * s).round() as u32).max(1))
     };
-    let (aw, ah) = fit(region_a);
-    let (bw, bh) = fit(region_b);
-    let ca = extract(a, region_a, aw, ah);
-    let cb = extract(b, region_b, bw, bh);
-    let w = round_up(aw + COMPOSITE_GAP + bw, ALIGN);
-    let h = round_up(ah.max(bh), ALIGN);
+    let sizes: Vec<(u32, u32)> = cells.iter().map(|c| fit(c.1)).collect();
+    let col_w: Vec<u32> = (0..cols).map(|c| (0..rows).filter_map(|r| sizes.get(r * cols + c)).map(|s| s.0).max().unwrap_or(1)).collect();
+    let row_h: Vec<u32> = (0..rows).map(|r| (0..cols).filter_map(|c| sizes.get(r * cols + c)).map(|s| s.1).max().unwrap_or(1)).collect();
+    let x_of = |c: usize| col_w[..c].iter().sum::<u32>() + COMPOSITE_GAP * c as u32;
+    let y_of = |r: usize| row_h[..r].iter().sum::<u32>() + COMPOSITE_GAP * r as u32;
+    let w = round_up(x_of(cols - 1) + col_w[cols - 1], ALIGN);
+    let h = round_up(y_of(rows - 1) + row_h[rows - 1], ALIGN);
     let mut out = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
-    image::imageops::replace(&mut out, &ca, 0, 0);
-    let bx = aw + COMPOSITE_GAP;
-    image::imageops::replace(&mut out, &cb, bx as i64, 0);
-    let px = (h as f32 / 14.0).clamp(20.0, 64.0);
-    draw_label(&mut out, 0, 0, "A", px);
-    draw_label(&mut out, bx, 0, "B", px);
-    let factor = |r: RectF, cw: u32| r.w / cw as f64;
-    SentImage {
-        role: ImageRole::Composite,
-        label: None,
-        tile: 0,
-        pixels: out,
-        regions: vec![
-            Placement { label: ImageLabel::A, src: region_a, content_w: aw, content_h: ah, offset_x: 0, offset_y: 0 },
-            Placement { label: ImageLabel::B, src: region_b, content_w: bw, content_h: bh, offset_x: bx, offset_y: 0 },
-        ],
-        description: format!(
-            "Composite {}x{}: A on the left ({}x{}, downscaled {}), B on the right ({}x{}, downscaled {}), {} px black gap, labels burned in at the top-left of each half",
+    let px = (h as f32 / rows as f32 / 14.0).clamp(20.0, 64.0);
+    let mut regions = Vec::new();
+    for (i, (&(img, region, label), &(cw, ch))) in cells.iter().zip(&sizes).enumerate() {
+        let (x, y) = (x_of(i % cols), y_of(i / cols));
+        let content = extract(img, region, cw, ch);
+        image::imageops::replace(&mut out, &content, x as i64, y as i64);
+        draw_label(&mut out, x, y, label.as_str(), px);
+        regions.push(Placement { label, src: region, content_w: cw, content_h: ch, offset_x: x, offset_y: y });
+    }
+    let factor = |p: &Placement| fmt_factor(p.src.w / p.content_w.max(1) as f64);
+    let description = if regions.len() == 2 {
+        let (a, b) = (&regions[0], &regions[1]);
+        format!(
+            "Composite {}x{}: {} on the left ({}x{}, downscaled {}), {} on the right ({}x{}, downscaled {}), {} px black gap, labels burned in at the top-left of each half",
             w,
             h,
-            aw,
-            ah,
-            fmt_factor(factor(region_a, aw)),
-            bw,
-            bh,
-            fmt_factor(factor(region_b, bw)),
+            a.label.as_str(),
+            a.content_w,
+            a.content_h,
+            factor(a),
+            b.label.as_str(),
+            b.content_w,
+            b.content_h,
+            factor(b),
             COMPOSITE_GAP
-        ),
-    }
+        )
+    } else {
+        let parts: Vec<String> = regions
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{} {} ({}x{}, downscaled {})", p.label.as_str(), GRID_PLACES[i.min(3)], p.content_w, p.content_h, factor(p)))
+            .collect();
+        format!("Composite {w}x{h}: 2x2 grid, {}, {COMPOSITE_GAP} px black gaps, labels burned in at the top-left of each cell", parts.join(", "))
+    };
+    SentImage { role: ImageRole::Composite, label: None, tile: 0, pixels: out, regions, description }
 }
 
 /// White text on a dark box at (x, y).
@@ -838,6 +891,48 @@ mod tests {
         let m = c.map_bbox(ImageLabel::A, [bx, by, bx, by], CoordConvention::Relative1000).unwrap();
         assert_eq!(m.label, ImageLabel::B, "the box center decides the half");
         assert!((m.x0 - 960.0).abs() < 4.0 && (m.y0 - 540.0).abs() < 4.0, "{m:?}");
+    }
+
+    #[test]
+    fn grid_composite_maps_four_cells() {
+        let imgs: Vec<RgbaImage> = (0..4).map(|_| gradient(800, 600)).collect();
+        let cells: Vec<(&RgbaImage, RectF, ImageLabel)> =
+            imgs.iter().enumerate().map(|(i, im)| (im, Roi::full(800, 600).to_f(), ImageLabel::from_index(i).unwrap())).collect();
+        let c = composite_grid(&cells, 1536);
+        let (w, h) = c.pixels.dimensions();
+        assert_eq!((w, h), (1536, 1184), "{}", c.description);
+        assert_eq!(c.regions.len(), 4);
+        let d = c.regions[3];
+        assert_eq!((d.label, d.offset_x, d.offset_y, d.content_w, d.content_h), (ImageLabel::D, 776, 586, 760, 570));
+        assert!(c.description.starts_with("Composite 1536x1184: 2x2 grid, A top left (760x570"), "{}", c.description);
+        assert!(c.description.contains("D bottom right"), "{}", c.description);
+        // A box in the bottom-right cell lands on D, in D's pixels.
+        let m = c.map_bbox(ImageLabel::A, [700.0, 700.0, 800.0, 780.0], CoordConvention::Relative1000).unwrap();
+        assert_eq!(m.label, ImageLabel::D);
+        assert!(m.x0 >= 0.0 && m.x1 <= 800.0 && m.y0 >= 0.0 && m.y1 <= 600.0, "{m:?}");
+        // Three images leave the bottom-right cell empty.
+        let three = composite_grid(&cells[..3], 1536);
+        assert_eq!(three.regions.len(), 3);
+        assert!(three.description.contains("C bottom left"), "{}", three.description);
+        // Two images keep the side-by-side layout.
+        let two = composite_grid(&cells[..2], 1536);
+        assert!(two.description.contains("A on the left") && two.description.contains("B on the right"), "{}", two.description);
+        assert_eq!(two.regions[1].offset_y, 0);
+    }
+
+    #[test]
+    fn labels_parse_and_index() {
+        assert_eq!(ImageLabel::parse(" c "), Some(ImageLabel::C));
+        assert_eq!(ImageLabel::parse("E"), None);
+        assert_eq!(ImageLabel::from_index(3), Some(ImageLabel::D));
+        assert_eq!(ImageLabel::D.index(), 3);
+        assert_eq!(ImageLabel::C.other(), ImageLabel::C);
+        assert_eq!(ImageLabel::A.other(), ImageLabel::B);
+        let small = gradient(400, 300);
+        let a_list = vec![overview(&gradient(800, 600), ImageLabel::A, 1536)];
+        let c = matching_as(&small, &a_list, (800, 600), ImageLabel::C);
+        assert_eq!(c[0].label, Some(ImageLabel::C));
+        assert!(c[0].description.starts_with("C full view, 800x600, resampled from 400x300"), "{}", c[0].description);
     }
 
     fn png_chunks(b: &[u8]) -> Vec<String> {
