@@ -1,0 +1,45 @@
+# Metadata and EXIF windows, pixel values, inspect views and the line profile.
+open {media}\RoundA\DeviceX\scene_01.jpg
+wait 3000
+run ShowMetadata
+wait 3000
+shot metadata_capture.png
+run ShowExif
+wait 1500
+shot metadata_exif.png
+run ShowExif
+wait 800
+run TogglePixelValues
+hover 500 350
+wait 800
+shot viewer_pixel.png
+run CycleInspect
+wait 3000
+shot viewer_clipping.png
+run CycleInspect
+wait 3000
+shot viewer_false_color.png
+run CycleInspect
+wait 3000
+shot viewer_peaking.png
+open {media}\Compare2
+wait 2500
+run SelectAll
+run Compare
+wait 3500
+run ShowMetadata
+wait 3000
+shot compare_metadata.png
+run ShowMetadata
+wait 800
+key V
+hover 300 400
+wait 800
+shot compare_pixel.png
+key O
+wait 3000
+shot compare_clipping.png
+key P
+drag 200 300 420 320
+wait 1500
+shot compare_profile.png
