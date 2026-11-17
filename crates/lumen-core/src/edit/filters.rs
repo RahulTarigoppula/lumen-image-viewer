@@ -20,11 +20,44 @@ pub fn is_opaque(img: &RgbaImage) -> bool {
 /// A channel type the separable kernels can run on (8-bit for opaque images,
 /// 16-bit premultiplied when there is transparency).
 pub trait Px: Copy + Default + Send + Sync + 'static {
+    /// Accumulator for 16.16 fixed-point kernels (weights summing to 65536).
+    type Acc: Acc;
     fn get(self) -> u32;
     fn put(v: u32) -> Self;
 }
 
+/// Sum of `weight * value` products in a kernel: `u32` holds 65536 x 255
+/// exactly (8-bit, and vectorizes far better), 16-bit channels need `u64`.
+pub trait Acc: Copy + Default + Send + Sync + std::ops::AddAssign + 'static {
+    fn mul(k: u32, v: u32) -> Self;
+    /// `(self + 0.5) / 65536`, rounded down.
+    fn round16(self) -> u32;
+}
+
+impl Acc for u32 {
+    #[inline]
+    fn mul(k: u32, v: u32) -> Self {
+        k * v
+    }
+    #[inline]
+    fn round16(self) -> u32 {
+        (self + 32768) >> 16
+    }
+}
+
+impl Acc for u64 {
+    #[inline]
+    fn mul(k: u32, v: u32) -> Self {
+        k as u64 * v as u64
+    }
+    #[inline]
+    fn round16(self) -> u32 {
+        ((self + 32768) >> 16) as u32
+    }
+}
+
 impl Px for u8 {
+    type Acc = u32;
     #[inline]
     fn get(self) -> u32 {
         self as u32
@@ -36,6 +69,7 @@ impl Px for u8 {
 }
 
 impl Px for u16 {
+    type Acc = u64;
     #[inline]
     fn get(self) -> u32 {
         self as u32
@@ -168,43 +202,63 @@ fn gauss_kernel(sigma: f32) -> Vec<u32> {
 }
 
 fn conv_h<P: Px>(src: &[P], dst: &mut [P], w: usize, _h: usize, k: &[u32]) {
-    let r = (k.len() / 2) as i64;
+    let r = k.len() / 2;
     let stride = w * 4;
-    dst.par_chunks_mut(stride).zip(src.par_chunks(stride)).for_each(|(out, row)| {
-        for x in 0..w {
-            let mut acc = [0u64; 4];
-            for (j, &kw) in k.iter().enumerate() {
-                let sx = clampi(x as i64 + j as i64 - r, w) * 4;
-                let kw = kw as u64;
-                acc[0] += kw * row[sx].get() as u64;
-                acc[1] += kw * row[sx + 1].get() as u64;
-                acc[2] += kw * row[sx + 2].get() as u64;
-                acc[3] += kw * row[sx + 3].get() as u64;
+    // Pixels [x0, x1) have every tap inside the row: there each tap is one
+    // pass over contiguous values (vectorizes). Border pixels clamp per tap.
+    let x0 = r.min(w);
+    let x1 = w.saturating_sub(r).max(x0);
+    dst.par_chunks_mut(stride).zip(src.par_chunks(stride)).for_each_init(
+        || vec![P::Acc::default(); (x1 - x0) * 4],
+        |acc, (out, row)| {
+            if x1 > x0 {
+                // Here x0 == r, so every tap offset is in range.
+                acc.fill(P::Acc::default());
+                for (j, &kw) in k.iter().enumerate() {
+                    let s = &row[(x0 + j - r) * 4..(x1 + j - r) * 4];
+                    for (a, &v) in acc.iter_mut().zip(s) {
+                        *a += P::Acc::mul(kw, v.get());
+                    }
+                }
+                for (o, &a) in out[x0 * 4..x1 * 4].iter_mut().zip(acc.iter()) {
+                    *o = P::put(a.round16());
+                }
             }
-            for c in 0..4 {
-                out[x * 4 + c] = P::put(((acc[c] + 32768) >> 16) as u32);
+            for x in (0..x0).chain(x1..w) {
+                let mut sum = [P::Acc::default(); 4];
+                for (j, &kw) in k.iter().enumerate() {
+                    let sx = clampi(x as i64 + j as i64 - r as i64, w) * 4;
+                    for c in 0..4 {
+                        sum[c] += P::Acc::mul(kw, row[sx + c].get());
+                    }
+                }
+                for c in 0..4 {
+                    out[x * 4 + c] = P::put(sum[c].round16());
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn conv_v<P: Px>(src: &[P], dst: &mut [P], w: usize, h: usize, k: &[u32]) {
     let r = (k.len() / 2) as i64;
     let stride = w * 4;
-    dst.par_chunks_mut(stride).enumerate().for_each(|(y, out)| {
-        let mut acc = vec![0u64; stride];
-        for (j, &kw) in k.iter().enumerate() {
-            let sy = clampi(y as i64 + j as i64 - r, h);
-            let row = &src[sy * stride..(sy + 1) * stride];
-            let kw = kw as u64;
-            for (a, &v) in acc.iter_mut().zip(row) {
-                *a += kw * v.get() as u64;
+    dst.par_chunks_mut(stride).enumerate().for_each_init(
+        || vec![P::Acc::default(); stride],
+        |acc, (y, out)| {
+            acc.fill(P::Acc::default());
+            for (j, &kw) in k.iter().enumerate() {
+                let sy = clampi(y as i64 + j as i64 - r, h);
+                let row = &src[sy * stride..(sy + 1) * stride];
+                for (a, &v) in acc.iter_mut().zip(row) {
+                    *a += P::Acc::mul(kw, v.get());
+                }
             }
-        }
-        for (o, a) in out.iter_mut().zip(acc) {
-            *o = P::put(((a + 32768) >> 16) as u32);
-        }
-    });
+            for (o, &a) in out.iter_mut().zip(acc.iter()) {
+                *o = P::put(a.round16());
+            }
+        },
+    );
 }
 
 /// Box sizes approximating a Gaussian (Kovesi / Ivan Kutskir). Returns radii.
@@ -661,6 +715,54 @@ mod tests {
             cur
         }
         with_premul(img, |src, w, h| run(src, w, h, distance, s, c), |src, w, h| run(src, w, h, distance, s, c))
+    }
+
+    /// The separable Gaussian passes before the interior fast path (the reference).
+    fn old_gauss_small<P: Px>(src: &[P], w: usize, h: usize, sigma: f32) -> Vec<P> {
+        let k = gauss_kernel(sigma);
+        let r = (k.len() / 2) as i64;
+        let mut tmp = vec![P::default(); w * h * 4];
+        for (y, out) in tmp.chunks_mut(w * 4).enumerate() {
+            let row = &src[y * w * 4..(y + 1) * w * 4];
+            for x in 0..w {
+                let mut acc = [0u64; 4];
+                for (j, &kw) in k.iter().enumerate() {
+                    let sx = clampi(x as i64 + j as i64 - r, w) * 4;
+                    for c in 0..4 {
+                        acc[c] += kw as u64 * row[sx + c].get() as u64;
+                    }
+                }
+                for c in 0..4 {
+                    out[x * 4 + c] = P::put(((acc[c] + 32768) >> 16) as u32);
+                }
+            }
+        }
+        let mut out = vec![P::default(); w * h * 4];
+        for (y, o) in out.chunks_mut(w * 4).enumerate() {
+            let mut acc = vec![0u64; w * 4];
+            for (j, &kw) in k.iter().enumerate() {
+                let sy = clampi(y as i64 + j as i64 - r, h);
+                for (a, &v) in acc.iter_mut().zip(&tmp[sy * w * 4..(sy + 1) * w * 4]) {
+                    *a += kw as u64 * v.get() as u64;
+                }
+            }
+            for (p, a) in o.iter_mut().zip(acc) {
+                *p = P::put(((a + 32768) >> 16) as u32);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gaussian_matches_reference() {
+        for (w, h) in [(1usize, 1usize), (3, 40), (13, 9), (64, 33), (130, 70)] {
+            let img = noisy(w as u32, h as u32);
+            let pre = premultiply16(&img);
+            for sigma in [0.2f32, 0.7, 1.5, 3.0] {
+                assert!(gaussian_raw(img.as_raw(), w, h, sigma) == old_gauss_small(img.as_raw(), w, h, sigma), "u8 {w}x{h} {sigma}");
+                assert!(gaussian_raw(&pre, w, h, sigma) == old_gauss_small(&pre, w, h, sigma), "u16 {w}x{h} {sigma}");
+            }
+        }
     }
 
     #[test]
