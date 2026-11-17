@@ -280,6 +280,9 @@ pub struct Project {
     pub votes: Vec<Vote>,
     /// How the devices were found, for the record.
     pub detected_by: String,
+    /// The previous round's project folder (relative to this project's
+    /// folder when possible) for regression tracking.
+    pub previous: Option<String>,
 }
 
 impl Default for Project {
@@ -294,6 +297,7 @@ impl Default for Project {
             scenes: Vec::new(),
             votes: Vec::new(),
             detected_by: String::new(),
+            previous: None,
         }
     }
 }
@@ -684,9 +688,114 @@ pub fn find_root(path: &Path, levels: usize) -> Option<PathBuf> {
     None
 }
 
+/// One score that changed between two rounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreChange {
+    pub scene: String,
+    pub device: String,
+    pub attribute: String,
+    pub before: i32,
+    pub after: i32,
+}
+
+/// What changed for one device since the previous round.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceDelta {
+    pub device: String,
+    /// Mean change per attribute over scenes scored in both rounds.
+    pub mean: Vec<(String, f64)>,
+    pub wins_before: usize,
+    pub wins_after: usize,
+    pub losses_before: usize,
+    pub losses_after: usize,
+}
+
+/// Round-over-round comparison: scenes and devices are matched by name.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RoundDiff {
+    pub devices: Vec<DeviceDelta>,
+    /// Scores that went down by `threshold` or more, worst first.
+    pub regressions: Vec<ScoreChange>,
+    /// Scores that went up by `threshold` or more, best first.
+    pub improvements: Vec<ScoreChange>,
+    /// Scenes present in both rounds.
+    pub shared_scenes: usize,
+}
+
+/// Compare `cur` with the previous round `prev`. Only scenes and devices
+/// with the same names in both are compared; a change of at least
+/// `threshold` points counts as a regression or improvement.
+pub fn compare_rounds(cur: &Project, prev: &Project, threshold: i32) -> RoundDiff {
+    let mut diff = RoundDiff::default();
+    let mut sums: BTreeMap<(String, String), (f64, usize)> = BTreeMap::new();
+    for s in &cur.scenes {
+        let Some(o) = prev.scenes.iter().find(|o| o.name == s.name) else { continue };
+        diff.shared_scenes += 1;
+        for sc in &s.scores {
+            let Some(old) = o.score(&sc.device) else { continue };
+            for (attr, &after) in &sc.attrs {
+                let Some(&before) = old.attrs.get(attr) else { continue };
+                let e = sums.entry((sc.device.clone(), attr.clone())).or_default();
+                e.0 += (after - before) as f64;
+                e.1 += 1;
+                let ch = ScoreChange { scene: s.name.clone(), device: sc.device.clone(), attribute: attr.clone(), before, after };
+                if after - before <= -threshold {
+                    diff.regressions.push(ch);
+                } else if after - before >= threshold {
+                    diff.improvements.push(ch);
+                }
+            }
+        }
+    }
+    diff.regressions.sort_by_key(|c| (c.after - c.before, c.scene.clone()));
+    diff.improvements.sort_by_key(|c| (c.before - c.after, c.scene.clone()));
+    let (tc, tp) = (cur.tally(), prev.tally());
+    for d in &cur.devices {
+        let now = tc.iter().find(|t| t.device == d.name);
+        let before = tp.iter().find(|t| t.device == d.name);
+        let mean: Vec<(String, f64)> = cur.attributes.iter().filter_map(|a| sums.get(&(d.name.clone(), a.clone())).map(|(s, n)| (a.clone(), s / *n as f64))).collect();
+        if before.is_none() && mean.is_empty() {
+            continue;
+        }
+        diff.devices.push(DeviceDelta {
+            device: d.name.clone(),
+            mean,
+            wins_before: before.map(|t| t.win).unwrap_or(0),
+            wins_after: now.map(|t| t.win).unwrap_or(0),
+            losses_before: before.map(|t| t.lose).unwrap_or(0),
+            losses_after: now.map(|t| t.lose).unwrap_or(0),
+        });
+    }
+    diff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_are_compared_by_name() {
+        let mut prev = sample();
+        let mut cur = sample();
+        prev.scenes[1].score_mut("X").attrs.insert("Noise".into(), 4);
+        prev.scenes[1].score_mut("X").attrs.insert("Color".into(), 2);
+        prev.scenes[0].score_mut("X").verdict = Some(Verdict::Lose);
+        cur.scenes[1].score_mut("X").attrs.insert("Noise".into(), 2);
+        cur.scenes[1].score_mut("X").attrs.insert("Color".into(), 4);
+        cur.scenes[0].score_mut("X").verdict = Some(Verdict::Win);
+        // A scene only in this round is ignored.
+        cur.scenes.push(Scene { name: "new".into(), ..Default::default() });
+        let d = compare_rounds(&cur, &prev, 1);
+        assert_eq!(d.shared_scenes, 2);
+        assert_eq!(d.regressions.len(), 1);
+        assert_eq!((d.regressions[0].attribute.as_str(), d.regressions[0].before, d.regressions[0].after), ("Noise", 4, 2));
+        assert_eq!(d.improvements.len(), 1);
+        let x = d.devices.iter().find(|t| t.device == "X").unwrap();
+        assert_eq!(x.mean, vec![("Color".to_string(), 2.0), ("Noise".to_string(), -2.0)]);
+        assert_eq!((x.wins_before, x.wins_after, x.losses_before, x.losses_after), (0, 1, 1, 0));
+        // A higher threshold hides small changes.
+        assert!(compare_rounds(&cur, &prev, 3).regressions.is_empty());
+    }
 
     fn sample() -> Project {
         let d = detect::detect(&[

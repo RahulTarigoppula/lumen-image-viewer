@@ -19,6 +19,8 @@ const CROP_SIDE: u32 = 1000;
 #[derive(Clone)]
 pub struct DeckJob {
     pub ws: Workspace,
+    /// The previous round, for the "since" page.
+    pub prev: Option<Workspace>,
     pub title: String,
     pub author: String,
     pub summary: String,
@@ -181,6 +183,30 @@ pub fn run(job: &DeckJob, done: &AtomicUsize) -> Result<PathBuf> {
         let note = format!("Mean over all scenes, every capture scaled to {} px on its long side. {}.", measure::MEASURE_SIDE, better.join("; "));
         Some(report::Table { header, rows, note })
     };
+    let round = job.prev.as_ref().map(|prev| {
+        let diff = lumen_core::workbench::compare_rounds(p, &prev.project, 1);
+        let attrs: Vec<&String> = p.attributes.iter().filter(|a| diff.devices.iter().any(|d| d.mean.iter().any(|(k, _)| k == *a))).collect();
+        let mut header = vec!["Device".to_string()];
+        header.extend(attrs.iter().map(|a| a.to_string()));
+        header.push("Wins".into());
+        let rows = diff
+            .devices
+            .iter()
+            .map(|d| {
+                let mut r = vec![p.display(&d.device).to_string()];
+                r.extend(attrs.iter().map(|a| d.mean.iter().find(|(k, _)| k == *a).map(|(_, v)| format!("{v:+.1}")).unwrap_or_else(|| "-".into())));
+                r.push(format!("{} to {}", d.wins_before, d.wins_after));
+                r
+            })
+            .collect();
+        let pname = if prev.project.name.is_empty() { "the previous round".to_string() } else { prev.project.name.clone() };
+        deck::DeckRound {
+            title: format!("Since {pname}"),
+            table: report::Table { header, rows, note: String::new() },
+            regressions: diff.regressions.iter().map(|c| format!("{}: {} {} {} to {}", c.scene, p.display(&c.device), c.attribute, c.before, c.after)).collect(),
+            improvements: diff.improvements.len(),
+        }
+    });
     let d = deck::Deck {
         title: if job.title.trim().is_empty() { p.name.clone() } else { job.title.trim().to_string() },
         author: job.author.trim().to_string(),
@@ -194,6 +220,7 @@ pub fn run(job: &DeckJob, done: &AtomicUsize) -> Result<PathBuf> {
         ranking,
         tag_counts,
         measures,
+        round,
         scenes,
     };
     deck::write(&d, job.format, &job.out)?;

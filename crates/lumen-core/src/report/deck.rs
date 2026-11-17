@@ -61,6 +61,18 @@ pub struct DeckTally {
     pub means: Vec<(String, f64)>,
 }
 
+/// The "since the previous round" page.
+#[derive(Clone, Debug)]
+pub struct DeckRound {
+    /// "Since Round 2".
+    pub title: String,
+    /// Mean score change per device (rows) and attribute (columns).
+    pub table: Table,
+    /// "night_01: PhoneX Noise 4 to 2", worst first.
+    pub regressions: Vec<String>,
+    pub improvements: usize,
+}
+
 /// A blind test result row.
 #[derive(Clone, Debug)]
 pub struct DeckRank {
@@ -90,6 +102,8 @@ pub struct Deck {
     pub tag_counts: Vec<(String, Vec<usize>)>,
     /// Mean objective measurements per device (rows) and metric (columns).
     pub measures: Option<Table>,
+    /// Changes since the previous round.
+    pub round: Option<DeckRound>,
     pub scenes: Vec<DeckScene>,
 }
 
@@ -320,6 +334,31 @@ fn measures_page(d: &Deck, title: &str) -> Option<Slide> {
     Some(s)
 }
 
+fn round_page(d: &Deck, title: &str) -> Option<Slide> {
+    let r = d.round.as_ref()?;
+    let mut s = Slide::default();
+    header(&mut s, title, &r.title);
+    let b = body();
+    let row_h = 24.0;
+    let mut y = b.y;
+    if !r.table.rows.is_empty() {
+        let h = (row_h * (r.table.rows.len() + 1) as f32).min(b.h * 0.5);
+        s.els.push(El::Table { bx: Box2::new(b.x, y, b.w, h), table: Table { header: r.table.header.clone(), rows: r.table.rows.clone(), note: String::new() } });
+        y += h + 8.0;
+        s.els.push(fitted(Box2::new(b.x, y, b.w, 16.0), "Mean score change over the scenes scored in both rounds (positive is better).", &[10.0], false, MUTED));
+        y += 24.0;
+    }
+    let head = if r.regressions.is_empty() { "No score went down".to_string() } else { format!("{} score{} went down", r.regressions.len(), if r.regressions.len() == 1 { "" } else { "s" }) };
+    let head = format!("{head}; {} went up", r.improvements);
+    s.els.push(text(Box2::new(b.x, y, b.w, 16.0), head.to_uppercase(), 9.0, true, ACCENT));
+    y += 20.0;
+    if !r.regressions.is_empty() && y < b.y + b.h - 20.0 {
+        let list = r.regressions.iter().take(18).map(|l| format!("•  {l}")).collect::<Vec<_>>().join("\n");
+        s.els.push(fitted(Box2::new(b.x, y, b.w, b.y + b.h - y), &list, &[11.0, 10.0, 9.0], false, INK));
+    }
+    Some(s)
+}
+
 fn ranking_page(d: &Deck, title: &str) -> Option<Slide> {
     if d.ranking.is_empty() {
         return None;
@@ -456,6 +495,7 @@ pub fn layout(d: &Deck) -> Vec<Slide> {
     let mut slides = vec![title_page(d)];
     slides.push(summary_page(d, &title));
     slides.extend(attribute_page(d, &title));
+    slides.extend(round_page(d, &title));
     slides.extend(measures_page(d, &title));
     slides.extend(issues_page(d, &title));
     slides.extend(ranking_page(d, &title));
@@ -526,6 +566,7 @@ mod tests {
             scale: (1, 5),
             ranking: vec![DeckRank { device: "PhoneY".into(), color: [34, 160, 92], score: 64.0, low: 52.0, high: 75.0, votes: 20 }, DeckRank { device: "A56".into(), color: [47, 111, 235], score: 40.0, low: 30.0, high: 51.0, votes: 20 }],
             tag_counts: vec![("Flare".into(), vec![0, 3, 1]), ("Noise".into(), vec![2, 1, 0])],
+            round: Some(DeckRound { title: "Since Round 2".into(), table: Table { header: vec!["Device".into(), "Noise".into()], rows: vec![vec!["PhoneX".into(), "-0.5".into()]], note: String::new() }, regressions: vec!["Night 1: PhoneX Noise 4 to 2".into()], improvements: 3 }),
             measures: Some(Table { header: vec!["Device".into(), "Sharpness".into(), "Noise".into()], rows: vec![vec!["A56".into(), "412".into(), "1.20 levels".into()]], note: "Higher sharpness is better.".into() }),
             scenes,
         }
@@ -535,8 +576,8 @@ mod tests {
     fn deck_pages_stay_on_page() {
         let d = sample();
         let slides = layout(&d);
-        // title, summary, attributes, measures, issues, ranking, 3 x (scene + detail)
-        assert_eq!(slides.len(), 6 + 6);
+        // title, summary, attributes, round, measures, issues, ranking, 3 x (scene + detail)
+        assert_eq!(slides.len(), 7 + 6);
         for s in &slides {
             for e in &s.els {
                 let b = match e {
@@ -560,6 +601,7 @@ mod tests {
         d.ranking.clear();
         d.tag_counts.clear();
         d.measures = None;
+        d.round = None;
         let slides = layout(&d);
         assert_eq!(slides.len(), 3 + 6);
     }

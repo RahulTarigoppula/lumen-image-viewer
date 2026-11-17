@@ -82,6 +82,8 @@ pub struct WorkbenchUi {
     /// Scroll the selected row into view next frame.
     scroll_to_selected: bool,
     measuring: Option<MeasureJob>,
+    /// The previous round's project (regression tracking).
+    pub prev: Option<Workspace>,
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
@@ -127,9 +129,16 @@ impl WorkbenchUi {
             blind: None,
             scroll_to_selected: false,
             measuring: None,
+            prev: None,
         };
+        ui.load_previous();
         ui.refresh_meta();
         Ok((ui, created))
+    }
+
+    /// Load the previous round named in the project (if any).
+    fn load_previous(&mut self) {
+        self.prev = self.ws.project.previous.as_ref().and_then(|p| Workspace::load(&self.ws.abs(p)).ok());
     }
 
     fn refresh_meta(&mut self) {
@@ -588,6 +597,38 @@ impl WorkbenchUi {
                 self.ws.project.reference = r;
                 self.touch();
             }
+            if let Some(prev) = &self.prev {
+                let d = lumen_core::workbench::compare_rounds(&self.ws.project, &prev.project, 1);
+                ui.add_space(6.0);
+                let pname = if prev.project.name.is_empty() { "previous round".to_string() } else { prev.project.name.clone() };
+                widgets::section_title(ui, &p, &format!("SINCE {}", pname.to_uppercase()));
+                ui.label(RichText::new(format!("{} scenes in both rounds", d.shared_scenes)).size(text::SMALL).color(p.faint));
+                for dd in &d.devices {
+                    let mut parts: Vec<String> = dd.mean.iter().filter(|(_, v)| v.abs() >= 0.05).map(|(a, v)| format!("{} {:+.1}", short(a), v)).collect();
+                    if dd.wins_before != dd.wins_after || dd.losses_before != dd.losses_after {
+                        parts.push(format!("wins {} to {}", dd.wins_before, dd.wins_after));
+                    }
+                    let line = if parts.is_empty() { "no change".to_string() } else { parts.join("  ·  ") };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(self.ws.project.display(&dd.device)).size(text::SMALL).color(p.text));
+                        ui.label(RichText::new(line).size(text::SMALL).color(p.muted));
+                    });
+                }
+                if d.regressions.is_empty() {
+                    ui.label(RichText::new(format!("{}  No score went down", I::CHECK_CIRCLE)).size(text::SMALL).color(p.ok));
+                } else {
+                    ui.label(RichText::new(format!("{}  {} score{} went down", I::TREND_DOWN, d.regressions.len(), if d.regressions.len() == 1 { "" } else { "s" })).size(text::SMALL).color(p.danger));
+                    for r in d.regressions.iter().take(8) {
+                        let t = format!("{}: {} {} {} to {}", r.scene, self.ws.project.display(&r.device), r.attribute, r.before, r.after);
+                        if ui.add(egui::Label::new(RichText::new(t).size(text::SMALL).color(p.muted)).sense(Sense::click())).on_hover_text("Open this scene").clicked() {
+                            if let Some(k) = self.ws.project.scene_index(&r.scene) {
+                                self.selected = k;
+                                self.requests.push(WbRequest::OpenScene(k));
+                            }
+                        }
+                    }
+                }
+            }
             ui.add_space(6.0);
             widgets::section_title(ui, &p, "COMPLETENESS");
             let missing = self.ws.project.missing();
@@ -894,6 +935,7 @@ impl WorkbenchUi {
         let mut open = true;
         let mut changed = false;
         let mut redetect = false;
+        let (mut pick_prev, mut clear_prev) = (false, false);
         widgets::app_window("wb-setup", "Project setup").open(&mut open).default_size(520.0, 560.0).min_size(400.0, 320.0).show(ctx, |ui| {
             let p = core.pal;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -941,6 +983,20 @@ impl WorkbenchUi {
                 if widgets::secondary_button(ui, &format!("{}  Find devices and scenes again", I::ARROW_CLOCKWISE)).clicked() {
                     redetect = true;
                 }
+                widgets::section_title(ui, &p, "PREVIOUS ROUND");
+                ui.label(RichText::new("Pick the project of the previous round (another folder with a lumen-project.json) to see which scores went up or down, scene by scene.").size(text::SMALL).color(p.muted));
+                ui.horizontal(|ui| {
+                    let current = self.prev.as_ref().map(|w| w.root.display().to_string()).unwrap_or_else(|| "None".into());
+                    ui.add(egui::Label::new(RichText::new(current).size(text::SMALL).color(p.text)).truncate());
+                });
+                ui.horizontal(|ui| {
+                    if widgets::secondary_button(ui, &format!("{}  Choose...", I::FOLDER_OPEN)).clicked() {
+                        pick_prev = true;
+                    }
+                    if self.prev.is_some() && widgets::secondary_button(ui, "Clear").clicked() {
+                        clear_prev = true;
+                    }
+                });
                 widgets::section_title(ui, &p, "ARTIFACT TAGS");
                 let names: Vec<&str> = ARTIFACT_TAGS.iter().map(|(n, _)| *n).collect();
                 ui.label(RichText::new(names.join(", ")).size(text::SMALL).color(p.muted));
@@ -962,6 +1018,25 @@ impl WorkbenchUi {
         }
         if redetect {
             self.redetect(core);
+        }
+        if clear_prev {
+            self.ws.project.previous = None;
+            self.prev = None;
+            changed = true;
+        }
+        if pick_prev {
+            let start = self.ws.root.parent().map(Path::to_path_buf).unwrap_or_else(|| self.ws.root.clone());
+            if let Some(dir) = rfd::FileDialog::new().set_title("Folder of the previous round's project").set_directory(&start).pick_folder() {
+                match Workspace::load(&dir) {
+                    Ok(w) if w.root != self.ws.root => {
+                        self.ws.project.previous = Some(relative_path(&self.ws.root, &dir));
+                        self.prev = Some(w);
+                        changed = true;
+                    }
+                    Ok(_) => core.toasts.info("That is this project"),
+                    Err(_) => core.toasts.error("That folder has no Lumen project. Open it in the Workbench once first."),
+                }
+            }
         }
         if changed {
             self.touch();
@@ -1062,7 +1137,7 @@ impl WorkbenchUi {
         prefs.author = form.author.trim().to_string();
         prefs.format = ext.into();
         prefs.save();
-        let job = DeckJob { ws: self.ws.clone(), title: form.title, author: form.author, summary: form.summary, format: form.format, out, details: form.details, reviewed_only: form.reviewed_only };
+        let job = DeckJob { ws: self.ws.clone(), prev: self.prev.clone(), title: form.title, author: form.author, summary: form.summary, format: form.format, out, details: form.details, reviewed_only: form.reviewed_only };
         let total = job.ws.project.scenes.len();
         let done = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1087,6 +1162,23 @@ impl WorkbenchUi {
             Ok(()) => core.toasts.success(format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
             Err(e) => core.toasts.error(format!("Could not save the CSV: {e:#}")),
         }
+    }
+}
+
+/// `target` relative to `base` ("../Round2"), or absolute when on another drive.
+fn relative_path(base: &Path, target: &Path) -> String {
+    let b: Vec<_> = base.components().collect();
+    let t: Vec<_> = target.components().collect();
+    let common = b.iter().zip(&t).take_while(|(x, y)| x.as_os_str().eq_ignore_ascii_case(y.as_os_str())).count();
+    if common == 0 {
+        return target.to_string_lossy().to_string();
+    }
+    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), b.len() - common).collect();
+    parts.extend(t[common..].iter().map(|c| c.as_os_str().to_string_lossy().to_string()));
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
     }
 }
 
