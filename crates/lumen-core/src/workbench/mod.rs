@@ -7,6 +7,7 @@
 //! live on a network drive. Nothing here knows about the UI.
 
 pub mod detect;
+pub mod measure;
 pub mod rank;
 
 use anyhow::{Context, Result};
@@ -207,6 +208,17 @@ pub struct Scene {
     pub comment: String,
     /// The reviewer marked the scene as reviewed.
     pub done: bool,
+    /// Objective measurements per device (see [`measure`]).
+    pub measures: Vec<DeviceMeasure>,
+}
+
+/// Headline values of the measured metrics for one device on one scene.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceMeasure {
+    pub device: String,
+    /// Metric id -> headline value.
+    pub values: BTreeMap<String, f64>,
 }
 
 impl Scene {
@@ -227,6 +239,10 @@ impl Scene {
         };
         &mut self.scores[k]
     }
+    pub fn measure(&self, device: &str) -> Option<&DeviceMeasure> {
+        self.measures.iter().find(|m| m.device == device)
+    }
+
     pub fn has_scores(&self) -> bool {
         self.scores.iter().any(|s| !s.is_empty())
     }
@@ -408,6 +424,58 @@ impl Project {
             .collect()
     }
 
+    /// Metric ids that have a value somewhere in the project, in display order.
+    pub fn measured_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = measure::MEASURES.iter().map(|(id, _)| id.to_string()).filter(|id| self.scenes.iter().any(|s| s.measures.iter().any(|m| m.values.contains_key(id)))).collect();
+        // Ids from a newer build last.
+        for s in &self.scenes {
+            for m in &s.measures {
+                for k in m.values.keys() {
+                    if !ids.contains(k) {
+                        ids.push(k.clone());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Mean measured value per device and metric: (device, [(metric id, mean)]).
+    pub fn measure_means(&self) -> Vec<(String, Vec<(String, f64)>)> {
+        let ids = self.measured_ids();
+        self.devices
+            .iter()
+            .map(|d| {
+                let means = ids
+                    .iter()
+                    .filter_map(|id| {
+                        let vals: Vec<f64> = self.scenes.iter().filter_map(|s| s.measure(&d.name)?.values.get(id).copied()).collect();
+                        (!vals.is_empty()).then(|| (id.clone(), vals.iter().sum::<f64>() / vals.len() as f64))
+                    })
+                    .collect();
+                (d.name.clone(), means)
+            })
+            .collect()
+    }
+
+    /// Captures not measured yet: (scene index, device).
+    pub fn unmeasured(&self) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (i, s) in self.scenes.iter().enumerate() {
+            let mut seen: Vec<&str> = Vec::new();
+            for sh in &s.shots {
+                if seen.contains(&sh.device.as_str()) {
+                    continue;
+                }
+                seen.push(&sh.device);
+                if s.measure(&sh.device).is_none_or(|m| m.values.is_empty()) {
+                    out.push((i, sh.device.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Short plain-language headline per device ("PhoneX: 5 wins, 2 par,
     /// 1 loss against A56 over 8 scenes").
     pub fn headline(&self) -> Vec<String> {
@@ -441,6 +509,8 @@ impl Project {
         let mut head = vec!["Scene".to_string(), "Device".to_string(), "File".to_string()];
         head.extend(self.attributes.iter().cloned());
         head.extend(["Verdict".to_string(), "Note".to_string(), "Scene comment".to_string()]);
+        let measured = self.measured_ids();
+        head.extend(measured.iter().map(|id| format!("Measured: {}", measure::name_of(id))));
         out.push_str(&csv_row(&head));
         for s in &self.scenes {
             for d in &self.devices {
@@ -453,6 +523,9 @@ impl Project {
                 row.push(sc.and_then(|x| x.verdict).map(|v| v.label().to_string()).unwrap_or_default());
                 row.push(sc.map(|x| x.note.clone()).unwrap_or_default());
                 row.push(s.comment.clone());
+                for id in &measured {
+                    row.push(s.measure(&d.name).and_then(|m| m.values.get(id)).map(|v| format!("{v:.4}")).unwrap_or_default());
+                }
                 out.push_str(&csv_row(&row));
             }
         }

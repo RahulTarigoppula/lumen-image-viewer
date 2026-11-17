@@ -6,7 +6,7 @@
 use super::review;
 use anyhow::Result;
 use lumen_core::report::{self, deck};
-use lumen_core::workbench::{rank, Workspace};
+use lumen_core::workbench::{measure, rank, Workspace};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -158,6 +158,29 @@ pub fn run(job: &DeckJob, done: &AtomicUsize) -> Result<PathBuf> {
             .map(|r| deck::DeckRank { device: p.display(&r.device).to_string(), color: p.device_color(&r.device), score: r.score, low: r.low, high: r.high, votes: r.votes })
             .collect()
     };
+    let means = p.measure_means();
+    let ids = p.measured_ids();
+    let measures = if ids.is_empty() {
+        None
+    } else {
+        let mut header = vec!["Device".to_string()];
+        header.extend(ids.iter().map(|id| measure::name_of(id).to_string()));
+        let rows = means
+            .iter()
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(dev, m)| {
+                let mut r = vec![p.display(dev).to_string()];
+                r.extend(ids.iter().map(|id| m.iter().find(|(k, _)| k == id).map(|(_, v)| measure::fmt_value(id, *v)).unwrap_or_else(|| "-".into())));
+                r
+            })
+            .collect();
+        let better: Vec<String> = ids
+            .iter()
+            .filter_map(|id| measure::higher_is_better(id).map(|h| format!("{} {}", measure::name_of(id), if h { "higher is better" } else { "lower is better" })))
+            .collect();
+        let note = format!("Mean over all scenes, every capture scaled to {} px on its long side. {}.", measure::MEASURE_SIDE, better.join("; "));
+        Some(report::Table { header, rows, note })
+    };
     let d = deck::Deck {
         title: if job.title.trim().is_empty() { p.name.clone() } else { job.title.trim().to_string() },
         author: job.author.trim().to_string(),
@@ -170,6 +193,7 @@ pub fn run(job: &DeckJob, done: &AtomicUsize) -> Result<PathBuf> {
         scale: p.scale.range(),
         ranking,
         tag_counts,
+        measures,
         scenes,
     };
     deck::write(&d, job.format, &job.out)?;

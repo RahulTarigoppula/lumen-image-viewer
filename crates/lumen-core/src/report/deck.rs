@@ -88,6 +88,8 @@ pub struct Deck {
     pub ranking: Vec<DeckRank>,
     /// (tag, count per device in `tally` order).
     pub tag_counts: Vec<(String, Vec<usize>)>,
+    /// Mean objective measurements per device (rows) and metric (columns).
+    pub measures: Option<Table>,
     pub scenes: Vec<DeckScene>,
 }
 
@@ -304,6 +306,20 @@ fn issues_page(d: &Deck, title: &str) -> Option<Slide> {
     Some(s)
 }
 
+fn measures_page(d: &Deck, title: &str) -> Option<Slide> {
+    let t = d.measures.as_ref().filter(|t| !t.rows.is_empty())?;
+    let mut s = Slide::default();
+    header(&mut s, title, "Measured quality");
+    let b = body();
+    let row_h = 24.0;
+    let h = (row_h * (t.rows.len() + 1) as f32).min(b.h - 50.0);
+    s.els.push(El::Table { bx: Box2::new(b.x, b.y, b.w, h), table: Table { header: t.header.clone(), rows: t.rows.clone(), note: String::new() } });
+    if !t.note.is_empty() {
+        s.els.push(fitted(Box2::new(b.x, b.y + h + 8.0, b.w, 40.0), &t.note, &[10.0, 9.0], false, MUTED));
+    }
+    Some(s)
+}
+
 fn ranking_page(d: &Deck, title: &str) -> Option<Slide> {
     if d.ranking.is_empty() {
         return None;
@@ -440,6 +456,7 @@ pub fn layout(d: &Deck) -> Vec<Slide> {
     let mut slides = vec![title_page(d)];
     slides.push(summary_page(d, &title));
     slides.extend(attribute_page(d, &title));
+    slides.extend(measures_page(d, &title));
     slides.extend(issues_page(d, &title));
     slides.extend(ranking_page(d, &title));
     for (k, sc) in d.scenes.iter().enumerate() {
@@ -509,6 +526,7 @@ mod tests {
             scale: (1, 5),
             ranking: vec![DeckRank { device: "PhoneY".into(), color: [34, 160, 92], score: 64.0, low: 52.0, high: 75.0, votes: 20 }, DeckRank { device: "A56".into(), color: [47, 111, 235], score: 40.0, low: 30.0, high: 51.0, votes: 20 }],
             tag_counts: vec![("Flare".into(), vec![0, 3, 1]), ("Noise".into(), vec![2, 1, 0])],
+            measures: Some(Table { header: vec!["Device".into(), "Sharpness".into(), "Noise".into()], rows: vec![vec!["A56".into(), "412".into(), "1.20 levels".into()]], note: "Higher sharpness is better.".into() }),
             scenes,
         }
     }
@@ -517,8 +535,8 @@ mod tests {
     fn deck_pages_stay_on_page() {
         let d = sample();
         let slides = layout(&d);
-        // title, summary, attributes, issues, ranking, 3 x (scene + detail)
-        assert_eq!(slides.len(), 5 + 6);
+        // title, summary, attributes, measures, issues, ranking, 3 x (scene + detail)
+        assert_eq!(slides.len(), 6 + 6);
         for s in &slides {
             for e in &s.els {
                 let b = match e {
@@ -541,6 +559,7 @@ mod tests {
         }
         d.ranking.clear();
         d.tag_counts.clear();
+        d.measures = None;
         let slides = layout(&d);
         assert_eq!(slides.len(), 3 + 6);
     }

@@ -18,7 +18,8 @@ use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use lumen_core::report;
-use lumen_core::workbench::{rank, Choice, Scale, Verdict, Vote, Workspace, ARTIFACT_TAGS};
+use lumen_core::workbench::{measure, rank, Choice, DeviceMeasure, Scale, Verdict, Vote, Workspace, ARTIFACT_TAGS};
+use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +44,14 @@ pub struct Blind {
     pub count: usize,
     rng: rank::Rng,
     pub rater: String,
+}
+
+/// A running measurement of the project's captures.
+struct MeasureJob {
+    rx: Receiver<(usize, String, std::collections::BTreeMap<String, f64>)>,
+    done: Arc<AtomicUsize>,
+    total: usize,
+    cancel: Arc<AtomicBool>,
 }
 
 struct ExportForm {
@@ -72,6 +81,7 @@ pub struct WorkbenchUi {
     pub blind: Option<Blind>,
     /// Scroll the selected row into view next frame.
     scroll_to_selected: bool,
+    measuring: Option<MeasureJob>,
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
@@ -116,6 +126,7 @@ impl WorkbenchUi {
             last_export: None,
             blind: None,
             scroll_to_selected: false,
+            measuring: None,
         };
         ui.refresh_meta();
         Ok((ui, created))
@@ -168,6 +179,7 @@ impl WorkbenchUi {
                 self.disk_stamp = now;
             }
         }
+        self.poll_measure(core);
         if let Some((rx, _, _)) = &self.job {
             match rx.try_recv() {
                 Ok(Ok(path)) => {
@@ -187,6 +199,86 @@ impl WorkbenchUi {
                 }
                 Err(_) => core.ctx.request_repaint_after(Duration::from_millis(150)),
             }
+        }
+    }
+
+    // ------------------------------------------------------------ measuring
+
+    /// Measure every capture not measured yet (or all with `all`), off the UI thread.
+    pub fn start_measure(&mut self, core: &mut Core, all: bool) {
+        if measure::available().is_empty() {
+            core.toasts.info("This build has no measurements");
+            return;
+        }
+        let todo: Vec<(usize, String)> = if all {
+            let mut v = Vec::new();
+            for (i, s) in self.ws.project.scenes.iter().enumerate() {
+                for sh in &s.shots {
+                    if !v.iter().any(|(k, d): &(usize, String)| *k == i && *d == sh.device) {
+                        v.push((i, sh.device.clone()));
+                    }
+                }
+            }
+            v
+        } else {
+            self.ws.project.unmeasured()
+        };
+        if todo.is_empty() {
+            core.toasts.info("Every capture is measured already");
+            return;
+        }
+        let jobs: Vec<(usize, String, PathBuf)> = todo.into_iter().filter_map(|(i, d)| Some((i, d.clone(), self.ws.abs(&self.ws.project.scenes.get(i)?.shot(&d)?.path)))).collect();
+        let total = jobs.len();
+        let done = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (ctx, d2, c2) = (core.ctx.clone(), done.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            crate::bg::background_priority();
+            let pool = lumen_analysis::job::AnalysisPool::new(None);
+            for (i, dev, path) in jobs {
+                if c2.load(Ordering::Relaxed) {
+                    break;
+                }
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let img = lumen_core::decode::decode_file(&path, lumen_core::decode::DecodeOptions { color_manage: true, animations: false }).ok()?;
+                    Some(measure::measure(&img.image, &pool))
+                }));
+                if let Ok(Some(values)) = res {
+                    let _ = tx.send((i, dev, values));
+                } else {
+                    log::warn!("workbench: could not measure {}", path.display());
+                }
+                d2.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            }
+        });
+        self.measuring = Some(MeasureJob { rx, done, total, cancel });
+    }
+
+    fn poll_measure(&mut self, core: &mut Core) {
+        let Some(job) = &self.measuring else { return };
+        let mut got = Vec::new();
+        while let Ok(m) = job.rx.try_recv() {
+            got.push(m);
+        }
+        let total = job.total;
+        let finished = job.done.load(Ordering::Relaxed) >= total || (job.cancel.load(Ordering::Relaxed) && job.rx.is_empty() && got.is_empty());
+        if !got.is_empty() {
+            for (i, dev, values) in got {
+                if let Some(s) = self.ws.project.scenes.get_mut(i) {
+                    s.measures.retain(|m| m.device != dev);
+                    s.measures.push(DeviceMeasure { device: dev, values });
+                }
+            }
+            self.touch();
+        }
+        if finished {
+            let n = total;
+            self.measuring = None;
+            core.toasts.success(format!("Measured {n} capture{}", if n == 1 { "" } else { "s" }));
+        } else {
+            core.ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -415,6 +507,20 @@ impl WorkbenchUi {
                 if r.on_hover_text("One report for the whole project: summary with Win / Par / Lose and scores per device, flagged artifacts, blind test ranking, then every scene with its marks and details. PowerPoint, PDF or web page.").clicked() {
                     self.open_export();
                 }
+                let (mlabel, mtip) = match &self.measuring {
+                    Some(j) => (format!("Measuring {}/{}", j.done.load(Ordering::Relaxed), j.total), "Measuring the captures; click to stop".to_string()),
+                    None => ("Measure".to_string(), format!("Measure sharpness, noise, clipping and color of every capture, each scaled to {} px so devices are compared fairly. Shift+click measures everything again.", measure::MEASURE_SIDE)),
+                };
+                let r = widgets::labeled_icon_button(ui, if self.measuring.is_some() { I::SPINNER } else { I::GAUGE }, &mlabel, &mtip, self.measuring.is_some());
+                if r.clicked() {
+                    match &self.measuring {
+                        Some(j) => j.cancel.store(true, Ordering::Relaxed),
+                        None => {
+                            let all = ui.input(|i| i.modifiers.shift);
+                            self.start_measure(core, all);
+                        }
+                    }
+                }
                 if widgets::labeled_icon_button(ui, I::TABLE, "CSV", "Save scores, verdicts and notes per scene and device as a spreadsheet (CSV)", false).clicked() {
                     self.save_csv(core);
                 }
@@ -497,6 +603,44 @@ impl WorkbenchUi {
                 let list: Vec<String> = dups.iter().take(30).map(|(s, d, n)| format!("{}: {} has {n}", self.ws.project.scenes[*s].name, self.ws.project.display(d))).collect();
                 ui.label(RichText::new(format!("{}  {} scene{} with extra captures", I::WARNING, dups.len(), if dups.len() == 1 { "" } else { "s" })).size(text::SMALL).color(p.warn))
                     .on_hover_text(format!("Only the first capture of a device is compared and reported.\n{}", list.join("\n")));
+            }
+            let ids = self.ws.project.measured_ids();
+            if !ids.is_empty() {
+                ui.add_space(6.0);
+                widgets::section_title(ui, &p, "MEASURED (MEAN OVER SCENES)");
+                let means = self.ws.project.measure_means();
+                for id in &ids {
+                    let vals: Vec<(String, f64)> = means.iter().filter_map(|(d, m)| m.iter().find(|(k, _)| k == id).map(|(_, v)| (d.clone(), *v))).collect();
+                    if vals.is_empty() {
+                        continue;
+                    }
+                    let best = match measure::higher_is_better(id) {
+                        Some(true) => vals.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max),
+                        Some(false) => vals.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min),
+                        None => f64::NAN,
+                    };
+                    let dir = match measure::higher_is_better(id) {
+                        Some(true) => "higher is better",
+                        Some(false) => "lower is better",
+                        None => "",
+                    };
+                    ui.label(RichText::new(measure::name_of(id)).size(text::SMALL).color(p.text)).on_hover_text(format!("{} ({dir}). The best device is highlighted.", lumen_analysis::metrics::get(id).map(|m| m.info().name).unwrap_or(id)));
+                    for (d, v) in vals {
+                        let is_best = v == best;
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(self.ws.project.display(&d)).size(text::SMALL).color(p.muted));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let t = RichText::new(measure::fmt_value(id, v)).size(text::SMALL);
+                                ui.label(if is_best { t.color(p.ok).strong() } else { t.color(p.muted) });
+                            });
+                        });
+                    }
+                }
+                let left = self.ws.project.unmeasured().len();
+                if left > 0 {
+                    ui.label(RichText::new(format!("{left} capture{} not measured yet", if left == 1 { "" } else { "s" })).size(text::SMALL).color(p.faint));
+                }
             }
             let reviewed = self.ws.project.scenes.iter().filter(|s| s.done).count();
             ui.label(RichText::new(format!("{reviewed} of {} scenes reviewed", self.ws.project.scenes.len())).size(text::SMALL).color(p.muted));
@@ -620,6 +764,14 @@ impl WorkbenchUi {
                         let br = Rect::from_min_size(Pos2::new(tr.max.x - w - 4.0, tr.min.y + 4.0), Vec2::new(w, 17.0));
                         ui.painter().rect_filled(br, CornerRadius::same(8), rgb(v.color()));
                         ui.painter().text(br.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.5), Color32::WHITE);
+                    }
+                    let measured = scene.measure(d).filter(|m| !m.values.is_empty());
+                    if sc.is_none_or(|s| s.attrs.is_empty()) && measured.is_some() {
+                        let m = measured.expect("checked");
+                        let line = measure::MEASURES.iter().filter_map(|(id, name)| m.values.get(*id).map(|v| format!("{} {}", short(name), measure::fmt_value(id, *v)))).take(3).collect::<Vec<_>>().join("  ");
+                        let g = ui.painter().layout_no_wrap(line, FontId::proportional(text::CAPTION), p.faint);
+                        let clip = Rect::from_min_max(Pos2::new(cell.min.x, tr.max.y + 2.0), Pos2::new(cell.max.x, cell.max.y));
+                        ui.painter().with_clip_rect(clip).galley(Pos2::new(cell.min.x + 2.0, tr.max.y + 4.0), g, p.faint);
                     }
                     if let Some(s) = sc.filter(|s| !s.attrs.is_empty()) {
                         let line = attrs.iter().filter_map(|a| s.attrs.get(a).map(|v| format!("{} {v}", short(a)))).collect::<Vec<_>>().join("  ");
@@ -837,6 +989,9 @@ impl WorkbenchUi {
                 s.scores = o.scores.clone();
                 s.comment = o.comment.clone();
                 s.done = o.done;
+                if s.shots == o.shots {
+                    s.measures = o.measures.clone();
+                }
             }
         }
         p.normalize();

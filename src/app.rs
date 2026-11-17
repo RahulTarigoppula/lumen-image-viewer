@@ -2634,9 +2634,29 @@ impl App {
     /// Show scene `k` of the project in Compare.
     fn open_scene(&mut self, k: usize) {
         let Some(w) = &self.workbench else { return };
-        let (files, link) = w.link_for(k);
+        let (files, mut link) = w.link_for(k);
         if files.len() < 2 {
             self.core.toasts.info("This scene has a capture from one device only");
+            return;
+        }
+        // Video captures open in video compare (up to four, from their start).
+        let videos = files.iter().filter(|f| crate::video::is_video_ext(&crate::formats::ext_of(f))).count();
+        if videos == files.len() {
+            self.video = Some(crate::video::VideoMode::new(files, &self.core));
+            self.mode = Mode::Video;
+            return;
+        }
+        if videos > 0 {
+            self.core.toasts.info("This scene mixes photos and videos: only the photos are compared");
+        }
+        let keep: Vec<bool> = files.iter().map(|f| !crate::video::is_video_ext(&crate::formats::ext_of(f))).collect();
+        fn pick<T>(v: Vec<T>, keep: &[bool]) -> Vec<T> {
+            v.into_iter().zip(keep).filter(|(_, k)| **k).map(|(x, _)| x).collect()
+        }
+        link.labels = pick(std::mem::take(&mut link.labels), &keep);
+        link.colors = pick(std::mem::take(&mut link.colors), &keep);
+        let files: Vec<PathBuf> = pick(files, &keep);
+        if files.len() < 2 {
             return;
         }
         let scorecard = self.compare.as_ref().map(|c| c.scorecard).unwrap_or(true);
