@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (in progress)
+## 2.0.0 (17 November 2026)
 
 Lumen becomes an image quality workbench: whole camera comparison rounds,
 not one comparison at a time.

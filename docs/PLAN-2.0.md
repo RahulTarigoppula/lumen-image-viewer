@@ -34,3 +34,11 @@ answered with defaults that work for most teams and can be changed later.
 3. Workstreams 1, 2, 3 (the workbench) form the core of 2.0.
 4. Workstream 7 and integration of alignment into Compare and reports.
 5. Performance pass, documentation, version 2.0.0.
+
+## Status (17 November 2026)
+
+All eight workstreams are in 2.0.0. Every change was built and tested in CI on Windows (FFmpeg and AI included), and
+the UI smoke test drives the real app through 13 scenarios with screenshots on every push (`tools/ui-smoke`).
+
+Next candidates: region-aware metrics (faces, sky), HDR (Ultra HDR gain maps, HDR10 video), a company report
+template, VMAF for video pairs, remappable Compare shortcuts.

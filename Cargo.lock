@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-ai"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "ab_glyph",
  "base64",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-analysis"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "blake3",
  "butteraugli",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-core"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
