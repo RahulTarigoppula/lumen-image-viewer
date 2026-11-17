@@ -792,6 +792,37 @@ mod tests {
         dst
     }
 
+    /// Old against new kernels on one thread, in the same process (less
+    /// sensitive to the machine than the parallel timings):
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_filters_old_vs_new() {
+        let img = RgbaImage::from_fn(4000, 3000, |x, y| image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x ^ y) % 256) as u8, 255]));
+        let (w, h) = (4000usize, 3000usize);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let time = |f: &dyn Fn()| {
+            (0..3)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        pool.install(|| {
+            let pair = |name: &str, old: &dyn Fn(), new: &dyn Fn()| eprintln!("1 thread 12 MP {name:>10}: old {:8.1} ms, new {:8.1} ms", time(old), time(new));
+            pair("motion 40", &|| drop(old_motion_blur(&img, 30.0, 40.0)), &|| drop(motion_blur(&img, 30.0, 40.0)));
+            pair("gauss 2", &|| drop(old_gauss_small(img.as_raw(), w, h, 2.0)), &|| drop(gaussian_raw(img.as_raw(), w, h, 2.0)));
+            pair("box_h 20", &|| drop(old_box_h(img.as_raw(), w, 20)), &|| {
+                let mut out = vec![0u8; img.as_raw().len()];
+                box_h(img.as_raw(), &mut out, w, h, 20);
+            });
+            pair("median 3", &|| drop(tiled(&img, 1, |t| median_tile_scalar(t, 1))), &|| drop(median(&img, 1)));
+            pair("median 5", &|| drop(tiled(&img, 2, |t| median_tile_scalar(t, 2))), &|| drop(median(&img, 2)));
+        });
+    }
+
     #[test]
     fn box_h_matches_reference() {
         for (w, h) in [(1usize, 3usize), (5, 4), (40, 6), (257, 3)] {
