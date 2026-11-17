@@ -78,3 +78,52 @@ pub fn half(src: &RgbaImage) -> RgbaImage {
     }
     dst
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// Deterministic photo-like content (smooth gradients plus noise).
+    pub(crate) fn synth(w: u32, h: u32, alpha: bool) -> RgbaImage {
+        let mut s = 0x9E37_79B9u32;
+        let mut v = Vec::with_capacity(w as usize * h as usize * 4);
+        for y in 0..h {
+            for x in 0..w {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let n = (s & 15) as u8;
+                let a = if alpha { ((x * 7 + y * 3) % 256) as u8 } else { 255 };
+                v.extend_from_slice(&[((x * 255 / w) as u8).wrapping_add(n), ((y * 255 / h) as u8).wrapping_add(n), ((x ^ y) as u8) / 2 + n, a]);
+            }
+        }
+        RgbaImage::from_raw(w, h, v).unwrap()
+    }
+
+    pub(crate) fn best_ms(runs: usize, mut f: impl FnMut()) -> f64 {
+        (0..runs)
+            .map(|_| {
+                let s = std::time::Instant::now();
+                f();
+                s.elapsed().as_secs_f64() * 1000.0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_imaging() {
+        for (w, h, alpha) in [(6000, 4000, false), (6000, 4000, true), (12000, 8000, false)] {
+            let img = synth(w, h, alpha);
+            let t = best_ms(5, || {
+                std::hint::black_box(half(&img));
+            });
+            eprintln!("half {w}x{h} alpha={alpha}: {t:.2} ms");
+            let t = best_ms(5, || {
+                std::hint::black_box(resize_to_fit(&img, 384, 384));
+            });
+            eprintln!("resize_to_fit 384 {w}x{h} alpha={alpha}: {t:.2} ms");
+        }
+    }
+}

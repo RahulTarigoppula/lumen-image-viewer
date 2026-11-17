@@ -804,6 +804,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_decode() {
+        use crate::imaging::tests::{best_ms, synth};
+        let (w, h) = (6000u32, 4000u32);
+        let img = synth(w, h, false);
+        let rgb = crate::encode::flatten_rgb(&img, [0, 0, 0]);
+        let mut jpg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpg, 90).encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).unwrap();
+        let opts = DecodeOptions { color_manage: true, animations: false };
+        let t = best_ms(3, || {
+            std::hint::black_box(decode_bytes(&jpg, "jpg", opts).unwrap());
+        });
+        eprintln!("decode_bytes 24 MP JPEG: {t:.2} ms");
+        let rgb_img = image::RgbImage::from_raw(w, h, rgb).unwrap();
+        let mut total = 0.0;
+        for _ in 0..3 {
+            let d = DynamicImage::ImageRgb8(rgb_img.clone());
+            let s = std::time::Instant::now();
+            std::hint::black_box(to_rgba8(d));
+            let e = s.elapsed().as_secs_f64() * 1000.0;
+            total = if total == 0.0 { e } else { f64::min(total, e) };
+        }
+        eprintln!("to_rgba8 Rgb8 24 MP: {total:.2} ms");
+        for o in 2..=8u8 {
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let c = img.clone();
+                let s = std::time::Instant::now();
+                std::hint::black_box(apply_orientation(c, o));
+                best = best.min(s.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!("apply_orientation {o} 24 MP: {best:.2} ms");
+        }
+        let t = best_ms(5, || {
+            std::hint::black_box(image_has_alpha(&img));
+        });
+        eprintln!("image_has_alpha 24 MP: {t:.2} ms");
+    }
+
     #[test]
     fn new_formats_via_files() {
         let d = tmpdir("formats");

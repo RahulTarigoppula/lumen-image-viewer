@@ -328,6 +328,62 @@ mod tests {
         assert!(!matches_filter("Holiday_Beach_01.JPG", "beach .png"));
         assert!(matches_filter("x", "  "));
     }
+    fn entries_10k() -> Vec<Entry> {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        (0..10_000u64)
+            .map(|i| {
+                let k = (i * 7919) % 10_000;
+                let name = match i % 4 {
+                    0 => format!("IMG_{k:04}.JPG"),
+                    1 => format!("DSC{k}.jpg"),
+                    2 => format!("Holiday 2024 - beach {k} (edit).png"),
+                    _ => format!("20240{}{:02}_{k:06}.jpeg", k % 9 + 1, k % 28 + 1),
+                };
+                let path = PathBuf::from(format!(r"C:\Users\someone\Pictures\Trips\{name}"));
+                Entry { ext: formats::ext_of(&path), path, name, kind: EntryKind::Image, size: k * 1000, modified: Some(t0 + std::time::Duration::from_secs(k * 37)), created: None, hidden: false }
+            })
+            .collect()
+    }
+
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_sort() {
+        use std::collections::HashMap;
+        let base = entries_10k();
+        let taken: HashMap<PathBuf, i64> = base.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(i, e)| (e.path.clone(), 1_600_000_000 + (i as i64 * 7907) % 100_000)).collect();
+        let dims = |_: &Path| -> Option<(u32, u32)> { None };
+        let tk = |p: &Path| taken.get(p).copied();
+        let zero = |_: &Path| 0u8;
+        let no = |_: &Path| false;
+        let cx = SortContext { dims: &dims, taken: &tk, rating: &zero, flagged: &no, label: &zero };
+        let best = |f: &dyn Fn()| {
+            (0..5)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        for key in [SortKey::Name, SortKey::Modified, SortKey::DateTaken] {
+            let t = best(&|| {
+                let mut v = base.clone();
+                sort_entries(&mut v, key, false, true, &cx);
+                std::hint::black_box(v);
+            });
+            eprintln!("sort 10k by {key:?}: {t:.2} ms (includes a 10k clone)");
+        }
+        let t = best(&|| {
+            std::hint::black_box(base.clone());
+        });
+        eprintln!("clone 10k entries: {t:.2} ms");
+        let t = best(&|| {
+            std::hint::black_box(base.iter().filter(|e| matches_filter(&e.name, "beach .png")).count());
+        });
+        eprintln!("filter 10k names: {t:.2} ms");
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(human_size(512), "512 B");

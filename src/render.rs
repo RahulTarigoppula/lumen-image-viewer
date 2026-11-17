@@ -380,6 +380,42 @@ mod tests {
         assert_eq!(ci.pixels[4 + 1], expect);
     }
 
+    /// `cargo test --release -p lumen --no-default-features -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_render() {
+        let mut s = 1u32;
+        let mut synth = |w: u32, h: u32, alpha: bool| {
+            RgbaImage::from_fn(w, h, |x, y| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (s >> 28) as u8;
+                image::Rgba([(x % 256) as u8 ^ n, (y % 256) as u8, n, if alpha { (x % 256) as u8 } else { 255 }])
+            })
+        };
+        let best = |f: &mut dyn FnMut()| {
+            (0..5)
+                .map(|_| {
+                    let s = Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        for alpha in [false, true] {
+            let img = Arc::new(synth(6000, 4000, alpha));
+            let t = best(&mut || {
+                std::hint::black_box(build_pyramid(img.clone()));
+            });
+            eprintln!("build_pyramid 24 MP alpha={alpha}: {t:.2} ms");
+            let t = best(&mut || {
+                for k in 0..8 {
+                    std::hint::black_box(to_color_image_gutter(&img, k * TILE % 4000, 1024, TILE, TILE, GUTTER));
+                }
+            });
+            eprintln!("8 tile copies alpha={alpha}: {t:.2} ms");
+        }
+    }
+
     #[test]
     fn gutter_uv_maps_content() {
         let uv = gutter_uv(1024, 1000, 2);

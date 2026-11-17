@@ -327,6 +327,74 @@ fn write_cached(file: &Path, img: &image::RgbaImage, dims: Option<(u32, u32)>) -
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service with no worker threads, so requests stay queued.
+    fn idle_service() -> ThumbService {
+        let shared = Arc::new(Shared { jobs: Mutex::new(Vec::new()), cv: Condvar::new(), disk_cache: AtomicBool::new(false), min_seq: AtomicU64::new(0) });
+        let (_tx, rx) = unbounded();
+        ThumbService {
+            shared,
+            rx,
+            textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
+            pending: HashMap::new(),
+            failed: HashSet::new(),
+            seq: 0,
+            gen: 0,
+            ctx: egui::Context::default(),
+            cache_dir: std::env::temp_dir(),
+        }
+    }
+
+    fn job_seq(j: &Job) -> u64 {
+        j.seq
+    }
+
+    fn key(i: usize) -> ThumbKey {
+        ThumbKey::new(Path::new(&format!(r"C:\Users\someone\Pictures\Holiday 2024\IMG_{i:05}.jpg")), 3_000_000 + i as u64, None)
+    }
+
+    #[test]
+    fn rerequest_bumps_priority_of_queued_job() {
+        let mut s = idle_service();
+        for i in 0..10 {
+            assert!(matches!(s.get(&key(i)), Thumb::Pending));
+        }
+        // Asking again for an older one makes it the newest request.
+        s.get(&key(2));
+        let jobs = s.shared.jobs.lock();
+        assert_eq!(jobs.len(), 10);
+        let newest = jobs.iter().max_by_key(|j| job_seq(j)).unwrap();
+        assert!(newest.key == key(2));
+    }
+
+    /// Frame cost of re-requesting visible thumbnails while a long queue is
+    /// waiting (fast scrolling through a 10,000-file folder).
+    /// `cargo test --release -p lumen --no-default-features -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_thumb_requests() {
+        let mut s = idle_service();
+        let keys: Vec<ThumbKey> = (0..4000).map(key).collect();
+        for k in &keys {
+            s.get(k);
+        }
+        let frames = 200;
+        let start = std::time::Instant::now();
+        for f in 0..frames {
+            s.begin_frame();
+            // 60 visible cells, a window that moves through the queue.
+            let base = (f * 17) % (keys.len() - 60);
+            for k in &keys[base..base + 60] {
+                std::hint::black_box(matches!(s.get(k), Thumb::Pending));
+            }
+        }
+        eprintln!("60 pending thumbnail requests with 4000 queued: {:.3} ms per frame", start.elapsed().as_secs_f64() * 1000.0 / frames as f64);
+    }
+}
+
 /// Delete the oldest cache files until the folder is under `limit` bytes.
 pub fn prune_disk_cache(dir: &Path, limit: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };

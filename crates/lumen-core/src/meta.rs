@@ -218,3 +218,97 @@ impl MetaService {
         self.requested.remove(path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type IfdEntry = (u16, u16, u32, Vec<u8>);
+
+    /// A camera-like EXIF blob: `n0` ASCII tags in IFD0, then an EXIF IFD with
+    /// DateTimeOriginal and `n1` rational tags.
+    fn exif_blob(n0: u16, n1: u16) -> Vec<u8> {
+        let ifd0: Vec<IfdEntry> = (0..n0).map(|i| (0xE000 + i, 2u16, 24u32, format!("Value number {i:>10}\0").into_bytes())).collect();
+        let mut ifd1: Vec<IfdEntry> = vec![(0x9003, 2, 20, b"2021:06:15 10:20:30\0".to_vec())];
+        ifd1.extend((0..n1).map(|i| (0xE100 + i, 5u16, 1u32, [(i as u32 + 1).to_le_bytes(), 7u32.to_le_bytes()].concat())));
+        let size = |n: usize| 2 + 12 * n + 4;
+        let ifd0_at = 8usize;
+        let data0_at = ifd0_at + size(ifd0.len() + 1);
+        let data0_len: usize = ifd0.iter().map(|e| e.3.len()).sum();
+        let ifd1_at = data0_at + data0_len;
+        let data1_at = ifd1_at + size(ifd1.len());
+        let mut v = b"II*\0".to_vec();
+        v.extend_from_slice(&(ifd0_at as u32).to_le_bytes());
+        let write_ifd = |v: &mut Vec<u8>, entries: &[IfdEntry], mut data_at: usize, exif_ptr: Option<u32>| {
+            v.extend_from_slice(&((entries.len() + exif_ptr.is_some() as usize) as u16).to_le_bytes());
+            for (tag, ty, n, payload) in entries {
+                v.extend_from_slice(&tag.to_le_bytes());
+                v.extend_from_slice(&ty.to_le_bytes());
+                v.extend_from_slice(&n.to_le_bytes());
+                v.extend_from_slice(&(data_at as u32).to_le_bytes());
+                data_at += payload.len();
+            }
+            if let Some(p) = exif_ptr {
+                v.extend_from_slice(&0x8769u16.to_le_bytes());
+                v.extend_from_slice(&4u16.to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes());
+                v.extend_from_slice(&p.to_le_bytes());
+            }
+            v.extend_from_slice(&0u32.to_le_bytes());
+            for e in entries {
+                v.extend_from_slice(&e.3);
+            }
+        };
+        write_ifd(&mut v, &ifd0, data0_at, Some(ifd1_at as u32));
+        assert_eq!(v.len(), ifd1_at);
+        write_ifd(&mut v, &ifd1, data1_at, None);
+        v
+    }
+
+    fn jpeg_with_exif() -> Vec<u8> {
+        let rgb = vec![120u8; 64 * 48 * 3];
+        let mut out = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut out, 90);
+        enc.add_exif_metadata(&exif_blob(40, 40)).unwrap();
+        enc.encode(&rgb, 64, 48, jpeg_encoder::ColorType::Rgb).unwrap();
+        out
+    }
+
+    fn temp_jpeg(tag: &str) -> (PathBuf, PathBuf) {
+        let d = std::env::temp_dir().join(format!("lumen-meta-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("a.jpg");
+        std::fs::write(&p, jpeg_with_exif()).unwrap();
+        (d, p)
+    }
+
+    #[test]
+    fn read_taken_matches_summary() {
+        let (d, p) = temp_jpeg("taken");
+        let s = read_exif(&p).unwrap();
+        assert!(s.all.len() > 40, "{}", s.all.len());
+        assert_eq!(s.taken.as_deref(), Some("2021-06-15 10:20:30"));
+        assert!(s.taken_ts.is_some());
+        assert_eq!(read_taken(&p), s.taken_ts);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_meta() {
+        let (d, p) = temp_jpeg("bench");
+        let n = 500;
+        let time = |f: &dyn Fn() -> Option<i64>| {
+            let s = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(f());
+            }
+            s.elapsed().as_secs_f64() * 1e6 / n as f64
+        };
+        eprintln!("read_exif(..).taken_ts: {:.1} us per file", time(&|| read_exif(&p).and_then(|e| e.taken_ts)));
+        eprintln!("read_taken: {:.1} us per file", time(&|| read_taken(&p)));
+        eprintln!("probe_dimensions: {:.1} us per file", time(&|| crate::decode::probe_dimensions(&p).map(|d| d.0 as i64)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

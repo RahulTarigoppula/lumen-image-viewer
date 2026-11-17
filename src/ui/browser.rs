@@ -1452,7 +1452,7 @@ impl Browser {
             s += &format!(", {folders} folder{}", if folders == 1 { "" } else { "s" });
         }
         if !self.selected.is_empty() {
-            let (n, bytes) = self.entries.iter().filter(|e| self.selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size));
+            let (n, bytes) = selection_totals(&self.entries, &self.selected);
             if n > 0 {
                 s += &format!("   ·   {n} selected ({})", catalog::human_size(bytes));
             }
@@ -1576,6 +1576,60 @@ fn clamp_anchor(anchor: Option<usize>, fallback: usize, len: usize) -> usize {
     match anchor {
         Some(a) if a < len => a,
         _ => fallback.min(last),
+    }
+}
+
+/// Number and total size of the entries whose path is in `selected` (the
+/// status bar shows it every frame).
+fn selection_totals(entries: &[Entry], selected: &HashSet<PathBuf>) -> (usize, u64) {
+    entries.iter().filter(|e| selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn entries(n: usize) -> Vec<Entry> {
+        (0..n)
+            .map(|i| {
+                let path = PathBuf::from(format!(r"C:\Users\someone\Pictures\Holiday 2024\IMG_{i:05}.jpg"));
+                Entry { name: format!("IMG_{i:05}.jpg"), ext: "jpg".into(), path, kind: EntryKind::Image, size: 1000 + i as u64, modified: None, created: None, hidden: false }
+            })
+            .collect()
+    }
+
+    fn reference(entries: &[Entry], selected: &HashSet<PathBuf>) -> (usize, u64) {
+        entries.iter().filter(|e| selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size))
+    }
+
+    #[test]
+    fn totals_match_the_set_lookup() {
+        let e = entries(300);
+        let mut s: HashSet<PathBuf> = HashSet::new();
+        assert_eq!(selection_totals(&e, &s), (0, 0));
+        for step in [1usize, 7, 31, 97] {
+            s = e.iter().step_by(step).map(|e| e.path.clone()).collect();
+            assert_eq!(selection_totals(&e, &s), reference(&e, &s), "step {step}");
+        }
+        // A selected path that is no longer listed (and one spelled differently).
+        s = [e[3].path.clone(), PathBuf::from(r"C:\gone.jpg"), PathBuf::from(r"C:/Users/someone/Pictures/Holiday 2024/IMG_00005.jpg")].into_iter().collect();
+        assert_eq!(selection_totals(&e, &s), reference(&e, &s));
+    }
+
+    /// `cargo test --release -p lumen --no-default-features -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_selection_totals() {
+        let e = entries(10_000);
+        for k in [1usize, 4, 100, 10_000] {
+            let s: HashSet<PathBuf> = e.iter().step_by(e.len() / k).take(k).map(|e| e.path.clone()).collect();
+            let n = 200;
+            let start = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(selection_totals(&e, &s));
+            }
+            eprintln!("selection_totals 10k entries, {k} selected: {:.3} ms per frame", start.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        }
     }
 }
 
