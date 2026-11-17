@@ -2,11 +2,14 @@
 //! videos (side by side, wipe, difference) with start points, metrics,
 //! scopes, frame index timeline and media info.
 
+use super::align::{self, AlignJob, Outcome};
 use super::audio::AudioOut;
 use super::engine::{self, Cmd, Event, IndexEntry, MediaInfo, Player, VFrame};
 use super::metrics::{self, FrameMetrics};
 use super::scopes::{self, HistMode, Scope};
 use super::sync::{self, Loop, View, LETTERS, MAX_VIDEOS};
+use super::timealign::Confidence;
+use super::timing::{self, IssueKind, TimingReport};
 use crate::app::Core;
 use crate::ui::commands::Command;
 use crate::ui::icons as I;
@@ -143,6 +146,8 @@ struct Source {
     index: engine::SharedIndex,
     index_progress: Arc<AtomicU32>,
     index_cancel: Arc<AtomicBool>,
+    /// Frame timing checks, made from the index once it is built.
+    timing: Arc<Mutex<Option<Arc<TimingReport>>>>,
     eof: bool,
     out_size: (u32, u32),
     /// A new decode size waiting for the window to settle.
@@ -170,13 +175,19 @@ impl Source {
         let player = Player::open(path, audio, index.clone(), ctx.clone())?;
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
+        let timing_slot: Arc<Mutex<Option<Arc<TimingReport>>>> = Arc::new(Mutex::new(None));
         {
-            let (index, progress, cancel, path, ctx) = (index.clone(), progress.clone(), cancel.clone(), path.to_path_buf(), ctx.clone());
+            let (index, progress, cancel, path, ctx, timing_slot) = (index.clone(), progress.clone(), cancel.clone(), path.to_path_buf(), ctx.clone(), timing_slot.clone());
+            // The rate the file states: r_frame_rate unless it is a time base
+            // in disguise (90000), else the average.
+            let declared = if info.fps > 0.0 && info.fps <= 1000.0 { info.fps } else { info.avg_fps };
             std::thread::spawn(move || {
                 let p2 = progress.clone();
                 let res = engine::build_index(&path, &cancel, &|f| p2.store(f.to_bits(), Ordering::Relaxed));
                 if let Ok(v) = res {
+                    let stamps: Vec<timing::FrameStamp> = v.iter().map(|e| timing::FrameStamp { pts: e.pts, size: e.size, key: e.key, repeats: e.repeats as u32 }).collect();
                     *index.lock() = Some(v);
+                    *timing_slot.lock() = Some(Arc::new(timing::analyze(&stamps, declared)));
                 }
                 progress.store(1.0f32.to_bits(), Ordering::Relaxed);
                 ctx.request_repaint();
@@ -196,6 +207,7 @@ impl Source {
             index,
             index_progress: progress,
             index_cancel: cancel,
+            timing: timing_slot,
             eof: false,
             out_size: out,
             out_wait: sync::Debounce::default(),
@@ -212,6 +224,16 @@ impl Source {
 
     fn name(&self) -> String {
         crate::ui::viewer::file_name(&self.path)
+    }
+
+    /// The frame timing checks (once the index is built).
+    fn timing(&self) -> Option<Arc<TimingReport>> {
+        self.timing.lock().clone()
+    }
+
+    /// The frame index is being built.
+    fn indexing(&self) -> bool {
+        f32::from_bits(self.index_progress.load(Ordering::Relaxed)) < 1.0
     }
 
     fn fps(&self) -> f64 {
@@ -504,6 +526,43 @@ struct Analysis {
     bit_max: f64,
 }
 
+/// The last auto-align: what it found, and the start points before and
+/// after it (Undo puts the old ones back while the new ones are unchanged).
+struct AlignResult {
+    paths: Vec<PathBuf>,
+    outcomes: Vec<Outcome>,
+    before: Vec<Option<f64>>,
+    before_sync: SyncMode,
+    after: Vec<Option<f64>>,
+    /// At least one start point was set.
+    applied: bool,
+}
+
+/// An auto-align result is used (its start point set) from this confidence on.
+const ALIGN_MIN: Confidence = Confidence::Low;
+
+const ALIGN_TIP: &str = "Auto-align start points: compare how the picture changes over the first 45 seconds of every video (motion, lights, cuts) to find how far apart they started, then set the start points so they play in step. Works across phones with different exposure and frame rates; Undo in the Info panel";
+
+/// What to call a video whose start point moved by `off` seconds against A.
+fn fmt_offset(off: f64) -> String {
+    if off.abs() < 5e-4 {
+        "with A".into()
+    } else {
+        format!("A {} {:.3} s", if off > 0.0 { "+" } else { "-" }, off.abs())
+    }
+}
+
+/// One auto-align outcome in words, and whether it is trustworthy.
+fn outcome_text(o: &Outcome) -> (String, bool) {
+    match o {
+        Outcome::Reference => ("reference".into(), true),
+        Outcome::Found(a) if a.level() >= ALIGN_MIN => (format!("{}, {}", fmt_offset(a.offset), a.level().label()), a.level() > Confidence::Low),
+        Outcome::Found(a) => (format!("no match (best guess {}), not set", fmt_offset(a.offset)), false),
+        Outcome::NoSignal => ("too little changes in the picture, not set".into(), false),
+        Outcome::Failed(e) => (format!("could not be read ({e}), not set"), false),
+    }
+}
+
 /// What a frame save job does with the decoded frames.
 #[derive(Clone)]
 enum SaveTarget {
@@ -794,6 +853,9 @@ pub struct VideoMode {
     /// The audio clock's last value and when it changed (a stalled clock
     /// is ignored).
     audio_seen: Option<(f64, Instant)>,
+    /// Auto-align of the start points while it runs, then what it found.
+    align_job: Option<AlignJob>,
+    align_result: Option<AlignResult>,
 }
 
 impl VideoMode {
@@ -847,6 +909,8 @@ impl VideoMode {
             metrics_native: false,
             pane_px: Vec2::new(1280.0, 720.0),
             audio_seen: None,
+            align_job: None,
+            align_result: None,
         };
         for p in paths.into_iter().take(MAX_VIDEOS) {
             vm.add_source(&p, &core.ctx);
@@ -1166,6 +1230,144 @@ impl VideoMode {
         }
         let lead = self.lead();
         self.clock.base_pts = self.sources[lead].start.unwrap_or(0.0);
+    }
+
+    // ---------------------------------------------------------------- auto-align
+
+    fn source_paths(&self) -> Vec<PathBuf> {
+        self.sources.iter().map(|s| s.path.clone()).collect()
+    }
+
+    /// Start estimating every video's start point against A.
+    fn start_auto_align(&mut self, ctx: &egui::Context) {
+        if self.sources.len() < 2 || self.align_job.is_some() {
+            return;
+        }
+        self.pause();
+        let videos = self.sources.iter().map(|s| (s.path.clone(), s.info.rotation)).collect();
+        self.align_job = Some(AlignJob::start(videos, ctx.clone()));
+    }
+
+    fn cancel_auto_align(&mut self) {
+        if let Some(job) = self.align_job.take() {
+            job.cancel();
+        }
+    }
+
+    /// Apply a finished auto-align (once).
+    fn poll_auto_align(&mut self, core: &mut Core) {
+        if self.align_job.is_none() {
+            return;
+        }
+        let paths = self.source_paths();
+        let Some(job) = &self.align_job else { return };
+        if job.paths != paths {
+            // Videos were added, removed or swapped: the result would not fit.
+            self.cancel_auto_align();
+            return;
+        }
+        let polled = job.poll();
+        match polled {
+            None => core.ctx.request_repaint_after(Duration::from_millis(250)),
+            Some(res) => {
+                self.align_job = None;
+                match res {
+                    Ok(outcomes) => self.apply_alignment(outcomes, core),
+                    Err(e) if align::is_cancelled(&e) => {}
+                    Err(e) => core.toasts.error(format!("Auto-align failed: {e}")),
+                }
+            }
+        }
+    }
+
+    /// Set the start points from auto-align's offsets: A keeps its start
+    /// point (moved later only so that no video would start before its
+    /// first frame), the others get A's plus their offset. Videos without a
+    /// usable match keep theirs.
+    fn apply_alignment(&mut self, outcomes: Vec<Outcome>, core: &mut Core) {
+        if outcomes.len() != self.sources.len() || self.sources.len() < 2 {
+            return;
+        }
+        let before = self.starts();
+        let before_sync = self.sync;
+        let offs: Vec<Option<f64>> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match o {
+                _ if i == 0 => Some(0.0),
+                Outcome::Found(a) if a.level() >= ALIGN_MIN => Some(a.offset),
+                _ => None,
+            })
+            .collect();
+        let applied = offs.iter().skip(1).any(|o| o.is_some());
+        if applied {
+            let lowest = offs.iter().flatten().fold(0.0f64, |m, &o| m.min(o));
+            let base = self.sources[0].start.unwrap_or(0.0).max(-lowest);
+            for (s, o) in self.sources.iter_mut().zip(&offs) {
+                if let Some(o) = o {
+                    s.start = Some(base + o);
+                }
+            }
+            self.sync = SyncMode::Linked;
+            self.analysis = None;
+            self.go_to_starts();
+        }
+        let list: Vec<String> = outcomes.iter().enumerate().skip(1).map(|(i, o)| format!("{} {}", letter(i), outcome_text(o).0)).collect();
+        if !applied {
+            core.toasts.error(format!("Auto-align found no reliable match: {}", list.join("; ")));
+        } else if outcomes.iter().all(|o| outcome_text(o).1) {
+            core.toasts.success(format!("Start points aligned: {}", list.join("; ")));
+        } else {
+            core.toasts.info(format!("Start points aligned, check the weak ones: {}", list.join("; ")));
+        }
+        if dev_dir().is_some() {
+            let items: Vec<String> = outcomes
+                .iter()
+                .enumerate()
+                .map(|(i, o)| match o {
+                    Outcome::Found(a) => format!("{}:{:.4}/{:.2}", letter(i), a.offset, a.confidence),
+                    other => format!("{}:{other:?}", letter(i)),
+                })
+                .collect();
+            dev_log(&format!("autoalign {}", items.join(" ")));
+        }
+        self.align_result = Some(AlignResult { paths: self.source_paths(), outcomes, before, before_sync, after: self.starts(), applied });
+    }
+
+    /// Auto-align's start points are still in place and can be undone.
+    fn can_undo_align(&self) -> bool {
+        self.align_result.as_ref().is_some_and(|r| r.applied && r.paths == self.source_paths() && r.after == self.starts())
+    }
+
+    /// Put back the start points from before auto-align.
+    fn undo_auto_align(&mut self, core: &mut Core) {
+        if !self.can_undo_align() {
+            return;
+        }
+        let Some(r) = self.align_result.take() else { return };
+        for (s, b) in self.sources.iter_mut().zip(&r.before) {
+            s.start = *b;
+        }
+        self.sync = r.before_sync;
+        self.analysis = None;
+        self.go_to_starts();
+        core.toasts.info("Start points are back as they were before auto-align");
+    }
+
+    /// Show video `i` at its own time `t` (a frame timing problem): every
+    /// video moves when linked, only `i` when independent.
+    fn show_at(&mut self, i: usize, t: f64) {
+        if i >= self.sources.len() {
+            return;
+        }
+        if self.sync == SyncMode::Independent && self.sources.len() > 1 {
+            self.select(i);
+            self.seek_all(t, true);
+        } else {
+            let lead = self.lead();
+            let t = sync::target(t, i, lead, &self.offsets());
+            self.seek_all(t, true);
+        }
     }
 
     // ---------------------------------------------------------------- playback
@@ -1561,7 +1763,13 @@ impl VideoMode {
         let Some(an) = &self.analysis else { return };
         let rows = an.rows.lock().clone();
         let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("lumen_metrics.csv").save_file() else { return };
-        match std::fs::write(&p, metrics::to_csv(&rows)) {
+        // The frame timing of A and B as comments under the title line.
+        let mut csv = metrics::to_csv(&rows);
+        let notes: String = self.sources.iter().take(2).enumerate().filter_map(|(i, s)| s.timing().map(|r| format!("# {} frame timing ({}): {}\n", letter(i), s.name(), r.verdict))).collect();
+        if let Some(nl) = csv.find('\n') {
+            csv.insert_str(nl + 1, &notes);
+        }
+        match std::fs::write(&p, csv) {
             Ok(()) => core.toasts.success(format!("Exported {}", p.display())),
             Err(e) => core.toasts.error(e.to_string()),
         }
@@ -1583,6 +1791,7 @@ impl VideoMode {
         }
 
         self.poll_snapshot(core);
+        self.poll_auto_align(core);
         // Poll decoders.
         let playing = self.playing;
         for s in &mut self.sources {
@@ -1661,8 +1870,8 @@ impl VideoMode {
             // Wide: names on the buttons. Narrow: icons, then the compare and
             // sync controls move into a menu.
             let pair_extra = if n == 2 { if self.mode == CompareMode::Difference { 650.0 } else { 400.0 } } else { 0.0 };
-            let labels = avail >= 1250.0 + pair_extra;
-            let inline_need = 760.0 + pair_extra * 0.6;
+            let labels = avail >= 1350.0 + pair_extra;
+            let inline_need = 800.0 + pair_extra * 0.6;
             let inline = n < 2 || avail >= inline_need;
             if avail >= 620.0 {
                 let title = if avail < 900.0 { I::FILM_STRIP.to_string() } else { format!("{}  Video", I::FILM_STRIP) };
@@ -1703,7 +1912,7 @@ impl VideoMode {
                 if n == 0 {
                     return;
                 }
-                if button(ui, I::INFO, "Info", "Info and metrics: the current frame, start points, quality of B against A and media details (I)", self.show_info).clicked() {
+                if button(ui, I::INFO, "Info", "Info and metrics: the current frame, start points and auto-align, quality of B against A, frame timing (dropped and duplicated frames) and media details (I)", self.show_info).clicked() {
                     self.show_info = !self.show_info;
                 }
                 let scopes_tip = if n > 1 { "Scopes for every video (F2): waveform, RGB parade, vectorscope and histogram show brightness and color levels" } else { "Scopes (F2): waveform, RGB parade, vectorscope and histogram show brightness and color levels" };
@@ -1813,6 +2022,16 @@ impl VideoMode {
                 self.clear_starts();
                 ui.close();
             }
+            let running = self.align_job.is_some();
+            let (label, tip) = if running { ("Cancel auto-align", "Stop auto-align; the start points stay as they are") } else { ("Auto-align start points", ALIGN_TIP) };
+            if widgets::menu_item(ui, I::MAGIC_WAND, label, "").on_hover_text(tip).clicked() {
+                if running {
+                    self.cancel_auto_align();
+                } else {
+                    self.start_auto_align(&core.ctx);
+                }
+                ui.close();
+            }
             if n == 2 {
                 ui.separator();
                 if widgets::menu_item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X").clicked() {
@@ -1832,6 +2051,20 @@ impl VideoMode {
             }
             if any && widgets::icon_button(ui, I::X, clear_tip, false).clicked() {
                 self.clear_starts();
+            }
+            let running = self.align_job.is_some();
+            let tip = if running { "Auto-align is running: click to stop it (the start points stay as they are)" } else { ALIGN_TIP };
+            let r = if labels { widgets::labeled_icon_button(ui, I::MAGIC_WAND, "Auto-align", tip, running) } else { widgets::icon_button(ui, I::MAGIC_WAND, tip, running) };
+            if r.clicked() {
+                if running {
+                    self.cancel_auto_align();
+                } else {
+                    self.start_auto_align(&core.ctx);
+                }
+            }
+            if let Some(job) = &self.align_job {
+                ui.label(RichText::new(format!("{:.0}%", job.progress() * 100.0)).size(theme::text::SMALL).color(p.muted))
+                    .on_hover_text("Auto-align: decoding the first 45 seconds of every video at low resolution");
             }
             if n == 2 {
                 widgets::separator_v(ui);
@@ -2960,6 +3193,8 @@ impl VideoMode {
                     };
                     widgets::kv_row(ui, &p, letter(i), &if i == 0 && s.start.is_none() { "not set (from the first frame)".into() } else { text });
                 }
+                ui.add_space(4.0);
+                self.align_section(ui, core);
                 ui.add_space(8.0);
                 widgets::section_title(ui, &p, "Quality: B compared with A");
                 match &self.metrics_now {
@@ -3041,6 +3276,8 @@ impl VideoMode {
                 }
             }
             ui.add_space(8.0);
+            self.timing_section(ui, core);
+            ui.add_space(8.0);
             widgets::section_title(ui, &p, "Media info");
             let durations: Vec<f64> = self.sources.iter().map(|s| s.duration()).collect();
             let rows = media_rows(&self.sources.iter().map(|s| &s.info).collect::<Vec<_>>(), &durations);
@@ -3048,6 +3285,159 @@ impl VideoMode {
             ui.add_space(6.0);
             ui.label(RichText::new(format!("Decoder: FFmpeg {}", engine::ffmpeg_version())).size(10.5).color(p.faint));
         });
+    }
+
+    /// Auto-align in the Info panel: the button (or its progress), what it
+    /// found and Undo.
+    fn align_section(&mut self, ui: &mut Ui, core: &mut Core) {
+        let p = core.pal;
+        if let Some(job) = &self.align_job {
+            let prog = job.progress();
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 72.0).max(60.0);
+                ui.add(egui::ProgressBar::new(prog).desired_width(w).text(format!("Aligning... {:.0}%", prog * 100.0)))
+                    .on_hover_text("Decoding the first 45 seconds of every video at low resolution");
+                cancel = ui.button("Cancel").on_hover_text("Stop auto-align; the start points stay as they are").clicked();
+            });
+            if cancel {
+                self.cancel_auto_align();
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            return;
+        }
+        if ui.add(egui::Button::new(format!("{}  Auto-align start points", I::MAGIC_WAND)).min_size(Vec2::new(ui.available_width(), 28.0))).on_hover_text(ALIGN_TIP).clicked() {
+            self.start_auto_align(&core.ctx);
+        }
+        let paths = self.source_paths();
+        let Some(r) = self.align_result.as_ref().filter(|r| r.paths == paths) else { return };
+        let mut weak = false;
+        for (i, o) in r.outcomes.iter().enumerate().skip(1) {
+            let (text, good) = outcome_text(o);
+            weak |= !good;
+            let tip = match o {
+                Outcome::Found(a) => format!("Correlation {:.2} at this offset, {:.2} at the best other one: confidence {:.0}%", a.peak, a.second, a.confidence * 100.0),
+                _ => "Auto-align could not use this video".to_string(),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(letter(i)).strong().color(letter_color(&p, i)));
+                ui.add(egui::Label::new(RichText::new(text).size(theme::text::SMALL).color(if good { p.text } else { p.warn })).wrap()).on_hover_text(tip);
+            });
+        }
+        if weak {
+            let msg = format!("{}  Not every video could be aligned with confidence. Check them side by side and fine-tune with Independent and , / .", I::WARNING);
+            ui.add(egui::Label::new(RichText::new(msg).size(theme::text::SMALL).color(p.warn)).wrap());
+        }
+        if self.can_undo_align() && ui.button(format!("{}  Undo auto-align", I::ARROW_COUNTER_CLOCKWISE)).on_hover_text("Put the start points back as they were before auto-align").clicked() {
+            self.undo_auto_align(core);
+        }
+    }
+
+    /// Frame timing in the Info panel, per video: the verdict, the numbers
+    /// and the problem places (click one to show it).
+    fn timing_section(&mut self, ui: &mut Ui, core: &mut Core) {
+        const MAX_PLACES: usize = 8;
+        let p = core.pal;
+        let compare = self.sources.len() > 1;
+        widgets::section_title(ui, &p, "Frame timing");
+        let plural = |n: u64, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+        let mut jump: Option<(usize, f64)> = None;
+        let mut any = false;
+        for (i, s) in self.sources.iter().enumerate() {
+            if compare {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(letter(i)).strong().color(letter_color(&p, i)));
+                    ui.add(egui::Label::new(RichText::new(s.name()).size(theme::text::SMALL).color(p.muted)).truncate());
+                });
+            }
+            let Some(r) = s.timing() else {
+                let text = if s.indexing() {
+                    ui.ctx().request_repaint_after(Duration::from_millis(250));
+                    format!("Reading the frame index... {:.0}%", f32::from_bits(s.index_progress.load(Ordering::Relaxed)) * 100.0)
+                } else {
+                    "The frame index could not be read".to_string()
+                };
+                ui.label(RichText::new(text).size(theme::text::SMALL).color(p.muted));
+                ui.add_space(6.0);
+                continue;
+            };
+            any = true;
+            let (icon, color) = if r.smooth { (I::CHECK_CIRCLE, p.ok) } else { (I::WARNING, p.warn) };
+            ui.add(egui::Label::new(RichText::new(format!("{icon}  {}", r.verdict)).size(12.5).color(color)).wrap()).on_hover_text(
+                "Measured from the timestamp and size of every frame. A gap longer than 1.5 frame intervals means dropped frames; a non-key frame of only a few bytes usually repeats the picture before it",
+            );
+            let rate = if r.vfr {
+                format!("{} to {} fps, {} on average", timing::fmt_fps(r.min_fps), timing::fmt_fps(r.max_fps), timing::fmt_fps(r.measured_fps))
+            } else {
+                format!("{} fps", timing::fmt_fps(r.measured_fps))
+            };
+            let declared = if r.declared_fps > 0.0 && (r.declared_fps - r.measured_fps).abs() > 0.01 * r.declared_fps { format!("  ·  file says {}", timing::fmt_fps(r.declared_fps)) } else { String::new() };
+            widgets::kv_row(ui, &p, "Frame rate", &format!("{rate}{declared}"));
+            widgets::kv_row(ui, &p, "Frames", &format!("{}  ·  {}", r.frames, fmt_time(r.duration)));
+            let dropped = if r.dropped_events == 0 {
+                "none".to_string()
+            } else {
+                format!("{} in {} ({:.2} s)", plural(r.dropped_frames as u64, "frame", "frames"), plural(r.dropped_events as u64, "gap", "gaps"), r.dropped_secs)
+            };
+            widgets::kv_row(ui, &p, "Dropped", &dropped);
+            let mut dups = Vec::new();
+            if r.repeated_timestamps > 0 {
+                dups.push(plural(r.repeated_timestamps as u64, "repeated timestamp", "repeated timestamps"));
+            }
+            if r.likely_duplicates > 0 {
+                dups.push(format!("{} likely (tiny frames)", r.likely_duplicates));
+            }
+            widgets::kv_row(ui, &p, "Duplicated", &if dups.is_empty() { "none".to_string() } else { dups.join(", ") });
+            widgets::kv_row(ui, &p, "Jitter", &format!("{:.2} ms typical, {:.2} ms at most", r.jitter_std_ms, r.jitter_max_ms));
+            widgets::kv_row(ui, &p, "Stutter", &if r.stutter_events == 0 { "none".to_string() } else { plural(r.stutter_events as u64, "place", "places") });
+            if !r.issues.is_empty() {
+                ui.label(RichText::new("Problem places (click to show)").size(11.5).color(p.faint));
+                for is in r.issues.iter().take(MAX_PLACES) {
+                    let (what, tip) = match is.kind {
+                        IssueKind::Dropped => (
+                            format!("{} dropped ({:.0} ms missing)", plural(is.frames as u64, "frame", "frames"), is.secs * 1000.0),
+                            format!("Show the last frame before the gap (frame {}); step forward with . to see the jump", is.frame.saturating_sub(1)),
+                        ),
+                        IssueKind::RepeatedTimestamp => (format!("Timestamp repeated by {}", plural(is.frames as u64, "frame", "frames")), format!("Show frame {}, whose timestamp an earlier frame already has", is.frame)),
+                        IssueKind::LikelyDuplicate => (
+                            format!("{} likely duplicated", plural(is.frames as u64, "frame", "frames")),
+                            format!("Show frame {}: a non-key frame of only a few bytes, which normally repeats the picture before it", is.frame),
+                        ),
+                        IssueKind::Stutter => (
+                            format!("Stutter, up to {:.0} ms off", is.secs * 1000.0),
+                            format!("Show the frame before it: {} shown noticeably early or late from frame {}", plural(is.frames as u64, "frame", "frames"), is.frame),
+                        ),
+                    };
+                    if ui.add(egui::Button::new(RichText::new(format!("{}  {what}", timing::fmt_pos(is.t))).monospace().size(11.5)).frame(false)).on_hover_text(tip).clicked() {
+                        jump = Some((i, is.t));
+                    }
+                }
+                if r.issues.len() > MAX_PLACES {
+                    ui.label(RichText::new(format!("and {} more (all of them in Export timing CSV)", r.issues.len() - MAX_PLACES)).size(11.0).color(p.faint));
+                }
+            }
+            ui.add_space(6.0);
+        }
+        if let Some((i, t)) = jump {
+            self.show_at(i, t);
+        }
+        if any && ui.button(format!("{}  Export timing CSV", I::EXPORT)).on_hover_text("Save the frame timing of every video (a summary and every problem place) as a CSV file (for Excel)").clicked() {
+            self.export_timing_csv(core);
+        }
+    }
+
+    fn export_timing_csv(&self, core: &mut Core) {
+        let compare = self.sources.len() > 1;
+        let reports: Vec<(String, Arc<TimingReport>)> = self.sources.iter().enumerate().filter_map(|(i, s)| s.timing().map(|r| (if compare { format!("{} {}", letter(i), s.name()) } else { s.name() }, r))).collect();
+        if reports.is_empty() {
+            return;
+        }
+        let refs: Vec<(String, &TimingReport)> = reports.iter().map(|(n, r)| (n.clone(), r.as_ref())).collect();
+        let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("lumen_timing.csv").save_file() else { return };
+        match std::fs::write(&path, timing::to_csv(&refs)) {
+            Ok(()) => core.toasts.success(format!("Exported {}", path.display())),
+            Err(e) => core.toasts.error(e.to_string()),
+        }
     }
 
     fn scopes_panel(&mut self, ui: &mut Ui, p: &Palette) {
@@ -3282,6 +3672,17 @@ impl VideoMode {
                 "start" => self.set_start(num, core),
                 "starts" => self.set_all_starts(core),
                 "gotostarts" => self.go_to_starts(),
+                "autoalign" => self.start_auto_align(&core.ctx),
+                "undoalign" => self.undo_auto_align(core),
+                "timing" => {
+                    for (i, s) in self.sources.iter().enumerate() {
+                        let line = match s.timing() {
+                            Some(r) => format!("timing {}:{} fps={:.3} vfr={} dropped={} repeated={} likely_dup={} stutter={} jitter_ms={:.3} verdict={}", letter(i), s.name(), r.measured_fps, r.vfr, r.dropped_frames, r.repeated_timestamps, r.likely_duplicates, r.stutter_events, r.jitter_std_ms, r.verdict),
+                            None => format!("timing {}:{} pending", letter(i), s.name()),
+                        };
+                        dev_log(&line);
+                    }
+                }
                 "audio" => self.set_audio_source(num),
                 "mode" => {
                     self.mode = match arg {
@@ -3821,7 +4222,7 @@ mod tests {
         for i in 0..1000 {
             let key = i % 10 == 0;
             // Mid-frame times keep the binning clear of rounding at column edges.
-            idx.push(IndexEntry { pts: (i as f64 + 0.5) / 25.0, size: if key { 100_000 } else { 10_000 }, key, kind: if key { b'I' } else { b'?' } });
+            idx.push(IndexEntry { pts: (i as f64 + 0.5) / 25.0, size: if key { 100_000 } else { 10_000 }, key, kind: if key { b'I' } else { b'?' }, repeats: 0 });
         }
         let cols = timeline_columns(&idx, 40.0, 100);
         assert_eq!(cols.len(), 100);
@@ -3832,7 +4233,7 @@ mod tests {
             assert!((c.shares[3] - 90.0 / 190.0).abs() < 1e-4);
         }
         // Few frames: one per column, colored by its own type.
-        let small = [IndexEntry { pts: 0.0, size: 50, key: true, kind: b'I' }, IndexEntry { pts: 1.0, size: 10, key: false, kind: b'B' }];
+        let small = [IndexEntry { pts: 0.0, size: 50, key: true, kind: b'I', repeats: 0 }, IndexEntry { pts: 1.0, size: 10, key: false, kind: b'B', repeats: 0 }];
         let cols = timeline_columns(&small, 2.0, 2);
         assert_eq!(cols[0].shares, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(cols[1].shares, [0.0, 0.0, 1.0, 0.0]);

@@ -1,9 +1,12 @@
 //! UI-free video pieces: the list of video extensions, the pure frame metrics
-//! (PSNR/SSIM) and scopes, and a hook for the FFmpeg thumbnailer that the app
+//! (PSNR/SSIM) and scopes, frame timing checks, start point alignment
+//! between clips, and a hook for the FFmpeg thumbnailer that the app
 //! registers when it is built with the `video` feature.
 
 pub mod metrics;
 pub mod scopes;
+pub mod timealign;
+pub mod timing;
 
 use std::path::Path;
 use std::sync::OnceLock;
