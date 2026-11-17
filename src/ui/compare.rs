@@ -2205,6 +2205,19 @@ impl Compare {
             ("?", "This help"),
             ("Esc", "Back"),
         ];
+        let mut rows: Vec<(&str, &str)> = rows.to_vec();
+        match &self.link {
+            Some(l) if l.blind => {
+                rows.retain(|(k, _)| !matches!(*k, "M" | "C" | "Ctrl+Z  /  Ctrl+Y" | "Del" | "Ctrl+Shift+E" | "0 - 5" | "Q  or  `" | "K" | "H" | "+ / -  arrows"));
+                rows.insert(0, ("Left / Right", "The left / right image is better"));
+                rows.insert(1, ("Down  or  Space", "About the same"));
+            }
+            Some(_) => {
+                rows.insert(0, ("Page Up / Page Down", "Previous / next scene of the project"));
+                rows.insert(1, ("S", "Scorecard: verdicts and scores per device"));
+            }
+            None => {}
+        }
         let r = Rect::from_center_size(area.center(), Vec2::new(480.0, 60.0 + rows.len() as f32 * 24.0));
         let painter = ui.painter();
         painter.rect_filled(r, CornerRadius::same(14), Color32::from_rgba_unmultiplied(18, 19, 22, 240));
