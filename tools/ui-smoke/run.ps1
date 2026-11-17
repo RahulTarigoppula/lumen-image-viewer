@@ -36,7 +36,7 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 
-function Abs([string]$p) { return [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $p)) }
+function Abs([string]$p) { return [System.IO.Path]::GetFullPath([System.IO.Path]::Combine((Get-Location).Path, $p)) }
 $Exe = Abs $Exe; $Media = Abs $Media; $Out = Abs $Out; $Scenarios = Abs $Scenarios
 if ($Mesa) { $Mesa = Abs $Mesa }
 

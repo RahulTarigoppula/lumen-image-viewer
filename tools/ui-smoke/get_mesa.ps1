@@ -19,6 +19,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $Work) { $Work = [System.IO.Path]::GetTempPath() }
+# Known hashes of pinned releases.
+if (-not $Sha256 -and $Version -eq "26.1.8") { $Sha256 = "4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9" }
 $name = "mesa3d-$Version-release-msvc.7z"
 $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$Version/$name"
 $dl = Join-Path $Work "mesa-dl-$Version"

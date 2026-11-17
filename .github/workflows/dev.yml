@@ -102,6 +102,7 @@ jobs:
     timeout-minutes: 30
     env:
       MESA_VERSION: "26.1.8"
+      MESA_SHA256: 4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9
     steps:
       - uses: actions/checkout@v4
 
@@ -120,7 +121,7 @@ jobs:
       - name: Get Mesa llvmpipe OpenGL
         if: steps.mesa-cache.outputs.cache-hit != 'true'
         shell: pwsh
-        run: tools/ui-smoke/get_mesa.ps1 -Dest mesa -Version $env:MESA_VERSION
+        run: tools/ui-smoke/get_mesa.ps1 -Dest mesa -Version $env:MESA_VERSION -Sha256 $env:MESA_SHA256
 
       - name: Make test media
         shell: pwsh
