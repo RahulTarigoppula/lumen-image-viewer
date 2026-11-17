@@ -1256,6 +1256,9 @@ impl VideoMode {
 
     /// Apply a finished auto-align (once).
     fn poll_auto_align(&mut self, core: &mut Core) {
+        if self.align_job.is_none() {
+            return;
+        }
         let paths = self.source_paths();
         let Some(job) = &self.align_job else { return };
         if job.paths != paths {
