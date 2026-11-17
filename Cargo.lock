@@ -2307,6 +2307,7 @@ dependencies = [
  "dirs",
  "epaint_default_fonts",
  "fast_image_resize",
+ "flate2",
  "image",
  "img-parts",
  "jpeg-encoder",

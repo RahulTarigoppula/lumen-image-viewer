@@ -11,6 +11,7 @@ pub mod edit;
 pub mod encode;
 pub mod formats;
 pub mod imaging;
+pub mod inspect;
 pub mod meta;
 pub mod metaedit;
 pub mod ocr;
