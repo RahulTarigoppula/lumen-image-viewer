@@ -202,6 +202,9 @@ pub struct IndexEntry {
     pub key: bool,
     /// b'I', b'P', b'B' or b'?' (filled in as frames get decoded).
     pub kind: u8,
+    /// Further packets with this same timestamp, merged into this entry
+    /// (the frame timing check reports them as repeated timestamps).
+    pub repeats: u16,
 }
 
 /// Demux-only pass over the file: exact frame count, timestamps, packet sizes.
@@ -237,14 +240,20 @@ pub fn build_index(path: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> 
         let Some(ts) = ts else { continue };
         let pts = ts as f64 * tb - start;
         let key = pkt.is_key();
-        out.push(IndexEntry { pts, size: pkt.size() as u32, key, kind: if key { b'I' } else { b'?' } });
+        out.push(IndexEntry { pts, size: pkt.size() as u32, key, kind: if key { b'I' } else { b'?' }, repeats: 0 });
         n += 1;
         if n % 500 == 0 && duration > 0.0 {
             progress((pts / duration).clamp(0.0, 1.0) as f32);
         }
     }
     out.sort_by(|a, b| a.pts.partial_cmp(&b.pts).unwrap_or(std::cmp::Ordering::Equal));
-    out.dedup_by(|a, b| (a.pts - b.pts).abs() < 1e-9);
+    out.dedup_by(|a, b| {
+        let same = (a.pts - b.pts).abs() < 1e-9;
+        if same {
+            b.repeats = b.repeats.saturating_add(1);
+        }
+        same
+    });
     progress(1.0);
     Ok(out)
 }
@@ -1019,6 +1028,71 @@ fn copy_planes(f: &ff::frame::Video, wide: bool, roi: Option<Roi>) -> YuvFrame {
     YuvFrame { planes, bit_depth: depth }
 }
 
+/// Mean of each cell of a `gw` x `gh` grid over a `w` x `h` picture, sampled
+/// on a lattice of about 128 x 72 points; `px(x, y)` reads a sample as 0..1.
+fn grid_means(w: usize, h: usize, gw: usize, gh: usize, px: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+    let mut sum = vec![0f32; gw * gh];
+    let mut cnt = vec![0u32; gw * gh];
+    if w == 0 || h == 0 {
+        return sum;
+    }
+    let (sx, sy) = ((w / 128).max(1), (h / 72).max(1));
+    let mut y = sy / 2;
+    while y < h {
+        let cy = (y * gh / h).min(gh - 1);
+        let mut x = sx / 2;
+        while x < w {
+            let c = cy * gw + (x * gw / w).min(gw - 1);
+            sum[c] += px(x, y);
+            cnt[c] += 1;
+            x += sx;
+        }
+        y += sy;
+    }
+    for (s, n) in sum.iter_mut().zip(&cnt) {
+        if *n > 0 {
+            *s /= *n as f32;
+        }
+    }
+    sum
+}
+
+/// [`grid_means`] of the luma plane read in place, for layouts whose first
+/// plane holds luma alone (planar and semi-planar YUV and gray, 8 to 16 bit,
+/// little-endian); `None` for anything else.
+fn luma_grid(f: &ff::frame::Video, gw: usize, gh: usize) -> Option<Vec<f32>> {
+    // AV_PIX_FMT_FLAG_BE, _PAL, _HWACCEL, _RGB and _FLOAT (libavutil/pixdesc.h).
+    const UNSUPPORTED: u64 = (1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 9);
+    let (bytes, depth, shift) = unsafe {
+        let d = ff::ffi::av_pix_fmt_desc_get(f.format().into());
+        if d.is_null() || (*d).nb_components == 0 || ((*d).flags as u64) & UNSUPPORTED != 0 {
+            return None;
+        }
+        let c = &(*d).comp[0];
+        let depth = c.depth.max(1) as usize;
+        let bytes = depth.div_ceil(8);
+        if c.plane != 0 || c.offset != 0 || c.step as usize != bytes || !(1..=2).contains(&bytes) {
+            return None;
+        }
+        (bytes, depth as u32, c.shift.max(0) as u32)
+    };
+    let (w, h) = (f.plane_width(0) as usize, f.plane_height(0) as usize);
+    let stride = f.stride(0);
+    let data = f.data(0);
+    if w == 0 || h == 0 || data.len() < (h - 1) * stride + w * bytes {
+        return None;
+    }
+    let max = ((1u32 << depth) - 1) as f32;
+    Some(if bytes == 1 {
+        grid_means(w, h, gw, gh, |x, y| data[y * stride + x] as f32 / max)
+    } else {
+        grid_means(w, h, gw, gh, |x, y| {
+            let o = y * stride + x * 2;
+            (u16::from_le_bytes([data[o], data[o + 1]]) >> shift) as f32 / max
+        })
+    })
+}
+
 /// Tell swscale which YUV matrix and range the source uses (it defaults to
 /// BT.601 limited, which renders HD video with wrong colors).
 fn set_colorspace(sc: &mut ff::software::scaling::Context, f: &ff::frame::Video) {
@@ -1573,6 +1647,34 @@ impl SeqDecoder {
     /// Read only keyframes from now on (non-key packets are not decoded).
     pub fn set_keyframes_only(&mut self, on: bool) {
         self.keyframes_only = on;
+    }
+
+    /// Decode faster at a small cost in picture quality (the in-loop
+    /// deblocking filter is skipped): for coarse signals such as
+    /// [`SeqDecoder::next_luma_grid`], never for metrics.
+    pub fn set_fast(&mut self, on: bool) {
+        unsafe {
+            (*self.dec.as_mut_ptr()).skip_loop_filter = if on { ff::ffi::AVDiscard::AVDISCARD_ALL } else { ff::ffi::AVDiscard::AVDISCARD_DEFAULT };
+        }
+    }
+
+    /// Next frame in presentation order reduced to a `gw` x `gh` grid of
+    /// mean luma (0..1, row major), with its presentation time in seconds
+    /// (the timeline's time). Reads the luma plane in place on a sparse
+    /// lattice, so it is cheap even for 4K frames.
+    pub fn next_luma_grid(&mut self, gw: usize, gh: usize) -> Option<(f64, Vec<f32>)> {
+        let (gw, gh) = (gw.max(1), gh.max(1));
+        let (i, f) = self.next_raw()?;
+        let pts = f.timestamp().or(f.pts()).map(|t| t as f64 * self.tb - self.start).unwrap_or(i as f64 * self.frame_dur);
+        if let Some(g) = luma_grid(&f, gw, gh) {
+            return Some((pts, g));
+        }
+        // Other layouts (RGB, palettes, big-endian): normalised first.
+        let (y, _) = self.native.convert(&f, None).ok()?;
+        let plane = y.planes.first()?;
+        let max = ((1u64 << y.bit_depth.clamp(1, 16)) - 1) as f32;
+        let (w, h) = (plane.width, plane.height);
+        Some((pts, grid_means(w, h, gw, gh, |x, yy| plane.get(yy * w + x) as f32 / max)))
     }
 
     /// Read `range` (see [`FrameRange`]) as `(index, frame)` pairs.

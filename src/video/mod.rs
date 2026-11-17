@@ -7,8 +7,10 @@
 
 pub use lumen_core::video::{is_video_ext, VIDEO_EXTS};
 #[cfg(feature = "video")]
-pub use lumen_core::video::{metrics, scopes};
+pub use lumen_core::video::{metrics, scopes, timealign, timing};
 
+#[cfg(feature = "video")]
+mod align;
 #[cfg(feature = "video")]
 pub mod analyze;
 #[cfg(feature = "video")]
