@@ -35,7 +35,7 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 
 **Video**: play with audio (A/V synced), `,` and `.` frame stepping in both directions, go to frame or time (G), A-B loop, speed control, compare two encodes with a frame offset, PSNR-Y/U/V and SSIM, whole-file analysis with worst-frame list, scopes, native-resolution snapshots.
 
-**Analysis** (Ctrl+Q): one-click Analyze with a plain-language summary (sharpness, noise, clipping, color cast, compression; how close B is to A, with Show where; a video's average and worst frame), then every number and option for experts: metric presets (Quick, Encode QA, Photo technical), region of interest (R), heatmap overlays with colormaps and thresholds, per-frame graphs and worst frames for video, history per file, CSV, JSON, PNG and TIFF export. AI tab: quality critique, A vs B comparison, encode review, photo technical review, video frame review, free-form questions and a quick score, with findings drawn on the image.
+**Analysis** (Ctrl+Q): one-click Analyze with a plain-language summary (sharpness, noise, clipping, color cast, compression; how close B is to A, with Show where; a video's average and worst frame), then every number and option for experts: metric presets (Quick, Encode QA, Photo technical), region of interest (R), heatmap overlays with colormaps and thresholds, per-frame graphs and worst frames for video, history per file, CSV, JSON, PNG and TIFF export. AI tab: quality critique, A vs B comparison, encode review, photo technical review, video frame review, free-form questions, a quick score and ranking 3 or 4 devices in one request, with findings drawn on the image (and added as review marks in compare).
 
 **Workbench** (Ctrl+Shift+W): camera comparison projects from a folder of captures (one folder per device, device in the file name, or EXIF camera model), scene x device overview with thumbnails, missing-capture check, reference device, Compare per scene with Page Up / Page Down, scorecard panel (Win / Par / Lose, 1-5 or -3..+3 attribute scores, notes), artifact tags and severity on marks, batch measurement of every capture at a common size, blind test with hidden names and a Bradley-Terry ranking, round report (PowerPoint, PDF, web page) and CSV. The project file uses relative paths and works on a shared drive.
 
@@ -90,7 +90,8 @@ The optional AI analysis is the only network feature. It is off until you set it
 
 1. On the server: `vllm serve <your Qwen vision model> --limit-mm-per-prompt '{"image": 8}' --max-model-len 32768` (add `--api-key <key>` if you want one).
 2. In Lumen: press Ctrl+Q, choose AI review, type the server's IP (port 8000 is assumed, `host:port` or a full `http://host:port/v1` URL also work) and press Test & connect. The model list is fetched and a vision model is picked; change it there or in Settings, AI review (API key, HTTPS, timeouts).
-3. Open an image, compare pair or video: the mode fits what is on screen (critique, A vs B, video frame). Press Run AI review.
+3. Open an image, compare pair or video: the mode fits what is on screen (critique, A vs B, video frame; Rank devices when compare shows three or four images). Press Run AI review.
+4. Rank devices sends all compare panes (2 to 4) in one request and shows a verdict, the ranking best first (score, strengths and weaknesses per image, in the pane colors) and the problems found, drawn on the right panes. In compare mode, Add findings as marks turns each problem into a red review mark with its description as note, a matching artifact tag and the severity.
 
 ## Troubleshooting
 

@@ -206,7 +206,7 @@ pub fn privacy_note(core: &crate::app::Core) -> &'static str {
 pub fn export_bundle_requested(core: &mut crate::app::Core, subject: Option<&Subject>) {
     let Some(parent) = core.metrics.take_bundle_request() else { return };
     #[cfg(feature = "ai")]
-    let cards: Vec<String> = match subject.and_then(|s| s.file_key()) {
+    let cards: Vec<String> = match subject.and_then(|s| ai::history_key(s, &ai::extra_images(core, s))) {
         Some(key) => core.ai.records(&key).iter().filter_map(|r| r.result().map(|res| ai_view::markdown(r, res))).collect(),
         None => Vec::new(),
     };
@@ -265,6 +265,7 @@ pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Opti
     }
     #[cfg(feature = "ai")]
     let state = {
+        let key = subject.and_then(|s| ai::history_key(s, &ai::extra_images(core, s)));
         let ai = &mut core.ai;
         let phase = match &ai.phase {
             ai::Phase::Idle => "idle",
@@ -275,11 +276,13 @@ pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Opti
         let steps: Vec<String> = ai.steps.iter().map(|s| format!("{}:{:?}", s.step.label(), s.status)).collect();
         let (host, port, model, enabled, models, live, error) =
             (ai.settings.host.clone(), ai.settings.port, ai.settings.model.clone(), ai.settings.enabled, ai.models.len(), ai.live.text.len(), ai.error.clone());
-        let shown = subject.and_then(|s| s.file_key()).and_then(|k| {
+        let shown = key.and_then(|k| {
             ai.shown_record(&k).map(|r| match &r.outcome {
                 ai::Outcome::Done(res) => {
-                    let findings = res.report.as_ref().and_then(|r| r.as_ref().ok()).map(|r| r.findings.len()).unwrap_or(0);
-                    format!("done({}, {findings} findings)", r.preset)
+                    let report = res.report.as_ref().and_then(|r| r.as_ref().ok());
+                    let findings = report.map(|r| r.findings.len()).unwrap_or(0);
+                    let ranking: String = report.map(|r| r.ranking.iter().map(|e| e.image.as_str()).collect()).unwrap_or_default();
+                    format!("done({}, {findings} findings, ranking={ranking})", r.preset)
                 }
                 ai::Outcome::Failed { message, .. } => format!("failed({message})"),
                 ai::Outcome::Cancelled { partial } => format!("cancelled({} chars)", partial.len()),
@@ -303,6 +306,14 @@ pub fn dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Opti
 
 #[cfg(feature = "ai")]
 fn ai_dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Option<&Subject>, verb: &str, rest: &str, actions: &mut Vec<PanelAction>) {
+    let extra = subject.map(|s| ai::extra_images(core, s)).unwrap_or_default();
+    // Like the AI result's "Add findings as marks" button (compare mode).
+    if verb == "marks" {
+        if let Some(s) = subject {
+            panel.ai.add_marks(core, s, actions);
+        }
+        return;
+    }
     let ai = &mut core.ai;
     match verb {
         "enable" | "disable" => {
@@ -332,14 +343,12 @@ fn ai_dev(panel: &mut AnalysisPanel, core: &mut crate::app::Core, subject: Optio
         // Like clicking finding n (1-based) in the list: zoom to its box.
         "finding" => {
             let n: usize = rest.parse().unwrap_or(1);
-            let Some(key) = subject.and_then(|s| s.file_key()) else { return };
+            let Some(key) = subject.and_then(|s| ai::history_key(s, &extra)) else { return };
             let Some(rec) = ai.shown_record(&key) else { return };
             let Some(Ok(report)) = rec.result().and_then(|r| r.report.as_ref()) else { return };
             if let Some(s) = report.findings.get(n.saturating_sub(1)).and_then(|f| f.source) {
-                let b = s.label == lumen_ai::ImageLabel::B;
-                if let Some((w, h)) = rec.dims[b as usize] {
+                if let (Some((w, h)), Some(slot)) = (rec.dims_of(s.label), canvas::Slot::from_index(s.label.index())) {
                     let (w, h) = (w as f32, h as f32);
-                    let slot = if b { canvas::Slot::B } else { canvas::Slot::A };
                     actions.push(PanelAction::ZoomTo { slot, rect: [s.x0 as f32 / w, s.y0 as f32 / h, s.x1 as f32 / w, s.y1 as f32 / h] });
                 }
             }

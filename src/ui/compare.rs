@@ -1101,6 +1101,28 @@ impl Compare {
         Subject { kind: SubjectKind::Pair, a: self.panes.first().map(img), b: self.panes.get(1).map(img) }
     }
 
+    /// Adds review marks (pane index, mark in that pane's image pixels), for
+    /// example AI findings; marks already there and blind tests are skipped.
+    /// Returns how many were added.
+    pub fn add_marks(&mut self, marks: Vec<(usize, super::review::Mark)>) -> usize {
+        if self.blind() {
+            return 0;
+        }
+        let mut added = 0;
+        for (pane, m) in marks {
+            if let Some(im) = self.rv.review.images.get_mut(pane) {
+                if !im.marks.contains(&m) {
+                    im.marks.push(m);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.rv.touch();
+        }
+        added
+    }
+
     /// Shows `r` (fractions 0..1 of pane `i`'s image) in every synced pane.
     pub fn zoom_to_region(&mut self, i: usize, r: [f32; 4], ppp: f32) {
         let rects = self.layout(self.last_area);

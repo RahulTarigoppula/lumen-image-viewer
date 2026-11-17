@@ -9,7 +9,7 @@
 //!   server's Retry-After), a refused or lost connection once after 0.5 s,
 //!   only before the first token;
 //! - "At most N image(s)" rebuilds the request for N images (a composite
-//!   when N is 1) and reports the learned limit;
+//!   when N is below the number of images compared) and reports the learned limit;
 //! - a rejected `response_format` resends with the schema in the prompt;
 //! - rejected vLLM extensions (`chat_template_kwargs`...) are dropped.
 
@@ -371,7 +371,8 @@ fn run_pass(client: &Client, mut req: PreparedRequest, st: &mut Fallback, em: &E
                 req = req.with_max_images(l)?;
                 req.swapped = None;
                 if req.layout.iter().any(|e| e.role == ImageRole::Composite) {
-                    format!("The server accepts {l} image(s) per request: resent with A and B in one composite")
+                    let which = if req.labels().len() > 2 { "all images" } else { "A and B" };
+                    format!("The server accepts {l} image(s) per request: resent with {which} in one composite")
                 } else {
                     format!("The server accepts {l} image(s) per request: resent with {} image(s)", req.image_count())
                 }
@@ -406,6 +407,9 @@ fn parse_output(req: &PreparedRequest, out: &ChatOutput, warnings: &mut Vec<Stri
     let report = req.structured().then(|| {
         parse_report(&out.content, req.output, conv).map(|mut r| {
             r.map_findings(&req.layout, conv);
+            if req.output == OutputKind::RankingJson {
+                r.check_ranking(&req.labels());
+            }
             r
         })
     });

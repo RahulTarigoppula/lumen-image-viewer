@@ -21,10 +21,12 @@ pub enum PresetId {
     QuickScore,
     VideoFrame,
     VideoCompare,
+    /// Rank 2 to 4 captures of the same scene (compare panes A to D).
+    Rank,
 }
 
 impl PresetId {
-    pub const ALL: [PresetId; 8] = [
+    pub const ALL: [PresetId; 9] = [
         PresetId::Quality,
         PresetId::Compare,
         PresetId::Encode,
@@ -33,6 +35,7 @@ impl PresetId {
         PresetId::QuickScore,
         PresetId::VideoFrame,
         PresetId::VideoCompare,
+        PresetId::Rank,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +48,7 @@ impl PresetId {
             PresetId::QuickScore => "quick_score",
             PresetId::VideoFrame => "video_frame",
             PresetId::VideoCompare => "video_compare",
+            PresetId::Rank => "rank",
         }
     }
 
@@ -58,6 +62,19 @@ impl PresetId {
 pub enum Arity {
     One,
     Two,
+    /// Two to four images: A and B, then C and D when given (rankings).
+    Many,
+}
+
+impl Arity {
+    /// Most images a preset of this arity takes.
+    pub fn max_images(self) -> usize {
+        match self {
+            Arity::One => 1,
+            Arity::Two => 2,
+            Arity::Many => 4,
+        }
+    }
 }
 
 /// What the model is asked to return.
@@ -67,6 +84,8 @@ pub enum OutputKind {
     QualityJson,
     /// The comparison report (`comparison_schema`).
     ComparisonJson,
+    /// The ranking of 2 to 4 images (`ranking_schema`).
+    RankingJson,
     /// Free text, rendered as Markdown.
     Markdown,
     /// One token with logprobs (Q-ReAlign).
@@ -75,7 +94,7 @@ pub enum OutputKind {
 
 impl OutputKind {
     pub fn is_json(self) -> bool {
-        matches!(self, OutputKind::QualityJson | OutputKind::ComparisonJson)
+        matches!(self, OutputKind::QualityJson | OutputKind::ComparisonJson | OutputKind::RankingJson)
     }
 }
 
@@ -125,7 +144,7 @@ const VIDEO_NOTES: &str = "These are single frames paused from moving video. Mot
 /// The report is read by people deciding something, not by experts:
 /// a verdict, then only what matters.
 const FOCUS: &str = "What to report:
-- verdict: one plain sentence that answers the real question first, for one image whether it is acceptable for its purpose (and the main reason), for two images which one is better and why (for example \"B is better: A loses the fine detail in the hair to compression\"). Write it for someone who is not an image expert.
+- verdict: one plain sentence that answers the real question first, for one image whether it is acceptable for its purpose (and the main reason), for two or more images which one is better and why (for example \"B is better: A loses the fine detail in the hair to compression\"). Write it for someone who is not an image expert.
 - findings: only significant problems, moderate or severe, that a viewer would notice at normal viewing or that change the decision. Skip minor nitpicks and anything you are unsure about. At most 6, the most important first; one finding per problem area, not one per small spot.
 - Describe each finding plainly: what is wrong and where, in words (for example \"the sky at the top left shows visible bands instead of a smooth gradient\"), plus its box.
 - summary: two or three sentences on what matters most; no repetition of every score.";
@@ -139,13 +158,17 @@ const HONESTY: &str = "Rules:
 
 const METRICS_RULE: &str = "Objective metrics computed by software may be provided as context. Use them to check your judgement, not to replace it, and mention when what you see disagrees with them.";
 
-fn location_rules(conv: CoordConvention) -> String {
+/// How a ranking is written (after the rubric and the categories).
+const RANK_RULES: &str = "Ranking: list every image exactly once, best first. overall is that image's score from 1 to 10 using the anchors above; give equal scores when images are indistinguishable and keep them in the order given. strengths and weaknesses are a few words each (for example \"fine hair detail, clean shadows\" and \"blue cast, smeared grass\"); write \"none\" when there is nothing notable. The categories above only label findings; the ranking gives one overall score per image.";
+
+fn location_rules(conv: CoordConvention, many: bool) -> String {
     let coords = match conv {
         CoordConvention::Relative1000 => "integer coordinates from 0 to 1000 relative to the width and height of that image as you see it ([0, 0] is the top-left corner, [1000, 1000] the bottom-right)",
         CoordConvention::AbsolutePixels => "integer pixel coordinates of that image as you see it ([0, 0] is the top-left corner)",
     };
+    let (names, together) = if many { ("\"A\", \"B\", \"C\" or \"D\"", "the images are") } else { ("\"A\" or \"B\"", "A and B are") };
     format!(
-        "Locations: every finding names the image (\"A\" or \"B\"), the tile number (0 for a full view or a composite, otherwise the ROI tile number given in the text before that image), and a bounding box [x0, y0, x1, y1] in {coords}. Draw the box tightly around the defect. When A and B are shown in one composite image, use tile 0 and give the box relative to the whole composite."
+        "Locations: every finding names the image ({names}), the tile number (0 for a full view or a composite, otherwise the ROI tile number given in the text before that image), and a bounding box [x0, y0, x1, y1] in {coords}. Draw the box tightly around the defect. When {together} shown in one composite image, use tile 0 and give the box relative to the whole composite."
     )
 }
 
@@ -256,6 +279,18 @@ impl Preset {
                 "Compare frame B with frame A and return the comparison report: a one-sentence verdict saying which is better and why, then only the significant differences.",
                 (Some("reference"), Some("test")),
             ),
+            PresetId::Rank => p(
+                "Rank devices",
+                "Rank 2 to 4 captures of the same scene, best first, with strengths and weaknesses",
+                Arity::Many,
+                OutputKind::RankingJson,
+                false,
+                format!(
+                    "{ROLE_ANALYST}\nYou rank two to four captures of the same scene, labeled A, B, C and D, for example the same shot taken with different phones or cameras, the way a camera image quality engineer compares devices. None of them is a reference: judge each as a candidate. Weigh what a careful viewer would notice at normal viewing size and at 100% zoom: detail and sharpness, noise and smearing from noise reduction, exposure and dynamic range (clipped highlights, crushed shadows), color and white balance, and artifacts such as halos, ghosting, flare, banding, moire and compression blocking. Small differences in framing or field of view are not defects."
+                ),
+                "Rank the images from best to worst and return the ranking report: a one-sentence verdict naming the best image and why, the ranking with a score, strengths and weaknesses for every image, then only the significant problems.",
+                (None, None),
+            ),
         }
     }
 
@@ -296,16 +331,25 @@ impl Preset {
         let mut s = self.system.clone();
         if self.output.is_json() {
             s.push_str("\n\n");
-            s.push_str(RUBRIC);
+            let ranking = self.output == OutputKind::RankingJson;
+            if ranking {
+                s.push_str(&RUBRIC.replacen("Score each category", "Score each image", 1));
+            } else {
+                s.push_str(RUBRIC);
+            }
             s.push_str("\n\n");
             s.push_str(CATEGORIES_TEXT);
             if self.output == OutputKind::ComparisonJson {
                 s.push_str("\nGive scores_a and scores_b for the same categories; detail_vs_reference is null for the reference itself.");
             }
+            if ranking {
+                s.push_str("\n\n");
+                s.push_str(RANK_RULES);
+            }
             s.push_str("\n\n");
             s.push_str(FOCUS);
             s.push_str("\n\n");
-            s.push_str(&location_rules(conv));
+            s.push_str(&location_rules(conv, self.arity == Arity::Many));
         }
         s.push_str("\n\n");
         s.push_str(HONESTY);
@@ -416,6 +460,26 @@ pub fn comparison_schema(max_coord: u32) -> Value {
         "$defs": defs()})
 }
 
+/// The ranking schema: a verdict, every image once (best first) with its
+/// score, strengths and weaknesses, and the findings. `labels` are the
+/// images sent (`["A", "B", "C"]`); `max_coord` as for `quality_schema`.
+pub fn ranking_schema(labels: &[&str], max_coord: u32) -> Value {
+    let n = labels.len();
+    json!({"type": "object", "additionalProperties": false,
+        "required": ["verdict", "ranking", "findings", "summary"],
+        "properties": {
+            "verdict": {"type": "string", "maxLength": 240},
+            "ranking": {"type": "array", "minItems": n, "maxItems": n, "items": {"type": "object", "additionalProperties": false,
+                "required": ["image", "overall", "strengths", "weaknesses"],
+                "properties": {
+                    "image": {"enum": labels},
+                    "overall": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "strengths": {"type": "string", "maxLength": 200},
+                    "weaknesses": {"type": "string", "maxLength": 200}}}},
+            "findings": findings_schema(labels, max_coord),
+            "summary": {"type": "string", "maxLength": 800}}})
+}
+
 /// `response_format` for a schema.
 pub fn response_format(name: &str, schema: &Value) -> Value {
     json!({"type": "json_schema", "json_schema": {"name": name, "strict": true, "schema": schema}})
@@ -522,9 +586,36 @@ mod tests {
         let c = find_preset("custom:Mine", &custom).unwrap();
         assert_eq!((c.arity, c.output), (Arity::Two, OutputKind::ComparisonJson));
         assert!(find_preset("custom:Other", &custom).is_none());
-        assert_eq!(all_presets(&custom).len(), 9);
+        assert_eq!(all_presets(&custom).len(), 10);
         assert!(Preset::builtin(PresetId::Compare).supports_swap_check());
         assert!(!Preset::builtin(PresetId::Encode).supports_swap_check());
+        let rank = Preset::builtin(PresetId::Rank);
+        assert_eq!((rank.arity, rank.output, rank.arity.max_images()), (Arity::Many, OutputKind::RankingJson, 4));
+        assert!(rank.output.is_json() && !rank.supports_swap_check());
+        assert_eq!(find_preset("rank", &[]).unwrap().name, "Rank devices");
+    }
+
+    #[test]
+    fn ranking_prompt_and_schema_name_four_images() {
+        let sys = Preset::builtin(PresetId::Rank).system_prompt(CoordConvention::Relative1000, None);
+        for needle in ["Score each image", "best first", "\"A\", \"B\", \"C\" or \"D\"", "the images are shown in one composite", "None of them is a reference", "JSON report only"] {
+            assert!(sys.contains(needle), "missing {needle}");
+        }
+        assert!(!sys.contains("Score each category"));
+        // Pair presets keep their wording.
+        assert!(Preset::builtin(PresetId::Compare).system_prompt(CoordConvention::Relative1000, None).contains("(\"A\" or \"B\")"));
+        let s = ranking_schema(&["A", "B", "C", "D"], 1000);
+        assert_eq!(s["required"], json!(["verdict", "ranking", "findings", "summary"]));
+        let r = &s["properties"]["ranking"];
+        assert_eq!((r["minItems"].as_u64(), r["maxItems"].as_u64()), (Some(4), Some(4)));
+        assert_eq!(r["items"]["properties"]["image"]["enum"], json!(["A", "B", "C", "D"]));
+        assert_eq!(r["items"]["properties"]["overall"]["maximum"], 10);
+        assert_eq!(r["items"]["required"], json!(["image", "overall", "strengths", "weaknesses"]));
+        assert_eq!(s["properties"]["findings"]["items"]["properties"]["image"]["enum"], json!(["A", "B", "C", "D"]));
+        assert_eq!(s["properties"]["findings"]["maxItems"], MAX_FINDINGS);
+        let three = ranking_schema(&["A", "B", "C"], 2048);
+        assert_eq!(three["properties"]["ranking"]["maxItems"], 3);
+        assert_eq!(three["properties"]["findings"]["items"]["properties"]["bbox"]["items"]["maximum"], 2048);
     }
 
     #[test]

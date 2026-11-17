@@ -91,6 +91,18 @@ pub struct Comparison {
     pub scores_b: Vec<CategoryScore>,
 }
 
+/// One image's place in a ranking.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankEntry {
+    pub image: ImageLabel,
+    /// 1..10; `None` when the model gave none.
+    pub overall: Option<u8>,
+    #[serde(default)]
+    pub strengths: String,
+    #[serde(default)]
+    pub weaknesses: String,
+}
+
 /// A parsed, validated report.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AiReport {
@@ -101,6 +113,9 @@ pub struct AiReport {
     pub overall: Option<u8>,
     pub categories: Vec<CategoryScore>,
     pub comparison: Option<Comparison>,
+    /// Ranking presets: every image once, best first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranking: Vec<RankEntry>,
     pub findings: Vec<Finding>,
     pub summary: String,
     /// The JSON was truncated and repaired; some fields may be missing.
@@ -262,11 +277,36 @@ fn categories(v: Option<&Value>, warnings: &mut Vec<String>) -> Vec<CategoryScor
 }
 
 fn label(v: Option<&Value>) -> Option<ImageLabel> {
-    match v?.as_str()?.trim().to_ascii_uppercase().as_str() {
-        "A" => Some(ImageLabel::A),
-        "B" => Some(ImageLabel::B),
-        _ => None,
+    ImageLabel::parse(v?.as_str()?)
+}
+
+fn ranking(v: &Value, kind: OutputKind, warnings: &mut Vec<String>) -> Vec<RankEntry> {
+    let mut out: Vec<RankEntry> = Vec::new();
+    let Some(list) = v.get("ranking").and_then(|r| r.as_array()) else {
+        if kind == OutputKind::RankingJson {
+            warnings.push("the answer has no ranking".into());
+        }
+        return out;
+    };
+    for (i, e) in list.iter().enumerate() {
+        let n = i + 1;
+        // A bare label ("B") is accepted as an entry without details.
+        let Some(image) = label(e.get("image")).or_else(|| label(Some(e))) else {
+            warnings.push(format!("ranking entry {n} names no image A to D and was skipped"));
+            continue;
+        };
+        if out.iter().any(|r| r.image == image) {
+            warnings.push(format!("image {} is ranked twice; the lower place was dropped", image.as_str()));
+            continue;
+        }
+        let overall = get_u8(e, "overall", 1, 10, warnings);
+        if overall.is_none() {
+            warnings.push(format!("image {} has no score", image.as_str()));
+        }
+        let text = |k: &str| e.get(k).and_then(|s| s.as_str()).unwrap_or("").trim().to_string();
+        out.push(RankEntry { image, overall, strengths: text("strengths"), weaknesses: text("weaknesses") });
     }
+    out
 }
 
 /// Parses model output into a report.
@@ -334,7 +374,10 @@ pub fn parse_report(text: &str, kind: OutputKind, conv: CoordConvention) -> Resu
             scores_b: categories(v.get("scores_b"), &mut warnings),
         }
     });
-    let overall = get_u8(&v, "overall", 1, 10, &mut warnings).or_else(|| comparison.as_ref().and_then(|c| c.overall_b));
+    let ranking = ranking(&v, kind, &mut warnings);
+    let overall = get_u8(&v, "overall", 1, 10, &mut warnings)
+        .or_else(|| comparison.as_ref().and_then(|c| c.overall_b))
+        .or_else(|| ranking.first().and_then(|r| r.overall));
     let categories = match v.get("categories") {
         Some(c) => categories(Some(c), &mut warnings),
         None => comparison.as_ref().map(|c| c.scores_b.clone()).unwrap_or_else(|| categories(None, &mut warnings)),
@@ -347,6 +390,7 @@ pub fn parse_report(text: &str, kind: OutputKind, conv: CoordConvention) -> Resu
         overall,
         categories,
         comparison,
+        ranking,
         findings,
         summary: v.get("summary").and_then(|s| s.as_str()).unwrap_or("").trim().to_string(),
         partial,
@@ -371,6 +415,26 @@ impl AiReport {
         }
     }
 
+    /// Checks a ranking against the images that were sent: entries for
+    /// images that were not sent are dropped, missing images are noted.
+    pub fn check_ranking(&mut self, sent: &[ImageLabel]) {
+        let before = self.ranking.len();
+        self.ranking.retain(|r| sent.contains(&r.image));
+        if self.ranking.len() < before {
+            self.warnings.push("the ranking named an image that was not sent; it was dropped".into());
+        }
+        for l in sent {
+            if !self.ranking.iter().any(|r| r.image == *l) {
+                self.warnings.push(format!("image {} is missing from the ranking", l.as_str()));
+            }
+        }
+    }
+
+    /// The best image of a ranking.
+    pub fn best(&self) -> Option<ImageLabel> {
+        self.ranking.first().map(|r| r.image)
+    }
+
     /// Converts a report from the swapped pass (B shown as A) back to the
     /// real labels.
     pub fn unswap(&mut self) {
@@ -385,6 +449,9 @@ impl AiReport {
                 s.label = s.label.other();
             }
         }
+        for r in &mut self.ranking {
+            r.image = r.image.other();
+        }
     }
 
     /// "Copy as Markdown". `pair`: A and B were sent, so findings name the
@@ -393,7 +460,19 @@ impl AiReport {
         let mut md = String::new();
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
         let score = |s: Option<u8>| s.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        // A ranking names every image's place.
+        let pair = pair || !self.ranking.is_empty();
         match &self.comparison {
+            _ if !self.ranking.is_empty() => {
+                md.push_str(&format!("## {title}: {} ranked best\n\n", self.ranking[0].image.as_str()));
+                if !self.verdict.is_empty() {
+                    md.push_str(&format!("**{}**\n\n", self.verdict));
+                }
+                md.push_str("| Rank | Image | Score | Strengths | Weaknesses |\n|---|---|---|---|---|\n");
+                for (i, r) in self.ranking.iter().enumerate() {
+                    md.push_str(&format!("| {} | {} | {} | {} | {} |\n", i + 1, r.image.as_str(), score(r.overall), cell(&r.strengths), cell(&r.weaknesses)));
+                }
+            }
             Some(c) => {
                 let verdict = match c.preferred {
                     Preference::Tie => "no visible preference (tie)".to_string(),
@@ -596,6 +675,75 @@ mod tests {
         let c = r.comparison.unwrap();
         assert_eq!((c.preferred, c.overall_a, c.scores_a[1].score), (Preference::A, Some(8), Some(8)));
         assert_eq!(r.findings[0].image, ImageLabel::B);
+    }
+
+    const RANK: &str = r#"{"verdict": "B is best: the most detail and the cleanest shadows.",
+      "ranking": [{"image": "B", "overall": 8, "strengths": "fine detail", "weaknesses": "slightly warm"},
+                  {"image": "D", "overall": 7, "strengths": "clean | neutral", "weaknesses": "soft corners"},
+                  {"image": "A", "overall": 6, "strengths": "none", "weaknesses": "noisy sky"},
+                  {"image": "C", "overall": 4, "strengths": "bright", "weaknesses": "clipped clouds"}],
+      "findings": [{"category": "exposure_dynamic_range", "severity": "severe", "image": "C", "tile": 0, "bbox": [100, 50, 600, 300], "description": "clouds burnt to white"}],
+      "summary": "B and D lead."}"#;
+
+    #[test]
+    fn parses_a_ranking() {
+        let r = parse_report(RANK, OutputKind::RankingJson, CoordConvention::Relative1000).unwrap();
+        let order: Vec<&str> = r.ranking.iter().map(|e| e.image.as_str()).collect();
+        assert_eq!(order, ["B", "D", "A", "C"]);
+        assert_eq!(r.ranking[0].overall, Some(8));
+        assert_eq!(r.ranking[1].strengths, "clean | neutral");
+        assert_eq!((r.best(), r.overall), (Some(ImageLabel::B), Some(8)));
+        assert!(r.comparison.is_none());
+        assert_eq!(r.findings[0].image, ImageLabel::C);
+        assert_eq!(r.verdict, "B is best: the most detail and the cleanest shadows.");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let mut checked = r.clone();
+        checked.check_ranking(&[ImageLabel::A, ImageLabel::B, ImageLabel::C, ImageLabel::D]);
+        assert!(checked.warnings.is_empty());
+        let md = r.to_markdown("Rank devices", false);
+        assert!(md.starts_with("## Rank devices: B ranked best"), "{md}");
+        assert!(md.contains("| 1 | B | 8 | fine detail | slightly warm |"), "{md}");
+        assert!(md.contains("| 2 | D | 7 | clean \\| neutral | soft corners |"), "{md}");
+        // Findings of a ranking always name the image.
+        assert!(md.contains("1. **severe** exposure and dynamic range (image C"), "{md}");
+        // Round trip, and results saved before rankings existed still load.
+        let back: AiReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.ranking, r.ranking);
+        let old = parse_report(FULL, OutputKind::QualityJson, CoordConvention::Relative1000).unwrap();
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("ranking").is_none());
+        assert!(serde_json::from_value::<AiReport>(v).unwrap().ranking.is_empty());
+    }
+
+    #[test]
+    fn ranking_tolerates_missing_and_odd_fields() {
+        // Out-of-range scores are clamped; unknown labels and repeats are dropped.
+        let text = r#"{"verdict": "A wins", "ranking": [{"image": "a", "overall": 14}, {"image": "E", "overall": 5}, {"image": "B"}, {"image": "A", "overall": 2}, "C"], "findings": [], "summary": ""}"#;
+        let mut r = parse_report(text, OutputKind::RankingJson, CoordConvention::Relative1000).unwrap();
+        let order: Vec<&str> = r.ranking.iter().map(|e| e.image.as_str()).collect();
+        assert_eq!(order, ["A", "B", "C"]);
+        assert_eq!(r.ranking[0].overall, Some(10), "clamped");
+        assert_eq!((r.ranking[1].overall, r.ranking[2].overall), (None, None));
+        assert!(r.ranking[1].strengths.is_empty());
+        let w = r.warnings.join("; ");
+        for needle in ["overall 14 clamped to 10", "entry 2 names no image", "image B has no score", "image A is ranked twice"] {
+            assert!(w.contains(needle), "missing '{needle}' in {w}");
+        }
+        // Checked against what was sent: D is missing, C was not sent.
+        r.check_ranking(&[ImageLabel::A, ImageLabel::B, ImageLabel::D]);
+        assert_eq!(r.ranking.len(), 2);
+        let w = r.warnings.join("; ");
+        assert!(w.contains("image D is missing from the ranking") && w.contains("not sent"), "{w}");
+        // No ranking at all: still a report, with a warning.
+        let r = parse_report(r#"{"verdict": "x", "findings": []}"#, OutputKind::RankingJson, CoordConvention::Relative1000).unwrap();
+        assert!(r.ranking.is_empty() && r.overall.is_none());
+        assert!(r.warnings.iter().any(|w| w == "the answer has no ranking"));
+        // Truncated mid-ranking: the complete entries are kept.
+        let cut = &RANK[..RANK.find("{\"image\": \"A\"").unwrap() + 20];
+        let r = parse_report(cut, OutputKind::RankingJson, CoordConvention::Relative1000).unwrap();
+        assert!(r.partial);
+        assert!(r.ranking.len() >= 2, "{:?}", r.ranking);
+        assert_eq!(r.ranking[0].image, ImageLabel::B);
     }
 
     #[test]

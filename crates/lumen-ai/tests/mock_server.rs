@@ -659,3 +659,64 @@ fn cancel_while_the_server_is_silent() {
     assert!(matches!(done(&events), Err(AiError::Cancelled)));
     assert!(t.elapsed() < Duration::from_millis(1500), "cancel took {:?}", t.elapsed());
 }
+
+const RANK: &str = r#"{"verdict": "B is best: the most detail and the cleanest shadows.", "ranking": [{"image": "B", "overall": 8, "strengths": "fine detail", "weaknesses": "slightly warm"}, {"image": "D", "overall": 7, "strengths": "neutral", "weaknesses": "soft corners"}, {"image": "A", "overall": 6, "strengths": "none", "weaknesses": "noisy sky"}, {"image": "C", "overall": 4, "strengths": "bright", "weaknesses": "clipped clouds"}], "findings": [{"category": "exposure_dynamic_range", "severity": "severe", "image": "D", "tile": 0, "bbox": [700, 700, 800, 780], "description": "clouds burnt to white"}], "summary": "B and D lead."}"#;
+
+fn rank_input() -> RequestInput {
+    RequestInput::new(Preset::builtin(PresetId::Rank), InputImage::new(image(800, 600, 1)))
+        .with_b(InputImage::new(image(800, 600, 2)))
+        .with_extra(InputImage::new(image(800, 600, 3)))
+        .with_extra(InputImage::new(image(800, 600, 4)))
+}
+
+#[test]
+fn ranks_four_images_in_one_request() {
+    let mock = vllm_mock(|_, _| Reply::Sse(sse_for(RANK, Duration::from_millis(1))));
+    let s = mock.settings();
+    let prepared = prepare(&s, "Qwen/Qwen2.5-VL-7B-Instruct", rank_input()).unwrap();
+    assert_eq!(prepared.image_count(), 4);
+    let task = spawn_run(Client::from_settings(&s, None).unwrap(), prepared, repaint());
+    let events = collect(&task, Duration::from_secs(20));
+    let r = done(&events).as_ref().unwrap();
+    let body = mock.chats()[0].json();
+    assert_eq!(image_parts(&body), 4);
+    assert_eq!(body["response_format"]["json_schema"]["name"], "lumen_ranking_report");
+    let texts: Vec<&str> = body["messages"][1]["content"].as_array().unwrap().iter().filter_map(|p| p["text"].as_str()).collect();
+    assert!(texts.iter().any(|t| t.starts_with("Image D: full view")), "{texts:?}");
+    let report = r.report.as_ref().unwrap().as_ref().unwrap();
+    let order: Vec<ImageLabel> = report.ranking.iter().map(|e| e.image).collect();
+    assert_eq!(order, [ImageLabel::B, ImageLabel::D, ImageLabel::A, ImageLabel::C]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    // The finding is on D's own full view (800x600 padded to 800x608),
+    // mapped to D's pixels.
+    let src = report.findings[0].source.unwrap();
+    assert_eq!(src.label, ImageLabel::D);
+    assert!((src.x0 - 560.0).abs() < 1.0 && (src.y1 - 474.24).abs() < 1.0, "{src:?}");
+    assert_eq!(r.layout.len(), 4);
+}
+
+#[test]
+fn ranking_falls_back_to_a_grid_composite() {
+    let mock = vllm_mock(|r, _| {
+        if image_parts(&r.json()) > 2 {
+            Reply::Json(400, err("At most 2 image(s) may be provided in one prompt.", 400))
+        } else {
+            Reply::Sse(sse_for(RANK, Duration::from_millis(1)))
+        }
+    });
+    let s = mock.settings();
+    let task = spawn_run(Client::from_settings(&s, None).unwrap(), prepare(&s, "m", rank_input()).unwrap(), repaint());
+    let events = collect(&task, Duration::from_secs(20));
+    assert!(events.iter().any(|e| matches!(e, AiEvent::ImageLimitLearned { limit: 2, .. })), "{events:?}");
+    assert!(events.iter().any(|e| matches!(e, AiEvent::Status(m) if m.contains("all images in one composite"))), "{events:?}");
+    let r = done(&events).as_ref().unwrap();
+    assert_eq!(r.sent.images.len(), 1);
+    assert!(r.sent.user_prompt.contains("2x2 grid"));
+    assert_eq!(image_parts(&mock.chats()[1].json()), 1);
+    // The box in the bottom-right cell of the grid lands on D.
+    let report = r.report.as_ref().unwrap().as_ref().unwrap();
+    let src = report.findings[0].source.unwrap();
+    assert_eq!((report.findings[0].image, src.label), (ImageLabel::D, ImageLabel::D));
+    assert!(src.x0 >= 0.0 && src.x1 <= 800.0 && src.y1 <= 600.0, "{src:?}");
+    assert_eq!(report.ranking.len(), 4);
+}

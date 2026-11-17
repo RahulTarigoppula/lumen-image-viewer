@@ -1,16 +1,19 @@
 //! The Analysis panel's AI tab: server status and model, preset, Run and
 //! Cancel, the live output while the answer streams, result cards, the
 //! per-file history, and the numbered finding boxes drawn on the image.
+//! A ranking of compare panes A to D shows the ranking with the pane badge
+//! colors, and findings can become review marks ("Add findings as marks").
 
 use std::collections::HashMap;
 
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
-use lumen_ai::{all_presets, AiReport, ImageLabel, OutputKind, Preference, Preset, PresetId, RunResult, Severity};
+use lumen_ai::{all_presets, AiReport, Arity, ImageLabel, OutputKind, Preference, Preset, PresetId, RankEntry, RunResult, Severity, SourceBox};
 
-use super::ai::{Outcome, Phase, RunRecord, RunRequest};
+use super::ai::{extra_images, history_key, Outcome, Phase, RunRecord, RunRequest};
 use super::canvas::{Pane, Slot};
 use super::look;
-use super::{PanelAction, Subject, SubjectKind};
+use super::{PanelAction, Subject, SubjectImage, SubjectKind};
+use crate::ui::review::{self, Mark, Shape};
 use crate::app::Core;
 use crate::ui::icons as I;
 use crate::ui::theme::{self, semibold, Palette};
@@ -19,8 +22,9 @@ use crate::ui::widgets;
 /// Per-panel UI state of the AI tab.
 #[derive(Default)]
 pub struct AiView {
-    /// Chosen preset id per kind of view.
-    presets: HashMap<SubjectKind, String>,
+    /// Chosen preset id per kind of view (and whether compare shows three
+    /// or four images).
+    presets: HashMap<(SubjectKind, bool), String>,
     /// Free-form question (and extra instructions for the other presets).
     pub question: String,
     /// Finding under the pointer in the list (drawn highlighted on the image).
@@ -29,17 +33,19 @@ pub struct AiView {
 }
 
 /// Built-in presets offered for a kind of view, then matching custom ones.
-pub fn presets_for(kind: SubjectKind, custom: &[lumen_ai::CustomPreset]) -> Vec<Preset> {
+/// `multi`: compare shows three or four images, so ranking them comes first.
+pub fn presets_for(kind: SubjectKind, multi: bool, custom: &[lumen_ai::CustomPreset]) -> Vec<Preset> {
     use PresetId::*;
     let ids: &[PresetId] = match kind {
         SubjectKind::Image => &[Quality, Photo, FreeForm, QuickScore],
-        SubjectKind::Pair => &[Compare, Encode, FreeForm],
+        SubjectKind::Pair if multi => &[Rank, Compare, Encode, FreeForm],
+        SubjectKind::Pair => &[Compare, Encode, FreeForm, Rank],
         SubjectKind::Video => &[VideoFrame, FreeForm, QuickScore],
         SubjectKind::VideoPair => &[VideoCompare, VideoFrame, FreeForm],
     };
     let pair = kind.is_pair();
     let mut v: Vec<Preset> = ids.iter().map(|&id| Preset::builtin(id)).collect();
-    v.extend(all_presets(custom).into_iter().filter(|p| p.builtin.is_none() && (p.arity == lumen_ai::Arity::Two) == pair));
+    v.extend(all_presets(custom).into_iter().filter(|p| p.builtin.is_none() && (p.arity != Arity::One) == pair));
     v
 }
 
@@ -62,22 +68,35 @@ fn score_color(p: &Palette, score: u8) -> Color32 {
 impl AiView {
     /// The mode the tab would run for `kind`: the one picked for this kind
     /// of view, else the one that fits it (critique for an image, A vs B for
-    /// a pair, frame review for a video).
-    pub fn preset(&self, kind: SubjectKind, core: &Core) -> Preset {
-        let list = presets_for(kind, &core.ai.settings.custom_presets);
-        match self.presets.get(&kind) {
+    /// a pair, ranking for three or four compare panes, frame review for a
+    /// video). `multi`: compare shows three or four images.
+    pub fn preset(&self, kind: SubjectKind, multi: bool, core: &Core) -> Preset {
+        let list = presets_for(kind, multi, &core.ai.settings.custom_presets);
+        match self.presets.get(&(kind, multi)) {
             Some(want) => list.iter().find(|p| &p.id == want).cloned().unwrap_or_else(|| list[0].clone()),
             None => list[0].clone(),
         }
     }
 
+    /// Picks the mode for a kind of view, with two or more images alike (dev hook).
     pub fn set_preset(&mut self, kind: SubjectKind, id: &str) {
-        self.presets.insert(kind, id.to_string());
+        self.presets.insert((kind, false), id.to_string());
+        self.presets.insert((kind, true), id.to_string());
+    }
+
+    /// "Add findings as marks" for the shown result (dev hook `ai marks`).
+    pub fn add_marks(&self, core: &mut Core, subject: &Subject, out: &mut Vec<PanelAction>) {
+        let extra = extra_images(core, subject);
+        let Some(key) = history_key(subject, &extra) else { return };
+        if let Some(rec) = core.ai.shown_record(&key) {
+            out.push(PanelAction::AddMarks(marks_for(rec, subject, &extra)));
+        }
     }
 
     /// Run (button, Ctrl+Shift+Q, dev hook).
     pub fn run(&mut self, core: &mut Core, subject: &Subject, roi: Option<(u32, u32, u32, u32)>, metrics: Vec<(String, f64, String)>) {
-        let preset = self.preset(subject.kind, core);
+        let extra = extra_images(core, subject);
+        let preset = self.preset(subject.kind, !extra.is_empty(), core);
         // Quick score asks a fixed question; nothing typed is sent with it.
         let question = if preset.output == OutputKind::QuickScore { String::new() } else { self.question.clone() };
         let scope = match (subject.kind.is_pair(), roi.is_some()) {
@@ -86,7 +105,7 @@ impl AiView {
             (false, true) => "ROI",
             (false, false) => "",
         };
-        core.ai.start_run(RunRequest { subject: subject.clone(), preset, roi, question, metrics, metric_scope: scope.to_string() });
+        core.ai.start_run(RunRequest { subject: subject.clone(), extra, preset, roi, question, metrics, metric_scope: scope.to_string() });
     }
 
     /// The tab's contents.
@@ -98,8 +117,10 @@ impl AiView {
             return;
         }
         self.server_row(ui, core, out);
-        self.preset_row(ui, core, subject.kind);
-        let preset = self.preset(subject.kind, core);
+        let extra = extra_images(core, subject);
+        let multi = !extra.is_empty();
+        self.preset_row(ui, core, subject.kind, multi);
+        let preset = self.preset(subject.kind, multi, core);
         // Free-form needs a question; the other presets take optional extra
         // instructions (sent too, so they always stay visible).
         if preset.output == OutputKind::Markdown {
@@ -107,19 +128,20 @@ impl AiView {
         } else if preset.output != OutputKind::QuickScore {
             ui.add(egui::TextEdit::singleline(&mut self.question).hint_text("Extra instructions (optional)").desired_width(f32::INFINITY));
         }
-        self.run_row(ui, core, subject, roi, metrics);
+        let images = if preset.arity == Arity::Many { 2 + extra.len().min(lumen_ai::MAX_IMAGES - 2) } else { 0 };
+        self.run_row(ui, core, subject, roi, metrics, images);
         if let Some(e) = core.ai.error.clone() {
             ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
         }
         if matches!(core.ai.phase, Phase::Running { .. }) {
             self.live(ui, core);
         }
-        let Some(key) = subject.file_key() else { return };
+        let Some(key) = history_key(subject, &extra) else { return };
         let Some(shown) = core.ai.shown_index(&key) else { return };
         ui.add_space(4.0);
         self.history_row(ui, core, &key, shown);
         if let Some(rec) = core.ai.shown_record(&key).cloned() {
-            self.card(ui, &p, &rec, subject, out);
+            self.card(ui, &p, &rec, subject, &extra, out);
         }
     }
 
@@ -216,10 +238,10 @@ impl AiView {
     }
 
     /// Model and mode, as two aligned rows.
-    fn preset_row(&mut self, ui: &mut Ui, core: &mut Core, kind: SubjectKind) {
+    fn preset_row(&mut self, ui: &mut Ui, core: &mut Core, kind: SubjectKind, multi: bool) {
         let p = core.pal;
-        let list = presets_for(kind, &core.ai.settings.custom_presets);
-        let cur = self.preset(kind, core);
+        let list = presets_for(kind, multi, &core.ai.settings.custom_presets);
+        let cur = self.preset(kind, multi, core);
         let mut pick = None;
         let label_w = 46.0;
         let label = |ui: &mut Ui, text: &str| {
@@ -261,7 +283,7 @@ impl AiView {
         });
         ui.horizontal(|ui| {
             label(ui, "Mode");
-            widgets::combo(("ai-preset", kind)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
+            widgets::combo(("ai-preset", kind, multi)).selected_text(cur.name.clone()).width(ui.available_width()).show_ui(ui, |ui| {
                 for pr in &list {
                     if ui.selectable_label(pr.id == cur.id, &pr.name).on_hover_text(&pr.description).clicked() {
                         pick = Some(pr.id.clone());
@@ -274,7 +296,7 @@ impl AiView {
             ui.add(egui::Label::new(RichText::new(&cur.description).size(theme::text::SMALL).color(p.faint)).wrap());
         });
         if let Some(id) = pick {
-            self.set_preset(kind, &id);
+            self.presets.insert((kind, multi), id.clone());
             if core.ai.settings.preset != id {
                 core.ai.settings.preset = id;
                 core.ai.dirty = true;
@@ -282,7 +304,8 @@ impl AiView {
         }
     }
 
-    fn run_row(&mut self, ui: &mut Ui, core: &mut Core, subject: &Subject, roi: Option<(u32, u32, u32, u32)>, metrics: Vec<(String, f64, String)>) {
+    /// `images`: how many images a ranking sends (0 for other modes).
+    fn run_row(&mut self, ui: &mut Ui, core: &mut Core, subject: &Subject, roi: Option<(u32, u32, u32, u32)>, metrics: Vec<(String, f64, String)>, images: usize) {
         let p = core.pal;
         let busy = core.ai.busy();
         let w = ui.available_width();
@@ -310,7 +333,17 @@ impl AiView {
                 });
             } else {
                 let ready = subject.a.is_some();
-                let what = if roi.is_some() { "the region" } else if subject.kind.is_pair() { "A and B" } else if subject.kind.is_video() { "the frame on screen" } else { "the whole image" };
+                let what = if roi.is_some() {
+                    "the region".to_string()
+                } else if images > 2 {
+                    format!("all {images} images")
+                } else if subject.kind.is_pair() {
+                    "A and B".to_string()
+                } else if subject.kind.is_video() {
+                    "the frame on screen".to_string()
+                } else {
+                    "the whole image".to_string()
+                };
                 let run = ui.allocate_ui_with_layout(Vec2::new(w, theme::size::CONTROL), Layout::top_down_justified(Align::Center), |ui| widgets::primary_button_enabled(ui, &p, ready, "Run AI review")).inner;
                 let resp = run.on_hover_text(format!("Send {what} to your AI server ({})", crate::ui::commands::Command::RunAi.shortcut()));
                 if resp.clicked() {
@@ -397,7 +430,7 @@ impl AiView {
     }
 
     /// The result card of `rec`.
-    fn card(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, subject: &Subject, out: &mut Vec<PanelAction>) {
+    fn card(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, subject: &Subject, extra: &[SubjectImage], out: &mut Vec<PanelAction>) {
         egui::Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(10).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 5.0;
@@ -413,7 +446,7 @@ impl AiView {
                 }
             }
             match &rec.outcome {
-                Outcome::Done(res) => self.done(ui, p, rec, res, out),
+                Outcome::Done(res) => self.done(ui, p, rec, res, subject, extra, out),
                 Outcome::Failed { message, detail, partial } => {
                     let l = ui.add(egui::Label::new(RichText::new(format!("{}  {message}", I::X_CIRCLE)).color(p.danger)).wrap());
                     if let Some(d) = detail {
@@ -434,7 +467,8 @@ impl AiView {
         });
     }
 
-    fn done(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, res: &RunResult, out: &mut Vec<PanelAction>) {
+    #[allow(clippy::too_many_arguments)]
+    fn done(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, res: &RunResult, subject: &Subject, extra: &[SubjectImage], out: &mut Vec<PanelAction>) {
         for w in &res.warnings {
             ui.add(egui::Label::new(RichText::new(format!("{}  {w}", I::WARNING)).size(11.5).color(p.warn)).wrap());
         }
@@ -486,7 +520,7 @@ impl AiView {
         let bytes: usize = res.sent.images.iter().map(|i| i.bytes).sum();
         foot.push(format!("{} image(s), {}", res.sent.images.len(), fmt_bytes(bytes)));
         let foot_l = ui.add(egui::Label::new(RichText::new(foot.join("  |  ")).size(10.5).color(p.faint)).wrap());
-        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({} × {}, {} {})", shown_text(&i.description, rec.dims[1].is_some()), i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
+        let sent: Vec<String> = res.sent.images.iter().map(|i| format!("{} ({} × {}, {} {})", shown_text(&i.description, rec.multi()), i.width, i.height, fmt_bytes(i.bytes), i.mime)).collect();
         foot_l.on_hover_text(format!("Sent to {}:\n{}", res.sent.destination, sent.join("\n")));
         for c in &res.sent.changes {
             ui.label(RichText::new(c).size(10.5).color(p.faint));
@@ -500,6 +534,17 @@ impl AiView {
                 out.push(PanelAction::ExportJson(serde_json::to_string_pretty(res).unwrap_or_default()));
             }
         });
+        // Compare mode keeps review marks: the problems found can become marks.
+        let boxed = res.report.as_ref().and_then(|r| r.as_ref().ok()).is_some_and(|r| r.findings.iter().any(|f| f.source.is_some()));
+        if subject.kind == SubjectKind::Pair
+            && boxed
+            && ui
+                .button(format!("{}  Add findings as marks", I::BOUNDING_BOX))
+                .on_hover_text("Add each problem found as a red rectangle mark on its image, with the description as the note, a matching artifact tag and the severity. The marks join your review (Review panel, report) and can be edited or deleted like any other.")
+                .clicked()
+        {
+            out.push(PanelAction::AddMarks(marks_for(rec, subject, extra)));
+        }
     }
 
     fn report(&mut self, ui: &mut Ui, p: &Palette, rec: &RunRecord, r: &AiReport, out: &mut Vec<PanelAction>) {
@@ -515,6 +560,14 @@ impl AiView {
             ui.add_space(2.0);
         }
         match &r.comparison {
+            // Ranking: every image best first, with the compare pane colors.
+            _ if !r.ranking.is_empty() => {
+                ui.label(RichText::new(format!("{}  Ranking", I::RANKING)).font(semibold(12.5)).color(p.text))
+                    .on_hover_text("Best first. The letters and colors match the compare panes; scores are out of 10, the model's opinion.");
+                for (i, e) in r.ranking.iter().enumerate() {
+                    rank_row(ui, p, i, e);
+                }
+            }
             Some(c) => {
                 ui.horizontal(|ui| {
                     let (text, col) = match c.preferred {
@@ -566,16 +619,14 @@ impl AiView {
                 .on_hover_text("Only problems that matter are listed. Click one to zoom to it; the numbers match the boxes on the image.");
             let mut hovered = None;
             for (i, f) in r.findings.iter().enumerate() {
-                let resp = finding_row(ui, p, i, f, rec.dims[1].is_some());
+                let resp = finding_row(ui, p, i, f, rec.multi());
                 if resp.hovered() {
                     hovered = Some(i);
                 }
                 if resp.clicked() {
                     if let Some(s) = f.source {
-                        let dims = rec.dims[if s.label == ImageLabel::B { 1 } else { 0 }];
-                        if let Some((w, h)) = dims {
+                        if let (Some((w, h)), Some(slot)) = (rec.dims_of(s.label), Slot::from_index(s.label.index())) {
                             let (w, h) = (w.max(1) as f32, h.max(1) as f32);
-                            let slot = if s.label == ImageLabel::B { Slot::B } else { Slot::A };
                             out.push(PanelAction::ZoomTo { slot, rect: [s.x0 as f32 / w, s.y0 as f32 / h, s.x1 as f32 / w, s.y1 as f32 / h] });
                         }
                     }
@@ -598,7 +649,8 @@ impl AiView {
     /// Numbered, severity-colored boxes of the shown result on every pane of
     /// the matching image.
     pub fn overlay(&self, ui: &Ui, core: &mut Core, subject: &Subject, panes: &[Pane]) {
-        let Some(key) = subject.file_key() else { return };
+        let extra = extra_images(core, subject);
+        let Some(key) = history_key(subject, &extra) else { return };
         let Some(rec) = core.ai.shown_record(&key) else { return };
         if let (Some(f), Some(cur)) = (rec.frame, subject.frame()) {
             if f.index != cur.index {
@@ -607,13 +659,9 @@ impl AiView {
         }
         let Some(Ok(report)) = rec.result().and_then(|r| r.report.as_ref()) else { return };
         for pane in panes {
-            // Only A and B are sent; C and D panes have no findings.
-            let label = match pane.slot {
-                Slot::A => ImageLabel::A,
-                Slot::B => ImageLabel::B,
-                _ => continue,
-            };
-            let Some((w, h)) = rec.dims[if pane.slot == Slot::B { 1 } else { 0 }] else { continue };
+            // C and D have findings only when a ranking sent them.
+            let Some(label) = ImageLabel::from_index(pane.slot.index()) else { continue };
+            let Some((w, h)) = rec.dims_of(label) else { continue };
             // In a wipe or split view the other image covers the rest of the
             // same place: its side shows this image's boxes dashed, so a
             // finding stays visible wherever the divider is, without being
@@ -696,6 +744,9 @@ impl Uncovered {
 /// Frame color of the verdict: the preferred image's color for a pair, the
 /// score's color for one image.
 fn verdict_color(p: &Palette, r: &AiReport) -> Color32 {
+    if let Some(best) = r.best() {
+        return label_color(p, best);
+    }
     match &r.comparison {
         Some(c) => match c.preferred {
             Preference::A => p.accent,
@@ -707,6 +758,9 @@ fn verdict_color(p: &Palette, r: &AiReport) -> Color32 {
 }
 
 fn overall_text(r: &AiReport) -> Option<String> {
+    if let Some(best) = r.best() {
+        return Some(format!("{} best", best.as_str()));
+    }
     match &r.comparison {
         Some(c) => Some(match c.preferred {
             Preference::Tie => "tie".into(),
@@ -714,6 +768,36 @@ fn overall_text(r: &AiReport) -> Option<String> {
         }),
         None => r.overall.map(|s| format!("{s}/10")),
     }
+}
+
+/// Pane badge colors A to D, the same as compare's.
+pub fn label_color(p: &Palette, l: ImageLabel) -> Color32 {
+    [p.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][l.index()]
+}
+
+/// One place of a ranking: number, the pane's letter badge, the score bar,
+/// then strengths and weaknesses.
+fn rank_row(ui: &mut Ui, p: &Palette, place: usize, e: &RankEntry) {
+    let col = label_color(p, e.image);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (r, _) = ui.allocate_exact_size(Vec2::new(12.0, 24.0), Sense::hover());
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, (place + 1).to_string(), semibold(12.5), p.muted);
+        let (r, _) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 11.5, col);
+        ui.painter().circle_stroke(r.center(), 11.5, Stroke::new(1.0, Color32::from_black_alpha(90)));
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, e.image.as_str(), semibold(12.5), Color32::WHITE);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            score_bar(ui, p, "Overall", e.overall, "", Some(52.0), false);
+            for (what, text, c) in [("Strengths", &e.strengths, p.text), ("Weaknesses", &e.weaknesses, p.muted)] {
+                if !text.is_empty() && !text.eq_ignore_ascii_case("none") {
+                    ui.add(egui::Label::new(RichText::new(format!("{what}: {text}")).size(11.5).color(c)).wrap());
+                }
+            }
+        });
+    });
+    ui.add_space(2.0);
 }
 
 fn badge(ui: &mut Ui, p: &Palette, text: &str, col: Color32) {
@@ -824,7 +908,7 @@ pub fn shown_text(s: &str, pair: bool) -> String {
 /// "Copy as Markdown": the report (or free-form answer) and where it came from.
 pub fn markdown(rec: &RunRecord, res: &RunResult) -> String {
     let mut md = match &res.report {
-        Some(Ok(r)) => r.to_markdown(&res.preset_name, rec.dims[1].is_some()),
+        Some(Ok(r)) => r.to_markdown(&res.preset_name, rec.multi()),
         _ => match &res.quick_score {
             Some(Ok(q)) => format!("## {}: MOS {:.2} (score {:.3})\n", res.preset_name, q.mos(), q.score),
             _ => format!("## {}\n\n{}\n", res.preset_name, res.text.trim()),
@@ -836,9 +920,190 @@ pub fn markdown(rec: &RunRecord, res: &RunResult) -> String {
     md
 }
 
+// ---------------------------------------------------------------- findings as marks
+
+/// Artifact tags by keyword, most specific first (a "halo from sharpening"
+/// is Over-sharpening, "noise reduction smearing" is Texture loss).
+/// Keywords match at the start of a word, in the description and the
+/// category; the names are `lumen_core::workbench::ARTIFACT_TAGS`.
+const TAG_RULES: &[(&[&str], &str)] = &[
+    (&["oversharpen", "over-sharpen", "sharpening halo", "crunchy"], "Over-sharpening"),
+    (&["halo"], "Halo"),
+    (&["ghost", "double edge", "double image"], "Ghosting"),
+    (&["flare", "glare", "veiling"], "Flare"),
+    (&["moir"], "Moire"),
+    (&["band", "posteriz", "contouring"], "Banding"),
+    (&["ringing", "ripple"], "Ringing"),
+    (&["fring", "chromatic aberration", "purple edge"], "Color fringing"),
+    (&["demosaic", "zipper", "maze"], "Demosaic error"),
+    (&["smear", "waxy", "plastic", "watercolor", "texture loss", "lost texture", "loss of texture", "noise reduction", "detail vs reference"], "Texture loss"),
+    (&["noise", "noisy", "grain", "speckle"], "Noise"),
+    (&["compression", "blocking", "blocky", "blocks", "macroblock", "mosquito", "jpeg"], "Compression"),
+    (&["white balance", "color cast", "colour cast", "cast", "tint", "too warm", "too cool", "yellowish", "bluish", "greenish"], "White balance"),
+    (&["clipped", "clipping", "blown", "overexpos", "burnt", "burned out", "highlight"], "Clipped highlights"),
+    (&["crush", "shadow", "underexpos", "too dark"], "Crushed shadows"),
+    (&["color shift", "colour shift", "hue", "skin tone", "saturat", "color", "colour"], "Color shift"),
+    (&["blur", "soft", "focus", "defocus", "misfocus", "unsharp", "not sharp", "lack of detail", "lacks detail", "loss of detail", "lost detail", "sharpness"], "Blur"),
+    (&["distort", "stretched", "warped"], "Distortion"),
+    (&["rolling shutter", "judder", "jello", "motion artifact"], "Motion artifact"),
+    (&["dark"], "Crushed shadows"),
+    (&["bright"], "Clipped highlights"),
+];
+
+/// `key` occurs in `hay` at the start of a word.
+fn has_word(hay: &str, key: &str) -> bool {
+    hay.match_indices(key).any(|(i, _)| !hay[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric()))
+}
+
+/// The artifact tag (a name from `lumen_core::workbench::ARTIFACT_TAGS`)
+/// that best fits a finding's category and description; "Other" when none does.
+pub fn artifact_tag(category: &str, description: &str) -> &'static str {
+    let hay = format!("{} {}", description, category.replace('_', " ")).to_lowercase();
+    TAG_RULES.iter().find(|(keys, _)| keys.iter().any(|k| has_word(&hay, k))).map(|(_, tag)| *tag).unwrap_or("Other")
+}
+
+/// A finding's box (in pixels of the image as sent, `sent` wide and high)
+/// as two corners in pixels of the image as shown now (`shown`, the same
+/// size unless it was reloaded at another size), clamped to it. Very thin
+/// boxes get at least 2 px so the mark is visible.
+pub fn box_to_image(s: &SourceBox, sent: (u32, u32), shown: (u32, u32)) -> Option<[[f32; 2]; 2]> {
+    let (w, h) = (shown.0 as f64, shown.1 as f64);
+    if w < 2.0 || h < 2.0 {
+        return None;
+    }
+    let (kx, ky) = (w / sent.0.max(1) as f64, h / sent.1.max(1) as f64);
+    let span = |a: f64, b: f64, k: f64, side: f64| {
+        let (mut lo, mut hi) = ((a.min(b) * k).clamp(0.0, side), (a.max(b) * k).clamp(0.0, side));
+        if hi - lo < 2.0 {
+            let c = ((lo + hi) / 2.0).clamp(1.0, side - 1.0);
+            (lo, hi) = (c - 1.0, c + 1.0);
+        }
+        (lo as f32, hi as f32)
+    };
+    let (x0, x1) = span(s.x0, s.x1, kx, w);
+    let (y0, y1) = span(s.y0, s.y1, ky, h);
+    (x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()).then_some([[x0, y0], [x1, y1]])
+}
+
+/// Review marks for the findings that have a box: (compare pane index,
+/// red rectangle in that image's pixels, the description as note, the
+/// matching artifact tag and the finding's severity). `sent`: an image's
+/// size as sent (the boxes' pixels); `shown`: its size on screen now.
+pub fn finding_marks(report: &AiReport, sent: impl Fn(ImageLabel) -> Option<(u32, u32)>, shown: impl Fn(ImageLabel) -> Option<(u32, u32)>) -> Vec<(usize, Mark)> {
+    report
+        .findings
+        .iter()
+        .filter_map(|f| {
+            let s = f.source?;
+            let sent_dims = sent(s.label)?;
+            let shown_dims = shown(s.label).unwrap_or(sent_dims);
+            let [a, b] = box_to_image(&s, sent_dims, shown_dims)?;
+            let severity = match f.severity {
+                Severity::Severe => review::Severity::Severe,
+                Severity::Moderate => review::Severity::Moderate,
+                Severity::Minor => review::Severity::Minor,
+            };
+            let mark = Mark {
+                shape: Shape::Rect,
+                pts: vec![a, b],
+                color: review::COLORS[0].1,
+                width: review::stroke_px(Shape::Rect, 1, shown_dims),
+                note: f.description.trim().to_string(),
+                tag: Some(artifact_tag(&f.category, &f.description).to_string()),
+                severity,
+            };
+            Some((s.label.index(), mark))
+        })
+        .collect()
+}
+
+/// [`finding_marks`] of a history record, on the images shown now.
+fn marks_for(rec: &RunRecord, subject: &Subject, extra: &[SubjectImage]) -> Vec<(usize, Mark)> {
+    let Some(Ok(report)) = rec.result().and_then(|r| r.report.as_ref()) else { return Vec::new() };
+    let shown: Vec<Option<(u32, u32)>> = [subject.a.as_ref(), subject.b.as_ref()].into_iter().chain(extra.iter().map(Some)).map(|i| i.and_then(|i| i.size)).collect();
+    finding_marks(report, |l| rec.dims_of(l), |l| shown.get(l.index()).copied().flatten())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn findings_map_to_artifact_tags() {
+        let cases = [
+            ("noise", "chroma noise in the shadows", "Noise"),
+            ("sharpness_detail", "the subject is out of focus", "Blur"),
+            ("sharpness_detail", "bright halos along the roof edge", "Halo"),
+            ("sharpness_detail", "crunchy edges from oversharpening", "Over-sharpening"),
+            ("compression_artifacts", "the sky shows visible bands instead of a gradient", "Banding"),
+            ("compression_artifacts", "8x8 blocking in the dark areas", "Compression"),
+            ("exposure_dynamic_range", "lens flare from the street lamp", "Flare"),
+            ("color", "a strong blue cast over the whole scene", "White balance"),
+            ("color", "skin tones look too red", "Color shift"),
+            ("color", "colors look wrong", "Color shift"),
+            ("exposure_dynamic_range", "clouds are clipped to white", "Clipped highlights"),
+            ("exposure_dynamic_range", "shadows are blocked up and crushed", "Crushed shadows"),
+            ("sharpness_detail", "moire on the striped shirt", "Moire"),
+            ("sharpness_detail", "double edges on the moving car", "Ghosting"),
+            ("noise", "grass smeared by heavy noise reduction", "Texture loss"),
+            ("color", "the overcast sky is blown out", "Clipped highlights"),
+            ("blur", "", "Blur"),
+            ("noise", "", "Noise"),
+            ("detail_vs_reference", "less detail than A", "Texture loss"),
+            ("exposure_dynamic_range", "flat contrast overall", "Other"),
+            ("", "something odd", "Other"),
+        ];
+        let names: Vec<&str> = lumen_core::workbench::ARTIFACT_TAGS.iter().map(|t| t.0).collect();
+        for (cat, desc, want) in cases {
+            let got = artifact_tag(cat, desc);
+            assert_eq!(got, want, "{cat}: {desc}");
+            assert!(names.contains(&got), "{got} is not an artifact tag");
+        }
+        // Every tag a rule can give exists.
+        for (_, tag) in TAG_RULES {
+            assert!(names.contains(tag), "{tag} is not an artifact tag");
+        }
+    }
+
+    #[test]
+    fn finding_boxes_map_to_image_pixels() {
+        let b = |x0, y0, x1, y1| SourceBox { label: ImageLabel::B, x0, y0, x1, y1 };
+        // Same size: the box as is (corners ordered).
+        assert_eq!(box_to_image(&b(300.0, 250.0, 100.0, 50.0), (1000, 500), (1000, 500)), Some([[100.0, 50.0], [300.0, 250.0]]));
+        // The image shown at twice the size it was sent at.
+        assert_eq!(box_to_image(&b(100.0, 50.0, 300.0, 250.0), (1000, 500), (2000, 1000)), Some([[200.0, 100.0], [600.0, 500.0]]));
+        // Clamped to the image; a zero-size box gets 2 px.
+        assert_eq!(box_to_image(&b(-20.0, 400.0, 1200.0, 900.0), (1000, 500), (1000, 500)), Some([[0.0, 400.0], [1000.0, 500.0]]));
+        assert_eq!(box_to_image(&b(1000.0, 10.0, 1000.0, 10.0), (1000, 500), (1000, 500)), Some([[998.0, 9.0], [1000.0, 11.0]]));
+        assert_eq!(box_to_image(&b(1.0, 1.0, 5.0, 5.0), (10, 10), (1, 1)), None);
+    }
+
+    #[test]
+    fn findings_become_marks_on_their_panes() {
+        let text = r#"{"verdict": "B is best", "ranking": [{"image": "B", "overall": 8}, {"image": "A", "overall": 6}, {"image": "C", "overall": 5}, {"image": "D", "overall": 4}],
+          "findings": [{"category": "noise", "severity": "severe", "image": "D", "tile": 0, "bbox": [0, 0, 10, 10], "description": " chroma noise in the sky "},
+                       {"category": "color", "severity": "moderate", "image": "A", "tile": 0, "bbox": [0, 0, 10, 10], "description": "green tint"},
+                       {"category": "noise", "severity": "moderate", "image": "C", "tile": 0, "bbox": [0, 0, 10, 10], "description": "no box mapped"}],
+          "summary": ""}"#;
+        let mut r = lumen_ai::report::parse_report(text, OutputKind::RankingJson, lumen_ai::CoordConvention::Relative1000).unwrap();
+        r.findings[0].source = Some(SourceBox { label: ImageLabel::D, x0: 100.0, y0: 50.0, x1: 400.0, y1: 250.0 });
+        r.findings[1].source = Some(SourceBox { label: ImageLabel::A, x0: 10.0, y0: 20.0, x1: 30.0, y1: 40.0 });
+        // D was sent at 1000x500 and is shown at 2000x1000; A at its sent size.
+        let sent = |l: ImageLabel| Some(if l == ImageLabel::D { (1000, 500) } else { (4000, 3000) });
+        let shown = |l: ImageLabel| (l == ImageLabel::D).then_some((2000, 1000));
+        let marks = finding_marks(&r, sent, shown);
+        assert_eq!(marks.len(), 2, "the finding without a box is skipped");
+        let (pane, m) = &marks[0];
+        assert_eq!(*pane, 3);
+        assert_eq!(m.shape, Shape::Rect);
+        assert_eq!(m.pts, vec![[200.0, 100.0], [800.0, 500.0]]);
+        assert_eq!(m.color, review::COLORS[0].1);
+        assert_eq!((m.note.as_str(), m.tag.as_deref(), m.severity), ("chroma noise in the sky", Some("Noise"), review::Severity::Severe));
+        assert!(m.is_valid() && m.width >= 1.0);
+        let (pane, m) = &marks[1];
+        assert_eq!((*pane, m.tag.as_deref(), m.severity), (0, Some("White balance"), review::Severity::Moderate));
+        assert_eq!(m.pts, vec![[10.0, 20.0], [30.0, 40.0]]);
+    }
 
     #[test]
     fn shown_text_uses_the_times_sign_and_drops_a_for_one_image() {
@@ -853,13 +1118,17 @@ mod tests {
 
     #[test]
     fn preset_lists_fit_the_view() {
-        let ids = |k| presets_for(k, &[]).into_iter().map(|p| p.id).collect::<Vec<_>>();
+        let ids = |k| presets_for(k, false, &[]).into_iter().map(|p| p.id).collect::<Vec<_>>();
         assert_eq!(ids(SubjectKind::Image)[0], "quality");
-        assert_eq!(ids(SubjectKind::Pair), ["compare", "encode", "freeform"]);
+        assert_eq!(ids(SubjectKind::Pair), ["compare", "encode", "freeform", "rank"]);
+        // Three or four compare panes: ranking them is the default.
+        let multi: Vec<String> = presets_for(SubjectKind::Pair, true, &[]).into_iter().map(|p| p.id).collect();
+        assert_eq!(multi[0], "rank");
+        assert!(!ids(SubjectKind::Image).contains(&"rank".to_string()));
         assert_eq!(ids(SubjectKind::Video)[0], "video_frame");
         assert_eq!(ids(SubjectKind::VideoPair)[0], "video_compare");
         let custom = [lumen_ai::CustomPreset { name: "Mine".into(), pair: true, ..Default::default() }];
-        assert!(presets_for(SubjectKind::Pair, &custom).iter().any(|p| p.id == "custom:Mine"));
-        assert!(!presets_for(SubjectKind::Image, &custom).iter().any(|p| p.id == "custom:Mine"));
+        assert!(presets_for(SubjectKind::Pair, false, &custom).iter().any(|p| p.id == "custom:Mine"));
+        assert!(!presets_for(SubjectKind::Image, false, &custom).iter().any(|p| p.id == "custom:Mine"));
     }
 }
