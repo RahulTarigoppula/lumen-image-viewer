@@ -252,6 +252,14 @@ fn level_under(pyr: &[Arc<RgbaImage>], max_px: u64) -> Arc<RgbaImage> {
     pyr.last().cloned().expect("pyramid has a level")
 }
 
+/// Results of an "Align to A" job.
+enum AlignMsg {
+    Pane { i: usize, image: Arc<RgbaImage>, pyramid: Vec<Arc<RgbaImage>>, result: lumen_analysis::align::AlignResult },
+    Failed { i: usize, error: String },
+    /// Every pane done: the field of view all aligned panes share, as fractions of A.
+    Done { common: Option<[f32; 4]> },
+}
+
 enum DiffMsg {
     Done { raw: Arc<RgbaImage>, stats: DiffStats, amp: f32, pyramid: Vec<Arc<RgbaImage>>, note: Option<String> },
     Amplified { amp: f32, pyramid: Vec<Arc<RgbaImage>> },
@@ -377,6 +385,14 @@ struct Pane {
     path: PathBuf,
     loaded: Option<Arc<LoadedImage>>,
     gpu: Option<GpuImage>,
+    /// "Align to A": the image not on screen (the aligned one while
+    /// alignment is off, the original while it is on).
+    alt_gpu: Option<GpuImage>,
+    /// This pane warped into A's frame, and how it was aligned.
+    aligned: Option<Arc<RgbaImage>>,
+    align: Option<Result<lumen_analysis::align::AlignResult, String>>,
+    /// `gpu` holds the aligned image.
+    showing_aligned: bool,
     error: Option<String>,
     hist: Option<Histogram>,
     hist_rx: Option<Receiver<Histogram>>,
@@ -470,6 +486,12 @@ pub struct Compare {
     pub link_requests: Vec<LinkRequest>,
     /// The workbench scorecard panel is shown (the app draws it).
     pub scorecard: bool,
+    /// "Align to A" is on (panes B-D show their aligned images).
+    align_on: bool,
+    align_job: Option<Receiver<AlignMsg>>,
+    /// After aligning: zoom every pane to the field of view they share
+    /// (fractions of A).
+    pending_fov: Option<[f32; 4]>,
     panes: Vec<Pane>,
     views: Vec<View>,
     mode: CmpMode,
@@ -521,10 +543,24 @@ fn fmt_size(b: u64) -> String {
 
 const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
 
+/// Plain words for an alignment confidence.
+fn confidence_word(c: f32) -> &'static str {
+    if c >= 0.5 {
+        "good match"
+    } else if c >= 0.2 {
+        "rough match"
+    } else {
+        "uncertain"
+    }
+}
+
 impl Compare {
     pub fn new(paths: Vec<PathBuf>, _core: &Core) -> Self {
         let paths: Vec<PathBuf> = paths.into_iter().take(4).collect();
-        let panes = paths.iter().map(|p| Pane { path: p.clone(), loaded: None, gpu: None, error: None, hist: None, hist_rx: None, exif: Default::default() }).collect();
+        let panes = paths
+            .iter()
+            .map(|p| Pane { path: p.clone(), loaded: None, gpu: None, alt_gpu: None, aligned: None, align: None, showing_aligned: false, error: None, hist: None, hist_rx: None, exif: Default::default() })
+            .collect();
         let (mode, sync, basis) = START;
         let views = vec![View::fitted(basis); paths.len()];
         let rv = ReviewUi::new(&paths);
@@ -533,6 +569,9 @@ impl Compare {
             link: None,
             link_requests: Vec::new(),
             scorecard: true,
+            align_on: false,
+            align_job: None,
+            pending_fov: None,
             panes,
             views,
             mode,
@@ -654,7 +693,164 @@ impl Compare {
 
     /// Mark up works where each image is drawn in its own geometry.
     fn markup_allowed(&self) -> bool {
-        !(self.pair_mode() && self.mode == CmpMode::Difference)
+        !(self.pair_mode() && self.mode == CmpMode::Difference) && !self.panes.iter().any(|p| p.showing_aligned)
+    }
+
+    // ------------------------------------------------------------ align to A
+
+    /// Show or hide the aligned images of panes B-D (aligning them first).
+    fn toggle_alignment(&mut self, core: &mut Core) {
+        if self.align_on {
+            self.align_on = false;
+            self.show_aligned(false);
+            core.toasts.info("Alignment off: the original images are shown");
+            return;
+        }
+        if self.panes.len() < 2 {
+            return;
+        }
+        if self.rv.markup {
+            self.rv.markup = false;
+        }
+        self.align_on = true;
+        if self.panes[1..].iter().all(|p| p.align.is_some()) {
+            self.show_aligned(true);
+            return;
+        }
+        let Some(a) = self.panes[0].loaded.as_ref().map(|l| l.decoded.image.clone()) else {
+            self.align_on = false;
+            core.toasts.info("Wait until the images are loaded, then align");
+            return;
+        };
+        let others: Vec<(usize, Arc<RgbaImage>)> = self.panes.iter().enumerate().skip(1).filter_map(|(i, p)| Some((i, p.loaded.as_ref()?.decoded.image.clone()))).collect();
+        if others.len() + 1 != self.panes.len() {
+            self.align_on = false;
+            core.toasts.info("Wait until the images are loaded, then align");
+            return;
+        }
+        let (tx, rx) = unbounded();
+        let ctx = core.ctx.clone();
+        std::thread::spawn(move || {
+            crate::bg::background_priority();
+            let (aw, ah) = a.dimensions();
+            let mut common: Option<[f64; 4]> = Some([0.0, 0.0, aw as f64, ah as f64]);
+            for (i, b) in others {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let opts = lumen_analysis::align::AlignOptions::default();
+                    let r = lumen_analysis::align::align_rgba(a.as_raw(), aw, ah, b.as_raw(), b.width(), b.height(), &opts, None).map_err(|e| e.to_string())?;
+                    let warped = lumen_analysis::align::warp_rgba(b.as_raw(), b.width(), b.height(), &r.h, aw, ah);
+                    let img = RgbaImage::from_raw(aw, ah, warped).ok_or_else(|| "could not build the aligned image".to_string())?;
+                    let overlap = lumen_analysis::align::overlap_rect(&r.h, b.width(), b.height(), aw, ah);
+                    Ok::<_, String>((Arc::new(img), r, overlap))
+                }));
+                match res {
+                    Ok(Ok((image, result, overlap))) => {
+                        common = match (common, overlap) {
+                            (Some(c), Some(o)) => {
+                                let r = [c[0].max(o[0]), c[1].max(o[1]), c[2].min(o[2]), c[3].min(o[3])];
+                                (r[2] > r[0] && r[3] > r[1]).then_some(r)
+                            }
+                            _ => None,
+                        };
+                        let pyramid = render::build_pyramid(image.clone());
+                        let _ = tx.send(AlignMsg::Pane { i, image, pyramid, result });
+                    }
+                    Ok(Err(error)) => {
+                        let _ = tx.send(AlignMsg::Failed { i, error });
+                    }
+                    Err(_) => {
+                        let _ = tx.send(AlignMsg::Failed { i, error: "the alignment failed unexpectedly".into() });
+                    }
+                }
+                ctx.request_repaint();
+            }
+            let rel = common.map(|c| [(c[0] / aw as f64) as f32, (c[1] / ah as f64) as f32, (c[2] / aw as f64) as f32, (c[3] / ah as f64) as f32]);
+            let _ = tx.send(AlignMsg::Done { common: rel });
+            ctx.request_repaint();
+        });
+        self.align_job = Some(rx);
+        core.toasts.info("Aligning the images to A...");
+    }
+
+    /// Swap the aligned images in (or the originals back).
+    fn show_aligned(&mut self, on: bool) {
+        for p in self.panes.iter_mut().skip(1) {
+            if p.showing_aligned != on && p.alt_gpu.is_some() {
+                std::mem::swap(&mut p.gpu, &mut p.alt_gpu);
+                p.showing_aligned = on;
+            }
+        }
+        // The difference view recomputes with the shown images.
+        self.diff = DiffState::default();
+    }
+
+    /// Forget the alignment (A changed: swap, remove).
+    fn reset_alignment(&mut self) {
+        self.show_aligned(false);
+        for p in &mut self.panes {
+            p.alt_gpu = None;
+            p.aligned = None;
+            p.align = None;
+        }
+        self.align_on = false;
+        self.align_job = None;
+        self.pending_fov = None;
+    }
+
+    fn poll_alignment(&mut self, core: &mut Core) {
+        let Some(rx) = &self.align_job else { return };
+        let mut msgs = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+        let disconnected = msgs.is_empty() && matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected));
+        for m in msgs {
+            match m {
+                AlignMsg::Pane { i, image, pyramid, result } => {
+                    if let Some(p) = self.panes.get_mut(i) {
+                        p.alt_gpu = Some(GpuImage::new(&core.ctx, &format!("cmp-aligned:{}", p.path.display()), pyramid));
+                        p.aligned = Some(image);
+                        p.align = Some(Ok(result));
+                    }
+                }
+                AlignMsg::Failed { i, error } => {
+                    if let Some(p) = self.panes.get_mut(i) {
+                        p.align = Some(Err(error));
+                    }
+                }
+                AlignMsg::Done { common } => {
+                    self.align_job = None;
+                    if self.align_on {
+                        self.show_aligned(true);
+                        self.pending_fov = common;
+                    }
+                    let parts: Vec<String> = self
+                        .panes
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .map(|(i, p)| match &p.align {
+                            Some(Ok(r)) => format!("{} {:.2}x, {}", LETTERS[i.min(3)], r.scale, confidence_word(r.confidence)),
+                            Some(Err(e)) => format!("{}: {e}", LETTERS[i.min(3)]),
+                            None => format!("{}: not aligned", LETTERS[i.min(3)]),
+                        })
+                        .collect();
+                    if self.panes.iter().skip(1).all(|p| matches!(p.align, Some(Err(_)))) {
+                        self.align_on = false;
+                        core.toasts.error(format!("Could not align: {}", parts.join("; ")));
+                    } else {
+                        core.toasts.success(format!("Aligned to A ({}). Every pane shows the field of view they share.", parts.join("; ")));
+                    }
+                    return;
+                }
+            }
+        }
+        if disconnected {
+            self.align_job = None;
+            self.align_on = false;
+        } else {
+            core.ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 
     fn blind(&self) -> bool {
@@ -732,6 +928,7 @@ impl Compare {
             return;
         }
         let (Some(a), Some(b)) = (self.panes[0].loaded.clone(), self.panes[1].loaded.clone()) else { return };
+        let aligned_b = self.panes[1].aligned.clone().filter(|_| self.panes[1].showing_aligned);
         let key = (self.panes[0].path.clone(), self.panes[1].path.clone());
         if self.diff.key.as_ref() != Some(&key) {
             self.diff = DiffState { key: Some(key), ..Default::default() };
@@ -745,7 +942,14 @@ impl Compare {
                     if ia.width() != a.decoded.image.width() {
                         notes.push(format!("computed at {}×{}", ia.width(), ia.height()));
                     }
-                    let ib = if b.decoded.image.dimensions() == ia.dimensions() {
+                    let ib = if let Some(al) = aligned_b {
+                        notes.push("B aligned to A".to_string());
+                        if al.dimensions() == ia.dimensions() {
+                            al
+                        } else {
+                            Arc::new(crate::imaging::resize_exact(&al, ia.width(), ia.height(), crate::imaging::Filter::Bilinear))
+                        }
+                    } else if b.decoded.image.dimensions() == ia.dimensions() {
                         b.decoded.image.clone()
                     } else {
                         // Use the smallest level that is still at least as large, then resample.
@@ -909,6 +1113,18 @@ impl Compare {
         self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, c));
     }
 
+    /// Pane `i` (and linked panes) fit region `r` (fractions) exactly.
+    fn zoom_to_region_exact(&mut self, i: usize, r: [f32; 4], ppp: f32) {
+        let rects = self.layout(self.last_area);
+        let (Some(d), Some(&pane)) = (self.panes.get(i).and_then(|p| p.dims()), rects.get(i)) else { return };
+        let (w, h) = (d.0 as f32, d.1 as f32);
+        let (rw, rh) = (((r[2] - r[0]) * w).max(16.0), ((r[3] - r[1]) * h).max(16.0));
+        let z = (pane.width() * ppp / rw).min(pane.height() * ppp / rh).min(8.0);
+        let c = Vec2::new((r[0] + r[2]) / 2.0 * w, (r[1] + r[3]) / 2.0 * h);
+        let basis = self.basis;
+        self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, c));
+    }
+
     /// Every pane shows detail `k` (the same fractions of each image).
     fn zoom_to_detail(&mut self, k: usize, ppp: f32) {
         let Some(r) = self.rv.review.details.get(k).map(|d| d.rect) else { return };
@@ -934,6 +1150,7 @@ impl Compare {
         if self.panes.len() <= 2 || i >= self.panes.len() {
             return;
         }
+        self.reset_alignment();
         self.panes.remove(i);
         self.views.remove(i);
         self.paths.remove(i);
@@ -946,6 +1163,7 @@ impl Compare {
 
     fn swap_ab(&mut self) {
         if self.panes.len() >= 2 {
+            self.reset_alignment();
             self.panes.swap(0, 1);
             self.views.swap(0, 1);
             self.paths.swap(0, 1);
@@ -1058,6 +1276,9 @@ impl Compare {
         if take(Key::X) {
             self.swap_ab();
         }
+        if take(Key::A) {
+            self.toggle_alignment(core);
+        }
         if take(Key::M) {
             self.toggle_markup(core);
         }
@@ -1074,6 +1295,7 @@ impl Compare {
     pub fn ui(&mut self, ui: &mut Ui, core: &mut Core) -> bool {
         let p = core.pal;
         self.update_loading(core);
+        self.poll_alignment(core);
         self.update_diff(ui.ctx());
         let ppp = ui.ctx().pixels_per_point();
         // Before the toolbar runs: its menus close themselves on Esc.
@@ -1152,6 +1374,11 @@ impl Compare {
         let rects = self.layout(area);
         if rects.len() != self.panes.len() {
             return true;
+        }
+        if let Some(fov) = self.pending_fov.take() {
+            // Linked panes all follow A to the shared field of view.
+            self.sync = true;
+            self.zoom_to_region_exact(0, fov, ppp);
         }
 
         if self.pair_mode() {
@@ -1497,6 +1724,11 @@ impl Compare {
         if let Some(l) = &pane.loaded {
             parts.push(fmt_size(l.file_size));
         }
+        if pane.showing_aligned {
+            if let Some(Ok(r)) = &pane.align {
+                parts.insert(1, format!("aligned to A ({})", confidence_word(r.confidence)));
+            }
+        }
         if let Some(z) = zoom {
             parts.push(format!("{:.0}%", z * 100.0));
         }
@@ -1529,7 +1761,7 @@ impl Compare {
             if zoom.is_none() {
                 self.placeholder(ui, core, i, rect);
             }
-            if let Some(g) = &geos[i] {
+            if let Some(g) = geos[i].as_ref().filter(|_| !self.panes[i].showing_aligned) {
                 self.rv.paint(ui, i, g);
             }
             self.view_input(ui, core, &resp, i, rects, ppp, &geos);
@@ -2086,6 +2318,16 @@ impl Compare {
             Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
+        let busy = self.align_job.is_some();
+        let label = if busy { "Aligning..." } else { "Align to A (match field of view)" };
+        if widgets::menu_check(ui, self.align_on, I::FRAME_CORNERS, label, "A")
+            .on_hover_text("Find the same scene content in every image and warp B-D onto A, so phones with different lenses and crops line up pixel for pixel; every pane then zooms to the view they all share. The difference view uses the aligned images. Mark up works on the originals.")
+            .clicked()
+        {
+            self.toggle_alignment(core);
+            ui.close();
+        }
+        ui.separator();
         let exporting = self.rv.exporting();
         let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, "Ctrl+Shift+E")).inner;
         if r.on_hover_text("Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page").clicked() {
@@ -2181,7 +2423,7 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 22] = [
+        let rows: [(&str, &str); 23] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
             ("Drag", "Pan (mark up: draw; Space+drag pans)"),
             ("Double-click  or  /", "Fit"),
@@ -2195,6 +2437,7 @@ impl Compare {
             ("Del", "Delete the selected mark"),
             ("Ctrl+Shift+E", "Export report (PowerPoint, PDF, web)"),
             ("X", "Swap A and B"),
+            ("A", "Align to A: match the field of view"),
             ("L", "Link / unlink zoom & pan"),
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),

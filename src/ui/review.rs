@@ -724,6 +724,38 @@ mod tests {
     }
 
     #[test]
+    fn project_reviews_follow_a_moved_folder() {
+        let a = PathBuf::from("C:/caps/A56/night.jpg");
+        let b = PathBuf::from("C:/caps/X/night.jpg");
+        let moved = [PathBuf::from("D:/share/caps/A56/night.jpg"), PathBuf::from("D:/share/caps/X/night.jpg")];
+        assert_eq!(review_key_in(Some(Path::new("C:/caps")), &[a.clone(), b.clone()]), review_key_in(Some(Path::new("D:/share/caps")), &moved));
+        assert_ne!(review_key_in(None, &[a.clone(), b.clone()]), review_key_in(None, &moved));
+        let mut r = Review::new(&[a, b]);
+        r.images[1].comment = "soft".into();
+        r.align(&moved);
+        assert_eq!(r.images[1].comment, "soft");
+        assert_eq!(r.images[1].path, moved[1]);
+        // Same file name in another device folder is a different file.
+        assert!(!same_name(Path::new("C:/caps/A56/night.jpg"), Path::new("C:/caps/X/night.jpg")));
+    }
+
+    #[test]
+    fn report_notes_carry_tags() {
+        let mut m = mark(Shape::Rect, vec![[0.0, 0.0], [10.0, 10.0]]);
+        assert_eq!(m.report_note(), "");
+        m.tag = Some("Halo".into());
+        m.severity = Severity::Severe;
+        assert_eq!(m.report_note(), "Halo (severe)");
+        m.note = " roof ".into();
+        assert_eq!(m.report_note(), "Halo (severe): roof");
+        let back: Mark = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // Old files without tags still load.
+        let old: Mark = serde_json::from_str(r#"{"shape":"Rect","pts":[[0,0],[1,1]],"color":[1,2,3],"width":2.0}"#).unwrap();
+        assert_eq!(old.tag, None);
+    }
+
+    #[test]
     fn save_and_load() {
         let dir = std::env::temp_dir().join(format!("lumen-review-{}", std::process::id()));
         let paths = vec![PathBuf::from("C:/x/a.jpg"), PathBuf::from("C:/x/b.jpg")];

@@ -20,6 +20,7 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 - **Video mode.** Frame-accurate stepping, A/B comparison (side by side, wipe, flicker, difference, overlay, checkerboard), PSNR/SSIM per frame and whole-file analysis with CSV export, an I/P/B frame-size timeline, scopes (waveform, RGB parade, vectorscope, histogram) and full media info.
 - **Quality analysis.** Objective metrics for images, compare pairs and video ranges: PSNR, SSIM and MS-SSIM, CIEDE2000, SSIMULACRA2, butteraugli and FLIP with heatmaps, plus no-reference sharpness, noise, exposure, color cast, blockiness and banding. Works on a whole image, a region or a frame range, and exports CSV and JSON.
 - **Optional AI critique on your own server.** Point Lumen at your vLLM (or any OpenAI-compatible) server by IP, pick the model (Qwen and other vision models), pick a mode and run. Off by default, local network only by default, and you see exactly what is sent.
+- **Camera comparison workbench.** Open a folder of captures from several phones as a project: devices and scenes are paired automatically, every scene opens side by side with device names, and the team scores it (Win / Par / Lose against a reference, attribute scorecards, artifact tags on marks), measures it objectively, runs blind A/B tests ranked with Bradley-Terry, and exports one round report for the whole project. See [docs/WORKBENCH.md](docs/WORKBENCH.md).
 - **Private.** Ratings, flags and labels live in a local file, never written into your photos and never uploaded.
 
 ## Features
@@ -35,6 +36,8 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 **Video**: play with audio (A/V synced), `,` and `.` frame stepping in both directions, go to frame or time (G), A-B loop, speed control, compare two encodes with a frame offset, PSNR-Y/U/V and SSIM, whole-file analysis with worst-frame list, scopes, native-resolution snapshots.
 
 **Analysis** (Ctrl+Q): one-click Analyze with a plain-language summary (sharpness, noise, clipping, color cast, compression; how close B is to A, with Show where; a video's average and worst frame), then every number and option for experts: metric presets (Quick, Encode QA, Photo technical), region of interest (R), heatmap overlays with colormaps and thresholds, per-frame graphs and worst frames for video, history per file, CSV, JSON, PNG and TIFF export. AI tab: quality critique, A vs B comparison, encode review, photo technical review, video frame review, free-form questions and a quick score, with findings drawn on the image.
+
+**Workbench** (Ctrl+Shift+W): camera comparison projects from a folder of captures (one folder per device, device in the file name, or EXIF camera model), scene x device overview with thumbnails, missing-capture check, reference device, Compare per scene with Page Up / Page Down, scorecard panel (Win / Par / Lose, 1-5 or -3..+3 attribute scores, notes), artifact tags and severity on marks, batch measurement of every capture at a common size, blind test with hidden names and a Bradley-Terry ranking, round report (PowerPoint, PDF, web page) and CSV. The project file uses relative paths and works on a shared drive.
 
 **Keyboard**: every shortcut is remappable (Settings, Keyboard), with a FastStone-compatible preset.
 
