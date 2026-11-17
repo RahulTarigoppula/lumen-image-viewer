@@ -40,5 +40,7 @@ answered with defaults that work for most teams and can be changed later.
 All eight workstreams are in 2.0.0. Every change was built and tested in CI on Windows (FFmpeg and AI included), and
 the UI smoke test drives the real app through 13 scenarios with screenshots on every push (`tools/ui-smoke`).
 
+After 2.0.0: metadata and EXIF windows in the viewer and compare (what the phone did: multi-frame, HDR gain map, night, portrait, motion photo; estimated JPEG quality), pixel values, inspect views, a line profile with edge width, and a metadata CSV export.
+
 Next candidates: region-aware metrics (faces, sky), HDR (Ultra HDR gain maps, HDR10 video), a company report
 template, VMAF for video pairs, remappable Compare shortcuts.
