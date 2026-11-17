@@ -10,6 +10,7 @@
 // autovectorizes); iterator zips of five or more slices read worse.
 #![allow(clippy::needless_range_loop)]
 
+pub mod align;
 pub mod cache;
 pub mod color;
 mod colormaps;

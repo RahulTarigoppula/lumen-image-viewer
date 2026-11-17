@@ -310,3 +310,63 @@ cache.clear();                // Settings > Privacy
   PSNR, numpy MS-SSIM) writes `tests/golden/`; `tools/golden/gen_colormaps.py`
   regenerates `src/colormaps.rs`. Timings:
   `cargo test -p lumen-analysis --release --test perf -- --ignored --nocapture`.
+
+## 10. Alignment (field of view matching)
+
+Phones differ in lens, crop and position, so the same scene lands at a
+different scale, offset, slight rotation and perspective. `align` estimates
+the homography from a moving image onto a reference image and renders the
+moving image in the reference frame, so crops and metrics compare the same
+content. Pure Rust (FAST corners, rotated BRIEF, RANSAC), no extra
+dependencies.
+
+```rust
+use lumen_analysis::align::{align_rgba, warp_rgba, overlap_rect, pixel_bounds, map_rect,
+                            AlignOptions, AlignResult, AlignError, Homography, Model};
+
+let opts = AlignOptions::default(); // max_side 1024, max_features 2000, ratio 0.8,
+                                    // ransac_px 3.0, iterations 2000, model Homography
+let res: AlignResult = align_rgba(&ref_rgba, rw, rh, &mov_rgba, mw, mh, &opts, Some(&cancel))?;
+// res.h maps MOVING pixels to REFERENCE pixels (full resolution, row-major 3x3).
+let warped = warp_rgba(&mov_rgba, mw, mh, &res.h, rw, rh); // moving drawn in the reference
+                                                           // frame, alpha 0 outside
+if let Some(r) = overlap_rect(&res.h, mw, mh, rw, rh) {    // common field of view in the
+    let [x, y, w, h] = pixel_bounds(r, rw, rh).unwrap();  // reference, whole pixels
+    // crop both `ref_rgba` and `warped` to x, y, w, h, then run metrics on the pair
+}
+```
+
+- Coordinates: pixel centers are integers; a `w` x `h` image covers
+  `[-0.5, w - 0.5] x [-0.5, h - 0.5]`. Rectangles are `[x0, y0, x1, y1]`.
+- Buffers are RGBA8, tightly packed; alpha is ignored by `align_rgba`.
+- `AlignResult`: `h`, `matches` (after ratio test and cross-check),
+  `inliers`, `rms_px` (inlier reprojection RMS in full-resolution reference
+  pixels), `scale` (reference pixels per moving pixel at the moving center),
+  `rotation_deg` (positive turns clockwise on screen), `confidence` (0..1;
+  above about 0.5 trustworthy, below 0.2 a guess), `model` (the model
+  actually used) and `features` (`[reference, moving]`).
+- `Model::Homography` (default) falls back to `Model::Similarity` when the
+  homography has fewer than 15 inliers or is implausible (strong
+  perspective, flip, scale outside 0.2..5 at working resolution, shear);
+  `Model::Affine` falls back the same way; `Model::Similarity` fits only
+  scale, rotation and translation. The fallback lowers `confidence`.
+- Errors: `TooFewFeatures` (an image has too little texture),
+  `NoConsensus` (no plausible model, usually different scenes),
+  `Cancelled` (the `CancelToken` was set), `BadInput` (empty image or short
+  buffer).
+- `Homography`: `identity()`, `translation`, `scaling`, `similarity(scale,
+  rotation_deg, tx, ty)`, `map(p)`, `inverse()`, `compose(&other)` (applies
+  `other` first: `a.compose(&b).map(p) == a.map(b.map(p))`), `normalized()`,
+  `jacobian(p)`, `scale_at(p)`, `rotation_deg_at(p)`. Serializable.
+- Geometry helpers: `map_rect(h, r)` (bounds of a mapped rectangle, infinite
+  when it crosses the horizon), `overlap_polygon(h, mw, mh, rw, rh)` (moving
+  outline clipped to the reference), `overlap_rect(...)` (near maximal axis
+  aligned rectangle inside both), `pixel_bounds(r, w, h)` (`[x, y, width,
+  height]` of the pixels whose centers lie in `r`).
+- Cost: the images are area downscaled to `max_side` first, so the time is
+  dominated by that downscale and stays well under a second for two 12 MP
+  photos. Run it off the UI thread (rayon is used inside).
+- Limits: scale differences up to about 2.5x and rotations up to about 30
+  degrees match reliably (descriptors are rotation invariant, the pyramid
+  covers 4x); scenes with strong depth (near objects) only align on the
+  dominant plane.
