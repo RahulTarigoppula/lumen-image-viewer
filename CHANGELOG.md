@@ -44,6 +44,13 @@ not one comparison at a time.
   a ranking with scores, strengths and weaknesses, and findings drawn on the right panes.
 - Add findings as marks: AI findings become review marks with the matching artifact tag and severity.
 
+### Speed
+- Portrait phone photos open about 0.15 s faster at 24 MP (parallel tiled rotation, in-place flips, direct RGB to
+  RGBA conversion, a faster display pyramid).
+- Browser sorting of 10,000 files 4 to 7 times faster; status bar totals no longer hash every path each frame;
+  thumbnail requests no longer lock the worker queue; capture dates read without formatting all EXIF tags.
+- Median filter 5 to 8 times faster, small Gaussian blur and unsharp mask about 2 times faster.
+
 ### Engineering
 - CI checks every work branch: unit tests with and without FFmpeg, clippy, a full debug build.
 - Report writers render any slide list; the web page version of decks keeps the slide layout.
