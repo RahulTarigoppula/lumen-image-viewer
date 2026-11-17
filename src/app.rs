@@ -1090,6 +1090,10 @@ impl App {
             ToggleHistogram => self.viewer.show_histogram = !self.viewer.show_histogram,
             ToggleMagnifier => self.viewer.magnifier_locked = !self.viewer.magnifier_locked,
             TogglePixelValues => self.viewer.show_pixel = !self.viewer.show_pixel,
+            CycleInspect => {
+                self.viewer.inspect = self.viewer.inspect.next();
+                self.core.toasts.info(format!("Inspect view: {}. {}", self.viewer.inspect.label(), self.viewer.inspect.tip()));
+            }
             ToggleFilmstrip => self.viewer.show_filmstrip = !self.viewer.show_filmstrip,
             PlayPause => self.viewer.toggle_animation(),
             NextFrame => self.viewer.step_frame(&self.core, 1),

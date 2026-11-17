@@ -499,6 +499,9 @@ pub struct Compare {
     pub info_request: Option<InfoRequest>,
     /// Pixel values under the pointer, at the same spot in every pane (V).
     probe: bool,
+    /// Clipping, false color, peaking or one channel in every pane (O).
+    inspect: super::inspect_view::InspectMode,
+    inspect_cache: super::inspect_view::InspectCache,
     /// "Align to A" is on (panes B-D show their aligned images).
     align_on: bool,
     align_job: Option<Receiver<AlignMsg>>,
@@ -584,6 +587,8 @@ impl Compare {
             scorecard: true,
             info_request: None,
             probe: false,
+            inspect: super::inspect_view::InspectMode::Off,
+            inspect_cache: Default::default(),
             align_on: false,
             align_job: None,
             pending_fov: None,
@@ -1354,6 +1359,10 @@ impl Compare {
         if take(Key::V) {
             self.probe = !self.probe;
         }
+        if take(Key::O) {
+            self.inspect = self.inspect.next();
+            core.toasts.info(format!("Inspect view: {}. {}", self.inspect.label(), self.inspect.tip()));
+        }
         if take(Key::M) {
             self.toggle_markup(core);
         }
@@ -1837,6 +1846,16 @@ impl Compare {
             let zoom = self.paint_image(ui, core, i, rect, rect, rects, ppp, fit_ref);
             if zoom.is_none() {
                 self.placeholder(ui, core, i, rect);
+            }
+            if self.inspect != super::inspect_view::InspectMode::Off {
+                if let Some(g) = &geos[i] {
+                    let pane = &self.panes[i];
+                    let img = if pane.showing_aligned { pane.aligned.clone() } else { pane.loaded.as_ref().map(|l| l.decoded.image.clone()) };
+                    if let Some(img) = img {
+                        let key = if pane.showing_aligned { pane.path.with_extension("aligned") } else { pane.path.clone() };
+                        self.inspect_cache.paint(ui, &key, &img, self.inspect, g.dest, g.clip);
+                    }
+                }
             }
             if let Some(g) = geos[i].as_ref().filter(|_| !self.panes[i].showing_aligned) {
                 self.rv.paint(ui, i, g);
@@ -2448,6 +2467,14 @@ impl Compare {
             Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
+        widgets::submenu(ui, I::EYE, "Inspect view", |ui| {
+            for m in super::inspect_view::InspectMode::ALL {
+                if widgets::menu_toggle(ui, self.inspect == m, m.label(), "").on_hover_text(m.tip()).clicked() {
+                    self.inspect = m;
+                    ui.close();
+                }
+            }
+        });
         if widgets::menu_check(ui, self.probe, I::EYEDROPPER, "Pixel values", "V").on_hover_text("Show RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane").clicked() {
             self.probe = !self.probe;
             ui.close();
@@ -2563,7 +2590,7 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 24] = [
+        let rows: [(&str, &str); 25] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
             ("Drag", "Pan (mark up: draw; Space+drag pans)"),
             ("Double-click  or  /", "Fit"),
@@ -2579,6 +2606,7 @@ impl Compare {
             ("X", "Swap A and B"),
             ("A", "Align to A: match the field of view"),
             ("V", "Pixel values at the same spot in every pane"),
+            ("O", "Inspect view: clipping, false color, peaking, channels"),
             ("L", "Link / unlink zoom & pan"),
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),

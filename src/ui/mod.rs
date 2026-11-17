@@ -17,6 +17,7 @@ pub mod review;
 pub mod review_ui;
 pub mod metadata_dialog;
 pub mod metadata_view;
+pub mod inspect_view;
 pub mod save_dialog;
 pub mod settings_window;
 pub mod slideshow;

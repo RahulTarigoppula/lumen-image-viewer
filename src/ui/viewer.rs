@@ -302,6 +302,9 @@ pub struct Viewer {
     pub show_histogram: bool,
     /// Pixel values under the pointer (Shift+V).
     pub show_pixel: bool,
+    /// Clipping, false color, peaking or one channel over the image (Shift+O).
+    pub inspect: super::inspect_view::InspectMode,
+    inspect_cache: super::inspect_view::InspectCache,
     pub show_filmstrip: bool,
     pub magnifier_locked: bool,
     magnifier_active: bool,
@@ -355,6 +358,8 @@ impl Viewer {
             show_info: false,
             show_histogram: false,
             show_pixel: false,
+            inspect: super::inspect_view::InspectMode::Off,
+            inspect_cache: Default::default(),
             show_filmstrip: false,
             magnifier_locked: false,
             magnifier_active: false,
@@ -972,6 +977,18 @@ impl Viewer {
                     self.paint_animation(ui, &painter, &path, &frames, dest);
                 } else if let Some((_, _, g)) = &mut self.gpu {
                     g.paint(ui.ctx(), &painter, dest, view, self.zoom, nearest, Color32::WHITE);
+                }
+            }
+            // Inspect view over the image (not while an edit tool previews).
+            if self.inspect != super::inspect_view::InspectMode::Off && self.tool.is_none() {
+                if let (Some(path), Some(l)) = (self.current().cloned(), self.loaded(core)) {
+                    let img = l.decoded.image.clone();
+                    self.inspect_cache.paint(ui, &path, &img, self.inspect, dest, view);
+                    let label = format!("{}  {}", I::EYE, self.inspect.label());
+                    let g = painter.layout_no_wrap(label, FontId::proportional(12.0), Color32::WHITE);
+                    let r = Rect::from_min_size(view.min + Vec2::new(12.0, 46.0), g.size() + Vec2::new(16.0, 8.0));
+                    painter.rect_filled(r, CornerRadius::same(10), Color32::from_black_alpha(160));
+                    painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
                 }
             }
             // Edit-tool canvas hook (interactive tools: draw board, retouch,
@@ -1684,6 +1701,8 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         }
         menu_check(ui, Command::ToggleLockZoom, "Lock zoom ratio", self.lock_zoom, ev);
         menu_check(ui, Command::ToggleHistogram, "Histogram", self.show_histogram, ev);
+        menu_check(ui, Command::TogglePixelValues, "Pixel values", self.show_pixel, ev);
+        menu_item(ui, Command::CycleInspect, ev);
         menu_check(ui, Command::ToggleAnalysis, "Analysis panel", analysis_open, ev);
         menu_item(ui, Command::Slideshow, ev);
         ui.separator();

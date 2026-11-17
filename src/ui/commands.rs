@@ -138,6 +138,8 @@ pub enum Command {
     ShowMetadata,
     /// Pixel values under the pointer in the viewer.
     TogglePixelValues,
+    /// Next inspect view (clipping, false color, peaking, channels).
+    CycleInspect,
 }
 
 use Command::*;
@@ -263,6 +265,7 @@ impl Command {
             ShowExif => "EXIF data".into(),
             ShowMetadata => "Metadata and capture features".into(),
             TogglePixelValues => "Pixel values under the pointer".into(),
+            CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
         }
     }
 
@@ -390,6 +393,7 @@ impl Command {
             ShowExif => I::APERTURE,
             ShowMetadata => I::FILE_MAGNIFYING_GLASS,
             TogglePixelValues => I::EYEDROPPER,
+            CycleInspect => I::EYE,
         }
     }
 
@@ -419,7 +423,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues, CycleInspect,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -454,7 +458,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues, CycleInspect]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v
