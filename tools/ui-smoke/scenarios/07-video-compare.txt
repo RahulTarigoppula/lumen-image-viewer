@@ -1,0 +1,11 @@
+# Video compare of two clips (select both, Compare).
+@needs video
+open {media}\Video
+wait 2500
+run SelectAll
+run Compare
+wait 5000
+shot compare.png
+run ToggleAnalysis
+wait 1500
+shot analysis.png

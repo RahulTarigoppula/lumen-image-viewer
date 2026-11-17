@@ -1,0 +1,19 @@
+# Compare of two images (select all in a folder with two, then Compare): views and metrics.
+open {media}\Compare2
+wait 2500
+run SelectAll
+run Compare
+wait 3000
+shot side_by_side.png
+key W
+wait 1500
+shot split.png
+key D
+wait 2500
+shot difference.png
+key B
+wait 1000
+run ToggleAnalysis
+run RunMetrics
+wait 10000
+shot analysis.png

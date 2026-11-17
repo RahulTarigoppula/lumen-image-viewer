@@ -1,0 +1,16 @@
+# Compare of three images, mark-up (M) with a drawn box, review panel (C).
+open {media}\Compare3
+wait 2500
+run SelectAll
+run Compare
+wait 3500
+shot three.png
+key M
+wait 1000
+shot markup.png
+drag 300 300 420 400
+wait 1000
+shot markup_box.png
+key C
+wait 1500
+shot review.png

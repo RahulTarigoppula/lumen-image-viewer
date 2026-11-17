@@ -1,0 +1,9 @@
+# Video mode on one clip: first frame, then playing.
+@needs video
+open {media}\Video\clip_DeviceX.mp4
+wait 4000
+shot paused.png
+run PlayPause
+wait 2000
+shot playing.png
+run PlayPause

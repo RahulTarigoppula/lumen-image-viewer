@@ -1,0 +1,12 @@
+# Analysis panel (Ctrl+Q) on one image, then Analyze (Shift+Q runs the selected metrics).
+open {media}\RoundA\DeviceY\scene_03.jpg
+wait 3000
+key Ctrl+Q
+wait 1500
+shot panel.png
+run RunMetrics
+wait 10000
+shot metrics.png
+ai metrics details
+wait 1000
+shot details.png

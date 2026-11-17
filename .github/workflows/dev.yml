@@ -92,3 +92,62 @@ jobs:
           name: lumen-dev
           path: target/debug/lumen.exe
           retention-days: 3
+
+      # Symbols, so panics in the UI smoke test have readable backtraces.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-dev-pdb
+          path: target/debug/lumen.pdb
+          retention-days: 3
+
+  # UI smoke test: runs the debug build from the check job on Mesa's software
+  # OpenGL (no GPU on hosted runners), drives tools/ui-smoke/scenarios through
+  # the dev hook and uploads screenshots and logs as the `ui-smoke` artifact.
+  ui-smoke:
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      MESA_VERSION: "26.1.8"
+      MESA_SHA256: 4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-dev
+          path: ui-smoke-bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-dev-pdb
+          path: ui-smoke-bin
+
+      - name: Cache Mesa
+        id: mesa-cache
+        uses: actions/cache@v4
+        with:
+          path: mesa
+          key: mesa-${{ env.MESA_VERSION }}-msvc-x64
+
+      - name: Get Mesa llvmpipe OpenGL
+        if: steps.mesa-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: tools/ui-smoke/get_mesa.ps1 -Dest mesa -Version $env:MESA_VERSION -Sha256 $env:MESA_SHA256
+
+      - name: Make test media
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -q pillow numpy imageio-ffmpeg
+          python tools/ui-smoke/make_media.py ui-smoke-media
+
+      - name: Run UI smoke test
+        shell: pwsh
+        run: tools/ui-smoke/run.ps1 -Exe ui-smoke-bin/lumen.exe -Mesa mesa -Media ui-smoke-media -Out ui-smoke-out -SetResolution
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-smoke
+          path: ui-smoke-out
+          retention-days: 7

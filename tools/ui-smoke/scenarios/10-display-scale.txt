@@ -1,0 +1,25 @@
+# Display scale change 1.0 -> 1.5 (as when the window moves to another monitor) in each mode.
+open {media}\RoundA\DeviceZ\scene_02.jpg
+wait 3000
+ppp 1.5
+wait 2000
+shot viewer_150.png
+run ToggleAnalysis
+wait 1500
+shot analysis_150.png
+run CloseViewer
+wait 1500
+shot browser_150.png
+open {media}\Compare2
+wait 2500
+run SelectAll
+run Compare
+wait 3000
+ppp 1.0
+wait 1500
+ppp 1.5
+wait 2000
+shot compare_150.png
+ppp 1.0
+wait 1500
+shot compare_100.png
