@@ -598,11 +598,15 @@ pub(crate) fn mpf_group(ctx: &Ctx) -> Group {
             if im.attr & 0x4000_0000 != 0 {
                 flags.push("dependent image");
             }
-            let note = if code == 0 && i > 0 && gain_hint {
+            let mut note = if code == 0 && i > 0 && gain_hint {
                 "Ultra HDR and similar files store their HDR gain map as an extra image with an undefined MPF type.".to_string()
             } else {
                 flags.join(", ")
             };
+            if im.offset > 0 {
+                let at = format!("Stored {} bytes after the MPF header.", super::thousands(im.offset as u64));
+                note = if note.is_empty() { at } else { format!("{note} {at}") };
+            }
             f.push(Field::new(format!("Image {}", i + 1), format!("{name}, {}", kb(im.size as u64)), note));
         }
     }
