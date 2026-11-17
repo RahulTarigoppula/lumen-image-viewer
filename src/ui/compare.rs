@@ -499,6 +499,10 @@ pub struct Compare {
     pub info_request: Option<InfoRequest>,
     /// Pixel values under the pointer, at the same spot in every pane (V).
     probe: bool,
+    /// Line profile tool (P): drag a line; the same line in every pane.
+    profile_mode: bool,
+    /// The line as fractions of each image (start, end).
+    profile: Option<([f32; 2], [f32; 2])>,
     /// Clipping, false color, peaking or one channel in every pane (O).
     inspect: super::inspect_view::InspectMode,
     inspect_cache: super::inspect_view::InspectCache,
@@ -559,6 +563,35 @@ fn fmt_size(b: u64) -> String {
 
 const LETTERS: [&str; 4] = ["A", "B", "C", "D"];
 
+/// Width in samples of the steepest 10%-90% rise (or fall) along `s`:
+/// `None` when the line crosses no clear brightness step.
+pub fn edge_width(s: &[f32]) -> Option<f32> {
+    let n = s.len();
+    if n < 4 {
+        return None;
+    }
+    // Light smoothing against noise.
+    let sm: Vec<f32> = (0..n).map(|i| (s[i.saturating_sub(1)] + s[i] + s[(i + 1).min(n - 1)]) / 3.0).collect();
+    let lo = sm.iter().copied().fold(f32::MAX, f32::min);
+    let hi = sm.iter().copied().fold(f32::MIN, f32::max);
+    if hi - lo < 20.0 {
+        return None;
+    }
+    let (t10, t90) = (lo + 0.1 * (hi - lo), lo + 0.9 * (hi - lo));
+    // The rise: from the last point under 10% before the first point over
+    // 90%; or the same for a fall.
+    let rising = sm.iter().position(|v| *v <= t10).unwrap_or(0) < sm.iter().position(|v| *v >= t90).unwrap_or(0);
+    let cross = |th: f32, above: bool, from: usize| -> Option<f32> {
+        (from..n - 1).find_map(|k| {
+            let (a, b) = (sm[k], sm[k + 1]);
+            let hit = if above { a < th && b >= th } else { a > th && b <= th };
+            hit.then(|| k as f32 + (th - a) / (b - a))
+        })
+    };
+    let (a, b) = if rising { (cross(t10, true, 0)?, cross(t90, true, 0)?) } else { (cross(t90, false, 0)?, cross(t10, false, 0)?) };
+    (b > a).then_some(b - a)
+}
+
 /// Plain words for an alignment confidence.
 fn confidence_word(c: f32) -> &'static str {
     if c >= 0.5 {
@@ -587,6 +620,8 @@ impl Compare {
             scorecard: true,
             info_request: None,
             probe: false,
+            profile_mode: false,
+            profile: None,
             inspect: super::inspect_view::InspectMode::Off,
             inspect_cache: Default::default(),
             align_on: false,
@@ -1359,6 +1394,15 @@ impl Compare {
         if take(Key::V) {
             self.probe = !self.probe;
         }
+        if take(Key::P) && !self.blind() {
+            self.profile_mode = !self.profile_mode;
+            if self.profile_mode {
+                self.rv.markup = false;
+                core.toasts.info("Line profile: drag across an edge; every pane shows the same line");
+            } else {
+                self.profile = None;
+            }
+        }
         if take(Key::O) {
             self.inspect = self.inspect.next();
             core.toasts.info(format!("Inspect view: {}. {}", self.inspect.label(), self.inspect.tip()));
@@ -1523,6 +1567,24 @@ impl Compare {
     }
 
     fn view_input(&mut self, ui: &Ui, core: &mut Core, resp: &egui::Response, src: usize, rects: &[Rect], ppp: f32, geos: &[Option<PaneGeo>]) {
+        // Line profile: the left button draws the line (Space or the middle button pans).
+        if self.profile_mode && !ui.input(|i| i.key_down(Key::Space)) {
+            if let (Some(g), Some(pos)) = (geos.get(src).and_then(|g| g.as_ref()), ui.input(|i| i.pointer.interact_pos())) {
+                let px = super::review::to_image(g.dest, g.dims, pos);
+                let rel = [(px[0] / g.dims.0.max(1) as f32).clamp(0.0, 1.0), (px[1] / g.dims.1.max(1) as f32).clamp(0.0, 1.0)];
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.profile = Some((rel, rel));
+                } else if resp.dragged_by(egui::PointerButton::Primary) {
+                    if let Some(l) = &mut self.profile {
+                        l.1 = rel;
+                    }
+                }
+            }
+            if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                return;
+            }
+        }
         // Marking up: the left button draws (Space or the middle button pans).
         let marking = self.rv.markup && self.markup_allowed() && !ui.input(|i| i.key_down(Key::Space));
         let hover = if self.pair_mode() { self.hover_pane } else { Some(src) };
@@ -1888,6 +1950,9 @@ impl Compare {
         if self.probe {
             self.paint_probe(ui, &geos);
         }
+        if self.profile_mode {
+            self.paint_profile(ui, core, &geos);
+        }
         // Thin separators.
         for (i, r) in rects.iter().enumerate() {
             if i > 0 {
@@ -1949,6 +2014,84 @@ impl Compare {
             painter.rect_stroke(sw, CornerRadius::same(2), Stroke::new(1.0, Color32::from_white_alpha(120)), egui::StrokeKind::Inside);
             painter.galley(r.min + Vec2::new(12.0 + gal.size().y, 4.0), gal, Color32::WHITE);
         }
+    }
+
+    /// Samples of luma (0..255) along the profile line in pane `i`'s image,
+    /// with the line's length in that image's pixels.
+    fn profile_samples(&self, i: usize, line: ([f32; 2], [f32; 2])) -> Option<(Vec<f32>, f32)> {
+        let pane = &self.panes[i];
+        let img = if pane.showing_aligned { pane.aligned.clone() } else { pane.loaded.as_ref().map(|l| l.decoded.image.clone()) }?;
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let (a, b) = ([line.0[0] * w, line.0[1] * h], [line.1[0] * w, line.1[1] * h]);
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if len < 2.0 {
+            return None;
+        }
+        let n = (len.ceil() as usize).clamp(2, 1200);
+        let samples = (0..n)
+            .map(|k| {
+                let t = k as f32 / (n - 1) as f32;
+                let (x, y) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                let (x, y) = ((x as u32).min(img.width() - 1), (y as u32).min(img.height() - 1));
+                let p = img.get_pixel(x, y).0;
+                0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+            })
+            .collect();
+        Some((samples, len))
+    }
+
+    /// The line on every pane and the profiles of all panes in one plot.
+    fn paint_profile(&self, ui: &Ui, core: &Core, geos: &[Option<PaneGeo>]) {
+        let area = self.last_area;
+        let Some(line) = self.profile else {
+            let r = Rect::from_center_size(Pos2::new(area.center().x, area.max.y - 90.0), Vec2::new(420.0, 30.0));
+            ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(170));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Line profile: drag across an edge (P to leave)", FontId::proportional(12.5), Color32::WHITE);
+            return;
+        };
+        for (i, g) in geos.iter().enumerate() {
+            let Some(g) = g else { continue };
+            let to = |r: [f32; 2]| super::review::to_screen(g.dest, g.dims, [r[0] * g.dims.0 as f32, r[1] * g.dims.1 as f32]);
+            let painter = ui.painter().with_clip_rect(g.clip);
+            let (a, b) = (to(line.0), to(line.1));
+            painter.line_segment([a, b], Stroke::new(3.0, Color32::from_black_alpha(180)));
+            painter.line_segment([a, b], Stroke::new(1.5, self.pane_color(core, i)));
+            painter.circle_filled(a, 3.5, Color32::WHITE);
+        }
+        let data: Vec<(usize, Vec<f32>, f32)> = (0..self.panes.len()).filter_map(|i| self.profile_samples(i, line).map(|(s, l)| (i, s, l))).collect();
+        if data.is_empty() {
+            return;
+        }
+        let plot = Rect::from_min_size(Pos2::new(area.min.x + 16.0, area.max.y - 236.0), Vec2::new((area.width() - 32.0).min(760.0), 170.0));
+        let painter = ui.painter();
+        painter.rect_filled(plot, CornerRadius::same(10), Color32::from_black_alpha(205));
+        let inner = plot.shrink2(Vec2::new(14.0, 26.0)).translate(Vec2::new(0.0, 8.0));
+        painter.text(plot.min + Vec2::new(14.0, 8.0), Align2::LEFT_TOP, "Brightness along the line", super::theme::semibold(12.0), Color32::WHITE);
+        for frac in [0.0f32, 0.5, 1.0] {
+            let y = inner.max.y - frac * inner.height();
+            painter.line_segment([Pos2::new(inner.min.x, y), Pos2::new(inner.max.x, y)], Stroke::new(1.0, Color32::from_white_alpha(28)));
+        }
+        let mut legend = Vec::new();
+        for (i, samples, len) in &data {
+            let col = self.pane_color(core, *i);
+            let n = samples.len();
+            let pts: Vec<Pos2> = samples.iter().enumerate().map(|(k, v)| Pos2::new(inner.min.x + inner.width() * k as f32 / (n - 1).max(1) as f32, inner.max.y - inner.height() * (v / 255.0))).collect();
+            painter.add(egui::Shape::line(pts, Stroke::new(1.6, col)));
+            let width = edge_width(samples).map(|w| w * len / (n - 1).max(1) as f32);
+            legend.push((col, format!("{}  {}", LETTERS[(*i).min(3)], match width {
+                Some(w) => format!("edge {w:.1} px"),
+                None => "no clear edge".to_string(),
+            })));
+        }
+        let mut x = plot.max.x - 14.0;
+        for (col, t) in legend.iter().rev() {
+            let g = painter.layout_no_wrap(t.clone(), FontId::proportional(11.5), *col);
+            x -= g.size().x;
+            painter.galley(Pos2::new(x, plot.min.y + 8.0), g, *col);
+            x -= 14.0;
+        }
+        let tip = Rect::from_min_size(Pos2::new(plot.min.x, plot.max.y + 4.0), Vec2::new(plot.width(), 16.0));
+        painter.text(tip.min, Align2::LEFT_TOP, "Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper). P to leave.", FontId::proportional(10.5), Color32::from_white_alpha(200));
     }
 
     /// "Keep, reject others" shows on the pane under the pointer only.
@@ -2590,7 +2733,7 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 25] = [
+        let rows: [(&str, &str); 26] = [
             ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
             ("Drag", "Pan (mark up: draw; Space+drag pans)"),
             ("Double-click  or  /", "Fit"),
@@ -2607,6 +2750,7 @@ impl Compare {
             ("A", "Align to A: match the field of view"),
             ("V", "Pixel values at the same spot in every pane"),
             ("O", "Inspect view: clipping, false color, peaking, channels"),
+            ("P", "Line profile: brightness along a line, edge width"),
             ("L", "Link / unlink zoom & pan"),
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),
@@ -2847,6 +2991,20 @@ mod tests {
     fn starts_side_by_side_linked_with_same_framing() {
         assert_eq!(START, (CmpMode::SideBySide, true, Basis::Relative));
         assert_eq!(MODES, [CmpMode::SideBySide, CmpMode::Split, CmpMode::Difference]);
+    }
+
+    #[test]
+    fn edge_width_measures_the_rise() {
+        // A ramp from 20 to 220 over 10 samples (10%-90% = 8 samples).
+        let s: Vec<f32> = (0..40).map(|i| if i < 15 { 20.0 } else if i >= 25 { 220.0 } else { 20.0 + 20.0 * (i - 15) as f32 }).collect();
+        let w = edge_width(&s).unwrap();
+        assert!((w - 8.0).abs() < 1.6, "{w}");
+        let falling: Vec<f32> = s.iter().rev().copied().collect();
+        assert!((edge_width(&falling).unwrap() - w).abs() < 0.5);
+        assert_eq!(edge_width(&[100.0; 30]), None);
+        // A sharper step is narrower.
+        let sharp: Vec<f32> = (0..40).map(|i| if i < 20 { 20.0 } else { 220.0 }).collect();
+        assert!(edge_width(&sharp).unwrap() < w);
     }
 
     #[test]
