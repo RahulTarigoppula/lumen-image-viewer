@@ -314,6 +314,7 @@ static REGISTRY: &[&dyn Metric] = &[
     &noref::sharpness::LaplacianVar,
     &noref::sharpness::Tenengrad,
     &noref::noise::Noise,
+    &noref::visual_noise::VisualNoise,
     &noref::exposure::Exposure,
     &noref::cast::ColorCast,
     &noref::blockiness::Blockiness,
@@ -346,7 +347,7 @@ pub fn preset(name: &str) -> &'static [&'static str] {
     match name {
         "quick" => &["psnr", "ssim.fast", "diff.abs"],
         "encode_qa" => &["psnr", "ssim.fast", "ssim.gauss", "ms_ssim", "deltae.2000", "blockiness", "banding", "temporal.freeze", "temporal.scene"],
-        "photo_technical" => &["sharpness.laplacian", "sharpness.tenengrad", "noise", "exposure", "color_cast"],
+        "photo_technical" => &["sharpness.laplacian", "sharpness.tenengrad", "noise", "visual_noise", "exposure", "color_cast"],
         _ => &[],
     }
 }
