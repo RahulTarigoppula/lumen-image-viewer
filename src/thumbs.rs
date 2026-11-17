@@ -57,7 +57,10 @@ pub enum Thumb<'a> {
 
 struct Job {
     key: ThumbKey,
-    seq: u64,
+    /// Request sequence number (higher = asked for more recently). Shared
+    /// with the service's `pending` entry so a re-request bumps it without
+    /// searching the queue or taking its lock.
+    seq: Arc<AtomicU64>,
     /// Request generation: a result whose generation is no longer the pending
     /// one (the path was forgotten meanwhile) is dropped.
     gen: u64,
@@ -77,8 +80,9 @@ pub struct ThumbService {
     shared: Arc<Shared>,
     rx: Receiver<ThumbResult>,
     textures: LruCache<ThumbKey, ThumbInfo>,
-    /// Requested and not finished, with the generation of the request.
-    pending: HashMap<ThumbKey, u64>,
+    /// Requested and not finished: the generation of the request and its
+    /// sequence number (shared with the queued job).
+    pending: HashMap<ThumbKey, (u64, Arc<AtomicU64>)>,
     failed: HashSet<ThumbKey>,
     seq: u64,
     gen: u64,
@@ -141,7 +145,7 @@ impl ThumbService {
         while let Ok((key, gen, res)) = self.rx.try_recv() {
             // A result for a request that was forgotten while it ran (the file was
             // moved, renamed or rewritten meanwhile) says nothing about the file now.
-            if self.pending.get(&key) != Some(&gen) {
+            if self.pending.get(&key).map(|p| p.0) != Some(gen) {
                 continue;
             }
             self.pending.remove(&key);
@@ -185,16 +189,15 @@ impl ThumbService {
             return Thumb::Failed;
         }
         self.seq += 1;
-        let mut jobs = self.shared.jobs.lock();
-        if self.pending.contains_key(key) {
-            if let Some(j) = jobs.iter_mut().find(|j| &j.key == key) {
-                j.seq = self.seq;
-            }
+        if let Some((_, seq)) = self.pending.get(key) {
+            // Still queued (or running): make it the newest request again.
+            seq.store(self.seq, Ordering::Relaxed);
             return Thumb::Pending;
         }
         self.gen += 1;
-        self.pending.insert(key.clone(), self.gen);
-        jobs.push(Job { key: key.clone(), seq: self.seq, gen: self.gen });
+        let seq = Arc::new(AtomicU64::new(self.seq));
+        self.pending.insert(key.clone(), (self.gen, seq.clone()));
+        self.shared.jobs.lock().push(Job { key: key.clone(), seq, gen: self.gen });
         self.shared.cv.notify_one();
         Thumb::Pending
     }
@@ -259,13 +262,13 @@ fn worker(s: Arc<Shared>, tx: Sender<ThumbResult>, ctx: egui::Context, dir: Path
         let job = {
             let mut jobs = s.jobs.lock();
             loop {
-                if let Some((i, _)) = jobs.iter().enumerate().max_by_key(|(_, j)| j.seq) {
+                if let Some((i, _)) = jobs.iter().enumerate().max_by_key(|(_, j)| j.seq.load(Ordering::Relaxed)) {
                     break jobs.swap_remove(i);
                 }
                 s.cv.wait(&mut jobs);
             }
         };
-        if job.seq < s.min_seq.load(Ordering::Relaxed) {
+        if job.seq.load(Ordering::Relaxed) < s.min_seq.load(Ordering::Relaxed) {
             let _ = tx.send((job.key, job.gen, Err("stale".into())));
             continue;
         }
@@ -349,7 +352,7 @@ mod tests {
     }
 
     fn job_seq(j: &Job) -> u64 {
-        j.seq
+        j.seq.load(Ordering::Relaxed)
     }
 
     fn key(i: usize) -> ThumbKey {

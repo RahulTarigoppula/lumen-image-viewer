@@ -178,7 +178,8 @@ impl MetaService {
                 let mut n = 0u32;
                 while let Ok(p) = jrx.recv() {
                     let dims = crate::decode::probe_dimensions(&p);
-                    let taken = read_exif(&p).and_then(|e| e.taken_ts);
+                    // Only the date: summarizing every tag as text is several times slower.
+                    let taken = read_taken(&p);
                     let _ = rtx.send((p, QuickMeta { dims, taken }));
                     n += 1;
                     if n % 32 == 0 || jrx.is_empty() {

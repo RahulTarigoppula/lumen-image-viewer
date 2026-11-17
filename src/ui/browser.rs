@@ -1582,6 +1582,25 @@ fn clamp_anchor(anchor: Option<usize>, fallback: usize, len: usize) -> usize {
 /// Number and total size of the entries whose path is in `selected` (the
 /// status bar shows it every frame).
 fn selection_totals(entries: &[Entry], selected: &HashSet<PathBuf>) -> (usize, u64) {
+    // A few selected files (the usual case): compare raw path strings, which
+    // rejects almost every entry on its length, instead of hashing every
+    // listed path each frame. Selected paths are copies of listed paths, so
+    // finding all of them this way gives the exact answer; otherwise (a file
+    // that is gone, a path spelled differently) fall through to the set lookup.
+    if selected.len() <= 32 {
+        let sel: Vec<&std::ffi::OsStr> = selected.iter().map(|p| p.as_os_str()).collect();
+        let (mut n, mut bytes) = (0usize, 0u64);
+        for e in entries {
+            let p = e.path.as_os_str();
+            if sel.iter().any(|s| *s == p) {
+                n += 1;
+                bytes += e.size;
+            }
+        }
+        if n == selected.len() {
+            return (n, bytes);
+        }
+    }
     entries.iter().filter(|e| selected.contains(&e.path)).fold((0usize, 0u64), |(n, b), e| (n + 1, b + e.size))
 }
 
