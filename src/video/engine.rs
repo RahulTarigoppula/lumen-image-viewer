@@ -2151,6 +2151,30 @@ mod tests {
     }
 
     #[test]
+    fn luma_grid_reads_the_picture_and_its_time() {
+        let dir = TestDir::new("engine-grid");
+        let p = dir.path("grid.y4m");
+        // Left half 40 + frame, right half 200 - frame.
+        write_y4m(&p, 64, 36, 10, |f, plane, x, _| if plane > 0 { 128 } else if x < 32 { 40 + f as u8 } else { 200 - f as u8 });
+        let mut d = SeqDecoder::open(&p).unwrap();
+        d.set_fast(true);
+        let grids: Vec<(f64, Vec<f32>)> = std::iter::from_fn(|| d.next_luma_grid(2, 1)).collect();
+        assert_eq!(grids.len(), 10);
+        for (f, (t, g)) in grids.iter().enumerate() {
+            assert!((t - f as f64 / 25.0).abs() < 1e-6, "frame {f} at {t}");
+            assert!((g[0] - (40 + f) as f32 / 255.0).abs() < 1e-4 && (g[1] - (200 - f) as f32 / 255.0).abs() < 1e-4, "frame {f}: {g:?}");
+        }
+    }
+
+    #[test]
+    fn index_of_a_clean_clip_has_no_repeats() {
+        let dir = TestDir::new("engine-index");
+        let p = clip(&dir);
+        let index = build_index(&p, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert!(index.iter().all(|e| e.repeats == 0));
+    }
+
+    #[test]
     fn roi_copies_and_views_the_same_samples() {
         let dir = TestDir::new("engine-roi");
         let p = clip(&dir);

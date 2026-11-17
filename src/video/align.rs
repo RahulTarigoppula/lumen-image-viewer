@@ -149,3 +149,66 @@ fn signature(path: &Path, rotation: i32, cancel: &AtomicBool, progress: &dyn Fn(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::engine::test_media::{write_y4m, TestDir};
+    use super::*;
+    use crate::video::timealign::Confidence;
+
+    /// Brightness of 4 x 4 cells that change at their own pace (scene frame
+    /// `s`, any sign).
+    fn level(s: i64, cell: usize) -> u8 {
+        let period = 3 + (cell % 5) as i64;
+        let q = (s + cell as i64 * 7).div_euclid(period);
+        let mut h = (q as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (cell as u64 + 1).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        h ^= h >> 29;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 32;
+        40 + (h % 170) as u8
+    }
+
+    /// 8 s at 25 fps of the scene, `delay` frames late.
+    fn clip(path: &Path, delay: i64) {
+        write_y4m(path, 64, 36, 200, |f, plane, x, y| if plane > 0 { 128 } else { level(f as i64 - delay, (y * 4 / 36) * 4 + x * 4 / 64) });
+    }
+
+    #[test]
+    fn finds_the_offset_between_two_clips() {
+        let dir = TestDir::new("align");
+        let (a, b, c) = (dir.path("a.y4m"), dir.path("b.y4m"), dir.path("c.y4m"));
+        clip(&a, 0);
+        clip(&b, 7);
+        clip(&c, -12);
+        let no = AtomicBool::new(false);
+        let sa = signature(&a, 0, &no, &|_| {}).unwrap();
+        assert_eq!(sa.len(), 200);
+        assert_eq!(sa[0].cells.len(), GRID * GRID);
+        assert!((sa[25].t - 1.0).abs() < 1e-6);
+        let progress: Vec<AtomicU32> = (0..3).map(|_| AtomicU32::new(0)).collect();
+        let res = run(&[(a, 0), (b, 0), (c, 0)], &progress, &no).unwrap();
+        assert!(matches!(res[0], Outcome::Reference));
+        for (i, want) in [(1, 0.28), (2, -0.48)] {
+            match &res[i] {
+                Outcome::Found(al) => {
+                    assert!((al.offset - want).abs() < 0.02, "video {i}: {al:?}");
+                    assert!(al.level() >= Confidence::Medium, "video {i}: {al:?}");
+                }
+                other => panic!("video {i}: {other:?}"),
+            }
+        }
+        assert!(progress.iter().all(|p| f32::from_bits(p.load(Ordering::Relaxed)) == 1.0));
+    }
+
+    #[test]
+    fn cancel_and_unreadable_files() {
+        let dir = TestDir::new("align-cancel");
+        let a = dir.path("a.y4m");
+        clip(&a, 0);
+        let progress: Vec<AtomicU32> = (0..2).map(|_| AtomicU32::new(0)).collect();
+        let err = run(&[(a.clone(), 0), (a.clone(), 0)], &progress, &AtomicBool::new(true)).unwrap_err();
+        assert!(is_cancelled(&err));
+        let res = run(&[(a, 0), (dir.path("missing.mp4"), 0)], &progress, &AtomicBool::new(false)).unwrap();
+        assert!(matches!(res[1], Outcome::Failed(_)), "{res:?}");
+    }
+}
