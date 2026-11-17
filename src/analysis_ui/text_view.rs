@@ -950,11 +950,11 @@ fn diff_job(p: &Palette, a: &TextReport, b: &TextReport, d: &TextDiff, only: boo
             continue;
         }
         if shown > 4000 {
-            job.append(" …", 0.0, plain.clone());
+            job.append(" ...", 0.0, plain.clone());
             break;
         }
         if gap && shown > 0 {
-            job.append("  …  ", 0.0, plain.clone());
+            job.append("  ...  ", 0.0, plain.clone());
         } else if !only && line_of(op).is_some() && last_line.is_some() && line_of(op) != last_line {
             job.append("\n", 0.0, plain.clone());
         } else if shown > 0 {

@@ -251,8 +251,8 @@ fn helv_width(c: char) -> u16 {
         'J' | 'c' | 'k' | 's' | 'v' | 'x' | 'y' | 'z' => 500,
         'L' => 556,
         '·' | '•' => 350,
-        '—' => 1000,
-        '–' => 556,
+        '\u{2014}' => 1000,
+        '\u{2013}' => 556,
         _ if c.is_ascii() => 556,
         _ => 600,
     }
@@ -306,10 +306,10 @@ fn fit_text(text: &str, bx: Box2, sizes: &[f32], bold: bool) -> (f32, String) {
     if lines.len() > max_lines {
         lines.truncate(max_lines);
         if let Some(l) = lines.last_mut() {
-            while !l.is_empty() && text_width(&format!("{l}…"), s, bold) > bx.w {
+            while !l.is_empty() && text_width(&format!("{l}\u{2026}"), s, bold) > bx.w {
                 l.pop();
             }
-            l.push('…');
+            l.push('\u{2026}');
         }
     }
     (s, lines.join("\n"))
