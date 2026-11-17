@@ -7,6 +7,7 @@ pub mod cast;
 pub mod exposure;
 pub mod noise;
 pub mod sharpness;
+pub mod visual_noise;
 
 use crate::frame::PlaneF32;
 use crate::heatmap::{Colormap, Heatmap, Pool};
@@ -119,4 +120,59 @@ pub(crate) fn sobel(up: &[f32], mid: &[f32], dn: &[f32], x: usize) -> (f32, f32)
     let gx = (up[x + 1] + 2.0 * mid[x + 1] + dn[x + 1]) - (up[x - 1] + 2.0 * mid[x - 1] + dn[x - 1]);
     let gy = (dn[x - 1] + 2.0 * dn[x] + dn[x + 1]) - (up[x - 1] + 2.0 * up[x] + up[x + 1]);
     (gx, gy)
+}
+
+/// Helpers for the unit tests of the no-reference metrics.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use crate::frame::{FrameCtx, FrameView, OwnedFrame};
+    use crate::job::CancelToken;
+    use crate::metrics::{Metric, MetricOptions, MetricResult};
+
+    /// xorshift64* PRNG (deterministic, no dependency).
+    pub struct Rng(u64);
+
+    impl Rng {
+        pub fn new(seed: u64) -> Self {
+            Rng(seed.max(1))
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn uniform(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        /// Standard normal (Box-Muller).
+        pub fn normal(&mut self) -> f64 {
+            let u1 = self.uniform().max(1e-12);
+            let u2 = self.uniform();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    /// Runs a no-reference metric on `view`.
+    pub fn run(m: &dyn Metric, view: &FrameView<'_>, o: &MetricOptions) -> MetricResult {
+        let ctx = FrameCtx::new(*view);
+        m.compute(&ctx, None, o, &CancelToken::new()).expect("metric failed")
+    }
+
+    /// An RGBA8 frame of `w` x `h` pixels from `f(x, y) -> [r, g, b]`.
+    pub fn rgb_frame(w: usize, h: usize, mut f: impl FnMut(usize, usize) -> [u8; 3]) -> OwnedFrame {
+        let mut d = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let p = f(x, y);
+                d.extend_from_slice(&[p[0], p[1], p[2], 255]);
+            }
+        }
+        OwnedFrame::rgba8(w, h, d)
+    }
 }

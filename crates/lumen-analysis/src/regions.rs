@@ -7,6 +7,7 @@
 //! the boxes are for what a viewer would notice.
 
 use crate::heatmap::Heatmap;
+use crate::metrics::Unit;
 use serde::{Deserialize, Serialize};
 
 /// Most regions reported for one image.
@@ -152,28 +153,37 @@ fn limit_grid(m: &Heatmap, limit: f32, full: f32) -> Grid {
     grid_like(m, bad)
 }
 
-/// Clipping from the per-pixel map (1 highlight, -1 shadow, NaN neither),
-/// pooled into cells; a cell is bad when most of it is clipped.
+/// Clipping from the exposure map, pooled into cells of about 1/64 of the
+/// long side (8 to 64 px); a cell is bad when most of it is clipped. Map
+/// values are clipped shares, positive for highlights and negative for
+/// shadows: percent per tile (the map `exposure` makes) or 1 / -1 / NaN per
+/// pixel.
 fn clip_grid(m: &Heatmap, highlights: bool) -> Option<Grid> {
     let (w, h) = (m.width as usize, m.height as usize);
-    if w == 0 || h == 0 || m.data.len() != w * h {
+    if w == 0 || h == 0 || m.data.len() != w * h || m.cell_w <= 0.0 || m.cell_h <= 0.0 {
         return None;
     }
-    let cell = (w.max(h) / 64).clamp(8, 64);
-    let (gw, gh) = (w.div_ceil(cell), h.div_ceil(cell));
-    let mut count = vec![(0u32, 0u32); gw * gh];
+    let full = if m.unit == Some(Unit::Percent) { 100.0 } else { 1.0 };
     let want = if highlights { 1.0 } else { -1.0 };
+    let long_px = (w as f32 * m.cell_w).max(h as f32 * m.cell_h);
+    let cell_px = (long_px / 64.0).floor().clamp(8.0, 64.0);
+    let cell = ((cell_px / m.cell_w).round() as usize).max(1);
+    let (gw, gh) = (w.div_ceil(cell), h.div_ceil(cell));
+    // (clipped share summed over map cells, map cells)
+    let mut count = vec![(0f32, 0u32); gw * gh];
     for y in 0..h {
         let row = &m.data[y * w..(y + 1) * w];
         let gy = y / cell;
         for (x, &v) in row.iter().enumerate() {
             let c = &mut count[gy * gw + x / cell];
             c.1 += 1;
-            c.0 += (v == want) as u32;
+            if v.is_finite() && v * want > 0.0 {
+                c.0 += (v.abs() / full).min(1.0);
+            }
         }
     }
     let bad = count.iter().map(|&(n, of)| {
-        let f = if of == 0 { 0.0 } else { n as f32 / of as f32 };
+        let f = if of == 0 { 0.0 } else { n / of as f32 };
         if f >= 0.6 { f } else { 0.0 }
     });
     let c = cell as f32 * m.cell_w;
@@ -355,6 +365,21 @@ mod tests {
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].kind, RegionKind::ClippedHighlights);
         assert!(r[0].rect[1] == 0.0 && r[0].rect[3] <= 48.0, "{:?}", r[0].rect);
+    }
+
+    #[test]
+    fn clipped_share_tiles_make_areas() {
+        // A tile map like exposure's: signed clipped share (percent) per tile.
+        let (w, h) = (32usize, 16usize);
+        let data = (0..w * h).map(|i| if i / w < 3 { 100.0 } else if i / w > 13 && i % w < 6 { -90.0 } else if i % w == 31 { 30.0 } else { f32::NAN }).collect();
+        let m = Heatmap::new(w, h, data, "clip").with_unit(Unit::Percent).with_cell(16.0, 16.0);
+        let r = find_regions(&[("exposure", &m)], 512, 256);
+        let hi: Vec<_> = r.iter().filter(|r| r.kind == RegionKind::ClippedHighlights).collect();
+        assert_eq!(hi.len(), 1, "{r:?}");
+        assert!(hi[0].rect[1] == 0.0 && hi[0].rect[3] <= 64.0 && hi[0].rect[2] == 512.0, "{:?}", hi[0].rect);
+        assert!(r.iter().any(|r| r.kind == RegionKind::ClippedShadows && r.rect[1] == 224.0), "{r:?}");
+        // A 30% share is not "most of it": no box along the right edge.
+        assert!(r.iter().all(|r| r.rect[0] < 480.0), "{r:?}");
     }
 
     #[test]

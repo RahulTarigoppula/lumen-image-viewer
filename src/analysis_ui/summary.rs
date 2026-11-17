@@ -142,6 +142,12 @@ pub const SHARP_SOFT: f64 = 100.0;
 /// above 5 it is plain at 100%.
 pub const NOISE_GOOD: f64 = 2.0;
 pub const NOISE_POOR: f64 = 5.0;
+/// Visual noise index on flat areas (CIELAB units, CPIQ-style weights):
+/// below 1 hard to see at 100%, above 3 plain. Below the flat share
+/// (percent) there is no flat area to judge it on.
+pub const VNOISE_GOOD: f64 = 1.0;
+pub const VNOISE_POOR: f64 = 3.0;
+pub const VNOISE_MIN_FLAT: f64 = 1.0;
 /// Clipped pixels in percent: a few light sources are normal.
 pub const CLIP_GOOD: f64 = 0.5;
 pub const CLIP_POOR: f64 = 2.0;
@@ -353,6 +359,29 @@ fn single(f: &Facts) -> Summary {
             key: "noise.y".into(),
         });
     }
+    if let Some(v) = f.get("visual_noise.index") {
+        let flat = f.get("visual_noise.flat_pct").unwrap_or(100.0);
+        if flat >= VNOISE_MIN_FLAT {
+            let (level, label) = match lo_level(v, VNOISE_GOOD, VNOISE_POOR) {
+                Level::Good => (Level::Good, "Clean flat areas"),
+                Level::Fair => (Level::Fair, "Some grain in flat areas"),
+                _ => (Level::Poor, "Grainy flat areas"),
+            };
+            let parts = match (f.get("visual_noise.l"), f.get("visual_noise.chroma")) {
+                (Some(l), Some(c)) => format!(" (brightness {l:.2}, color {c:.2})"),
+                _ => String::new(),
+            };
+            lines.push(Line {
+                level,
+                label: label.into(),
+                value: format!("{v:.2}"),
+                tip: format!("Visual noise {v:.2}{parts}{avg}: how much grain and color speckle shows in the smooth areas such as sky and walls ({} of the picture), with gradients removed. Below {VNOISE_GOOD:.0} it is hard to see at 100%, above {VNOISE_POOR:.0} it is plain. Weighted like the CPIQ visual noise but without its viewing model: compare shots of the same scene.", pct(flat)),
+                key: "visual_noise.index".into(),
+            });
+        } else {
+            ungraded.push(("visual_noise.index".to_string(), "Not graded: no flat area to judge visual noise on, so texture adds to the value".to_string()));
+        }
+    }
     if let (Some(hi), Some(lo)) = (f.get("exposure.clip_hi_pct"), f.get("exposure.clip_lo_pct")) {
         let level = lo_level(hi.max(lo), CLIP_GOOD, CLIP_POOR);
         let (label, value) = match (hi >= CLIP_GOOD, lo >= CLIP_GOOD) {
@@ -377,7 +406,7 @@ fn single(f: &Facts) -> Summary {
                 level: Level::Info,
                 label: "Color cast not measurable".into(),
                 value: "few gray areas".into(),
-                tip: format!("Only {} of the picture is near gray, so a cast cannot be told apart from the colors of the subject. The average color leans {hue} (Delta-E {de:.2}).", pct(neutral)),
+                tip: format!("White balance needs gray or white areas, and only {} of the picture is near gray, so a cast cannot be told apart from the colors of the subject. The average color leans {hue} (Delta-E {de:.2}).", pct(neutral)),
                 key: "color_cast.delta_e".into(),
             });
         } else {
@@ -391,7 +420,7 @@ fn single(f: &Facts) -> Summary {
                 level,
                 label,
                 value: format!("dE {de:.2}"),
-                tip: format!("Average color of the near-gray areas ({} of the picture) is {de:.2} Delta-E from neutral{avg}. Below {CAST_GOOD:.0} it is hard to see. Warm evening light or a graded look can be intentional.", pct(neutral)),
+                tip: format!("White balance: the average color of the near-gray areas ({} of the picture) is {de:.2} Delta-E from neutral{avg}. Below {CAST_GOOD:.0} it is hard to see. Warm evening light or a graded look can be intentional.", pct(neutral)),
                 key: "color_cast.delta_e".into(),
             });
         }
@@ -770,6 +799,31 @@ mod tests {
         let s = summarize(&facts(&[("banding.score", 9.0), ("banding.smooth_pct", 0.2)]));
         assert!(s.lines.is_empty());
         assert_eq!(s.verdict("banding.score").map(|v| v.0), Some(Level::Info));
+    }
+
+    #[test]
+    fn visual_noise_and_white_balance_lines() {
+        let s = summarize(&facts(&[
+            ("visual_noise.index", 0.6),
+            ("visual_noise.l", 0.5),
+            ("visual_noise.chroma", 0.4),
+            ("visual_noise.flat_pct", 35.0),
+            ("color_cast.delta_e", 3.0),
+            ("color_cast.neutral_pct", 12.0),
+            ("color_cast.hue", 70.0),
+        ]));
+        let v = line(&s, "flat areas");
+        assert_eq!((v.label.as_str(), v.level, v.key.as_str()), ("Clean flat areas", Level::Good, "visual_noise.index"));
+        assert!(v.tip.contains("brightness 0.50, color 0.40"), "{}", v.tip);
+        let c = line(&s, "cast");
+        assert_eq!(c.label, "Slight yellow cast");
+        assert!(c.tip.starts_with("White balance"), "{}", c.tip);
+        let s = summarize(&facts(&[("visual_noise.index", 3.5), ("visual_noise.flat_pct", 20.0)]));
+        assert_eq!(line(&s, "flat areas").level, Level::Poor);
+        // No flat area: measured on texture, so not graded.
+        let s = summarize(&facts(&[("visual_noise.index", 2.0), ("visual_noise.flat_pct", 0.0)]));
+        assert!(s.lines.is_empty());
+        assert_eq!(s.verdict("visual_noise.index").map(|v| v.0), Some(Level::Info));
     }
 
     #[test]

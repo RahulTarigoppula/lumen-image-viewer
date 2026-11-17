@@ -15,6 +15,7 @@ pub mod color;
 mod colormaps;
 pub mod frame;
 pub mod heatmap;
+pub mod jnd;
 pub mod job;
 pub mod metrics;
 pub mod regions;

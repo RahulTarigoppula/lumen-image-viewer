@@ -124,8 +124,9 @@ Values are reported as `<id>.<key>`. dB values are capped at 100
 | `sharpness.laplacian` | NR | **`p90`** (the sharpest tiles, 90th percentile of the tile variances) `var` (whole frame), levels^2 | tiles |
 | `sharpness.tenengrad` | NR | **`mean_g2`**, `edge_pct` | tiles |
 | `noise` | NR | **`y`** `cb cr` (Immerkaer sigma, levels, edges masked) | - |
-| `exposure` | NR | **`clip_pct`** (the larger of) `clip_lo_pct clip_hi_pct` (+ per channel for RGB), `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | clipped pixels (1 highlights, -1 shadows) |
-| `color_cast` | NR | **`delta_e`** `a b hue neutral_pct` + a text note | - |
+| `visual_noise` | NR | **`index`** `l chroma a b` (CIELAB units), `flat_pct` + a text note | 64 px tiles, each measured tile's index |
+| `exposure` | NR | **`clip_pct`** (the larger of) `clip_lo_pct clip_hi_pct`; RGB also `clip_lo_{r,g,b}_pct clip_hi_{r,g,b}_pct clip_lo_any_pct clip_hi_all_pct`; `l_mean l_median l_p0_5 l_p1 l_p5 l_p95 l_p99 l_p99_5`, `dr_stops`, `zone_0..zone_10` (%) | 32 px tiles, clipped share in % (+ highlights, - shadows) |
+| `color_cast` | NR | **`delta_e`** (Delta C*) `a b hue neutral_pct gray_world` + a text note | 64 px tiles, Delta C* of each tile's near-neutral pixels |
 | `blockiness` | NR | **`score`** `ratio_h ratio_v offset_x offset_y` | tiles |
 | `banding` | NR | **`score`** `smooth_pct contour_pct` | 64 px tiles, each tile's score (clear below 1%) |
 | `temporal.flicker` | T | **`flicker`** `delta mean_luma` | - |
@@ -139,6 +140,59 @@ at 1080p and 0.8 to 1 s at 4K, so image jobs emit a `Partial` result on a
 1/4-area preview first (`ImageSpec.preview_first`, frames of 1 MP and up).
 Keep them out of video range jobs unless the user asks. Their licenses need
 entries in THIRD-PARTY-NOTICES.md.
+
+### Camera metrics (no reference)
+
+For comparing phone cameras on real scenes; all are in the
+`photo_technical` preset.
+
+- `visual_noise`: noise measured where it is visible, on flat areas. Per
+  64 px tile (`MetricOptions::tile`) a plane is fitted to L*, a* and b* and
+  removed (gradients such as sky are not noise); the residual standard
+  deviations are the tile's noise. Flat tiles: under 1% clipped, L*
+  residual at most twice the cleanest tenth's (never under 0.3) and at most
+  6 L*. Pooled over the flat tiles: `l` (L* std), `a`, `b`, `chroma` =
+  sqrt(var a* + var b*) and the headline `index` = sqrt(var L* + 0.852 var
+  a* + 0.323 var b*) (CPIQ / ISO 15739 weights, no contrast sensitivity
+  filter or viewing model, so not a certified CPIQ value). `flat_pct` is the
+  share of the picture measured; 0 means no flat area was found and the
+  value comes from the least textured tenth (a note says so; the summary
+  does not grade it). Lower is better; about 1 is hard to see at 100%.
+- White balance on neutral areas is `color_cast` (extended, version 2): mean
+  a*, b* of near-neutral pixels (chroma < 10, 20 < L* < 90, which also keeps
+  clipped pixels out), `delta_e` = Delta C* of that mean from gray, `hue` in
+  degrees (0 red, 90 yellow, 180 green, 270 blue,
+  `metrics::noref::cast::describe(hue)` gives words), `neutral_pct` used and
+  `gray_world` = 1 when fewer than 2% were neutral and all pixels were
+  averaged instead. The map shows the cast per tile of the neutral pixels,
+  so mixed light shows up.
+- Clipping per channel is `exposure` (extended, version 4): a sample is
+  clipped within one 8-bit level of either end (>= 254 / <= 1 in 8-bit
+  terms, also for 16-bit and float RGB; YUV luma within a level of 16 / 235
+  or 0 / max). `clip_hi_pct` is any channel high, `clip_lo_pct` every
+  channel low, `clip_hi_all_pct` / `clip_lo_any_pct` the other readings,
+  `clip_{lo,hi}_{r,g,b}_pct` each channel. The map is the clipped share of
+  each 32 px tile in percent, positive for highlights, negative for shadows
+  (whichever is larger); `find_regions` reads it for clipped areas.
+
+### Just-noticeable differences
+
+`lumen_analysis::jnd` words the gap between two images' values of one metric
+in approximate JNDs. Rules of thumb, deliberately conservative, never
+pass / fail limits: Delta-E 2000 / 94 2.0 per JND, Delta-E 76 and
+`color_cast.delta_e` 2.3, PSNR 1.5 dB (nothing above 45 dB), `visual_noise`
+and `noise` 25% relative change (on value + 0.5 CIELAB / + 1 level).
+
+```rust
+use lumen_analysis::jnd;
+jnd::jnds("visual_noise.index", a, b);          // Some(2.3): positive when B is worse
+jnd::describe_gap("visual_noise", 1.0, 2.0);    // Some("B is about 2 JND noisier than A")
+jnd::describe_gap_named("color_cast.delta_e", 7.0, 1.0, "C", "D"); // "C is about 3 JND more tinted than D"
+jnd::step_at("visual_noise.index", best);        // metric gap of about 1 JND near `best`
+```
+
+Keys are full (`"deltae.2000.mean"`) or a bare metric id for its headline;
+metrics without a rule (sharpness, counts, shares) return `None`.
 
 Full-reference metrics are skipped (with a report note) when B is missing;
 no-reference metrics run on A. Temporal metrics run only in video jobs; with
@@ -246,7 +300,7 @@ let mut job = analyzer.submit_video(spec, rx);
 `Heatmap { width, height, data: Vec<f32>, label, unit, fixed_range, min_span,
 colormap, invert, pool, x0, y0, cell_w, cell_h }`. Cell `(i, j)` covers image
 pixels `x0 + i * cell_w ..` (frame coordinates, ROI offset included). SSIM
-maps start at (5, 5) (valid windows); tile maps have 64 px cells; NaN means
+maps start at (5, 5) (valid windows); tile maps have 64 px cells (the exposure clip map 32 px); NaN means
 "no value".
 
 ```rust

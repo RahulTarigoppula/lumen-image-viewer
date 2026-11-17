@@ -78,7 +78,7 @@ pub struct Check {
     pub higher_better: bool,
 }
 
-pub const CHECKS: [Check; 6] = [
+pub const CHECKS: [Check; 7] = [
     Check {
         name: "Sharpness",
         keys: &["sharpness.laplacian.p90", "sharpness.laplacian.var"],
@@ -89,6 +89,12 @@ pub const CHECKS: [Check; 6] = [
         name: "Noise",
         keys: &["noise.y"],
         explain: "Estimated grain in 8-bit levels. Lower is better: below 2 it is hard to see, above 5 it shows at 100% zoom.",
+        higher_better: false,
+    },
+    Check {
+        name: "Visual noise",
+        keys: &["visual_noise.index"],
+        explain: "Grain and color speckle in the smooth areas such as sky and walls (CIELAB units, weighted like CPIQ visual noise). Lower is better: below 1 it is hard to see at 100% zoom, above 3 it is plain.",
         higher_better: false,
     },
     Check {
@@ -137,6 +143,7 @@ pub fn cell(c: &Check, v: &Values) -> Option<(f64, Option<Verdict>)> {
             Verdict::Check
         }),
         "Noise" => Some(lower_better(x, summary::NOISE_GOOD, summary::NOISE_POOR)),
+        "Visual noise" => (get(v, "visual_noise.flat_pct").unwrap_or(100.0) >= summary::VNOISE_MIN_FLAT).then(|| lower_better(x, summary::VNOISE_GOOD, summary::VNOISE_POOR)),
         "Clipping" => Some(lower_better(x, summary::CLIP_GOOD, summary::CLIP_POOR)),
         "Color cast" => (get(v, "color_cast.neutral_pct").unwrap_or(100.0) >= summary::CAST_MIN_NEUTRAL).then(|| lower_better(x, summary::CAST_GOOD, summary::CAST_POOR)),
         "Blocking" => Some(lower_better(x, summary::BLOCK_GOOD, summary::BLOCK_POOR)),
@@ -172,6 +179,10 @@ pub fn sentence(v: &Values) -> String {
             ("Noise", Verdict::Ok) => "a little noise".to_string(),
             ("Noise", Verdict::Check) => "noticeable noise".to_string(),
             ("Noise", _) => "very noisy".to_string(),
+            ("Visual noise", Verdict::Good) => continue,
+            ("Visual noise", Verdict::Ok) => "some grain in flat areas".to_string(),
+            ("Visual noise", Verdict::Check) => "noticeable grain in flat areas".to_string(),
+            ("Visual noise", _) => "strong grain in flat areas".to_string(),
             ("Clipping", Verdict::Good) => continue,
             ("Clipping", _) => {
                 let hi = get(v, "exposure.clip_hi_pct").unwrap_or(x);
@@ -219,6 +230,8 @@ fn tolerance(c: &Check, best: f64) -> f64 {
     match c.name {
         "Sharpness" => best.abs() * 0.25,
         "Noise" => 0.4_f64.max(best.abs() * 0.2),
+        // About one just-noticeable difference at the best value.
+        "Visual noise" => lumen_analysis::jnd::step_at("visual_noise.index", best).unwrap_or(0.3),
         "Clipping" => 0.5,
         "Color cast" => 1.0,
         "Blocking" => 0.05,
@@ -254,6 +267,7 @@ pub fn comparison(images: &[(&str, &Values)]) -> String {
         let what = match c.name {
             "Sharpness" => "Sharpest",
             "Noise" => "Least noise",
+            "Visual noise" => "Least visual noise",
             "Clipping" => "Least clipping",
             "Color cast" => "Most neutral color",
             "Blocking" => "Least blocking",
@@ -735,7 +749,10 @@ mod tests {
         // Soft is never "poor": smooth subjects score low too.
         assert_eq!(cell(&CHECKS[0], &vals(&[("sharpness.laplacian.p90", 20.0)])).unwrap().1, Some(Verdict::Check));
         // Banding without smooth areas is measured but not graded.
-        assert_eq!(cell(&CHECKS[5], &vals(&[("banding.score", 9.0), ("banding.smooth_pct", 0.2)])).unwrap().1, None);
+        assert_eq!(cell(&CHECKS[6], &vals(&[("banding.score", 9.0), ("banding.smooth_pct", 0.2)])).unwrap().1, None);
+        // Visual noise likewise without flat areas.
+        assert_eq!(cell(&CHECKS[2], &vals(&[("visual_noise.index", 2.0), ("visual_noise.flat_pct", 0.0)])).unwrap().1, None);
+        assert_eq!(cell(&CHECKS[2], &vals(&[("visual_noise.index", 2.0), ("visual_noise.flat_pct", 30.0)])).unwrap().1, Some(Verdict::Check));
         assert!(cell(c, &Values::new()).is_none());
     }
 
@@ -766,6 +783,20 @@ mod tests {
         assert_eq!(comparison(&[("A", &a), ("B", &b), ("C", &c)]), "Sharpest: A and C. Least noise: A and C.");
         assert_eq!(comparison(&[("A", &a), ("B", &clean())]), "The images measure about the same.");
         assert_eq!(comparison(&[("A", &a)]), "");
+    }
+
+    #[test]
+    fn visual_noise_compares_in_noticeable_steps() {
+        let mut a = clean();
+        a.insert("visual_noise.index".into(), 0.8);
+        a.insert("visual_noise.flat_pct".into(), 30.0);
+        let mut b = a.clone();
+        b.insert("visual_noise.index".into(), 2.0);
+        assert_eq!(comparison(&[("A", &a), ("B", &b)]), "Least visual noise: A.");
+        assert_eq!(sentence(&b), "Sharp, low noise, noticeable grain in flat areas.");
+        // Under one just-noticeable difference apart: not called out.
+        b.insert("visual_noise.index".into(), 0.9);
+        assert_eq!(comparison(&[("A", &a), ("B", &b)]), "The images measure about the same.");
     }
 
     #[test]
