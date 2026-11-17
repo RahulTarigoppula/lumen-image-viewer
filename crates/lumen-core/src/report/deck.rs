@@ -26,6 +26,8 @@ pub struct DeckShot {
     pub note: String,
     /// "4000 x 3000, 3.2 MB".
     pub details: String,
+    /// Measured values ("Sharp 412", "Noise 1.2 levels"), shown under the scores.
+    pub measured: Vec<String>,
 }
 
 /// A flagged mark.
@@ -419,7 +421,7 @@ fn scene_page(d: &Deck, k: usize, sc: &DeckScene) -> Slide {
         notes_txt.push_str(&format!("{} #{}  {} ({}){}", is.device, is.number, is.tag, is.severity.to_lowercase(), note));
     }
     let bottom_h = if notes_txt.is_empty() { 0.0 } else { (wrap(&notes_txt, 10.0, false, b.w - 28.0).len() as f32 * leading(10.0) + 16.0).clamp(36.0, b.h * 0.3) };
-    let has_scores = sc.shots.iter().any(|x| !x.scores.is_empty());
+    let has_scores = sc.shots.iter().any(|x| !x.scores.is_empty() || !x.measured.is_empty());
     let score_h = if has_scores { 30.0 } else { 0.0 };
     let cap = 22.0;
     let area = Box2::new(b.x, b.y, b.w, b.h - bottom_h - if bottom_h > 0.0 { 10.0 } else { 0.0 });
@@ -442,8 +444,12 @@ fn scene_page(d: &Deck, k: usize, sc: &DeckScene) -> Slide {
         }
         s.els.push(El::Image { bx: ib, pic: sh.picture.clone() });
         s.els.push(El::Frame { bx: ib, color: sh.color, width: 1.25 });
-        if has_scores && !sh.scores.is_empty() {
-            let line = sh.scores.iter().map(|(a, v)| format!("{} {}", short_attr(a), v)).collect::<Vec<_>>().join(" · ");
+        if has_scores && (!sh.scores.is_empty() || !sh.measured.is_empty()) {
+            let mut parts: Vec<String> = sh.scores.iter().map(|(a, v)| format!("{} {}", short_attr(a), v)).collect();
+            if !sh.measured.is_empty() {
+                parts.push(format!("measured: {}", sh.measured.join(", ")));
+            }
+            let line = parts.join(" · ");
             s.els.push(fitted(Box2::new(ib.x, ib.y + ib.h + 4.0, ib.w.max(120.0).min(cell.w), score_h - 4.0), &line, &[9.0, 8.0, 7.0], false, MUTED));
         }
     }
@@ -548,7 +554,7 @@ mod tests {
                 comment: "Street lights flare on X".into(),
                 shots: devices
                     .iter()
-                    .map(|(n, c)| DeckShot { device: n.to_string(), color: *c, picture: pic(400, 300), verdict: Some(("Win".into(), [34, 160, 92])), scores: vec![("Noise".into(), 4), ("Overall".into(), 3)], note: "soft corners".into(), details: String::new() })
+                    .map(|(n, c)| DeckShot { device: n.to_string(), color: *c, picture: pic(400, 300), verdict: Some(("Win".into(), [34, 160, 92])), scores: vec![("Noise".into(), 4), ("Overall".into(), 3)], note: "soft corners".into(), details: String::new(), measured: vec!["Sharp 412".into()] })
                     .collect(),
                 issues: vec![DeckIssue { device: "PhoneX".into(), number: 1, tag: "Flare".into(), severity: "Severe".into(), note: "lamp".into() }],
                 details: vec![Detail { title: "Lamp".into(), comment: "flare".into(), crops: devices.iter().map(|(n, _)| (n.to_string(), pic(200, 200))).collect() }],

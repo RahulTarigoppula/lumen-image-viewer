@@ -92,6 +92,10 @@ fn scene(job: &DeckJob, k: usize) -> Option<(deck::DeckScene, Vec<(String, Strin
             scores: p.attributes.iter().filter_map(|a| score.and_then(|s| s.attrs.get(a)).map(|v| (a.clone(), *v))).collect(),
             note,
             details: format!("{} x {}", img.width(), img.height()),
+            measured: sc
+                .measure(dev)
+                .map(|m| measure::MEASURES.iter().filter_map(|(id, name)| m.values.get(*id).map(|v| format!("{name} {}", measure::fmt_value(id, *v)))).take(4).collect())
+                .unwrap_or_default(),
         });
     }
     let mut details = Vec::new();

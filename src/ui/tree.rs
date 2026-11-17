@@ -35,6 +35,9 @@ pub struct FolderTree {
     chan: Option<(crossbeam_channel::Sender<Listing>, crossbeam_channel::Receiver<Listing>)>,
     revealed_for: Option<PathBuf>,
     scroll_to: Option<PathBuf>,
+    /// Tree height last frame: after a big change (window resized, panel
+    /// moved) the current folder is scrolled into view again.
+    last_view_h: f32,
     drives: Vec<(PathBuf, String)>,
     drives_rx: Option<crossbeam_channel::Receiver<Vec<(PathBuf, String)>>>,
     drives_requested: bool,
@@ -328,6 +331,11 @@ impl FolderTree {
         let row_h = ROW_H;
         self.indent = indent_step(ui.available_width(), self.max_depth);
         self.tips = !super::overlay_open(&ctx);
+        let view_h = ui.available_height();
+        if self.last_view_h > 0.0 && (view_h - self.last_view_h).abs() > 3.0 * row_h && self.scroll_to.is_none() {
+            self.scroll_to = self.revealed_for.clone();
+        }
+        self.last_view_h = view_h;
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("folder-tree");
         if let Some(target) = self.scroll_to.clone() {
             // Look in the drive tree (after the "This PC" header), not in favorites / quick access.
