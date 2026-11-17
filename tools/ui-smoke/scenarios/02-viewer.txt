@@ -1,0 +1,14 @@
+# Viewer: fit, 100%, next image, info panel.
+open {media}\RoundA\DeviceX\scene_01.jpg
+wait 3000
+shot fit.png
+run ZoomActual
+wait 1500
+shot actual.png
+run ZoomFit
+run NextImage
+wait 2500
+shot next.png
+run ToggleInfo
+wait 2000
+shot info.png

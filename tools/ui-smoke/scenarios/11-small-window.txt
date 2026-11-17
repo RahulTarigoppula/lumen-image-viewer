@@ -1,0 +1,20 @@
+# Small window (the minimum size is 640 x 420) in browser, viewer, compare and settings.
+open {media}\RoundA\DeviceX
+wait 2500
+size 640 420
+wait 1500
+shot browser_small.png
+open {media}\RoundA\DeviceX\scene_02.jpg
+wait 2500
+run ToggleInfo
+wait 1500
+shot viewer_small.png
+open {media}\Compare3
+wait 2500
+run SelectAll
+run Compare
+wait 3000
+shot compare_small.png
+run Settings
+wait 1500
+shot settings_small.png

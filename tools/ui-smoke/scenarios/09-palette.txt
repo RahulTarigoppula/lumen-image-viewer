@@ -1,0 +1,10 @@
+# Command palette (Ctrl+K), empty and filtered.
+open {media}\RoundA\DeviceX
+wait 2000
+key Ctrl+K
+wait 1000
+shot open.png
+type compare
+wait 1000
+shot filtered.png
+key Escape

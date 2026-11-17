@@ -1,0 +1,14 @@
+# Browser: thumbnails of one device folder, a flat folder, details view, a folder of folders.
+open {media}\RoundA\DeviceX
+wait 3000
+shot grid.png
+open {media}\Flat
+wait 3000
+shot flat.png
+run ToggleDetails
+wait 1500
+shot details.png
+run ToggleDetails
+open {media}\RoundA
+wait 2000
+shot folders.png
