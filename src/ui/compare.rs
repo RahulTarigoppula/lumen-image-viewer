@@ -1180,6 +1180,14 @@ impl Compare {
         self.panes.remove(i);
         self.views.remove(i);
         self.paths.remove(i);
+        if let Some(l) = &mut self.link {
+            if i < l.labels.len() {
+                l.labels.remove(i);
+            }
+            if i < l.colors.len() {
+                l.colors.remove(i);
+            }
+        }
         self.rv.set_paths(&self.paths);
         self.selected = self.selected.min(self.panes.len() - 1);
         if self.panes.len() != 2 {
@@ -1193,6 +1201,14 @@ impl Compare {
             self.panes.swap(0, 1);
             self.views.swap(0, 1);
             self.paths.swap(0, 1);
+            if let Some(l) = &mut self.link {
+                if l.labels.len() >= 2 {
+                    l.labels.swap(0, 1);
+                }
+                if l.colors.len() >= 2 {
+                    l.colors.swap(0, 1);
+                }
+            }
             self.rv.set_paths(&self.paths);
         }
     }

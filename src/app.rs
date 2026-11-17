@@ -2893,6 +2893,14 @@ impl eframe::App for App {
             // frames it holds) elsewhere.
             self.core.metrics.set_video(None);
         }
+        // Project scenes: the Analysis panel names each file's device.
+        crate::analysis_ui::set_display_labels(match (&self.compare, self.mode) {
+            (Some(c), Mode::Compare) => match &c.link {
+                Some(l) if !l.blind => c.paths.iter().cloned().zip(l.labels.iter().cloned()).collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        });
         // A 3 or 4 image compare measures C and D against A too.
         self.core.metrics.set_compare_panes(match (&self.compare, self.mode) {
             (Some(c), Mode::Compare) => c.paths.clone(),

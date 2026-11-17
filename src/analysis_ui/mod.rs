@@ -162,8 +162,26 @@ pub fn toolbar_button(ui: &mut egui::Ui, core: &mut crate::app::Core) {
     }
 }
 
+/// Device names of the files on screen (a workbench project scene): captures
+/// of one scene often share a file name, so the panel says whose it is.
+static DISPLAY_LABELS: std::sync::RwLock<Vec<(PathBuf, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Set the device name shown with each file (empty: plain file names).
+pub fn set_display_labels(labels: Vec<(PathBuf, String)>) {
+    if let Ok(mut l) = DISPLAY_LABELS.write() {
+        if *l != labels {
+            *l = labels;
+        }
+    }
+}
+
 pub fn file_name(p: &Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
+    let base = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+    let label = DISPLAY_LABELS.read().ok().and_then(|l| l.iter().find(|(q, _)| q == p).map(|(_, n)| n.clone()));
+    match label {
+        Some(n) => format!("{n}: {base}"),
+        None => base,
+    }
 }
 
 /// Per-frame upkeep that must run whatever is on screen (AI tasks finish
