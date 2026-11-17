@@ -16,6 +16,8 @@
   JPEG XL and TIFF/DNG header facts.
 - ICC profile, XMP (Google, Adobe and Samsung namespaces), Samsung trailer entries, multi-picture (MPF) images, maker
   note, PNG text chunks (including generation parameters) and comments. Damaged files give warnings, never a crash.
+- Export metadata as CSV (browser right-click, Tools; main menu, Tools; command palette): one row per image with the
+  capture summary, every EXIF tag and the file and encoding facts, for the selected images or the whole folder.
 
 ### Viewer and compare
 - Pixel values under the pointer: RGB, hex, luma and Lab (Shift+V in the viewer; V in compare reads the same spot in

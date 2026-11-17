@@ -598,6 +598,21 @@ impl App {
                 let ctx = self.core.ctx.clone();
                 self.meta_window.show_for(files, tab, &ctx);
             }
+            ExportMetadataCsv => {
+                let files: Vec<PathBuf> = match self.mode {
+                    Mode::Compare => self.compare.as_ref().map(|c| c.info_files(&self.core).into_iter().map(|f| f.1).collect()).unwrap_or_default(),
+                    _ => {
+                        let sel: Vec<PathBuf> = self.browser.media_targets().into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
+                        if sel.len() > 1 { sel } else { self.browser.image_paths() }
+                    }
+                };
+                if files.is_empty() {
+                    self.core.toasts.info("No images to export: open a folder of images first");
+                    return;
+                }
+                let Some(dest) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_directory(&self.browser.folder).set_file_name("metadata.csv").save_file() else { return };
+                self.file_jobs.submit(format!("Reading metadata of {}", count(files.len(), "image")), metadata_csv_job(files, dest));
+            }
             MeasureProject => match &mut self.workbench {
                 Some(w) => {
                     w.start_measure(&mut self.core, false);
@@ -1500,6 +1515,8 @@ impl App {
                 }
             }
             JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
+            JobResult::Message { ok: true, text } => self.core.toasts.success(text),
+            JobResult::Message { ok: false, text } => self.core.toasts.error(text),
         }
     }
 
@@ -2618,7 +2635,7 @@ impl App {
                     item(ui, c, &mut fire);
                 }
                 ui.separator();
-                for c in [Command::EditComment, Command::RemoveMetadata, Command::ChangeDates, Command::ExportXmp] {
+                for c in [Command::EditComment, Command::RemoveMetadata, Command::ChangeDates, Command::ExportXmp, Command::ExportMetadataCsv] {
                     item(ui, c, &mut fire);
                 }
             });
@@ -3428,6 +3445,8 @@ enum JobResult {
     /// budget for keeping them is used up).
     Rotate { t: Transform, lossless: Vec<(PathBuf, Option<Vec<u8>>)>, reencoded: Vec<(PathBuf, Option<Vec<u8>>)>, skipped: Vec<String>, errs: Vec<String> },
     Panicked(String),
+    /// A job that only reports a line to the user.
+    Message { ok: bool, text: String },
 }
 
 struct JobProgress {
@@ -3486,6 +3505,27 @@ impl FileJobs {
             self.queued += 1;
         }
     }
+}
+
+/// Inspect `files` one by one and write one CSV row per file to `dest`.
+fn metadata_csv_job(files: Vec<PathBuf>, dest: PathBuf) -> FileJob {
+    Box::new(move |pr| {
+        let total = files.len();
+        let mut found = Vec::with_capacity(total);
+        for (i, f) in files.iter().enumerate() {
+            pr.set(i, total);
+            let name = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            found.push((name, lumen_core::inspect::inspect_file(f)));
+        }
+        pr.set(total, total);
+        let rows: Vec<(String, &lumen_core::inspect::Inspection)> = found.iter().map(|(n, i)| (n.clone(), i)).collect();
+        let csv = lumen_core::inspect::table_csv(&rows);
+        let shown = dest.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        match std::fs::write(&dest, csv) {
+            Ok(()) => JobResult::Message { ok: true, text: format!("Metadata of {} saved to {shown}", count(total, "image")) },
+            Err(e) => JobResult::Message { ok: false, text: format!("Could not save {shown}: {e}") },
+        }
+    })
 }
 
 /// Copy or move `files` into `dest` one by one, reporting progress.

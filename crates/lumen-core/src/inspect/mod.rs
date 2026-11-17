@@ -22,9 +22,12 @@ mod exifview;
 mod icc;
 mod jpeg;
 mod samsung;
+mod table;
 mod xmp;
 #[cfg(test)]
 mod tests;
+
+pub use table::table_csv;
 
 use std::path::Path;
 

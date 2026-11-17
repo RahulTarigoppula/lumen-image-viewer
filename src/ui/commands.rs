@@ -136,6 +136,8 @@ pub enum Command {
     ShowExif,
     /// Capture features and all other metadata of the image(s).
     ShowMetadata,
+    /// Capture summary, EXIF and encoding of many images as one CSV.
+    ExportMetadataCsv,
     /// Pixel values under the pointer in the viewer.
     TogglePixelValues,
     /// Next inspect view (clipping, false color, peaking, channels).
@@ -264,6 +266,7 @@ impl Command {
             MeasureProject => "Measure every capture (project)".into(),
             ShowExif => "EXIF data".into(),
             ShowMetadata => "Metadata and capture features".into(),
+            ExportMetadataCsv => "Export metadata of images as CSV".into(),
             TogglePixelValues => "Pixel values under the pointer".into(),
             CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
         }
@@ -392,6 +395,7 @@ impl Command {
             MeasureProject => I::GAUGE,
             ShowExif => I::APERTURE,
             ShowMetadata => I::FILE_MAGNIFYING_GLASS,
+            ExportMetadataCsv => I::FILE_CSV,
             TogglePixelValues => I::EYEDROPPER,
             CycleInspect => I::EYE,
         }
@@ -423,7 +427,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues, CycleInspect,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -458,7 +462,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, TogglePixelValues, CycleInspect]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

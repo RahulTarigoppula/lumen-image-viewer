@@ -1336,6 +1336,7 @@ impl Browser {
                     item(ui, Command::RemoveMetadata, ev);
                     item(ui, Command::ChangeDates, ev);
                     item(ui, Command::ExportXmp, ev);
+                    item(ui, Command::ExportMetadataCsv, ev);
                 });
                 ui.separator();
                 item(ui, Command::ShowInExplorer, ev);
