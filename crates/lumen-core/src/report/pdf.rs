@@ -1,7 +1,7 @@
 //! PDF writer: one page per laid-out slide, Helvetica text (WinAnsi), JPEG
 //! pictures embedded as-is (DCTDecode). No external dependencies.
 
-use super::{layout, wrap, leading, text_width, Align, Box2, El, Report, Table, INK, MUTED, PAGE_H, RULE};
+use super::{layout, wrap, leading, text_width, Align, Box2, El, Report, Slide, Table, INK, MUTED, PAGE_H, RULE};
 use anyhow::Result;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -135,10 +135,14 @@ impl Page {
 
 /// Render the report as PDF bytes.
 pub fn render(r: &Report) -> Result<Vec<u8>> {
-    let slides = layout(r);
+    render_slides(&layout(r), &r.title)
+}
+
+/// Render laid-out slides as PDF bytes (`title` goes into the document info).
+pub fn render_slides(slides: &[Slide], title: &str) -> Result<Vec<u8>> {
     let mut pics: Vec<(Arc<Vec<u8>>, u32, u32)> = Vec::new();
     let mut pages = Vec::new();
-    for s in &slides {
+    for s in slides {
         let mut p = Page { ops: Vec::new(), images: Vec::new() };
         for e in &s.els {
             match e {
@@ -205,7 +209,7 @@ pub fn render(r: &Report) -> Result<Vec<u8>> {
     for o in &offsets {
         let _ = writeln!(x, "{o:010} 00000 n ");
     }
-    let info_title = String::from_utf8_lossy(&pdf_string(&r.title)).to_string();
+    let info_title = String::from_utf8_lossy(&pdf_string(title)).to_string();
     let _ = write!(x, "trailer\n<< /Size {} /Root 1 0 R /Info << /Title {info_title} /Producer (Lumen) >> >>\nstartxref\n{xref_at}\n%%EOF\n", offsets.len() + 1);
     out.extend_from_slice(x.as_bytes());
     Ok(out)

@@ -19,3 +19,4 @@ pub mod settings;
 pub mod tags;
 pub mod text;
 pub mod video;
+pub mod workbench;

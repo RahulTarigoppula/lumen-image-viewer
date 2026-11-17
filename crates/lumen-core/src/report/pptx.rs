@@ -190,10 +190,15 @@ fn notes_master_xml() -> String {
 
 /// Render the report as a `.pptx` file's bytes.
 pub fn render(r: &Report) -> Result<Vec<u8>> {
-    let slides = layout(r);
+    render_slides(&layout(r), &r.title, &r.author)
+}
+
+/// Render laid-out slides as a `.pptx` file's bytes (`title` and `author`
+/// go into the document properties).
+pub fn render_slides(slides: &[Slide], title: &str, author: &str) -> Result<Vec<u8>> {
     let mut media: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
     let mut slide_parts = Vec::new();
-    for s in &slides {
+    for s in slides {
         let mut name_of = |j: &std::sync::Arc<Vec<u8>>| {
             let k = match media.iter().position(|m| std::sync::Arc::ptr_eq(m, j)) {
                 Some(k) => k,
@@ -232,8 +237,8 @@ pub fn render(r: &Report) -> Result<Vec<u8>> {
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let core = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>{}</dc:title><dc:creator>{}</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified></cp:coreProperties>"#,
-        xml_escape(&r.title),
-        xml_escape(&r.author)
+        xml_escape(title),
+        xml_escape(author)
     );
     put(&mut zip, "docProps/core.xml", core.as_bytes(), deflate)?;
     let app = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Lumen</Application><Slides>{n}</Slides></Properties>"#);

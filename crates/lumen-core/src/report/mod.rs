@@ -8,6 +8,7 @@
 //! each writer renders those boxes. PPTX and PDF share the layout, so both
 //! look the same; HTML is a flowing page built from the report itself.
 
+pub mod deck;
 pub mod html;
 pub mod pdf;
 pub mod pptx;

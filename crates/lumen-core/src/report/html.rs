@@ -2,7 +2,7 @@
 //! reads top to bottom: summary, side-by-side images, each image with its
 //! comments, detail crops and the measurement table. Prints well too.
 
-use super::{label_color, Picture, Report};
+use super::{label_color, Align, El, Picture, Report, Slide, PAGE_H, PAGE_W};
 
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -138,6 +138,78 @@ th{{background:var(--accent);color:#fff}}td:first-child,th:first-child{{text-ali
         }
     }
     h.push_str("<footer>Made with Lumen</footer></main></body></html>");
+    h
+}
+
+fn pct(v: f32, of: f32) -> String {
+    format!("{:.3}%", v / of * 100.0)
+}
+
+fn css_rgb(c: [u8; 3]) -> String {
+    format!("rgb({},{},{})", c[0], c[1], c[2])
+}
+
+/// Laid-out slides as one page of scalable 16:9 sheets: every element keeps
+/// its position and size relative to the sheet, so the page looks like the
+/// PowerPoint and PDF versions at any window width.
+pub fn render_slides(slides: &[Slide], title: &str) -> String {
+    let title = if title.trim().is_empty() { "Lumen report" } else { title.trim() };
+    let mut h = String::new();
+    h.push_str(&format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><style>
+*{{box-sizing:border-box}}body{{margin:0;background:#e9ecf1;font-family:"Segoe UI",Helvetica,Arial,sans-serif}}
+main{{max-width:1280px;margin:0 auto;padding:24px 16px 48px}}
+.sheet{{position:relative;width:100%;aspect-ratio:{}/{};background:#fff;margin:0 0 24px;box-shadow:0 2px 10px rgba(0,0,0,.12);container-type:inline-size;overflow:hidden}}
+.el{{position:absolute;overflow:hidden}}.tx{{white-space:pre-wrap;line-height:1.25}}
+.el img{{width:100%;height:100%;display:block}}
+table{{border-collapse:collapse;width:100%;height:100%}}th,td{{border-bottom:1px solid #dee2e8;padding:0 .6cqw;text-align:center;font-size:1.15cqw}}
+th{{background:#2f6feb;color:#fff}}td:first-child,th:first-child{{text-align:left;font-weight:600}}tr:nth-child(even) td{{background:#f5f7fa}}
+@media print{{body{{background:#fff}}main{{padding:0;max-width:none}}.sheet{{box-shadow:none;break-after:page;margin:0}}}}
+</style></head><body><main>"#,
+        esc(title),
+        PAGE_W,
+        PAGE_H
+    ));
+    for s in slides {
+        h.push_str(r#"<section class="sheet">"#);
+        for e in &s.els {
+            let bx = match e {
+                El::Fill { bx, .. } | El::Frame { bx, .. } | El::Image { bx, .. } | El::Table { bx, .. } => *bx,
+                El::Text(t) => t.bx,
+            };
+            let pos = format!("left:{};top:{};width:{};height:{}", pct(bx.x, PAGE_W), pct(bx.y, PAGE_H), pct(bx.w, PAGE_W), pct(bx.h, PAGE_H));
+            match e {
+                El::Fill { color, .. } => h.push_str(&format!(r#"<div class="el" style="{pos};background:{}"></div>"#, css_rgb(*color))),
+                El::Frame { color, width, .. } => h.push_str(&format!(r#"<div class="el" style="{pos};border:{:.3}cqw solid {}"></div>"#, width / PAGE_W * 100.0, css_rgb(*color))),
+                El::Image { pic, .. } => h.push_str(&format!(r#"<div class="el" style="{pos}">{}</div>"#, img(pic, ""))),
+                El::Text(t) => h.push_str(&format!(
+                    r#"<div class="el tx" style="{pos};font-size:{:.3}cqw;font-weight:{};color:{};text-align:{}">{}</div>"#,
+                    t.size / PAGE_W * 100.0,
+                    if t.bold { 700 } else { 400 },
+                    css_rgb(t.color),
+                    if t.align == Align::Center { "center" } else { "left" },
+                    esc(&t.text)
+                )),
+                El::Table { table, .. } => {
+                    h.push_str(&format!(r#"<div class="el" style="{pos}"><table><thead><tr>"#));
+                    for c in &table.header {
+                        h.push_str(&format!("<th>{}</th>", esc(c)));
+                    }
+                    h.push_str("</tr></thead><tbody>");
+                    for row in &table.rows {
+                        h.push_str("<tr>");
+                        for c in row {
+                            h.push_str(&format!("<td>{}</td>", esc(c)));
+                        }
+                        h.push_str("</tr>");
+                    }
+                    h.push_str("</tbody></table></div>");
+                }
+            }
+        }
+        h.push_str("</section>");
+    }
+    h.push_str("</main></body></html>");
     h
 }
 
