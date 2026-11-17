@@ -169,18 +169,9 @@ pub fn exif_orientation(exif: &[u8]) -> u8 {
         .unwrap_or(1)
 }
 
+/// Rotate / flip decoded pixels upright for an EXIF orientation (1..=8).
 pub fn apply_orientation(img: RgbaImage, orientation: u8) -> RgbaImage {
-    use image::imageops;
-    match orientation {
-        2 => imageops::flip_horizontal(&img),
-        3 => imageops::rotate180(&img),
-        4 => imageops::flip_vertical(&img),
-        5 => imageops::flip_horizontal(&imageops::rotate90(&img)),
-        6 => imageops::rotate90(&img),
-        7 => imageops::flip_horizontal(&imageops::rotate270(&img)),
-        8 => imageops::rotate270(&img),
-        _ => img,
-    }
+    crate::imaging::orient(img, orientation)
 }
 
 fn format_name(f: image::ImageFormat) -> &'static str {
@@ -431,8 +422,25 @@ fn to_rgba8(img: DynamicImage) -> RgbaImage {
             }
             out
         }
+        // The common 8-bit cases (JPEG, PNG) without the generic per-pixel conversion.
+        DynamicImage::ImageRgb8(rgb) => expand_to_rgba::<3>(rgb.width(), rgb.height(), rgb.as_raw(), |p| [p[0], p[1], p[2], 255]),
+        DynamicImage::ImageLuma8(l) => expand_to_rgba::<1>(l.width(), l.height(), l.as_raw(), |p| [p[0], p[0], p[0], 255]),
         other => other.into_rgba8(),
     }
+}
+
+/// Convert packed `N`-channel 8-bit pixels to RGBA with `f`, in parallel blocks.
+fn expand_to_rgba<const N: usize>(w: u32, h: u32, src: &[u8], f: impl Fn(&[u8; N]) -> [u8; 4] + Sync) -> RgbaImage {
+    use rayon::prelude::*;
+    const BLOCK: usize = 16 * 1024;
+    let n = w as usize * h as usize;
+    let mut out = vec![0u8; n * 4];
+    out.par_chunks_mut(BLOCK * 4).zip(src[..n * N].par_chunks(BLOCK * N)).for_each(|(o, i)| {
+        for (q, p) in o.as_chunks_mut::<4>().0.iter_mut().zip(i.as_chunks::<N>().0) {
+            *q = f(p);
+        }
+    });
+    RgbaImage::from_raw(w, h, out).expect("buffer size matches")
 }
 
 fn try_decode_animation(bytes: &[u8], format: image::ImageFormat) -> Result<Option<Decoded>> {
@@ -802,6 +810,58 @@ mod tests {
         let single = decode_file(&p, DecodeOptions { color_manage: true, animations: false }).unwrap();
         assert!(single.frames.is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_decode() {
+        use crate::imaging::tests::{best_ms, synth};
+        let (w, h) = (6000u32, 4000u32);
+        let img = synth(w, h, false);
+        let rgb = crate::encode::flatten_rgb(&img, [0, 0, 0]);
+        let mut jpg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpg, 90).encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).unwrap();
+        let opts = DecodeOptions { color_manage: true, animations: false };
+        let t = best_ms(3, || {
+            std::hint::black_box(decode_bytes(&jpg, "jpg", opts).unwrap());
+        });
+        eprintln!("decode_bytes 24 MP JPEG: {t:.2} ms");
+        let rgb_img = image::RgbImage::from_raw(w, h, rgb).unwrap();
+        let mut total = 0.0;
+        for _ in 0..3 {
+            let d = DynamicImage::ImageRgb8(rgb_img.clone());
+            let s = std::time::Instant::now();
+            std::hint::black_box(to_rgba8(d));
+            let e = s.elapsed().as_secs_f64() * 1000.0;
+            total = if total == 0.0 { e } else { f64::min(total, e) };
+        }
+        eprintln!("to_rgba8 Rgb8 24 MP: {total:.2} ms");
+        for o in 2..=8u8 {
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let c = img.clone();
+                let s = std::time::Instant::now();
+                std::hint::black_box(apply_orientation(c, o));
+                best = best.min(s.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!("apply_orientation {o} 24 MP: {best:.2} ms");
+        }
+        let t = best_ms(5, || {
+            std::hint::black_box(image_has_alpha(&img));
+        });
+        eprintln!("image_has_alpha 24 MP: {t:.2} ms");
+    }
+
+    #[test]
+    fn fast_rgba_conversion_matches_image_crate() {
+        let img = crate::imaging::tests::synth(37, 23, false);
+        let rgb = DynamicImage::ImageRgba8(img).into_rgb8();
+        assert!(to_rgba8(DynamicImage::ImageRgb8(rgb.clone())) == DynamicImage::ImageRgb8(rgb.clone()).into_rgba8());
+        let luma = DynamicImage::ImageRgb8(rgb).into_luma8();
+        assert!(to_rgba8(DynamicImage::ImageLuma8(luma.clone())) == DynamicImage::ImageLuma8(luma).into_rgba8());
+        let big = image::RgbImage::from_fn(300, 200, |x, y| image::Rgb([x as u8, y as u8, (x * y) as u8]));
+        assert!(to_rgba8(DynamicImage::ImageRgb8(big.clone())) == DynamicImage::ImageRgb8(big).into_rgba8());
     }
 
     #[test]

@@ -20,11 +20,44 @@ pub fn is_opaque(img: &RgbaImage) -> bool {
 /// A channel type the separable kernels can run on (8-bit for opaque images,
 /// 16-bit premultiplied when there is transparency).
 pub trait Px: Copy + Default + Send + Sync + 'static {
+    /// Accumulator for 16.16 fixed-point kernels (weights summing to 65536).
+    type Acc: Acc;
     fn get(self) -> u32;
     fn put(v: u32) -> Self;
 }
 
+/// Sum of `weight * value` products in a kernel: `u32` holds 65536 x 255
+/// exactly (8-bit, and vectorizes far better), 16-bit channels need `u64`.
+pub trait Acc: Copy + Default + Send + Sync + std::ops::AddAssign + 'static {
+    fn mul(k: u32, v: u32) -> Self;
+    /// `(self + 0.5) / 65536`, rounded down.
+    fn round16(self) -> u32;
+}
+
+impl Acc for u32 {
+    #[inline]
+    fn mul(k: u32, v: u32) -> Self {
+        k * v
+    }
+    #[inline]
+    fn round16(self) -> u32 {
+        (self + 32768) >> 16
+    }
+}
+
+impl Acc for u64 {
+    #[inline]
+    fn mul(k: u32, v: u32) -> Self {
+        k as u64 * v as u64
+    }
+    #[inline]
+    fn round16(self) -> u32 {
+        ((self + 32768) >> 16) as u32
+    }
+}
+
 impl Px for u8 {
+    type Acc = u32;
     #[inline]
     fn get(self) -> u32 {
         self as u32
@@ -36,6 +69,7 @@ impl Px for u8 {
 }
 
 impl Px for u16 {
+    type Acc = u64;
     #[inline]
     fn get(self) -> u32 {
         self as u32
@@ -168,43 +202,63 @@ fn gauss_kernel(sigma: f32) -> Vec<u32> {
 }
 
 fn conv_h<P: Px>(src: &[P], dst: &mut [P], w: usize, _h: usize, k: &[u32]) {
-    let r = (k.len() / 2) as i64;
+    let r = k.len() / 2;
     let stride = w * 4;
-    dst.par_chunks_mut(stride).zip(src.par_chunks(stride)).for_each(|(out, row)| {
-        for x in 0..w {
-            let mut acc = [0u64; 4];
-            for (j, &kw) in k.iter().enumerate() {
-                let sx = clampi(x as i64 + j as i64 - r, w) * 4;
-                let kw = kw as u64;
-                acc[0] += kw * row[sx].get() as u64;
-                acc[1] += kw * row[sx + 1].get() as u64;
-                acc[2] += kw * row[sx + 2].get() as u64;
-                acc[3] += kw * row[sx + 3].get() as u64;
+    // Pixels [x0, x1) have every tap inside the row: there each tap is one
+    // pass over contiguous values (vectorizes). Border pixels clamp per tap.
+    let x0 = r.min(w);
+    let x1 = w.saturating_sub(r).max(x0);
+    dst.par_chunks_mut(stride).zip(src.par_chunks(stride)).for_each_init(
+        || vec![P::Acc::default(); (x1 - x0) * 4],
+        |acc, (out, row)| {
+            if x1 > x0 {
+                // Here x0 == r, so every tap offset is in range.
+                acc.fill(P::Acc::default());
+                for (j, &kw) in k.iter().enumerate() {
+                    let s = &row[(x0 + j - r) * 4..(x1 + j - r) * 4];
+                    for (a, &v) in acc.iter_mut().zip(s) {
+                        *a += P::Acc::mul(kw, v.get());
+                    }
+                }
+                for (o, &a) in out[x0 * 4..x1 * 4].iter_mut().zip(acc.iter()) {
+                    *o = P::put(a.round16());
+                }
             }
-            for c in 0..4 {
-                out[x * 4 + c] = P::put(((acc[c] + 32768) >> 16) as u32);
+            for x in (0..x0).chain(x1..w) {
+                let mut sum = [P::Acc::default(); 4];
+                for (j, &kw) in k.iter().enumerate() {
+                    let sx = clampi(x as i64 + j as i64 - r as i64, w) * 4;
+                    for c in 0..4 {
+                        sum[c] += P::Acc::mul(kw, row[sx + c].get());
+                    }
+                }
+                for c in 0..4 {
+                    out[x * 4 + c] = P::put(sum[c].round16());
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn conv_v<P: Px>(src: &[P], dst: &mut [P], w: usize, h: usize, k: &[u32]) {
     let r = (k.len() / 2) as i64;
     let stride = w * 4;
-    dst.par_chunks_mut(stride).enumerate().for_each(|(y, out)| {
-        let mut acc = vec![0u64; stride];
-        for (j, &kw) in k.iter().enumerate() {
-            let sy = clampi(y as i64 + j as i64 - r, h);
-            let row = &src[sy * stride..(sy + 1) * stride];
-            let kw = kw as u64;
-            for (a, &v) in acc.iter_mut().zip(row) {
-                *a += kw * v.get() as u64;
+    dst.par_chunks_mut(stride).enumerate().for_each_init(
+        || vec![P::Acc::default(); stride],
+        |acc, (y, out)| {
+            acc.fill(P::Acc::default());
+            for (j, &kw) in k.iter().enumerate() {
+                let sy = clampi(y as i64 + j as i64 - r, h);
+                let row = &src[sy * stride..(sy + 1) * stride];
+                for (a, &v) in acc.iter_mut().zip(row) {
+                    *a += P::Acc::mul(kw, v.get());
+                }
             }
-        }
-        for (o, a) in out.iter_mut().zip(acc) {
-            *o = P::put(((a + 32768) >> 16) as u32);
-        }
-    });
+            for (o, &a) in out.iter_mut().zip(acc.iter()) {
+                *o = P::put(a.round16());
+            }
+        },
+    );
 }
 
 /// Box sizes approximating a Gaussian (Kovesi / Ivan Kutskir). Returns radii.
@@ -324,8 +378,10 @@ pub fn sample_bilinear(raw: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 
 fn sample_bilinear_px<P: Px>(raw: &[P], w: usize, h: usize, x: f32, y: f32) -> [f32; 4] {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
+    // Both are >= 0 here, so truncation is floor (and NaN still maps to 0)
+    // without a libm call per sample.
+    let x0 = x as usize;
+    let y0 = y as usize;
     let x1 = (x0 + 1).min(w - 1);
     let y1 = (y0 + 1).min(h - 1);
     let fx = x - x0 as f32;
@@ -342,6 +398,15 @@ fn sample_bilinear_px<P: Px>(raw: &[P], w: usize, h: usize, x: f32, y: f32) -> [
         out[i] = top + (bot - top) * fy;
     }
     out
+}
+
+/// The two source rows and vertical weight `sample_bilinear_px` uses for `y`.
+#[inline]
+fn source_rows<P: Px>(cur: &[P], w: usize, h: usize, y: f32) -> (&[P], &[P], f32) {
+    let y = y.clamp(0.0, (h - 1) as f32);
+    let y0 = y as usize;
+    let y1 = (y0 + 1).min(h - 1);
+    (&cur[y0 * w * 4..(y0 + 1) * w * 4], &cur[y1 * w * 4..(y1 + 1) * w * 4], y - y0 as f32)
 }
 
 /// Linear motion blur along `angle_deg` spread over `distance` pixels.
@@ -361,11 +426,31 @@ pub fn motion_blur(img: &RgbaImage, angle_deg: f32, distance: f32) -> RgbaImage 
             let (dx, dy) = (c * shift / 2.0, -s * shift / 2.0);
             let mut next = vec![P::default(); cur.len()];
             next.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
-                for x in 0..w {
-                    let a = sample_bilinear_px(&cur, w, h, x as f32 - dx, y as f32 - dy);
-                    let b = sample_bilinear_px(&cur, w, h, x as f32 + dx, y as f32 + dy);
+                // The same arithmetic as two `sample_bilinear_px` calls per
+                // pixel, with the row-only part (source rows and vertical
+                // weight) done once per row.
+                let (a0, a1, afy) = source_rows(&cur, w, h, y as f32 - dy);
+                let (b0, b1, bfy) = source_rows(&cur, w, h, y as f32 + dy);
+                let sample = |r0: &[P], r1: &[P], fy: f32, sx: f32| {
+                    let sx = sx.clamp(0.0, (w - 1) as f32);
+                    let x0 = sx as usize;
+                    let x1 = (x0 + 1).min(w - 1);
+                    let fx = sx - x0 as f32;
+                    let mut out = [0.0f32; 4];
                     for i in 0..4 {
-                        row[x * 4 + i] = P::put(((a[i] + b[i]) * 0.5 + 0.5) as u32);
+                        let (a, b) = (r0[x0 * 4 + i].get() as f32, r0[x1 * 4 + i].get() as f32);
+                        let (c, d) = (r1[x0 * 4 + i].get() as f32, r1[x1 * 4 + i].get() as f32);
+                        let top = a + (b - a) * fx;
+                        let bot = c + (d - c) * fx;
+                        out[i] = top + (bot - top) * fy;
+                    }
+                    out
+                };
+                for (x, o) in row.chunks_exact_mut(4).enumerate() {
+                    let a = sample(a0, a1, afy, x as f32 - dx);
+                    let b = sample(b0, b1, bfy, x as f32 + dx);
+                    for i in 0..4 {
+                        o[i] = P::put(((a[i] + b[i]) * 0.5 + 0.5) as u32);
                     }
                 }
             });
@@ -459,29 +544,135 @@ pub fn median(img: &RgbaImage, r: u32) -> RgbaImage {
     if r == 0 {
         return img.clone();
     }
-    tiled(img, r, |t| {
-        let (w, h) = (t.width() as i64, t.height() as i64);
-        let raw = t.as_raw();
-        let mut out = t.clone();
-        let ri = r as i64;
-        let mut buf: Vec<u8> = Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
-        for y in ri..h - ri {
-            for x in ri..w - ri {
-                for c in 0..3 {
-                    buf.clear();
-                    for dy in -ri..=ri {
-                        for dx in -ri..=ri {
-                            buf.push(raw[(((y + dy) * w + x + dx) * 4 + c as i64) as usize]);
-                        }
-                    }
-                    let mid = buf.len() / 2;
-                    let (_, m, _) = buf.select_nth_unstable(mid);
-                    out.as_mut()[((y * w + x) * 4 + c as i64) as usize] = *m;
+    let n = ((2 * r + 1) * (2 * r + 1)) as usize;
+    let net = median_network(n);
+    tiled(img, r, |t| median_tile(t, r as usize, &net))
+}
+
+/// Pixels per block of [`median_tile`] (64 bytes of RGBA).
+const MEDIAN_BLOCK: usize = 16;
+
+/// Median of every interior pixel of a padded tile (the outer `r` pixels
+/// keep their values). Works on blocks of 16 pixels at once: each window
+/// position is one 64-byte vector and a compare-exchange network (byte-wise
+/// min / max, which vectorize) sorts all 64 channel values together, so the
+/// result is exactly the per-channel median of the scalar version.
+fn median_tile(t: &RgbaImage, r: usize, net: &(usize, Vec<(usize, usize)>)) -> RgbaImage {
+    let (w, h) = (t.width() as usize, t.height() as usize);
+    if h <= 2 * r || w < 2 * r + MEDIAN_BLOCK {
+        return median_tile_scalar(t, r);
+    }
+    const L: usize = MEDIAN_BLOCK * 4;
+    let k = 2 * r + 1;
+    let n = k * k;
+    let (p, ces) = net;
+    let raw = t.as_raw();
+    let mut out = t.clone();
+    let stride = w * 4;
+    let x_end = w - r;
+    let mut v = vec![[255u8; L]; *p];
+    for y in r..h - r {
+        let mut x0 = r;
+        loop {
+            // The last block is moved back to end at the last pixel (it
+            // recomputes a few pixels, with the same result).
+            let xb = x0.min(x_end - MEDIAN_BLOCK);
+            for (i, vi) in v[..n].iter_mut().enumerate() {
+                let (dy, dx) = (i / k, i % k);
+                let s = (y + dy - r) * stride + (xb + dx - r) * 4;
+                vi.copy_from_slice(&raw[s..s + L]);
+            }
+            for vi in &mut v[n..] {
+                *vi = [255; L];
+            }
+            for &(a, b) in ces {
+                let (lo, hi) = v.split_at_mut(b);
+                let (x, z) = (&mut lo[a], &mut hi[0]);
+                for j in 0..L {
+                    let (q, u) = (x[j], z[j]);
+                    x[j] = q.min(u);
+                    z[j] = q.max(u);
                 }
             }
+            let m = &v[n / 2];
+            let o = &mut out.as_mut()[y * stride + xb * 4..y * stride + xb * 4 + L];
+            for (oc, mc) in o.chunks_exact_mut(4).zip(m.chunks_exact(4)) {
+                oc[..3].copy_from_slice(&mc[..3]);
+            }
+            if xb + MEDIAN_BLOCK >= x_end {
+                break;
+            }
+            x0 = xb + MEDIAN_BLOCK;
         }
-        out
-    })
+    }
+    out
+}
+
+/// Compare-exchange network (pairs `(a, b)`, `a < b`, min goes to `a`) that
+/// leaves the median of `n` values at index `n / 2`: Batcher's odd-even merge
+/// sort on the next power of two, keeping only the comparators that can
+/// affect that index. The inputs from `n` up to the returned size must be 255.
+fn median_network(n: usize) -> (usize, Vec<(usize, usize)>) {
+    let p = n.next_power_of_two();
+    let mut ces = Vec::new();
+    let mut q = 1;
+    while q < p {
+        let mut k = q;
+        while k > 0 {
+            let mut j = k % q;
+            while j + k < p {
+                for i in 0..k.min(p - j - k) {
+                    if (i + j) / (2 * q) == (i + j + k) / (2 * q) {
+                        ces.push((i + j, i + j + k));
+                    }
+                }
+                j += 2 * k;
+            }
+            k /= 2;
+        }
+        q *= 2;
+    }
+    let mut need = vec![false; p];
+    need[n / 2] = true;
+    let mut kept: Vec<(usize, usize)> = ces
+        .into_iter()
+        .rev()
+        .filter(|&(a, b)| {
+            let keep = need[a] || need[b];
+            if keep {
+                need[a] = true;
+                need[b] = true;
+            }
+            keep
+        })
+        .collect();
+    kept.reverse();
+    (p, kept)
+}
+
+/// Per-pixel median of a padded tile (tiles too narrow for whole blocks).
+fn median_tile_scalar(t: &RgbaImage, r: usize) -> RgbaImage {
+    let (w, h) = (t.width() as i64, t.height() as i64);
+    let raw = t.as_raw();
+    let mut out = t.clone();
+    let ri = r as i64;
+    let mut buf: Vec<u8> = Vec::with_capacity((2 * r + 1) * (2 * r + 1));
+    for y in ri..h - ri {
+        for x in ri..w - ri {
+            for c in 0..3 {
+                buf.clear();
+                for dy in -ri..=ri {
+                    for dx in -ri..=ri {
+                        buf.push(raw[(((y + dy) * w + x + dx) * 4 + c as i64) as usize]);
+                    }
+                }
+                let mid = buf.len() / 2;
+                let (_, m, _) = buf.select_nth_unstable(mid);
+                out.as_mut()[((y * w + x) * 4 + c as i64) as usize] = *m;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -493,6 +684,164 @@ mod tests {
             let v = ((x * 7919 + y * 104729) % 251) as u8;
             image::Rgba([v, v.wrapping_mul(3), 255 - v, 255])
         })
+    }
+
+    /// `motion_blur` before the per-row hoisting (the reference).
+    fn old_motion_blur(img: &RgbaImage, angle_deg: f32, distance: f32) -> RgbaImage {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        if !(distance >= 1.0) || w == 0 || h == 0 {
+            return img.clone();
+        }
+        let distance = distance.min(4.0 * w.max(h) as f32);
+        let (s, c) = angle_deg.to_radians().sin_cos();
+        fn run<P: Px>(src: &[P], w: usize, h: usize, distance: f32, s: f32, c: f32) -> Vec<P> {
+            let mut cur = src.to_vec();
+            let mut shift = distance / 2.0;
+            while shift >= 0.5 {
+                let (dx, dy) = (c * shift / 2.0, -s * shift / 2.0);
+                let mut next = vec![P::default(); cur.len()];
+                for (y, row) in next.chunks_mut(w * 4).enumerate() {
+                    for x in 0..w {
+                        let a = sample_bilinear_px(&cur, w, h, x as f32 - dx, y as f32 - dy);
+                        let b = sample_bilinear_px(&cur, w, h, x as f32 + dx, y as f32 + dy);
+                        for i in 0..4 {
+                            row[x * 4 + i] = P::put(((a[i] + b[i]) * 0.5 + 0.5) as u32);
+                        }
+                    }
+                }
+                cur = next;
+                shift /= 2.0;
+            }
+            cur
+        }
+        with_premul(img, |src, w, h| run(src, w, h, distance, s, c), |src, w, h| run(src, w, h, distance, s, c))
+    }
+
+    /// The separable Gaussian passes before the interior fast path (the reference).
+    fn old_gauss_small<P: Px>(src: &[P], w: usize, h: usize, sigma: f32) -> Vec<P> {
+        let k = gauss_kernel(sigma);
+        let r = (k.len() / 2) as i64;
+        let mut tmp = vec![P::default(); w * h * 4];
+        for (y, out) in tmp.chunks_mut(w * 4).enumerate() {
+            let row = &src[y * w * 4..(y + 1) * w * 4];
+            for x in 0..w {
+                let mut acc = [0u64; 4];
+                for (j, &kw) in k.iter().enumerate() {
+                    let sx = clampi(x as i64 + j as i64 - r, w) * 4;
+                    for c in 0..4 {
+                        acc[c] += kw as u64 * row[sx + c].get() as u64;
+                    }
+                }
+                for c in 0..4 {
+                    out[x * 4 + c] = P::put(((acc[c] + 32768) >> 16) as u32);
+                }
+            }
+        }
+        let mut out = vec![P::default(); w * h * 4];
+        for (y, o) in out.chunks_mut(w * 4).enumerate() {
+            let mut acc = vec![0u64; w * 4];
+            for (j, &kw) in k.iter().enumerate() {
+                let sy = clampi(y as i64 + j as i64 - r, h);
+                for (a, &v) in acc.iter_mut().zip(&tmp[sy * w * 4..(sy + 1) * w * 4]) {
+                    *a += kw as u64 * v.get() as u64;
+                }
+            }
+            for (p, a) in o.iter_mut().zip(acc) {
+                *p = P::put(((a + 32768) >> 16) as u32);
+            }
+        }
+        out
+    }
+
+    /// Old against new kernels on one thread, in the same process (less
+    /// sensitive to the machine than the parallel timings):
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_filters_old_vs_new() {
+        let img = RgbaImage::from_fn(4000, 3000, |x, y| image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x ^ y) % 256) as u8, 255]));
+        let (w, h) = (4000usize, 3000usize);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let time = |f: &dyn Fn()| {
+            (0..3)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        pool.install(|| {
+            let pair = |name: &str, old: &dyn Fn(), new: &dyn Fn()| eprintln!("1 thread 12 MP {name:>10}: old {:8.1} ms, new {:8.1} ms", time(old), time(new));
+            pair("motion 40", &|| drop(old_motion_blur(&img, 30.0, 40.0)), &|| drop(motion_blur(&img, 30.0, 40.0)));
+            pair("gauss 2", &|| drop(old_gauss_small(img.as_raw(), w, h, 2.0)), &|| drop(gaussian_raw(img.as_raw(), w, h, 2.0)));
+            pair("median 3", &|| drop(tiled(&img, 1, |t| median_tile_scalar(t, 1))), &|| drop(median(&img, 1)));
+            pair("median 5", &|| drop(tiled(&img, 2, |t| median_tile_scalar(t, 2))), &|| drop(median(&img, 2)));
+        });
+    }
+
+    #[test]
+    fn gaussian_matches_reference() {
+        for (w, h) in [(1usize, 1usize), (3, 40), (13, 9), (64, 33), (130, 70)] {
+            let img = noisy(w as u32, h as u32);
+            let pre = premultiply16(&img);
+            for sigma in [0.2f32, 0.7, 1.5, 3.0] {
+                assert!(gaussian_raw(img.as_raw(), w, h, sigma) == old_gauss_small(img.as_raw(), w, h, sigma), "u8 {w}x{h} {sigma}");
+                assert!(gaussian_raw(&pre, w, h, sigma) == old_gauss_small(&pre, w, h, sigma), "u16 {w}x{h} {sigma}");
+            }
+        }
+    }
+
+    #[test]
+    fn motion_blur_matches_reference() {
+        let mut alpha = noisy(61, 37);
+        for (i, p) in alpha.pixels_mut().enumerate() {
+            p.0[3] = (i * 37 % 256) as u8;
+        }
+        for img in [noisy(61, 37), noisy(5, 90), alpha] {
+            for (angle, dist) in [(0.0, 1.0), (30.0, 12.0), (-75.0, 7.5), (90.0, 40.0), (200.0, 300.0)] {
+                assert!(motion_blur(&img, angle, dist) == old_motion_blur(&img, angle, dist), "{angle} {dist}");
+            }
+        }
+    }
+
+    #[test]
+    fn median_matches_per_pixel_select() {
+        let mut img = noisy(300, 270);
+        for (i, p) in img.pixels_mut().enumerate() {
+            p.0[3] = (i % 256) as u8;
+            p.0[1] = (i.wrapping_mul(2_654_435_761) >> 13) as u8;
+        }
+        for r in 1..=4u32 {
+            let fast = median(&img, r);
+            let slow = tiled(&img, r, |t| median_tile_scalar(t, r as usize));
+            assert!(fast == slow, "r {r}");
+            let small = noisy(19, 7);
+            assert!(median(&small, r) == tiled(&small, r, |t| median_tile_scalar(t, r as usize)), "small r {r}");
+        }
+    }
+
+    #[test]
+    fn median_network_sorts_the_middle() {
+        for n in [9usize, 25, 49, 81] {
+            let (p, ces) = median_network(n);
+            let mut seed = 12345u32;
+            for _ in 0..200 {
+                let mut v = vec![255u8; p];
+                for x in &mut v[..n] {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    *x = (seed >> 16) as u8 % 7 * 40;
+                }
+                let mut sorted = v[..n].to_vec();
+                sorted.sort_unstable();
+                for &(a, b) in &ces {
+                    if v[a] > v[b] {
+                        v.swap(a, b);
+                    }
+                }
+                assert_eq!(v[n / 2], sorted[n / 2], "n {n}");
+            }
+        }
     }
 
     #[test]
@@ -571,6 +920,8 @@ mod tests {
         t("surface", &|| surface_blur(&img, 6.0, 20.0));
         t("median 3", &|| median(&img, 1));
         t("median 5", &|| median(&img, 2));
+        t("median 9", &|| median(&img, 4));
+        t("shadows/hi", &|| tone::shadows_highlights(&img, 0.5, 0.3));
         t("oil 4", &|| effects::oil_paint(&img, 4));
         t("edges", &|| effects::edges(&img, 1.0));
         t("emboss", &|| effects::emboss(&img, 2.0, 1.0));

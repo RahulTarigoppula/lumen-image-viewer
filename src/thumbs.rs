@@ -57,7 +57,10 @@ pub enum Thumb<'a> {
 
 struct Job {
     key: ThumbKey,
-    seq: u64,
+    /// Request sequence number (higher = asked for more recently). Shared
+    /// with the service's `pending` entry so a re-request bumps it without
+    /// searching the queue or taking its lock.
+    seq: Arc<AtomicU64>,
     /// Request generation: a result whose generation is no longer the pending
     /// one (the path was forgotten meanwhile) is dropped.
     gen: u64,
@@ -77,8 +80,9 @@ pub struct ThumbService {
     shared: Arc<Shared>,
     rx: Receiver<ThumbResult>,
     textures: LruCache<ThumbKey, ThumbInfo>,
-    /// Requested and not finished, with the generation of the request.
-    pending: HashMap<ThumbKey, u64>,
+    /// Requested and not finished: the generation of the request and its
+    /// sequence number (shared with the queued job).
+    pending: HashMap<ThumbKey, (u64, Arc<AtomicU64>)>,
     failed: HashSet<ThumbKey>,
     seq: u64,
     gen: u64,
@@ -141,7 +145,7 @@ impl ThumbService {
         while let Ok((key, gen, res)) = self.rx.try_recv() {
             // A result for a request that was forgotten while it ran (the file was
             // moved, renamed or rewritten meanwhile) says nothing about the file now.
-            if self.pending.get(&key) != Some(&gen) {
+            if self.pending.get(&key).map(|p| p.0) != Some(gen) {
                 continue;
             }
             self.pending.remove(&key);
@@ -185,16 +189,15 @@ impl ThumbService {
             return Thumb::Failed;
         }
         self.seq += 1;
-        let mut jobs = self.shared.jobs.lock();
-        if self.pending.contains_key(key) {
-            if let Some(j) = jobs.iter_mut().find(|j| &j.key == key) {
-                j.seq = self.seq;
-            }
+        if let Some((_, seq)) = self.pending.get(key) {
+            // Still queued (or running): make it the newest request again.
+            seq.store(self.seq, Ordering::Relaxed);
             return Thumb::Pending;
         }
         self.gen += 1;
-        self.pending.insert(key.clone(), self.gen);
-        jobs.push(Job { key: key.clone(), seq: self.seq, gen: self.gen });
+        let seq = Arc::new(AtomicU64::new(self.seq));
+        self.pending.insert(key.clone(), (self.gen, seq.clone()));
+        self.shared.jobs.lock().push(Job { key: key.clone(), seq, gen: self.gen });
         self.shared.cv.notify_one();
         Thumb::Pending
     }
@@ -259,13 +262,13 @@ fn worker(s: Arc<Shared>, tx: Sender<ThumbResult>, ctx: egui::Context, dir: Path
         let job = {
             let mut jobs = s.jobs.lock();
             loop {
-                if let Some((i, _)) = jobs.iter().enumerate().max_by_key(|(_, j)| j.seq) {
+                if let Some((i, _)) = jobs.iter().enumerate().max_by_key(|(_, j)| j.seq.load(Ordering::Relaxed)) {
                     break jobs.swap_remove(i);
                 }
                 s.cv.wait(&mut jobs);
             }
         };
-        if job.seq < s.min_seq.load(Ordering::Relaxed) {
+        if job.seq.load(Ordering::Relaxed) < s.min_seq.load(Ordering::Relaxed) {
             let _ = tx.send((job.key, job.gen, Err("stale".into())));
             continue;
         }
@@ -325,6 +328,74 @@ fn write_cached(file: &Path, img: &image::RgbaImage, dims: Option<(u32, u32)>) -
     std::fs::write(&tmp, &out)?;
     std::fs::rename(tmp, file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service with no worker threads, so requests stay queued.
+    fn idle_service() -> ThumbService {
+        let shared = Arc::new(Shared { jobs: Mutex::new(Vec::new()), cv: Condvar::new(), disk_cache: AtomicBool::new(false), min_seq: AtomicU64::new(0) });
+        let (_tx, rx) = unbounded();
+        ThumbService {
+            shared,
+            rx,
+            textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
+            pending: HashMap::new(),
+            failed: HashSet::new(),
+            seq: 0,
+            gen: 0,
+            ctx: egui::Context::default(),
+            cache_dir: std::env::temp_dir(),
+        }
+    }
+
+    fn job_seq(j: &Job) -> u64 {
+        j.seq.load(Ordering::Relaxed)
+    }
+
+    fn key(i: usize) -> ThumbKey {
+        ThumbKey::new(Path::new(&format!(r"C:\Users\someone\Pictures\Holiday 2024\IMG_{i:05}.jpg")), 3_000_000 + i as u64, None)
+    }
+
+    #[test]
+    fn rerequest_bumps_priority_of_queued_job() {
+        let mut s = idle_service();
+        for i in 0..10 {
+            assert!(matches!(s.get(&key(i)), Thumb::Pending));
+        }
+        // Asking again for an older one makes it the newest request.
+        s.get(&key(2));
+        let jobs = s.shared.jobs.lock();
+        assert_eq!(jobs.len(), 10);
+        let newest = jobs.iter().max_by_key(|j| job_seq(j)).unwrap();
+        assert!(newest.key == key(2));
+    }
+
+    /// Frame cost of re-requesting visible thumbnails while a long queue is
+    /// waiting (fast scrolling through a 10,000-file folder).
+    /// `cargo test --release -p lumen --no-default-features -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_thumb_requests() {
+        let mut s = idle_service();
+        let keys: Vec<ThumbKey> = (0..4000).map(key).collect();
+        for k in &keys {
+            s.get(k);
+        }
+        let frames = 200;
+        let start = std::time::Instant::now();
+        for f in 0..frames {
+            s.begin_frame();
+            // 60 visible cells, a window that moves through the queue.
+            let base = (f * 17) % (keys.len() - 60);
+            for k in &keys[base..base + 60] {
+                std::hint::black_box(matches!(s.get(k), Thumb::Pending));
+            }
+        }
+        eprintln!("60 pending thumbnail requests with 4000 queued: {:.3} ms per frame", start.elapsed().as_secs_f64() * 1000.0 / frames as f64);
+    }
 }
 
 /// Delete the oldest cache files until the folder is under `limit` bytes.

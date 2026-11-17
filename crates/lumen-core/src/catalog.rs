@@ -167,42 +167,52 @@ pub fn list_recursive(dir: &Path, limit: usize) -> Vec<Entry> {
 }
 
 /// Natural ordering: "img2" < "img10", case-insensitive.
+///
+/// Works on the bytes with an ASCII fast path and no allocation (sorting a
+/// 10,000-file folder makes over 100,000 comparisons on the UI thread).
 pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
     loop {
-        match (ai.peek().copied(), bi.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(ca), Some(cb)) => {
-                if ca.is_ascii_digit() && cb.is_ascii_digit() {
-                    let mut na = String::new();
-                    while let Some(c) = ai.peek().copied().filter(|c| c.is_ascii_digit()) {
-                        na.push(c);
-                        ai.next();
-                    }
-                    let mut nb = String::new();
-                    while let Some(c) = bi.peek().copied().filter(|c| c.is_ascii_digit()) {
-                        nb.push(c);
-                        bi.next();
-                    }
-                    let ta = na.trim_start_matches('0');
-                    let tb = nb.trim_start_matches('0');
-                    let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| na.len().cmp(&nb.len()));
-                    if ord != Ordering::Equal {
-                        return ord;
-                    }
-                } else {
-                    let la = ca.to_lowercase().next().unwrap_or(ca);
-                    let lb = cb.to_lowercase().next().unwrap_or(cb);
-                    if la != lb {
-                        return la.cmp(&lb);
-                    }
-                    ai.next();
-                    bi.next();
-                }
+        let (Some(&ca), Some(&cb)) = (ab.get(i), bb.get(j)) else {
+            // Whichever name ran out first sorts first.
+            return (i < ab.len()).cmp(&(j < bb.len()));
+        };
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            // Index i and j stay on char boundaries: ASCII digits never occur
+            // inside a multi-byte UTF-8 sequence.
+            let (si, sj) = (i, j);
+            while ab.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
             }
+            while bb.get(j).is_some_and(u8::is_ascii_digit) {
+                j += 1;
+            }
+            let (na, nb) = (&ab[si..i], &bb[sj..j]);
+            let ta = &na[na.iter().take_while(|&&c| c == b'0').count()..];
+            let tb = &nb[nb.iter().take_while(|&&c| c == b'0').count()..];
+            let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| na.len().cmp(&nb.len()));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else if ca.is_ascii() && cb.is_ascii() {
+            let (la, lb) = (ca.to_ascii_lowercase(), cb.to_ascii_lowercase());
+            if la != lb {
+                return la.cmp(&lb);
+            }
+            i += 1;
+            j += 1;
+        } else {
+            let xa = a[i..].chars().next().unwrap_or_default();
+            let xb = b[j..].chars().next().unwrap_or_default();
+            let la = xa.to_lowercase().next().unwrap_or(xa);
+            let lb = xb.to_lowercase().next().unwrap_or(xb);
+            if la != lb {
+                return la.cmp(&lb);
+            }
+            i += xa.len_utf8();
+            j += xb.len_utf8();
         }
     }
 }
@@ -218,38 +228,75 @@ pub struct SortContext<'a> {
 
 pub fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_first: bool, cx: &SortContext) {
     use std::cmp::Ordering;
-    entries.sort_by(|a, b| {
-        if folders_first && a.is_folder() != b.is_folder() {
-            return if a.is_folder() { Ordering::Less } else { Ordering::Greater };
-        }
-        let ord = match key {
-            SortKey::Name => natural_cmp(&a.name, &b.name),
-            SortKey::Size => a.size.cmp(&b.size),
-            SortKey::Modified => a.modified.cmp(&b.modified),
-            SortKey::Created => a.created.cmp(&b.created),
-            SortKey::Type => a.ext.cmp(&b.ext),
-            SortKey::Dimensions => {
-                let pa = (cx.dims)(&a.path).map(|(w, h)| w as u64 * h as u64);
-                let pb = (cx.dims)(&b.path).map(|(w, h)| w as u64 * h as u64);
-                pa.cmp(&pb)
-            }
-            SortKey::DateTaken => {
-                let ta = (cx.taken)(&a.path).or_else(|| a.modified.map(systime_secs));
-                let tb = (cx.taken)(&b.path).or_else(|| b.modified.map(systime_secs));
-                ta.cmp(&tb)
-            }
-            SortKey::Rating => (cx.rating)(&a.path).cmp(&(cx.rating)(&b.path)),
-            // Ascending puts flagged files first, like a "picks" view.
-            SortKey::Flagged => (cx.flagged)(&b.path).cmp(&(cx.flagged)(&a.path)),
-            // Ascending: red, yellow, green, blue, purple, then unlabeled files.
-            SortKey::ColorLabel => {
-                let k = |l: u8| if l == 0 { u8::MAX } else { l };
-                k((cx.label)(&a.path)).cmp(&k((cx.label)(&b.path)))
-            }
-        }
-        .then_with(|| natural_cmp(&a.name, &b.name));
+    let folder_ord = |a: &Entry, b: &Entry| (folders_first && a.is_folder() != b.is_folder()).then(|| if a.is_folder() { Ordering::Less } else { Ordering::Greater });
+    let finish = |a: &Entry, b: &Entry, ord: Ordering| {
+        let ord = ord.then_with(|| natural_cmp(&a.name, &b.name));
         if desc { ord.reverse() } else { ord }
-    });
+    };
+    // Keys that need a lookup by path (metadata, tags) are read once per
+    // entry, not twice per comparison.
+    let looked_up: Option<Vec<Option<i128>>> = match key {
+        SortKey::Dimensions => Some(entries.iter().map(|e| (cx.dims)(&e.path).map(|(w, h)| w as i128 * h as i128)).collect()),
+        SortKey::DateTaken => Some(entries.iter().map(|e| (cx.taken)(&e.path).or_else(|| e.modified.map(systime_secs)).map(i128::from)).collect()),
+        SortKey::Rating => Some(entries.iter().map(|e| Some((cx.rating)(&e.path) as i128)).collect()),
+        // Ascending puts flagged files first, like a "picks" view.
+        SortKey::Flagged => Some(entries.iter().map(|e| Some(if (cx.flagged)(&e.path) { 0 } else { 1 })).collect()),
+        // Ascending: red, yellow, green, blue, purple, then unlabeled files.
+        SortKey::ColorLabel => Some(
+            entries
+                .iter()
+                .map(|e| {
+                    let l = (cx.label)(&e.path);
+                    Some(if l == 0 { u8::MAX as i128 } else { l as i128 })
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    match looked_up {
+        None => entries.sort_by(|a, b| {
+            if let Some(o) = folder_ord(a, b) {
+                return o;
+            }
+            let ord = match key {
+                SortKey::Name => natural_cmp(&a.name, &b.name),
+                SortKey::Size => a.size.cmp(&b.size),
+                SortKey::Modified => a.modified.cmp(&b.modified),
+                SortKey::Created => a.created.cmp(&b.created),
+                SortKey::Type => a.ext.cmp(&b.ext),
+                _ => Ordering::Equal,
+            };
+            finish(a, b, ord)
+        }),
+        Some(keys) => {
+            let mut order: Vec<usize> = (0..entries.len()).collect();
+            order.sort_by(|&i, &j| {
+                let (a, b) = (&entries[i], &entries[j]);
+                folder_ord(a, b).unwrap_or_else(|| finish(a, b, keys[i].cmp(&keys[j])))
+            });
+            permute(entries, &order);
+        }
+    }
+}
+
+/// Reorder `items` in place so position k holds the item that was at `order[k]`.
+fn permute<T>(items: &mut [T], order: &[usize]) {
+    let mut done = vec![false; items.len()];
+    for start in 0..items.len() {
+        if done[start] {
+            continue;
+        }
+        let mut k = start;
+        loop {
+            done[k] = true;
+            let from = order[k];
+            if from == start {
+                break;
+            }
+            items.swap(k, from);
+            k = from;
+        }
+    }
 }
 
 pub fn systime_secs(t: SystemTime) -> i64 {
@@ -328,6 +375,224 @@ mod tests {
         assert!(!matches_filter("Holiday_Beach_01.JPG", "beach .png"));
         assert!(matches_filter("x", "  "));
     }
+    /// `natural_cmp` before it was made allocation-free (the reference).
+    fn old_natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+        loop {
+            match (ai.peek().copied(), bi.peek().copied()) {
+                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some(ca), Some(cb)) => {
+                    if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                        let mut na = String::new();
+                        while let Some(c) = ai.peek().copied().filter(|c| c.is_ascii_digit()) {
+                            na.push(c);
+                            ai.next();
+                        }
+                        let mut nb = String::new();
+                        while let Some(c) = bi.peek().copied().filter(|c| c.is_ascii_digit()) {
+                            nb.push(c);
+                            bi.next();
+                        }
+                        let ta = na.trim_start_matches('0');
+                        let tb = nb.trim_start_matches('0');
+                        let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| na.len().cmp(&nb.len()));
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    } else {
+                        let la = ca.to_lowercase().next().unwrap_or(ca);
+                        let lb = cb.to_lowercase().next().unwrap_or(cb);
+                        if la != lb {
+                            return la.cmp(&lb);
+                        }
+                        ai.next();
+                        bi.next();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sort_entries` before keys were looked up once per entry (the reference).
+    fn old_sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_first: bool, cx: &SortContext) {
+        use std::cmp::Ordering;
+        entries.sort_by(|a, b| {
+            if folders_first && a.is_folder() != b.is_folder() {
+                return if a.is_folder() { Ordering::Less } else { Ordering::Greater };
+            }
+            let ord = match key {
+                SortKey::Name => old_natural_cmp(&a.name, &b.name),
+                SortKey::Size => a.size.cmp(&b.size),
+                SortKey::Modified => a.modified.cmp(&b.modified),
+                SortKey::Created => a.created.cmp(&b.created),
+                SortKey::Type => a.ext.cmp(&b.ext),
+                SortKey::Dimensions => {
+                    let pa = (cx.dims)(&a.path).map(|(w, h)| w as u64 * h as u64);
+                    let pb = (cx.dims)(&b.path).map(|(w, h)| w as u64 * h as u64);
+                    pa.cmp(&pb)
+                }
+                SortKey::DateTaken => {
+                    let ta = (cx.taken)(&a.path).or_else(|| a.modified.map(systime_secs));
+                    let tb = (cx.taken)(&b.path).or_else(|| b.modified.map(systime_secs));
+                    ta.cmp(&tb)
+                }
+                SortKey::Rating => (cx.rating)(&a.path).cmp(&(cx.rating)(&b.path)),
+                SortKey::Flagged => (cx.flagged)(&b.path).cmp(&(cx.flagged)(&a.path)),
+                SortKey::ColorLabel => {
+                    let k = |l: u8| if l == 0 { u8::MAX } else { l };
+                    k((cx.label)(&a.path)).cmp(&k((cx.label)(&b.path)))
+                }
+            }
+            .then_with(|| old_natural_cmp(&a.name, &b.name));
+            if desc { ord.reverse() } else { ord }
+        });
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+
+    fn random_name(r: &mut Lcg) -> String {
+        const PARTS: [&str; 22] = ["a", "B", "z", "Z", "0", "00", "1", "2", "9", "10", "007", "123456789012345678901234567890", "_", " ", ".", "-", "\u{e9}", "\u{c4}", "\u{df}", "\u{65e5}", "\u{130}", "IMG"];
+        (0..r.next(7) + 1).map(|_| PARTS[r.next(PARTS.len())]).collect()
+    }
+
+    #[test]
+    fn natural_cmp_matches_reference() {
+        let mut r = Lcg(42);
+        let names: Vec<String> = (0..600).map(|_| random_name(&mut r)).collect();
+        for a in &names {
+            for b in names.iter().step_by(7) {
+                assert_eq!(natural_cmp(a, b), old_natural_cmp(a, b), "{a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(natural_cmp("", ""), std::cmp::Ordering::Equal);
+        assert_eq!(natural_cmp("", "a"), std::cmp::Ordering::Less);
+        assert_eq!(natural_cmp("a1", "a"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn sort_matches_reference() {
+        use std::collections::HashMap;
+        let mut r = Lcg(7);
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let entries: Vec<Entry> = (0..400)
+            .map(|i| {
+                let name = random_name(&mut r);
+                let path = PathBuf::from(format!(r"C:\x\{i}\{name}"));
+                let folder = r.next(6) == 0;
+                Entry {
+                    ext: ["jpg", "png", "JPG", ""][r.next(4)].into(),
+                    path,
+                    name,
+                    kind: if folder { EntryKind::Folder } else { EntryKind::Image },
+                    size: r.next(5) as u64,
+                    modified: (r.next(5) > 0).then(|| t0 + std::time::Duration::from_secs(r.next(4) as u64)),
+                    created: (r.next(5) > 0).then(|| t0 + std::time::Duration::from_secs(r.next(4) as u64)),
+                    hidden: false,
+                }
+            })
+            .collect();
+        let meta: HashMap<PathBuf, (Option<(u32, u32)>, Option<i64>, u8, bool, u8)> = entries
+            .iter()
+            .map(|e| {
+                let dims = (r.next(4) > 0).then(|| (r.next(3) as u32 * 1000, r.next(3) as u32 * 500));
+                let taken = (r.next(3) > 0).then(|| 1_600_000_000 + r.next(4) as i64);
+                (e.path.clone(), (dims, taken, r.next(6) as u8, r.next(2) == 0, r.next(6) as u8))
+            })
+            .collect();
+        let dims = |p: &Path| meta[p].0;
+        let taken = |p: &Path| meta[p].1;
+        let rating = |p: &Path| meta[p].2;
+        let flagged = |p: &Path| meta[p].3;
+        let label = |p: &Path| meta[p].4;
+        let cx = SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label };
+        let keys = [SortKey::Name, SortKey::Size, SortKey::Modified, SortKey::Created, SortKey::Type, SortKey::Dimensions, SortKey::DateTaken, SortKey::Rating, SortKey::Flagged, SortKey::ColorLabel];
+        for key in keys {
+            for desc in [false, true] {
+                for folders_first in [false, true] {
+                    let mut a = entries.clone();
+                    let mut b = entries.clone();
+                    sort_entries(&mut a, key, desc, folders_first, &cx);
+                    old_sort_entries(&mut b, key, desc, folders_first, &cx);
+                    let pa: Vec<&PathBuf> = a.iter().map(|e| &e.path).collect();
+                    let pb: Vec<&PathBuf> = b.iter().map(|e| &e.path).collect();
+                    assert_eq!(pa, pb, "{key:?} desc={desc} folders_first={folders_first}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permute_reorders() {
+        let mut v = vec!['a', 'b', 'c', 'd', 'e'];
+        permute(&mut v, &[3, 0, 4, 1, 2]);
+        assert_eq!(v, vec!['d', 'a', 'e', 'b', 'c']);
+    }
+
+    fn entries_10k() -> Vec<Entry> {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        (0..10_000u64)
+            .map(|i| {
+                let k = (i * 7919) % 10_000;
+                let name = match i % 4 {
+                    0 => format!("IMG_{k:04}.JPG"),
+                    1 => format!("DSC{k}.jpg"),
+                    2 => format!("Holiday 2024 - beach {k} (edit).png"),
+                    _ => format!("20240{}{:02}_{k:06}.jpeg", k % 9 + 1, k % 28 + 1),
+                };
+                let path = PathBuf::from(format!(r"C:\Users\someone\Pictures\Trips\{name}"));
+                Entry { ext: formats::ext_of(&path), path, name, kind: EntryKind::Image, size: k * 1000, modified: Some(t0 + std::time::Duration::from_secs(k * 37)), created: None, hidden: false }
+            })
+            .collect()
+    }
+
+    /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`
+    #[test]
+    #[ignore]
+    fn bench_perf_sort() {
+        use std::collections::HashMap;
+        let base = entries_10k();
+        let taken: HashMap<PathBuf, i64> = base.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(i, e)| (e.path.clone(), 1_600_000_000 + (i as i64 * 7907) % 100_000)).collect();
+        let dims = |_: &Path| -> Option<(u32, u32)> { None };
+        let tk = |p: &Path| taken.get(p).copied();
+        let zero = |_: &Path| 0u8;
+        let no = |_: &Path| false;
+        let cx = SortContext { dims: &dims, taken: &tk, rating: &zero, flagged: &no, label: &zero };
+        let best = |f: &dyn Fn()| {
+            (0..5)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        for key in [SortKey::Name, SortKey::Modified, SortKey::DateTaken] {
+            let t = best(&|| {
+                let mut v = base.clone();
+                sort_entries(&mut v, key, false, true, &cx);
+                std::hint::black_box(v);
+            });
+            eprintln!("sort 10k by {key:?}: {t:.2} ms (includes a 10k clone)");
+        }
+        let t = best(&|| {
+            std::hint::black_box(base.clone());
+        });
+        eprintln!("clone 10k entries: {t:.2} ms");
+        let t = best(&|| {
+            std::hint::black_box(base.iter().filter(|e| matches_filter(&e.name, "beach .png")).count());
+        });
+        eprintln!("filter 10k names: {t:.2} ms");
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(human_size(512), "512 B");
