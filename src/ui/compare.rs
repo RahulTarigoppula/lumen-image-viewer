@@ -1110,6 +1110,10 @@ impl Compare {
         }
         let mut added = 0;
         for (pane, m) in marks {
+            // Marks belong to the original image, not the aligned view.
+            if self.panes.get(pane).is_some_and(|p| p.showing_aligned) {
+                continue;
+            }
             if let Some(im) = self.rv.review.images.get_mut(pane) {
                 if !im.marks.contains(&m) {
                     im.marks.push(m);

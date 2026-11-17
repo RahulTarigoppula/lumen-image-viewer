@@ -39,6 +39,11 @@ not one comparison at a time.
 - Auto-align start points: clips of the same scene from different phones are synchronized from the picture
   (brightness and motion signals, exposure-independent), with confidence and undo.
 
+### AI review
+- Rank devices: 2 to 4 images in one request (a labelled 2x2 grid when the server takes fewer images), with a verdict,
+  a ranking with scores, strengths and weaknesses, and findings drawn on the right panes.
+- Add findings as marks: AI findings become review marks with the matching artifact tag and severity.
+
 ### Engineering
 - CI checks every work branch: unit tests with and without FFmpeg, clippy, a full debug build.
 - Report writers render any slide list; the web page version of decks keeps the slide layout.
