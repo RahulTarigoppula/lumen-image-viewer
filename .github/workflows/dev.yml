@@ -85,6 +85,7 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           cargo test --release -p lumen-core --lib -- --ignored --nocapture --test-threads=1 bench_perf_ bench_50mp
+          cargo test --release -p lumen-core --lib
           cargo test --release -p lumen --no-default-features --bins -- --ignored --nocapture --test-threads=1 bench_perf_
           cargo test --release -p lumen-analysis --test perf -- --ignored --nocapture --test-threads=1 perf_1080p_and_4k
 

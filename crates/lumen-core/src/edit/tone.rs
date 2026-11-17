@@ -53,17 +53,22 @@ pub fn shadows_highlights(img: &RgbaImage, shadows: f32, highlights: f32) -> Rgb
         .collect();
     super::mask::blur_plane(&mut grid, gw, gh, SH_GRID * 0.03);
     let stride = w as usize * 4;
+    // Grid columns and weights depend only on x: computed once, not per row.
+    // (Coordinates are clamped to >= 0, so truncation is floor.)
+    let cols: Vec<(usize, usize, f32)> = (0..w as usize)
+        .map(|x| {
+            let gxf = ((x as f32 + 0.5) / cw - 0.5).clamp(0.0, (gw - 1) as f32);
+            let gx0 = gxf as usize;
+            (gx0, (gx0 + 1).min(gw - 1), gxf - gx0 as f32)
+        })
+        .collect();
     let mut out = img.clone();
     out.as_mut().par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
         let gyf = ((y as f32 + 0.5) / ch - 0.5).clamp(0.0, (gh - 1) as f32);
-        let gy0 = gyf.floor() as usize;
+        let gy0 = gyf as usize;
         let gy1 = (gy0 + 1).min(gh - 1);
         let fy = gyf - gy0 as f32;
-        for x in 0..w as usize {
-            let gxf = ((x as f32 + 0.5) / cw - 0.5).clamp(0.0, (gw - 1) as f32);
-            let gx0 = gxf.floor() as usize;
-            let gx1 = (gx0 + 1).min(gw - 1);
-            let fx = gxf - gx0 as f32;
+        for (x, &(gx0, gx1, fx)) in cols.iter().enumerate() {
             let top = grid[gy0 * gw + gx0] * (1.0 - fx) + grid[gy0 * gw + gx1] * fx;
             let bot = grid[gy1 * gw + gx0] * (1.0 - fx) + grid[gy1 * gw + gx1] * fx;
             let local = top * (1.0 - fy) + bot * fy;

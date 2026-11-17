@@ -61,7 +61,8 @@ pub struct GpuImage {
 
 fn push_row(pixels: &mut Vec<Color32>, row: &[u8]) {
     // Opaque rows (the common case) need no premultiplication: copy bytes directly.
-    if row.iter().skip(3).step_by(4).all(|&a| a == 255) {
+    // AND of all alpha bytes over whole pixels (vectorizes, unlike a strided `all`).
+    if row.as_chunks::<4>().0.iter().fold(255u8, |m, p| m & p[3]) == 255 {
         pixels.extend_from_slice(bytemuck::cast_slice::<u8, Color32>(row));
     } else {
         pixels.extend(row.chunks_exact(4).map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])));
