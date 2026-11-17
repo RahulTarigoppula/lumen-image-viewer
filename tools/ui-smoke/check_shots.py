@@ -50,7 +50,9 @@ def main():
                 continue
             w, h, std, ncol = stats(p)
             blank = std < 2.0 or ncol < 4
-            if blank:
+            if blank and r["status"] == "known-fail":
+                r["errors"].append(f"blank screenshot {s}")
+            elif blank:
                 bad.append(f"{s}: blank ({w}x{h}, stddev {std:.1f}, {ncol} colors)")
                 r["errors"].append(f"blank screenshot {s}")
                 r["status"] = "fail"
@@ -61,10 +63,12 @@ def main():
     parts = ["<!doctype html><meta charset=utf-8><title>Lumen UI smoke</title>",
              "<style>body{font:14px system-ui;background:#1b1b1f;color:#ddd;margin:16px}"
              "img{max-width:640px;border:1px solid #444;display:block}figure{display:inline-block;margin:8px;vertical-align:top}"
-             ".fail{color:#ff6b6b}.pass{color:#6bd68a}.skipped{color:#aaa}</style>",
+             ".fail,.known-fail{color:#ff6b6b}.pass{color:#6bd68a}.skipped{color:#aaa}</style>",
              "<h1>Lumen UI smoke test</h1>"]
     for r in results:
         parts.append(f"<h2>{html.escape(r['name'])} <span class={r['status']}>{r['status']}</span> <small>{r.get('seconds', '')} s</small></h2>")
+        if r.get("known"):
+            parts.append(f"<div>Known failure: {html.escape(r['known'])}</div>")
         for e in r["errors"]:
             parts.append(f"<div class=fail>{html.escape(str(e))}</div>")
         parts.append(f"<div><a href='logs/{html.escape(r['name'])}/'>logs</a></div>")
@@ -100,12 +104,14 @@ def main():
             f.write("## UI smoke test\n\n| Scenario | Result | Time | Screenshots | Problems |\n|---|---|---|---|---|\n")
             for r in results:
                 probs = "; ".join(str(e) for e in r["errors"]).replace("|", "/")[:300]
+                if r.get("known"):
+                    probs = f"known: {r['known']}. " + probs
                 f.write(f"| {r['name']} | {r['status']} | {r.get('seconds', '')} s | {len(r['shots'])} | {probs} |\n")
             f.write("\nScreenshots and logs: artifact `ui-smoke` (open index.html or overview.png).\n")
 
     for r in results:
         for s, info in r["shot_info"]:
-            if info is None and r["status"] != "skipped":
+            if info is None and r["status"] not in ("skipped", "known-fail"):
                 bad.append(f"{s}: missing")
     for b in bad:
         print(f"check_shots: {b}")

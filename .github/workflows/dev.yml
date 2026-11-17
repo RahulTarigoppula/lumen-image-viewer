@@ -93,6 +93,13 @@ jobs:
           path: target/debug/lumen.exe
           retention-days: 3
 
+      # Symbols, so panics in the UI smoke test have readable backtraces.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-dev-pdb
+          path: target/debug/lumen.pdb
+          retention-days: 3
+
   # UI smoke test: runs the debug build from the check job on Mesa's software
   # OpenGL (no GPU on hosted runners), drives tools/ui-smoke/scenarios through
   # the dev hook and uploads screenshots and logs as the `ui-smoke` artifact.
@@ -109,6 +116,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: lumen-dev
+          path: ui-smoke-bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-dev-pdb
           path: ui-smoke-bin
 
       - name: Cache Mesa

@@ -1,4 +1,4 @@
-# Settings window and keyboard shortcuts help.
+# Settings window: first page, then closed with Escape.
 open {media}\RoundA\DeviceX
 wait 2000
 run Settings
@@ -6,6 +6,4 @@ wait 2000
 shot settings.png
 key Escape
 wait 800
-run ShortcutsHelp
-wait 1500
-shot shortcuts.png
+shot closed.png

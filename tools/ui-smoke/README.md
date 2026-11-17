@@ -58,6 +58,7 @@ hook command (full list at the top of `src/devhook.rs`):
 # Comment
 @needs video          # skip when no test videos were generated
 @timeout 120          # seconds per step (default 60; a `wait` adds its own time)
+@known-failure <why>  # a reported bug: shown as known-fail, does not fail the job
 open {media}\RoundA\DeviceX\scene_01.jpg
 wait 2000
 run ToggleInfo        # any `Command` variant name from src/ui/commands.rs
@@ -73,7 +74,12 @@ shot info.png         # saved as shots/NN-name__info.png
 `{media}` is replaced with the absolute path of the generated media folder.
 Give asynchronous work (folder listing, decoding, metrics, video) a `wait`
 before the `shot`. An unknown `run` command or `key` fails the scenario, so
-typos do not go unnoticed.
+typos do not go unnoticed. When a `@known-failure` scenario starts passing,
+the log says so; remove the directive then so it guards against regressions.
+
+Panic backtraces in `stderr.txt` and `crash.log` have function names and
+lines because the check job also uploads `lumen.pdb` (artifact
+`lumen-dev-pdb`) and `run.ps1` puts it beside the exe.
 
 ## Running it yourself
 

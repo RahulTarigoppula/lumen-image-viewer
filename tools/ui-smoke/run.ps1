@@ -12,7 +12,8 @@
   A scenario fails when Lumen exits early, a step times out (hang), a panic or
   crash is logged, a screenshot is missing, the dev hook reports an unknown
   command or key, or Lumen does not exit after `run Exit`. The script exits 1
-  when any scenario failed.
+  when any scenario failed (a scenario marked `@known-failure <reason>` is
+  reported as known-fail but does not fail the run).
 
 .EXAMPLE
   pwsh tools/ui-smoke/run.ps1 -Exe target\debug\lumen.exe -Mesa mesa -Media ui-smoke-media -Out ui-smoke-out
@@ -50,6 +51,9 @@ New-Item -ItemType Directory -Force $app | Out-Null
 
 # The app folder: lumen.exe, Mesa's OpenGL beside it (found before the system one), portable mode.
 Copy-Item $Exe (Join-Path $app "lumen.exe")
+# Symbols for readable panic backtraces, when the build's PDB sits beside the exe.
+$pdb = [System.IO.Path]::ChangeExtension($Exe, ".pdb")
+if (Test-Path $pdb) { Copy-Item $pdb (Join-Path $app "lumen.pdb") }
 if ($Mesa) {
     Get-ChildItem $Mesa -Filter *.dll | Copy-Item -Destination $app
     $env:GALLIUM_DRIVER = "llvmpipe"
@@ -118,6 +122,7 @@ foreach ($file in Get-ChildItem $Scenarios -Filter *.txt | Sort-Object Name) {
     # Parse the scenario: directives (@...), comments (#), {media}, shot names.
     $stepTimeout = $StepTimeout
     $needs = @()
+    $known = ""
     $steps = @("size $Width $Height", "wait 1500")
     foreach ($raw in Get-Content $file.FullName) {
         $line = $raw.Trim()
@@ -127,6 +132,7 @@ foreach ($file in Get-ChildItem $Scenarios -Filter *.txt | Sort-Object Name) {
             switch ($d[0]) {
                 "timeout" { $stepTimeout = [int]$d[1] }
                 "needs" { $needs += $d[1].Trim() }
+                "known-failure" { $known = $d[1].Trim() }
                 default { throw "${name}: unknown directive $line" }
             }
             continue
@@ -244,6 +250,16 @@ foreach ($file in Get-ChildItem $Scenarios -Filter *.txt | Sort-Object Name) {
         foreach ($l in Select-String -Path $state -Pattern "^unknown (command|key) ") { $res.errors += "dev hook: $($l.Line.Trim())" }
     }
     if ($res.errors.Count -gt 0) { $res.status = "fail" }
+    if ($known) {
+        # A bug already reported: show it, do not fail the job; say so once it is fixed.
+        $res.known = $known
+        if ($res.status -eq "fail") {
+            $res.status = "known-fail"
+            Write-Host "  known failure ($known)"
+        } else {
+            Write-Host "  NOTE: passes now; remove '@known-failure' from $($file.Name)"
+        }
+    }
     $res.seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     foreach ($e in $res.errors) { Write-Host "  FAIL: $e" }
     Write-Host ("  {0} in {1}s, {2} screenshots" -f $res.status, $res.seconds, @($res.shots | Where-Object { Test-Path (Join-Path $shots $_) }).Count)
@@ -265,7 +281,8 @@ if ($py) {
 
 $failed = @($results | Where-Object { $_.status -eq "fail" })
 $skipped = @($results | Where-Object { $_.status -eq "skipped" })
+$knownFails = @($results | Where-Object { $_.status -eq "known-fail" })
 Write-Host ""
-Write-Host ("UI smoke: {0} scenarios, {1} failed, {2} skipped" -f $results.Count, $failed.Count, $skipped.Count)
+Write-Host ("UI smoke: {0} scenarios, {1} failed, {2} known failures, {3} skipped" -f $results.Count, $failed.Count, $knownFails.Count, $skipped.Count)
 if ($failed.Count -gt 0 -or $checkFailed -or $results.Count -eq 0) { exit 1 }
 exit 0

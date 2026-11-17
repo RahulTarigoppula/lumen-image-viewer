@@ -2,6 +2,15 @@
 open {media}\RoundA\DeviceX
 wait 3000
 shot grid.png
+# Click the second thumbnail (window points at 1280 x 800), open it with Enter, back with Escape.
+click 570 160
+wait 500
+shot clicked.png
+key Enter
+wait 2500
+shot opened.png
+key Escape
+wait 1000
 open {media}\Flat
 wait 3000
 shot flat.png
