@@ -481,10 +481,10 @@ pub fn overlap_polygon(h: &Homography, mw: u32, mh: u32, rw: u32, rh: u32) -> Ve
     }
     let (x1, y1) = (rw as f64 - 0.5, rh as f64 - 0.5);
     let mut poly = q.to_vec();
-    poly = clip_poly(&poly, 0, 1.0, -0.5);
-    poly = clip_poly(&poly, 0, -1.0, -x1);
-    poly = clip_poly(&poly, 1, 1.0, -0.5);
-    poly = clip_poly(&poly, 1, -1.0, -y1);
+    poly = clip_poly(&poly, 0, 1.0, 0.5);
+    poly = clip_poly(&poly, 0, -1.0, x1);
+    poly = clip_poly(&poly, 1, 1.0, 0.5);
+    poly = clip_poly(&poly, 1, -1.0, y1);
     if poly.len() < 3 {
         poly.clear();
     }
@@ -1898,8 +1898,10 @@ mod tests {
         assert!(overlap_rect(&Homography::translation(1000.0, 0.0), 100, 100, 100, 100).is_none());
     }
 
+    /// Two 12 MP photos: checks accuracy at full resolution and prints the
+    /// time (`cargo test -p lumen-analysis --release aligns_12mp -- --nocapture`).
     #[test]
-    fn timing_probe_12mp() {
+    fn aligns_12mp_pair() {
         let (s, sw, sh) = scene();
         let (w, h) = (4000u32, 3000u32);
         let to_ref = Homography::scaling(10.0, 10.0).compose(&Homography::translation(-OFF.0, -OFF.1));
@@ -1918,8 +1920,15 @@ mod tests {
             res = Some(align_rgba(&r, w, h, &m, w, h, &AlignOptions::default(), None));
             best = best.min(t1.elapsed().as_secs_f64() * 1000.0);
         }
-        let res = res.unwrap();
-        let err = res.as_ref().ok().map(|a| dist(a.h.map(c), t.map(c)));
-        panic!("TIMING align 12MP best {best:.1} ms, warp 12MP {warp_ms:.1} ms, center error {err:?}, {res:?}");
+        let res = res.unwrap().unwrap_or_else(|e| panic!("align failed: {e}"));
+        eprintln!("align 12MP: best {best:.1} ms, warp 12MP: {warp_ms:.1} ms, {res:?}");
+        // Working resolution is about 3.9x smaller, so 4 px here is about
+        // 1 px there.
+        for p in [c, [800.0, 600.0], [3200.0, 2400.0], [800.0, 2400.0]] {
+            let e = dist(res.h.map(p), t.map(p));
+            assert!(e < 4.0, "error {e:.2} px at {p:?}, {res:?}");
+        }
+        assert_eq!(res.model, Model::Homography);
+        assert!((res.scale - 1.2).abs() < 0.01 && (res.rotation_deg - 5.0).abs() < 0.3, "{res:?}");
     }
 }
