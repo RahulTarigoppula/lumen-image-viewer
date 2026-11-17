@@ -645,44 +645,6 @@ impl WorkbenchUi {
                 ui.label(RichText::new(format!("{}  {} scene{} with extra captures", I::WARNING, dups.len(), if dups.len() == 1 { "" } else { "s" })).size(text::SMALL).color(p.warn))
                     .on_hover_text(format!("Only the first capture of a device is compared and reported.\n{}", list.join("\n")));
             }
-            let ids = self.ws.project.measured_ids();
-            if !ids.is_empty() {
-                ui.add_space(6.0);
-                widgets::section_title(ui, &p, "MEASURED (MEAN OVER SCENES)");
-                let means = self.ws.project.measure_means();
-                for id in &ids {
-                    let vals: Vec<(String, f64)> = means.iter().filter_map(|(d, m)| m.iter().find(|(k, _)| k == id).map(|(_, v)| (d.clone(), *v))).collect();
-                    if vals.is_empty() {
-                        continue;
-                    }
-                    let best = match measure::higher_is_better(id) {
-                        Some(true) => vals.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max),
-                        Some(false) => vals.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min),
-                        None => f64::NAN,
-                    };
-                    let dir = match measure::higher_is_better(id) {
-                        Some(true) => "higher is better",
-                        Some(false) => "lower is better",
-                        None => "",
-                    };
-                    ui.label(RichText::new(measure::name_of(id)).size(text::SMALL).color(p.text)).on_hover_text(format!("{} ({dir}). The best device is highlighted.", lumen_analysis::metrics::get(id).map(|m| m.info().name).unwrap_or(id)));
-                    for (d, v) in vals {
-                        let is_best = v == best;
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(self.ws.project.display(&d)).size(text::SMALL).color(p.muted));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let t = RichText::new(measure::fmt_value(id, v)).size(text::SMALL);
-                                ui.label(if is_best { t.color(p.ok).strong() } else { t.color(p.muted) });
-                            });
-                        });
-                    }
-                }
-                let left = self.ws.project.unmeasured().len();
-                if left > 0 {
-                    ui.label(RichText::new(format!("{left} capture{} not measured yet", if left == 1 { "" } else { "s" })).size(text::SMALL).color(p.faint));
-                }
-            }
             let reviewed = self.ws.project.scenes.iter().filter(|s| s.done).count();
             ui.label(RichText::new(format!("{reviewed} of {} scenes reviewed", self.ws.project.scenes.len())).size(text::SMALL).color(p.muted));
             if !self.ws.project.detected_by.is_empty() {
@@ -703,6 +665,44 @@ impl WorkbenchUi {
                     });
                 }
                 ui.label(RichText::new(format!("{} votes", self.ws.project.votes.len())).size(text::SMALL).color(p.muted));
+            }
+            let ids = self.ws.project.measured_ids();
+            if !ids.is_empty() {
+                ui.add_space(6.0);
+                widgets::section_title(ui, &p, "MEASURED (MEAN OVER SCENES)");
+                let means = self.ws.project.measure_means();
+                for id in &ids {
+                    let vals: Vec<(String, f64)> = means.iter().filter_map(|(d, m)| m.iter().find(|(k, _)| k == id).map(|(_, v)| (d.clone(), *v))).collect();
+                    if vals.is_empty() {
+                        continue;
+                    }
+                    let best = match measure::higher_is_better(id) {
+                        Some(true) => vals.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max),
+                        Some(false) => vals.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min),
+                        None => f64::NAN,
+                    };
+                    let dir = match measure::higher_is_better(id) {
+                        Some(true) => "higher is better",
+                        Some(false) => "lower is better",
+                        None => "",
+                    };
+                    let tip = format!("{} ({dir}). The best device is in green.", lumen_analysis::metrics::get(id).map(|m| m.info().name).unwrap_or(id));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(measure::name_of(id)).size(text::SMALL).color(p.text)).on_hover_text(tip.as_str());
+                        for (d, v) in vals {
+                            let is_best = v == best;
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(6.0, 12.0), Sense::hover());
+                            ui.painter().rect_filled(r, CornerRadius::same(2), rgb(self.ws.project.device_color(&d)));
+                            let t = RichText::new(measure::fmt_value(id, v)).size(text::SMALL);
+                            ui.label(if is_best { t.color(p.ok).strong() } else { t.color(p.muted) }).on_hover_text(self.ws.project.display(&d).to_string());
+                        }
+                    });
+                }
+                let left = self.ws.project.unmeasured().len();
+                if left > 0 {
+                    ui.label(RichText::new(format!("{left} capture{} not measured yet", if left == 1 { "" } else { "s" })).size(text::SMALL).color(p.faint));
+                }
             }
             if let Some(path) = self.last_export.clone() {
                 ui.add_space(8.0);
@@ -1187,6 +1187,11 @@ fn short(a: &str) -> String {
         "Exposure" => "Exp".into(),
         "Dynamic range" => "DR".into(),
         "Artifacts" => "Art".into(),
+        "Sharpness" => "Sharp".into(),
+        "Visual noise" => "VN".into(),
+        "White balance" => "WB".into(),
+        "Clipping" => "Clip".into(),
+        "Banding" => "Band".into(),
         _ => a.chars().take(5).collect(),
     }
 }

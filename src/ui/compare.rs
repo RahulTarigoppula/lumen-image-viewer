@@ -1743,7 +1743,9 @@ impl Compare {
                 None => self.pane_label(i).unwrap_or_default(),
             };
         }
-        let mut parts = vec![self.pane_label(i).map(|l| format!("{l}{CAPTION_SEP}{}", name_of(&pane.path))).unwrap_or_else(|| name_of(&pane.path))];
+        // "aligned" stays in the first part: later parts drop out when narrow.
+        let aligned = if pane.showing_aligned { " (aligned)" } else { "" };
+        let mut parts = vec![self.pane_label(i).map(|l| format!("{l}{aligned}{CAPTION_SEP}{}", name_of(&pane.path))).unwrap_or_else(|| format!("{}{aligned}", name_of(&pane.path)))];
         if let Some((w, h)) = pane.dims() {
             parts.push(format!("{w} × {h}"));
         }
@@ -1752,7 +1754,7 @@ impl Compare {
         }
         if pane.showing_aligned {
             if let Some(Ok(r)) = &pane.align {
-                parts.insert(1, format!("aligned to A ({})", confidence_word(r.confidence)));
+                parts.push(format!("aligned to A: {}", confidence_word(r.confidence)));
             }
         }
         if let Some(z) = zoom {
