@@ -554,6 +554,25 @@ impl App {
                     self.open_project(&p);
                 }
             }
+            BlindTest => match &mut self.workbench {
+                Some(w) => {
+                    w.start_blind(std::env::var("USERNAME").unwrap_or_default());
+                    if w.blind.as_ref().is_some_and(|b| b.trial.is_some()) {
+                        self.open_blind_trial();
+                    } else {
+                        w.blind = None;
+                        self.core.toasts.info("A blind test needs scenes with captures from at least two devices");
+                    }
+                }
+                None => self.core.toasts.info("Open a camera comparison project first (Tools, Workbench)"),
+            },
+            MeasureProject => match &mut self.workbench {
+                Some(w) => {
+                    w.start_measure(&mut self.core, false);
+                    self.mode = Mode::Workbench;
+                }
+                None => self.core.toasts.info("Open a camera comparison project first (Tools, Workbench)"),
+            },
             Workbench => {
                 let folder = self.browser.folder.clone();
                 let root = lumen_core::workbench::find_root(&folder, 3).unwrap_or(folder);

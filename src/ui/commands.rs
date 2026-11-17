@@ -128,6 +128,10 @@ pub enum Command {
     OpenProject,
     /// Open the browser's folder as a project, or go back to the open one.
     Workbench,
+    /// Start a blind test in the open project.
+    BlindTest,
+    /// Measure the open project's captures.
+    MeasureProject,
 }
 
 use Command::*;
@@ -248,6 +252,8 @@ impl Command {
             RunAi => "Run AI review".into(),
             OpenProject => "Open camera comparison project...".into(),
             Workbench => "Workbench: compare devices in this folder".into(),
+            BlindTest => "Blind test (project)".into(),
+            MeasureProject => "Measure every capture (project)".into(),
         }
     }
 
@@ -370,6 +376,8 @@ impl Command {
             RunAi => I::SPARKLE,
             OpenProject => I::FLASK,
             Workbench => I::FLASK,
+            BlindTest => I::EYE_SLASH,
+            MeasureProject => I::GAUGE,
         }
     }
 
@@ -399,7 +407,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -434,7 +442,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

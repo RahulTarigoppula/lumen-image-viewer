@@ -1,0 +1,30 @@
+# Workbench: open the camera test project, compare a scene, page to the next,
+# align to A, measure, blind test.
+open {media}\RoundA
+wait 2500
+run Workbench
+wait 4000
+shot overview.png
+key Enter
+wait 4000
+shot scene.png
+key PageDown
+wait 4000
+shot next_scene.png
+key A
+wait 8000
+shot aligned.png
+key Escape
+wait 2000
+run MeasureProject
+wait 15000
+shot measured.png
+run BlindTest
+wait 4000
+shot blind.png
+key Left
+wait 3000
+shot blind_next.png
+key Escape
+wait 2000
+shot after_blind.png

@@ -93,6 +93,8 @@ pub fn describe(c: Command) -> &'static str {
         RunAi => "Ask your AI server to describe the image's problems",
         OpenProject => "Pick a folder of captures from several phones: scenes are paired for review, scoring and one report",
         Workbench => "Treat this folder as a camera comparison project: devices and scenes are found automatically",
+        BlindTest => "Judge random pairs of the project with names hidden; devices are ranked from the votes",
+        MeasureProject => "Measure sharpness, noise, clipping and color of every capture in the project",
         _ => "",
     }
 }
