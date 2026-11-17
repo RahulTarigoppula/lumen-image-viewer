@@ -1,7 +1,4 @@
 # Keyboard shortcuts window (F1 / ShortcutsHelp).
-# Debug builds panic here: help_window in src/app.rs calls ui.add_space() directly
-# inside egui::Grid ("add_space makes no sense in a grid layout", egui ui.rs:1801).
-@known-failure help window panics in debug builds (add_space inside a Grid)
 open {media}\RoundA\DeviceX
 wait 2000
 run ShortcutsHelp

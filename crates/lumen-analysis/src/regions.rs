@@ -136,15 +136,39 @@ fn blur_grid(lap: &Heatmap, ten: &Heatmap) -> Option<Grid> {
     if n < 8 {
         return None;
     }
-    // The reference is the textured half of the picture: flat areas are
-    // mostly sensor noise, whose ratio is high and says nothing about focus.
-    let t50 = percentile(ten.data.iter().copied().filter(|&t| structured(t)).collect(), 50.0)?;
-    let reference = percentile(ratios.iter().zip(&ten.data).filter(|(_, &t)| t >= t50).map(|(&r, _)| r).collect(), 50.0)?;
+    // The reference is the most strongly structured quarter of the picture
+    // (the sharpest content): flat areas are mostly sensor noise, whose ratio
+    // is high and says nothing about focus.
+    let t75 = percentile(ten.data.iter().copied().filter(|&t| structured(t)).collect(), 75.0)?;
+    let reference = percentile(ratios.iter().zip(&ten.data).filter(|(_, &t)| t >= t75).map(|(&r, _)| r).collect(), 50.0)?;
     if reference <= 0.0 {
         return None;
     }
-    let bad = ratios.iter().map(|&r| if r.is_finite() && r < 0.3 * reference { (1.0 - r / (0.3 * reference)).clamp(0.2, 1.0) } else { 0.0 }).collect();
+    // The strongest edges of the picture are never "soft": blur lowers the
+    // gradient energy too. In a noisy night shot the noise has a higher
+    // ratio than crisp text, which must not make the text the blurry part.
+    let bad = ratios
+        .iter()
+        .zip(&ten.data)
+        .map(|(&r, &t)| if r.is_finite() && t < t75 && r < 0.3 * reference { (1.0 - r / (0.3 * reference)).clamp(0.2, 1.0) } else { 0.0 })
+        .collect();
     Some(grid_like(lap, bad))
+}
+
+/// Blocking: tile scores are noisy (a tile holds few block edges, and
+/// content aligned to the 8 px grid reads as blocking), so a tile counts only
+/// well above the image's typical tile; a picture whose typical tile shows no
+/// blocking never gets a strong blocking area.
+fn block_grid(m: &Heatmap) -> Grid {
+    let median = percentile(m.data.clone(), 50.0).unwrap_or(0.0).max(0.0);
+    let limit = 0.35f32.max(3.0 * median);
+    let mut g = limit_grid(m, limit, (limit + 0.65).max(1.0));
+    if median < 0.1 {
+        for b in &mut g.bad {
+            *b = b.min(0.55);
+        }
+    }
+    g
 }
 
 /// Tiles over a fixed limit, strength growing to 1 at `full`.
@@ -306,7 +330,7 @@ pub fn find_regions(maps: &[(&str, &Heatmap)], width: u32, height: u32) -> Vec<R
         }
     }
     if let Some(m) = map("blockiness") {
-        out.extend(regions_of(&limit_grid(m, 0.35, 1.0), RegionKind::Blocky, width, height, 1.5, 0.6));
+        out.extend(regions_of(&block_grid(m), RegionKind::Blocky, width, height, 1.5, 0.6));
     }
     if let Some(m) = map("banding") {
         out.extend(regions_of(&limit_grid(m, 10.0, 35.0), RegionKind::Banding, width, height, 1.0, 0.6));
@@ -380,6 +404,33 @@ mod tests {
         assert!(r.iter().any(|r| r.kind == RegionKind::ClippedShadows && r.rect[1] == 224.0), "{r:?}");
         // A 30% share is not "most of it": no box along the right edge.
         assert!(r.iter().all(|r| r.rect[0] < 480.0), "{r:?}");
+    }
+
+    #[test]
+    fn soft_half_is_blurry_but_crisp_text_in_noise_is_not() {
+        // Sharp left half, soft right half.
+        let lap = tiles(16, 8, |x, _| if x < 8 { 240.0 } else { 5.0 });
+        let ten = tiles(16, 8, |x, _| if x < 8 { 400.0 } else { 100.0 });
+        let r = find_regions(&[("sharpness.laplacian", &lap), ("sharpness.tenengrad", &ten)], 1024, 512);
+        assert!(r.iter().any(|r| r.kind == RegionKind::Blurry && r.rect[0] >= 512.0), "{r:?}");
+        assert!(r.iter().all(|r| r.rect[0] >= 512.0), "{r:?}");
+        // Night: crisp title text on top, noise and soft glows below. The
+        // noise has a higher Laplacian / gradient ratio than the text edges.
+        let lap = tiles(16, 8, |x, y| if y < 2 { 250.0 } else if x < 8 { 80.0 } else { 6.0 });
+        let ten = tiles(16, 8, |x, y| if y < 2 { 500.0 } else if x < 8 { 40.0 } else { 30.0 });
+        let r = find_regions(&[("sharpness.laplacian", &lap), ("sharpness.tenengrad", &ten)], 1024, 512);
+        assert!(r.iter().all(|r| !(r.kind == RegionKind::Blurry && r.rect[1] < 128.0)), "text flagged blurry: {r:?}");
+    }
+
+    #[test]
+    fn faint_blocking_is_never_strong() {
+        // Typical tile 0.05 (a good JPEG), a few noisy tiles at 0.8.
+        let m = tiles(10, 8, |x, y| if (2..5).contains(&x) && (2..4).contains(&y) { 0.8 } else { 0.05 });
+        let r = find_regions(&[("blockiness", &m)], 640, 512);
+        assert!(r.iter().all(|r| r.level == RegionLevel::Moderate), "{r:?}");
+        // Blocking everywhere: tiles must stand out from it to be boxed.
+        let m = tiles(10, 8, |x, y| if (x, y) == (3, 3) { 0.5 } else { 0.3 });
+        assert!(find_regions(&[("blockiness", &m)], 640, 512).is_empty());
     }
 
     #[test]

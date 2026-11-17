@@ -2456,9 +2456,13 @@ impl App {
                 // One grid for every section, so the key column lines up at the same x.
                 // Generated from the active keymap, so this list is always correct.
                 let no_wrap = |t: RichText| egui::Label::new(t).wrap_mode(egui::TextWrapMode::Extend);
+                // One grid cell: the gap above the title lives inside it
+                // (add_space directly in a grid row is not allowed).
                 let title = |ui: &mut egui::Ui, t: &str| {
-                    ui.add_space(10.0);
-                    ui.add(no_wrap(RichText::new(t).font(theme::text::subtitle()).color(p.text)));
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.add(no_wrap(RichText::new(t).font(theme::text::subtitle()).color(p.text)));
+                    });
                     ui.end_row();
                 };
                 egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).striped(false).show(ui, |ui| {

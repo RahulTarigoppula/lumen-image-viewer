@@ -2491,7 +2491,7 @@ impl VideoMode {
         }
         if self.audio.is_none() {
             if let Some(e) = &self.audio_error {
-                painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  No audio output: {e}", I::SPEAKER_SLASH), FontId::proportional(11.5), p.muted);
+                painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  {}", I::SPEAKER_SLASH, if e.to_lowercase().starts_with("no audio") { e.to_string() } else { format!("No audio output: {e}") }), FontId::proportional(11.5), p.muted);
             }
         }
     }
