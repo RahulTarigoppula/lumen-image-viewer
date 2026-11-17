@@ -1020,7 +1020,7 @@ impl WorkbenchUi {
         let Some(form) = self.export.as_mut() else { return };
         let p = core.pal;
         let mut result = None;
-        widgets::modal(ctx, egui::Id::new("wb-export"), 480.0, |ui| {
+        widgets::modal(ctx, egui::Id::unique("wb-export"), 480.0, |ui| {
             widgets::modal_title(ui, "Round report");
             widgets::modal_body(ui, "One report for the whole project: summary, scores, flagged artifacts, blind test ranking and every scene.");
             ui.add_space(8.0);

@@ -76,10 +76,10 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
       - name: Unit tests (all crates, image features)
-        run: cargo test --workspace --no-default-features
+        run: cargo test --workspace --no-default-features --no-fail-fast
 
       - name: Unit tests (app with video and AI)
-        run: cargo test -p lumen
+        run: cargo test -p lumen --no-fail-fast
 
       - name: Clippy (errors only)
         run: cargo clippy --workspace --all-targets -- -A clippy::all -D clippy::correctness
