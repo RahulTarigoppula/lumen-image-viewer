@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 (23 November 2026)
+
+Lumen becomes an image quality workbench: whole camera comparison rounds,
+not one comparison at a time.
 
 ### Metadata and EXIF
 - EXIF and Metadata buttons in the viewer toolbar and in compare (Ctrl+Shift+X, Ctrl+Shift+I; also in the browser for up
@@ -26,11 +29,6 @@
   red, green and blue channels.
 - Line profile (P in compare): drag a line to plot brightness along it in every pane, with the 10-90% edge width of
   each.
-
-## 2.0.0 (17 November 2026)
-
-Lumen becomes an image quality workbench: whole camera comparison rounds,
-not one comparison at a time.
 
 ### Workbench (camera comparison projects)
 - Open a folder of captures as a project (Ctrl+Shift+W or Tools, Workbench). Devices and scenes are found

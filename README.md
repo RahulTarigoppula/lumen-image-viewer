@@ -80,7 +80,7 @@ cargo build --release --no-default-features --features video   # video, no netwo
 
 The repository is a Cargo workspace: the `lumen` app at the root, the UI-free `lumen-core` library in `crates/lumen-core`, the metrics engine `lumen-analysis` and the AI client `lumen-ai` (the only network code). Run all unit tests with `cargo test --workspace --no-default-features` (no FFmpeg needed).
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md), the analysis design in [docs/ANALYSIS-PLAN.md](docs/ANALYSIS-PLAN.md), and the crate guides [lumen-analysis](crates/lumen-analysis/API.md) and [lumen-ai](crates/lumen-ai/API.md).
+Usage flows, build and test setup, and known gaps: [docs/HANDOFF.md](docs/HANDOFF.md). Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/VIDEO-RESEARCH.md](docs/VIDEO-RESEARCH.md), the analysis design in [docs/ANALYSIS-PLAN.md](docs/ANALYSIS-PLAN.md), and the crate guides [lumen-analysis](crates/lumen-analysis/API.md) and [lumen-ai](crates/lumen-ai/API.md).
 
 ## Privacy
 
