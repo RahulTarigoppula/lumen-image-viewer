@@ -19,7 +19,8 @@ concurrency:
 
 jobs:
   check:
-    runs-on: windows-latest
+    # windows-2022 (Visual Studio 2022): the Visual Studio 2026 compiler on newer images cannot build dav1d 1.5.4 for FFmpeg.
+    runs-on: windows-2022
     env:
       VCPKG_ROOT: C:\vcpkg-lumen
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-bincache,readwrite
