@@ -1656,6 +1656,47 @@ impl App {
         }
     }
 
+    /// First start: the few choices people coming from FastStone look for first.
+    fn welcome(&mut self, ctx: &egui::Context) {
+        use crate::settings::WheelAction;
+        use crate::ui::keymap::Preset;
+        let p = self.core.pal;
+        let mut done = false;
+        let s = &mut self.core.settings;
+        crate::ui::widgets::modal(ctx, egui::Id::new("welcome"), 460.0, |ui| {
+            crate::ui::widgets::modal_title(ui, "Welcome to Lumen");
+            ui.label(RichText::new("Two choices to start with; both can be changed any time in Settings (Ctrl+,).").color(p.muted));
+            ui.add_space(10.0);
+            ui.label(RichText::new("Keyboard shortcuts").strong());
+            let preset = Preset::from_id(&s.keymap_preset);
+            for pr in Preset::ALL {
+                let tip = match pr {
+                    Preset::Lumen => "Lumen's own keys (F1 lists them all)",
+                    Preset::FastStone => "The keys you know from FastStone Image Viewer",
+                };
+                if crate::ui::widgets::radio(ui, preset == pr, pr.label()).on_hover_text(tip).clicked() {
+                    s.keymap_preset = pr.id().to_string();
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Mouse wheel in the viewer").strong());
+            crate::ui::widgets::radio_value(ui, &mut s.wheel_action, WheelAction::Navigate, "Next / previous image (Ctrl + wheel zooms)");
+            crate::ui::widgets::radio_value(ui, &mut s.wheel_action, WheelAction::Zoom, "Zoom");
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if crate::ui::widgets::primary_button(ui, &p, "Start").clicked() {
+                    done = true;
+                }
+                ui.label(RichText::new("Tip: Ctrl+K finds any command by name.").color(p.muted).size(theme::text::SMALL));
+            });
+        });
+        if done {
+            self.core.settings.first_run_done = true;
+            crate::ui::keymap::install(&self.core.settings);
+            self.core.settings.save();
+        }
+    }
+
     /// "Next image after rating" (viewer only): step on after a short pause.
     fn schedule_advance(&mut self) {
         if self.core.settings.advance_after_tag && self.mode == Mode::Viewer {
@@ -2495,6 +2536,14 @@ impl App {
         }
         if self.show_help {
             self.help_window(ctx);
+        }
+        if !self.core.settings.first_run_done && self.mode == Mode::Browser {
+            // The UI smoke test drives a fresh app: no welcome card over its screenshots.
+            if std::env::var_os("LUMEN_DEV_DIR").is_some() {
+                self.core.settings.first_run_done = true;
+            } else {
+                self.welcome(ctx);
+            }
         }
         if self.show_about {
             let mut open = true;
