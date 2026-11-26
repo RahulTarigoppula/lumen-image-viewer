@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Browser
-- Arrange by hand, like FastStone: drag thumbnails (or rows in the details view) between others to put them in any
+- Arrange by hand, like FastStone: drag thumbnails (or rows in the details view, or the viewer's filmstrip) between others to put them in any
   order. A line shows where they will land; dropping on the empty area puts them last; the view scrolls when the
   pointer is held near the top or bottom. Ctrl+Alt+Left / Right move the selected files one place, Ctrl+Z undoes an
   arrangement. The viewer, slideshow, compare, batch tools and exports follow the arranged order.
