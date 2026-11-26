@@ -589,6 +589,8 @@ pub struct Duplicates {
     marked: HashSet<PathBuf>,
     keep_rule: KeepRule,
     confirm_delete: bool,
+    /// The marked files include some on a drive with no Recycle Bin (checked when asking).
+    delete_permanent: bool,
     deleting: Option<Receiver<Result<Vec<PathBuf>, String>>>,
     error: Option<String>,
 }
@@ -754,6 +756,7 @@ impl Duplicates {
             marked: HashSet::new(),
             keep_rule: KeepRule::Resolution,
             confirm_delete: false,
+            delete_permanent: false,
             deleting: None,
             error: None,
         }
@@ -894,7 +897,7 @@ impl Duplicates {
                     self.replace_items(items);
                 }
                 match r {
-                    Ok(_) => core.toasts.success(format!("Moved {} file{} to the Recycle Bin", gone.len(), if gone.len() == 1 { "" } else { "s" })),
+                    Ok(_) => core.toasts.success(format!("{} {} file{}", if self.delete_permanent { "Deleted" } else { "Moved to the Recycle Bin:" }, gone.len(), if gone.len() == 1 { "" } else { "s" })),
                     Err(e) => {
                         let msg = if gone.is_empty() { e } else { format!("{e} ({} file{} were moved to the Recycle Bin)", gone.len(), if gone.len() == 1 { "" } else { "s" }) };
                         core.toasts.error(msg.clone());
@@ -1000,11 +1003,17 @@ impl Duplicates {
             let paths: Vec<PathBuf> = self.marked.iter().cloned().collect();
             let bytes: u64 = self.items.iter().filter(|it| self.marked.contains(&it.path)).map(|it| it.size).sum();
             let all_gone = self.groups.iter().filter(|g| g.members.iter().all(|&i| self.marked.contains(&self.items[i].path))).count();
-            let mut body = format!("{} file{} ({}) will be moved to the Recycle Bin. You can restore them from there.", paths.len(), if paths.len() == 1 { "" } else { "s" }, human_size(bytes));
+            let n = format!("{} file{} ({})", paths.len(), if paths.len() == 1 { "" } else { "s" }, human_size(bytes));
+            let mut body = if self.delete_permanent {
+                format!("{n} will be deleted permanently: some are on a network or removable drive, which has no Recycle Bin.")
+            } else {
+                format!("{n} will be moved to the Recycle Bin. You can restore them from there.")
+            };
             if all_gone > 0 {
                 body.push_str(&format!("\n\nWarning: in {all_gone} group{} every copy is marked, so no copy will be kept.", if all_gone == 1 { "" } else { "s" }));
             }
-            match crate::ui::widgets::show_confirm(ctx, "Move to Recycle Bin?", &body, "Move to Recycle Bin", true, &p) {
+            let (title, button) = if self.delete_permanent { ("Delete permanently?", "Delete") } else { ("Move to Recycle Bin?", "Move to Recycle Bin") };
+            match crate::ui::widgets::show_confirm(ctx, title, &body, button, true, &p) {
                 Some(true) => {
                     self.confirm_delete = false;
                     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1062,6 +1071,7 @@ impl Duplicates {
             );
             if confirm {
                 self.confirm_delete = true;
+                self.delete_permanent = crate::fileops::is_permanent_delete(&self.marked.iter().cloned().collect::<Vec<_>>());
             }
         });
         egui::Panel::top("dup-options").frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 8 })).show(ui, |ui| {

@@ -66,7 +66,8 @@ enum PendingPrompt {
 }
 
 enum Confirm {
-    Delete(Vec<PathBuf>),
+    /// `permanent`: some files are on a network or removable drive, which has no Recycle Bin.
+    Delete { files: Vec<PathBuf>, permanent: bool },
     /// Rotate / flip non-JPEG files by decoding and re-encoding them in place.
     Reencode { files: Vec<PathBuf>, jpegs: Vec<PathBuf>, t: Transform },
     /// Saving in place over a file that changed on disk after it was opened
@@ -763,11 +764,7 @@ impl App {
                     self.pending_guard = Some(PendingAction::Delete(files));
                     return;
                 }
-                if self.core.settings.confirm_delete {
-                    self.confirm = Some(Confirm::Delete(files));
-                } else {
-                    self.delete_files(files);
-                }
+                self.ask_delete(files);
             }
             Rename => {
                 if let Some(p) = self.targets().first().cloned() {
@@ -1554,9 +1551,20 @@ impl App {
         }
     }
 
+    /// Delete, asking first when the setting says so, and always when the files
+    /// cannot go to the Recycle Bin (network and removable drives).
+    fn ask_delete(&mut self, files: Vec<PathBuf>) {
+        let permanent = fileops::is_permanent_delete(&files);
+        if self.core.settings.confirm_delete || permanent {
+            self.confirm = Some(Confirm::Delete { files, permanent });
+        } else {
+            self.delete_files(files);
+        }
+    }
+
     fn delete_files(&mut self, files: Vec<PathBuf>) {
-        match fileops::delete_to_trash(&files) {
-            Ok(()) => {
+        match fileops::recycle(&files) {
+            Ok(outcome) => {
                 for f in &files {
                     self.core.tags.removed(f);
                     self.core.loader.invalidate(f);
@@ -1565,7 +1573,10 @@ impl App {
                     self.viewer.remove_path(f);
                     self.browser.selected.remove(f);
                 }
-                self.core.toasts.success(format!("Moved {} to the Recycle Bin", count(files.len(), "item")));
+                self.core.toasts.success(match outcome {
+                    fileops::TrashOutcome::Recycled => format!("Moved {} to the Recycle Bin", count(files.len(), "item")),
+                    fileops::TrashOutcome::DeletedPermanently => format!("Deleted {} (network or removable drive: no Recycle Bin)", count(files.len(), "item")),
+                });
                 if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
                     self.mode = Mode::Browser;
                 }
@@ -1911,11 +1922,7 @@ impl App {
             }
             PendingAction::Transfer(files, dest, do_move) => self.transfer_files_now(files, dest, do_move),
             PendingAction::Delete(files) => {
-                if self.core.settings.confirm_delete {
-                    self.confirm = Some(Confirm::Delete(files));
-                } else {
-                    self.delete_files(files);
-                }
+                self.ask_delete(files);
             }
         }
     }
@@ -2537,15 +2544,16 @@ impl App {
                 None => {}
             }
         }
-        if let Some(Confirm::Delete(files)) = &self.confirm {
-            let files = files.clone();
-            let body = if files.len() == 1 {
-                format!("Move \"{}\" to the Recycle Bin?", crate::ui::viewer::file_name(&files[0]))
+        if let Some(Confirm::Delete { files, permanent }) = &self.confirm {
+            let (files, permanent) = (files.clone(), *permanent);
+            let what = if files.len() == 1 { format!("\"{}\"", crate::ui::viewer::file_name(&files[0])) } else { format!("{} items", files.len()) };
+            let body = if permanent {
+                format!("Delete {what} permanently? This drive has no Recycle Bin, so this cannot be undone.")
             } else {
-                format!("Move {} items to the Recycle Bin?", files.len())
+                format!("Move {what} to the Recycle Bin?")
             };
-            // Red, but Enter still confirms: the Recycle Bin can undo it (as in Explorer).
-            match widgets::show_confirm_with(ctx, "Delete", &body, "Delete", widgets::ButtonKind::Danger, true, &p) {
+            // Red, but Enter still confirms when the Recycle Bin can undo it (as in Explorer).
+            match widgets::show_confirm_with(ctx, if permanent { "Delete permanently" } else { "Delete" }, &body, "Delete", widgets::ButtonKind::Danger, !permanent, &p) {
                 Some(true) => {
                     self.confirm = None;
                     self.delete_files(files);
