@@ -4,6 +4,7 @@
 
 pub use lumen_core::edit::*;
 
+pub mod memory;
 pub mod tools;
 
 use image::RgbaImage;
@@ -106,6 +107,24 @@ pub trait EditTool: Send {
         false
     }
     fn redo(&mut self) -> bool {
+        false
+    }
+    /// Name under which the settings are remembered between uses (see
+    /// [`memory`]); `None` keeps nothing.
+    fn memory_key(&self) -> Option<&'static str> {
+        None
+    }
+    /// The settings to open with next time: what the user chose, never what
+    /// comes from the image (that is recomputed when the tool opens).
+    fn remember(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Take settings from [`remember`](Self::remember) into a newly made tool;
+    /// a value that does not fit keeps the defaults.
+    fn recall(&mut self, _v: &serde_json::Value) {}
+    /// Whether the remembered settings differ from the defaults, so Reset has
+    /// something to do before anything was changed.
+    fn differs_from_defaults(&self) -> bool {
         false
     }
 }
