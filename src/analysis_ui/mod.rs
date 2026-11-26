@@ -199,7 +199,7 @@ pub fn network_badge(ui: &mut egui::Ui, core: &crate::app::Core) -> bool {
     {
         if let Some(server) = core.ai.sending_to() {
             let text = format!("{}  Sending to {server}", crate::ui::icons::WIFI_HIGH);
-            ui.label(egui::RichText::new(text).size(11.5).color(core.pal.accent))
+            ui.label(egui::RichText::new(text).size(11.5).color(core.pal.accent_text))
                 .on_hover_text("An AI analysis request is in flight to the server set in Settings > AI review. Nothing else leaves this computer.");
             return true;
         }

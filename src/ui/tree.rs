@@ -437,7 +437,7 @@ impl FolderTree {
                 let caret = if self.expanded.contains(path) { I::CARET_DOWN } else { I::CARET_RIGHT };
                 ui.painter().text(Pos2::new(x0 + 5.0, cy), Align2::CENTER_CENTER, caret, FontId::proportional(11.0), p.faint);
             }
-            let icon_color = if selected { p.accent } else if is_favorite { Color32::from_rgb(250, 196, 60) } else { p.muted };
+            let icon_color = if selected { p.accent_text } else if is_favorite { Color32::from_rgb(250, 196, 60) } else { p.muted };
             ui.painter().text(Pos2::new(x0 + 22.0, cy), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), icon_color);
             let text_rect = Rect::from_min_max(Pos2::new(x0 + 34.0, rect.min.y), Pos2::new(rect.max.x - 8.0, rect.max.y));
             let color = if selected { p.text } else { p.text.gamma_multiply(0.92) };

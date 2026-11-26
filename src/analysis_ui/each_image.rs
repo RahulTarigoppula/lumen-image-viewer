@@ -547,10 +547,11 @@ impl EachImage {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(col_w, 18.0), Sense::hover());
                 let c = Pos2::new(rect.min.x + 7.0, rect.center().y);
                 ui.painter().circle_filled(c, 7.0, look::pane_color(p, i));
-                ui.painter().text(c, Align2::CENTER_CENTER, s.letter, theme::semibold(9.5), Color32::WHITE);
-                let mut job = egui::text::LayoutJob::simple_singleline(s.name(), egui::FontId::proportional(10.5), p.muted);
-                job.wrap = egui::text::TextWrapping::truncate_at_width((col_w - 20.0).max(8.0));
-                let g = ui.painter().layout_job(job);
+                ui.painter().text(c, Align2::CENTER_CENTER, s.letter, theme::semibold(9.5), look::pane_text(i));
+                // Shortened in the middle: compared files often differ only at the end.
+                let font = egui::FontId::proportional(10.5);
+                let name = crate::ui::compare::middle_ellipsis(ui, &s.name(), &font, (col_w - 20.0).max(8.0));
+                let g = ui.painter().layout_no_wrap(name, font, p.muted);
                 ui.painter().galley(Pos2::new(rect.min.x + 17.0, rect.center().y - g.size().y / 2.0), g, p.muted);
                 resp.on_hover_text(format!("{} · {}", s.letter, s.path.display()));
             }
@@ -602,7 +603,7 @@ fn level_meaning(w: Verdict) -> &'static str {
 fn badge(ui: &mut Ui, p: &Palette, i: usize, letter: &str, tip: &str) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 8.0, look::pane_color(p, i));
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, letter, theme::semibold(10.0), Color32::WHITE);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, letter, theme::semibold(10.0), look::pane_text(i));
     if !tip.is_empty() {
         resp.on_hover_text(tip);
     }

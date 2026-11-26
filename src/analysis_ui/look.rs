@@ -52,6 +52,10 @@ pub fn dot(ui: &mut Ui, color: Color32, meaning: &str) -> Response {
     }
 }
 
+/// Width of the value column of [`status_row`]: values right-aligned in it,
+/// so the "Show where" links before it line up from row to row.
+const STATUS_VALUE_W: f32 = 52.0;
+
 /// One summary line: a dot, the label and a muted value on the right; the
 /// label wraps when the panel is narrow. On hover: what the dot means, then
 /// `tip`. `link` ("Show where") is a small text link between the label and
@@ -61,16 +65,18 @@ pub fn status_row(ui: &mut Ui, p: &Palette, level: Level, label: &str, value: &s
     let w = ui.available_width();
     let text = if dim { p.faint } else { p.text };
     let vg = ui.painter().layout_no_wrap(value.to_string(), text::small(), p.muted);
+    // The value's cell: a fixed column, wider only for a long value.
+    let value_w = vg.size().x.max(STATUS_VALUE_W);
     let link_g = link.map(|l| ui.painter().layout_no_wrap(l.to_string(), text::small(), p.accent_text));
     let link_w = link_g.as_ref().map(|g| g.size().x + 12.0).unwrap_or(0.0);
-    let label_w = (w - 20.0 - vg.size().x - 10.0 - link_w).max(60.0);
+    let label_w = (w - 20.0 - value_w - 10.0 - link_w).max(60.0);
     let lg = ui.painter().layout(label.to_string(), text::body(), text, label_w);
     let h = (lg.size().y + 6.0).max(22.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
     let first_line = rect.min.y + 3.0 + lg.rows.first().map(|r| r.height()).unwrap_or(16.0) / 2.0;
-    // The link is its own target, right of the label, before the value.
+    // The link is its own target, right of the label, before the value column.
     let link = link_g.map(|g| {
-        let r = Rect::from_min_size(egui::pos2(rect.max.x - vg.size().x - 10.0 - g.size().x, first_line - g.size().y / 2.0), g.size()).expand2(Vec2::new(4.0, 2.0));
+        let r = Rect::from_min_size(egui::pos2(rect.max.x - value_w - 10.0 - g.size().x, first_line - g.size().y / 2.0), g.size()).expand2(Vec2::new(4.0, 2.0));
         (g, r, ui.interact(r, resp.id.with("link"), Sense::click()))
     });
     let over_link = link.as_ref().is_some_and(|l| l.2.hovered());
@@ -93,9 +99,15 @@ pub fn status_row(ui: &mut Ui, p: &Palette, level: Level, label: &str, value: &s
     (resp.on_hover_text(hover), clicked)
 }
 
-/// The badge color of compare pane `i` (A, B, C, D), as compare mode draws them.
-pub fn pane_color(p: &Palette, i: usize) -> Color32 {
-    [p.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][i % 4]
+/// The badge color of compare pane `i` (A, B, C, D), as compare mode draws
+/// them (fixed colors, not the accent). Draw its letter in [`pane_text`].
+pub fn pane_color(_p: &Palette, i: usize) -> Color32 {
+    crate::ui::theme::PANE_COLORS[i % 4]
+}
+
+/// The letter color that reads on pane `i`'s badge.
+pub fn pane_text(i: usize) -> Color32 {
+    crate::ui::theme::text_on(crate::ui::theme::PANE_COLORS[i % 4])
 }
 
 /// Muted small print.
