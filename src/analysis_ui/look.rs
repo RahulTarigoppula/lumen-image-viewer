@@ -54,7 +54,7 @@ pub fn dot(ui: &mut Ui, color: Color32, meaning: &str) -> Response {
 
 /// Width of the value column of [`status_row`]: values right-aligned in it,
 /// so the "Show where" links before it line up from row to row.
-const STATUS_VALUE_W: f32 = 52.0;
+const STATUS_VALUE_W: f32 = 44.0;
 
 /// One summary line: a dot, the label and a muted value on the right; the
 /// label wraps when the panel is narrow. On hover: what the dot means, then

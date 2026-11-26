@@ -357,7 +357,7 @@ impl BarPart {
 }
 
 /// Width of the Difference view's Amplify slider and its value box ("×50").
-const AMP_RAIL_W: f32 = 90.0;
+const AMP_RAIL_W: f32 = 80.0;
 const AMP_VALUE_W: f32 = 40.0;
 
 /// What a mode is for, for its tooltip.
@@ -385,6 +385,8 @@ struct BarPlan {
     labels: bool,
     /// Sync, the view toggles and Swap with their names next to the icons.
     icon_labels: bool,
+    /// Difference's "Amplify" word before its slider (the tooltip says it too).
+    amp_label: bool,
     /// The last resort: the mode buttons become one menu.
     modes_menu: bool,
     /// Parts moved into the "..." menu.
@@ -2419,7 +2421,8 @@ impl Compare {
         let title = text_w("Compare", text::title()) + s;
         let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(text::SMALL)) + s;
         let blind = self.blind();
-        let part = |b: BarPart, labels: bool| -> f32 {
+        let part = |b: BarPart, plan: &BarPlan| -> f32 {
+            let labels = plan.icon_labels;
             match b {
                 BarPart::Help => icon,
                 // A blind test keeps only the histograms.
@@ -2441,7 +2444,7 @@ impl Compare {
                 BarPart::Zoom => 2.0 * icon + 52.0 + s,
                 BarPart::Review => sep + button(MARKUP_LABEL, labels) + button(REVIEW_LABEL, labels),
                 BarPart::Extras => match self.mode {
-                    CmpMode::Difference if pair => sep + text_w("Amplify", FontId::proportional(text::SMALL)) + s + AMP_RAIL_W + 4.0 + AMP_VALUE_W + s,
+                    CmpMode::Difference if pair => sep + if plan.amp_label { text_w("Amplify", FontId::proportional(text::SMALL)) + s } else { 0.0 } + AMP_RAIL_W + 4.0 + AMP_VALUE_W + s,
                     CmpMode::Split if pair => sep + text_w("Divider 100%", FontId::proportional(12.0)) + s,
                     _ => 0.0,
                 },
@@ -2451,14 +2454,14 @@ impl Compare {
         let fixed = icon + 4.0 + sep + sep + icon + sep + icon + icon;
         let modes_menu = text_w(&format!("{}  {}", I::COLUMNS, I::CARET_DOWN), body.clone()) + pad + s;
         let omitted = if blind { vec![BarPart::Cull, BarPart::Swap, BarPart::Review] } else { Vec::new() };
-        let mut plan = BarPlan { count: true, title: true, labels: true, icon_labels: true, modes_menu: false, hidden: Vec::new(), omitted };
+        let mut plan = BarPlan { count: true, title: true, labels: true, icon_labels: true, amp_label: true, modes_menu: false, hidden: Vec::new(), omitted };
         let width = |p: &BarPlan| -> f32 {
             let mut w = fixed + if p.modes_menu { modes_menu } else if p.labels { modes_full } else { modes_compact };
             w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
-            w + BarPart::ALL.iter().filter(|b| p.shown(**b)).map(|b| part(*b, p.icon_labels)).sum::<f32>()
+            w + BarPart::ALL.iter().filter(|b| p.shown(**b)).map(|b| part(*b, p)).sum::<f32>()
         };
         let hideable: Vec<BarPart> = BarPart::ALL.iter().copied().filter(|b| !plan.omitted.contains(b)).collect();
-        for step in 0..5 + hideable.len() {
+        for step in 0..6 + hideable.len() {
             if width(&plan) <= avail {
                 break;
             }
@@ -2466,8 +2469,11 @@ impl Compare {
                 0 => plan.count = false,
                 1 => plan.icon_labels = false,
                 2 => plan.labels = false,
-                3 => plan.title = false,
-                n if n - 4 < hideable.len() => plan.hidden.push(hideable[n - 4]),
+                // Difference's "Amplify" goes before the title, so the bar
+                // keeps its left part when the mode changes.
+                3 => plan.amp_label = false,
+                4 => plan.title = false,
+                n if n - 5 < hideable.len() => plan.hidden.push(hideable[n - 5]),
                 _ => plan.modes_menu = true,
             }
         }
@@ -2475,6 +2481,10 @@ impl Compare {
         if !plan.title {
             plan.title = true;
             plan.title = width(&plan) <= avail;
+        }
+        if plan.title && !plan.amp_label {
+            plan.amp_label = true;
+            plan.amp_label = width(&plan) <= avail;
         }
         if plan.title && !plan.icon_labels {
             plan.icon_labels = true;
@@ -2630,7 +2640,7 @@ impl Compare {
             // Mode-specific controls.
             if shown(BarPart::Extras) && pair && self.mode != CmpMode::SideBySide {
                 widgets::separator_v(ui);
-                self.mode_controls(ui, &p);
+                self.mode_controls(ui, &p, plan.amp_label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
@@ -2657,12 +2667,15 @@ impl Compare {
         ui.selectable_value(basis, Basis::Pixel, "Match pixels").on_hover_text("Same pixel scale: 100% in one pane is 100% in all");
     }
 
-    /// The difference gain or the divider position.
-    fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
+    /// The difference gain (with its "Amplify" word when `label`) or the
+    /// divider position.
+    fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette, label: bool) {
         match self.mode {
             CmpMode::Difference => {
                 let tip = "Amplify: multiplies the difference so small changes become visible (does not change the numbers)";
-                ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted)).on_hover_text(tip);
+                if label {
+                    ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted)).on_hover_text(tip);
+                }
                 ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(AMP_RAIL_W).value_width(AMP_VALUE_W)).on_hover_text(tip);
             }
             CmpMode::Split => {
@@ -2783,7 +2796,7 @@ impl Compare {
                 }
                 BarPart::Extras if pair && self.mode != CmpMode::SideBySide => {
                     sep(ui);
-                    ui.horizontal(|ui| self.mode_controls(ui, &p));
+                    ui.horizontal(|ui| self.mode_controls(ui, &p, true));
                 }
                 BarPart::Help => {
                     if item(ui, I::QUESTION, "Shortcuts", "?", Some(self.help)) {
