@@ -142,6 +142,10 @@ pub enum Command {
     TogglePixelValues,
     /// Next inspect view (clipping, false color, peaking, channels).
     CycleInspect,
+    /// Move the selected files one place earlier in the folder's custom order.
+    MoveEarlier,
+    /// Move the selected files one place later in the folder's custom order.
+    MoveLater,
 }
 
 use Command::*;
@@ -269,6 +273,8 @@ impl Command {
             ExportMetadataCsv => "Export metadata of images as CSV".into(),
             TogglePixelValues => "Pixel values under the pointer".into(),
             CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
+            MoveEarlier => "Move earlier (custom order)".into(),
+            MoveLater => "Move later (custom order)".into(),
         }
     }
 
@@ -398,6 +404,8 @@ impl Command {
             ExportMetadataCsv => I::FILE_CSV,
             TogglePixelValues => I::EYEDROPPER,
             CycleInspect => I::EYE,
+            MoveEarlier => I::ARROW_LEFT,
+            MoveLater => I::ARROW_RIGHT,
         }
     }
 
@@ -427,7 +435,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, MoveEarlier, MoveLater,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -462,7 +470,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, MoveEarlier, MoveLater]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

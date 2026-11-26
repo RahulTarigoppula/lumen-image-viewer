@@ -116,6 +116,8 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Alt+Up", GoUp),
             ("Alt+Left", GoBack),
             ("Alt+Right", GoForward),
+            ("Ctrl+Alt+Left", MoveEarlier),
+            ("Ctrl+Alt+Right", MoveLater),
             ("Ctrl+A", SelectAll),
             ("Ctrl+D", SelectNone),
             ("Ctrl+I", InvertSelection),

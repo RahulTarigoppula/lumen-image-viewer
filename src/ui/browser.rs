@@ -71,6 +71,11 @@ pub struct Browser {
     right_w: f32,
     /// Set by the app while a modal dialog or tool window owns the keyboard.
     pub suppress_keys: bool,
+    /// A few images from inside each folder in the grid, for folder thumbnails.
+    peek: FolderPeek,
+    /// Set by `arrange`: the folder, its previous custom order and sort key, for
+    /// the app's undo list.
+    pub arranged: Option<(PathBuf, Option<Vec<String>>, SortKey)>,
     /// Grid tooltips are held back after an in-app file drag until the pointer moves,
     /// so the drop target's name does not pop up like a leftover drag label.
     tips_after_drag: bool,
@@ -106,6 +111,8 @@ impl Browser {
             right_w: 600.0,
             suppress_keys: false,
             tips_after_drag: true,
+            arranged: None,
+            peek: FolderPeek::new(),
         }
     }
 
@@ -139,6 +146,7 @@ impl Browser {
         self.pending_select = self.pending_select.take().or(keep_focus);
         let f = self.folder.clone();
         self.tree.invalidate(&f);
+        self.peek.forget_under(&f);
         let sel = self.selected.clone();
         self.load(f, ctx, show_hidden);
         self.selected = sel;
@@ -986,12 +994,43 @@ impl Browser {
         let order: Vec<String> = self.entries.iter().filter(|e| !e.is_folder()).map(|e| e.name.clone()).collect();
         let target_name = target_path.as_ref().and_then(|t| t.file_name()).map(|n| n.to_string_lossy().into_owned());
         let arranged = lumen_core::order::move_names(&order, &moving, target_name.as_deref(), after);
+        if arranged == order && core.settings.sort_key == SortKey::Custom {
+            return;
+        }
+        self.arranged = Some((self.folder.clone(), core.orders.get(&self.folder).map(|v| v.to_vec()), core.settings.sort_key));
         core.orders.set(&self.folder, arranged);
         if core.settings.sort_key != SortKey::Custom {
             core.settings.sort_key = SortKey::Custom;
             core.toasts.info("Custom order: drag thumbnails to arrange them; the viewer and slideshow follow it. Sort by name to go back.");
         }
         self.rebuild(core);
+    }
+
+    /// Move the selected files (or the focused one) one place earlier (`step` < 0)
+    /// or later in the custom order, past the neighbouring file.
+    pub fn nudge(&mut self, core: &mut Core, step: i32) {
+        let is_file = |b: &Browser, i: usize| !b.entries[b.items[i]].is_folder();
+        let mut files = self.selected_paths();
+        files.retain(|f| self.index_of(f).is_some_and(|i| is_file(self, i)));
+        if files.is_empty() {
+            match self.focus.filter(|&i| i < self.items.len() && is_file(self, i)) {
+                Some(i) => files.push(self.entries[self.items[i]].path.clone()),
+                None => return,
+            }
+        }
+        let idx: Vec<usize> = files.iter().filter_map(|f| self.index_of(f)).collect();
+        let (Some(&first), Some(&last)) = (idx.iter().min(), idx.iter().max()) else { return };
+        let target = if step < 0 {
+            (0..first).rev().find(|&i| is_file(self, i) && !files.contains(&self.entries[self.items[i]].path))
+        } else {
+            (last + 1..self.items.len()).find(|&i| is_file(self, i) && !files.contains(&self.entries[self.items[i]].path))
+        };
+        let Some(t) = target else { return };
+        self.arrange(core, &files, Some(t), step > 0);
+        if let Some(i) = self.focused_path().and_then(|p| self.index_of(&p)) {
+            self.focus = Some(i);
+        }
+        self.scroll_to_focus = true;
     }
 
     /// Back to name order and forget this folder's custom order.
@@ -1074,6 +1113,28 @@ impl Browser {
         match entry.kind {
             EntryKind::Folder => {
                 painter.text(img_area.center(), Align2::CENTER_CENTER, I::FOLDER, super::theme::icon_fill(ts * 0.55), p.accent.gamma_multiply(0.85));
+                // Like FastStone: the first pictures inside, fanned out on the folder.
+                match self.peek.get(&entry.path) {
+                    Some(imgs) if !imgs.is_empty() => {
+                        let side = ts * 0.30;
+                        let n = imgs.len() as f32;
+                        for (k, e) in imgs.iter().enumerate() {
+                            let key = ThumbKey::new(&e.path, e.size, e.modified);
+                            let Thumb::Ready(t) = core.thumbs.get(&key) else { continue };
+                            let tsz = t.tex.size_vec2();
+                            let s = (side / tsz.x).min(side / tsz.y);
+                            let c = img_area.center() + Vec2::new((k as f32 - (n - 1.0) / 2.0) * side * 0.62, ts * 0.05 + (k as f32 - (n - 1.0) / 2.0).abs() * ts * 0.02);
+                            let r = Rect::from_center_size(c, tsz * s);
+                            painter.rect_filled(r.expand(2.5).translate(Vec2::new(0.0, 1.5)), CornerRadius::same(3), Color32::from_black_alpha(80));
+                            painter.rect_filled(r.expand(2.0), CornerRadius::same(2), Color32::WHITE);
+                            let mut mesh = egui::Mesh::with_texture(t.tex.id());
+                            mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                            painter.add(egui::Shape::mesh(mesh));
+                        }
+                    }
+                    Some(_) => {}
+                    None => ui.ctx().request_repaint_after(std::time::Duration::from_millis(250)),
+                }
             }
             _ => {
                 let key = ThumbKey::new(&entry.path, entry.size, entry.modified);
@@ -1785,4 +1846,63 @@ fn paint_drag_badge(ui: &Ui, n: usize, p: &Palette) {
     let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
     painter.rect_filled(r, CornerRadius::same(8), p.accent);
     painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+}
+
+/// The first few images inside folders shown in the grid, listed on one
+/// background thread so slow (network) folders never block painting.
+struct FolderPeek {
+    tx: Option<crossbeam_channel::Sender<PathBuf>>,
+    found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<Entry>>>>,
+    asked: parking_lot::Mutex<HashSet<PathBuf>>,
+}
+
+impl FolderPeek {
+    /// Images shown per folder.
+    const COUNT: usize = 3;
+
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<Entry>>>> = Default::default();
+        let out = found.clone();
+        let spawned = std::thread::Builder::new().name("lumen-folder-peek".into()).spawn(move || {
+            crate::bg::background_priority();
+            for dir in rx {
+                let imgs = std::panic::catch_unwind(|| {
+                    let mut v: Vec<Entry> = catalog::list_folder(&dir, false).unwrap_or_default().into_iter().filter(|e| e.kind == EntryKind::Image).collect();
+                    v.sort_by(|a, b| catalog::natural_cmp(&a.name, &b.name));
+                    v.truncate(Self::COUNT);
+                    v
+                })
+                .unwrap_or_default();
+                let mut map = out.lock();
+                if map.len() > 4000 {
+                    map.clear();
+                }
+                map.insert(dir, imgs);
+            }
+        });
+        FolderPeek { tx: spawned.ok().map(|_| tx), found, asked: Default::default() }
+    }
+
+    /// The images of `dir` once listed; the first call asks for them.
+    fn get(&self, dir: &Path) -> Option<Vec<Entry>> {
+        if let Some(v) = self.found.lock().get(dir) {
+            return Some(v.clone());
+        }
+        let Some(tx) = &self.tx else { return Some(Vec::new()) };
+        let mut asked = self.asked.lock();
+        if asked.len() > 4000 {
+            asked.clear();
+        }
+        if asked.insert(dir.to_path_buf()) {
+            let _ = tx.send(dir.to_path_buf());
+        }
+        None
+    }
+
+    /// Forget the folders inside `parent` so they are listed again (Refresh).
+    fn forget_under(&self, parent: &Path) {
+        self.found.lock().retain(|d, _| d.parent() != Some(parent));
+        self.asked.lock().retain(|d| d.parent() != Some(parent));
+    }
 }

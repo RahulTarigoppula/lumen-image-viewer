@@ -24,3 +24,17 @@ run ToggleDetails
 wait 1500
 shot details_custom.png
 run ToggleDetails
+wait 1000
+# Keyboard: the second thumbnail moves one place earlier, then Ctrl+Z puts it back.
+click 570 150
+wait 500
+run MoveEarlier
+wait 1200
+shot nudged.png
+run Undo
+wait 2000
+shot undone.png
+# Folder thumbnails show the first pictures inside each folder.
+open {media}\RoundA
+wait 3500
+shot folder_thumbs.png

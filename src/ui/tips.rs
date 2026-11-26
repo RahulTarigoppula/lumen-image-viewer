@@ -99,6 +99,8 @@ pub fn describe(c: Command) -> &'static str {
         ShowMetadata => "Which camera features fired (HDR, night, zoom, lens), encoding, color profile, XMP and more",
         TogglePixelValues => "Show RGB, hex, L*a*b* and luma of the pixel under the pointer (in Compare: V)",
         ExportMetadataCsv => "One row per image: camera features, exposure, every EXIF tag, JPEG quality",
+        MoveEarlier => "Arrange the folder by hand: the selected files move one place earlier",
+        MoveLater => "Arrange the folder by hand: the selected files move one place later",
         CycleInspect => "Cycle clipping warnings, false color, focus peaking and single channels (in Compare: O)",
         _ => "",
     }

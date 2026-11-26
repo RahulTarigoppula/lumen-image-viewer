@@ -94,6 +94,8 @@ enum FileChange {
     /// previous bytes when they were kept; without them (only for JPEGs whose
     /// EXIF orientation alone changed) the inverse transform turns it back.
     Transform { t: Transform, files: Vec<(PathBuf, Option<Vec<u8>>)> },
+    /// A folder was arranged by hand: its previous custom order (none) and sort key.
+    Order { folder: PathBuf, previous: Option<Vec<String>>, sort: crate::settings::SortKey },
 }
 
 impl FileUndo {
@@ -101,7 +103,7 @@ impl FileUndo {
     fn bytes(&self) -> usize {
         match &self.change {
             FileChange::Transform { files, .. } => files.iter().filter_map(|(_, b)| b.as_ref()).map(Vec::len).sum(),
-            FileChange::Moves(_) => 0,
+            FileChange::Moves(_) | FileChange::Order { .. } => 0,
         }
     }
 }
@@ -1108,6 +1110,12 @@ impl App {
             ToggleHistogram => self.viewer.show_histogram = !self.viewer.show_histogram,
             ToggleMagnifier => self.viewer.magnifier_locked = !self.viewer.magnifier_locked,
             TogglePixelValues => self.viewer.show_pixel = !self.viewer.show_pixel,
+            MoveEarlier | MoveLater => {
+                if self.mode == Mode::Browser {
+                    let step = if cmd == MoveEarlier { -1 } else { 1 };
+                    self.browser.nudge(&mut self.core, step);
+                }
+            }
             CycleInspect => {
                 self.viewer.inspect = self.viewer.inspect.next();
                 self.core.toasts.info(format!("Inspect view: {}. {}", self.viewer.inspect.label(), self.viewer.inspect.tip()));
@@ -1632,6 +1640,15 @@ impl App {
                         self.browser.pending_select = Some(orig.clone());
                     }
                 }
+            }
+            FileChange::Order { folder, previous, sort } => {
+                match previous {
+                    Some(v) => self.core.orders.set(folder, v.clone()),
+                    None => self.core.orders.clear(folder),
+                }
+                self.core.settings.sort_key = *sort;
+                self.browser.mark_resort();
+                ok += 1;
             }
             FileChange::Transform { t, files } => {
                 for (p, bytes) in files {
@@ -2890,6 +2907,9 @@ impl eframe::App for App {
             self.set_fullscreen(false);
         }
         crate::analysis_ui::tick(&mut self.core);
+        if let Some((folder, previous, sort)) = self.browser.arranged.take() {
+            self.push_undo(FileUndo { label: "Arrange".into(), change: FileChange::Order { folder, previous, sort } });
+        }
         while let Ok(res) = self.file_jobs.rx.try_recv() {
             self.file_jobs.queued = self.file_jobs.queued.saturating_sub(1);
             self.finish_file_job(res);
