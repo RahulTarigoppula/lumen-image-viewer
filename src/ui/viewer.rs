@@ -1296,6 +1296,7 @@ impl Viewer {
                 ui.add_enabled_ui(dirty, |ui| menu_item(ui, Command::Save, ev));
                 menu_item(ui, Command::SaveAs, ev);
                 menu_item(ui, Command::CopyImage, ev);
+                menu_item(ui, Command::CopyImageText, ev);
                 widgets::submenu(ui, I::EXPORT, "Share & export", |ui| {
                     for c in [Command::SetWallpaper, Command::Print, Command::ShowInExplorer, Command::OpenWithEditor] {
                         menu_item(ui, c, ev);
@@ -1752,6 +1753,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         ui.add_enabled_ui(dirty, |ui| menu_item(ui, Command::Save, ev));
         menu_item(ui, Command::SaveAs, ev);
         menu_item(ui, Command::CopyImage, ev);
+        menu_item(ui, Command::CopyImageText, ev);
         menu_item(ui, Command::Print, ev);
         ui.separator();
         menu_item(ui, Command::Delete, ev);
