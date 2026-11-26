@@ -1,10 +1,12 @@
 //! EXIF / metadata extraction for the info panel and for sorting by date taken.
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default)]
 pub struct ExifSummary {
@@ -33,10 +35,209 @@ fn clean(s: String) -> Option<String> {
 }
 
 pub fn read_exif(path: &Path) -> Option<ExifSummary> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let exif = exif_from_file(path)?;
     Some(summarize(&exif))
+}
+
+/// Parse the EXIF of the file at `path` (JPEG, TIFF and TIFF-based RAW, PNG,
+/// HEIF, WebP). A TIFF is its own EXIF container, and kamadak-exif reads the
+/// whole file for it (gigabytes for a big scan, over a network share too):
+/// only the directories and the values they point to are read instead.
+pub fn exif_from_file(path: &Path) -> Option<exif::Exif> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    (&mut file).take(4).read_to_end(&mut head).ok()?;
+    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        file.seek(std::io::SeekFrom::Start(0)).ok()?;
+        if let Ok(Some(tiff)) = compact_tiff(&mut file, TIFF_EXIF_CAP) {
+            if let Ok(exif) = exif::Reader::new().read_raw(tiff) {
+                return Some(exif);
+            }
+        }
+    }
+    // Other containers are scanned only as far as their EXIF block; unusual
+    // TIFFs (damaged, or with huge tags) are read whole as before.
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
+    exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()
+}
+
+/// Most bytes of TIFF directories and tag values [`compact_tiff`] copies.
+const TIFF_EXIF_CAP: usize = 16 << 20;
+
+/// Reads ranges of a file, serving the ones inside its first block from memory
+/// (directories and tag values usually sit right after the header).
+struct RangeReader<'a, R> {
+    src: &'a mut R,
+    head: Vec<u8>,
+}
+
+impl<R: std::io::Read + std::io::Seek> RangeReader<'_, R> {
+    fn read(&mut self, at: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek};
+        let end = at.checked_add(len as u64)?;
+        if end <= self.head.len() as u64 {
+            return Some(self.head[at as usize..end as usize].to_vec());
+        }
+        self.src.seek(std::io::SeekFrom::Start(at)).ok()?;
+        let mut buf = vec![0u8; len];
+        self.src.read_exact(&mut buf).ok()?;
+        Some(buf)
+    }
+}
+
+/// A copy of what kamadak-exif parses in a TIFF (the chain of image directories,
+/// the EXIF, GPS and interoperability directories, and the out-of-line values of
+/// their tags) packed into a small TIFF with the offsets rewritten. Image data
+/// is not read. Ok(None) when the file is not a plain TIFF or anything is
+/// unusual (truncated, an odd pointer, more than `cap` bytes): the caller then
+/// lets kamadak-exif read the whole file, so the result is always the same.
+fn compact_tiff<R: std::io::Read + std::io::Seek>(src: &mut R, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    src.by_ref().take(256 * 1024).read_to_end(&mut head)?;
+    if head.len() < 8 {
+        return Ok(None);
+    }
+    let le = match &head[..4] {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return Ok(None),
+    };
+    let mut r = RangeReader { src, head };
+    let mut c = TiffCompactor { le, out: Vec::with_capacity(64 * 1024), cap };
+    c.out.extend_from_slice(&r.head[..4]);
+    c.out.extend_from_slice(&[0; 4]);
+    let first = c.u32_at(&r.head[4..8]);
+    let first = if first == 0 { Some(0) } else { c.copy_chain(&mut r, first as u64) };
+    match first {
+        Some(at) => {
+            c.put_u32(4, at);
+            Ok(Some(c.out))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Directory contexts, as kamadak-exif follows them.
+#[derive(Clone, Copy, PartialEq)]
+enum IfdKind {
+    Tiff,
+    Exif,
+    Gps,
+    Interop,
+}
+
+struct TiffCompactor {
+    le: bool,
+    out: Vec<u8>,
+    cap: usize,
+}
+
+impl TiffCompactor {
+    fn u16_at(&self, b: &[u8]) -> u16 {
+        let a = [b[0], b[1]];
+        if self.le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+    }
+
+    fn u32_at(&self, b: &[u8]) -> u32 {
+        let a = [b[0], b[1], b[2], b[3]];
+        if self.le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+    }
+
+    fn put_u32(&mut self, at: usize, v: u32) {
+        let b = if self.le { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.out[at..at + 4].copy_from_slice(&b);
+    }
+
+    /// Append `bytes` (word aligned, as TIFF wants); its offset in the copy.
+    fn append(&mut self, bytes: &[u8]) -> Option<u32> {
+        if self.out.len() % 2 == 1 {
+            self.out.push(0);
+        }
+        if self.out.len() + bytes.len() > self.cap {
+            return None;
+        }
+        let at = self.out.len();
+        self.out.extend_from_slice(bytes);
+        u32::try_from(at).ok()
+    }
+
+    /// Copy the main directory chain starting at `ofs`; the copy's first offset.
+    fn copy_chain<R: std::io::Read + std::io::Seek>(&mut self, r: &mut RangeReader<'_, R>, mut ofs: u64) -> Option<u32> {
+        let mut first = None;
+        let mut prev_next: Option<usize> = None;
+        let mut n = 0;
+        while ofs != 0 {
+            // kamadak-exif refuses more than 8 directories: let it see that itself.
+            if n >= 8 {
+                return None;
+            }
+            let (at, next_at, next) = self.copy_ifd(r, ofs, IfdKind::Tiff)?;
+            match prev_next {
+                Some(p) => self.put_u32(p, at),
+                None => first = Some(at),
+            }
+            prev_next = Some(next_at);
+            ofs = next as u64;
+            n += 1;
+        }
+        first
+    }
+
+    /// Copy one directory at `ofs` in the source and everything it points to.
+    /// Returns its offset in the copy, where its next-directory offset sits
+    /// (written as 0) and the source's next-directory offset.
+    fn copy_ifd<R: std::io::Read + std::io::Seek>(&mut self, r: &mut RangeReader<'_, R>, ofs: u64, kind: IfdKind) -> Option<(u32, usize, u32)> {
+        let count = self.u16_at(&r.read(ofs, 2)?) as usize;
+        let mut table = r.read(ofs, 2 + 12 * count + 4)?;
+        let next = self.u32_at(&table[2 + 12 * count..]);
+        let len = table.len();
+        table[len - 4..].fill(0);
+        let at = self.append(&table)?;
+        for i in 0..count {
+            let e = at as usize + 2 + 12 * i;
+            let entry = self.out[e..e + 12].to_vec();
+            let tag = self.u16_at(&entry[0..2]);
+            let typ = self.u16_at(&entry[2..4]);
+            let cnt = self.u32_at(&entry[4..8]);
+            let child = match (kind, tag) {
+                (IfdKind::Tiff, 0x8769) => Some(IfdKind::Exif),
+                (IfdKind::Tiff, 0x8825) => Some(IfdKind::Gps),
+                (IfdKind::Exif, 0xA005) => Some(IfdKind::Interop),
+                _ => None,
+            };
+            if let Some(child) = child {
+                // A pointer is one LONG; anything else is left to kamadak-exif.
+                if typ != 4 || cnt != 1 {
+                    return None;
+                }
+                let (child_at, _, child_next) = self.copy_ifd(r, self.u32_at(&entry[8..12]) as u64, child)?;
+                if child_next != 0 {
+                    return None;
+                }
+                self.put_u32(e + 8, child_at);
+                continue;
+            }
+            let unit: u64 = match typ {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                _ => 0,
+            };
+            let vlen = unit * cnt as u64;
+            if vlen > 4 {
+                if vlen > self.cap as u64 {
+                    return None;
+                }
+                let value = r.read(self.u32_at(&entry[8..12]) as u64, vlen as usize)?;
+                let vat = self.append(&value)?;
+                self.put_u32(e + 8, vat);
+            }
+        }
+        Some((at, at as usize + 2 + 12 * count, next))
+    }
 }
 
 pub fn read_exif_bytes(raw: &[u8]) -> Option<ExifSummary> {
@@ -122,8 +323,7 @@ fn taken(exif: &exif::Exif) -> Option<(String, Option<i64>)> {
 
 /// Just the capture date of a file (Unix seconds), without summarizing every tag.
 pub fn read_taken(path: &Path) -> Option<i64> {
-    let file = std::fs::File::open(path).ok()?;
-    let exif = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()?;
+    let exif = exif_from_file(path)?;
     taken(&exif)?.1
 }
 
@@ -156,54 +356,125 @@ pub struct QuickMeta {
     pub taken: Option<i64>,
 }
 
+struct MetaJob {
+    path: PathBuf,
+    /// Request sequence number (higher = asked for more recently), shared with
+    /// the service's `queued` entry so a re-request bumps it without the lock.
+    seq: Arc<AtomicU64>,
+}
+
+struct MetaShared {
+    jobs: Mutex<Vec<MetaJob>>,
+    cv: Condvar,
+    /// Jobs whose sequence number is at least this were asked for during the
+    /// last two frames: they are on screen (see `MetaService::poll`).
+    hot_from: AtomicU64,
+    /// When a worker last asked for a repaint.
+    last_repaint: Mutex<Instant>,
+}
+
+/// Results for files not on screen ask for a repaint at most this often.
+const REPAINT_EVERY: Duration = Duration::from_millis(250);
+
 pub struct MetaService {
-    tx: Sender<PathBuf>,
+    shared: Arc<MetaShared>,
     rx: Receiver<(PathBuf, QuickMeta)>,
     pub map: HashMap<PathBuf, QuickMeta>,
     requested: HashSet<PathBuf>,
-    _queue: Arc<Mutex<()>>,
+    /// Requested and not finished: the sequence number shared with the job.
+    queued: HashMap<PathBuf, Arc<AtomicU64>>,
+    seq: u64,
+    /// `seq` at the previous `poll`.
+    polled_seq: u64,
+}
+
+/// Index of the most recently requested job.
+fn newest_job(jobs: &[MetaJob]) -> Option<usize> {
+    jobs.iter().enumerate().max_by_key(|(_, j)| j.seq.load(Ordering::Relaxed)).map(|(i, _)| i)
+}
+
+fn meta_worker(s: Arc<MetaShared>, tx: Sender<(PathBuf, QuickMeta)>, repaint: impl Fn()) {
+    loop {
+        let job = {
+            let mut jobs = s.jobs.lock();
+            loop {
+                if let Some(i) = newest_job(&jobs) {
+                    break jobs.swap_remove(i);
+                }
+                s.cv.wait(&mut jobs);
+            }
+        };
+        let hot = job.seq.load(Ordering::Relaxed) >= s.hot_from.load(Ordering::Relaxed);
+        let p = job.path;
+        // A decoder or EXIF parser panicking on a hostile file must not stop
+        // this worker for good (the rest would never be read).
+        let meta = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| QuickMeta {
+            dims: crate::decode::probe_dimensions(&p),
+            // Only the date: summarizing every tag as text is several times slower.
+            taken: read_taken(&p),
+        }))
+        .unwrap_or_default();
+        if tx.send((p, meta)).is_err() {
+            return;
+        }
+        // On-screen results and the last one repaint at once; the rest (a whole
+        // folder read for sorting) a few times per second.
+        let idle = s.jobs.lock().is_empty();
+        let mut last = s.last_repaint.lock();
+        if hot || idle || last.elapsed() >= REPAINT_EVERY {
+            *last = Instant::now();
+            drop(last);
+            repaint();
+        }
+    }
 }
 
 impl MetaService {
-    /// `repaint` is called from the worker threads when a batch of results is
-    /// ready (the app passes a closure that requests a UI repaint).
+    /// `repaint` is called from the worker threads when results are ready
+    /// (the app passes a closure that requests a UI repaint).
     pub fn new(repaint: impl Fn() + Clone + Send + 'static) -> Self {
-        let (tx, jrx) = unbounded::<PathBuf>();
+        let shared = Arc::new(MetaShared { jobs: Mutex::new(Vec::new()), cv: Condvar::new(), hot_from: AtomicU64::new(0), last_repaint: Mutex::new(Instant::now()) });
         let (rtx, rx) = unbounded();
-        for _ in 0..2 {
-            let jrx = jrx.clone();
+        for i in 0..2 {
+            let s = shared.clone();
             let rtx = rtx.clone();
             let repaint = repaint.clone();
-            std::thread::spawn(move || {
-                let mut n = 0u32;
-                while let Ok(p) = jrx.recv() {
-                    let dims = crate::decode::probe_dimensions(&p);
-                    // Only the date: summarizing every tag as text is several times slower.
-                    let taken = read_taken(&p);
-                    let _ = rtx.send((p, QuickMeta { dims, taken }));
-                    n += 1;
-                    if n % 32 == 0 || jrx.is_empty() {
-                        repaint();
-                    }
-                }
-            });
+            let _ = std::thread::Builder::new().name(format!("lumen-meta-{i}")).spawn(move || meta_worker(s, rtx, repaint));
         }
-        MetaService { tx, rx, map: HashMap::new(), requested: HashSet::new(), _queue: Arc::new(Mutex::new(())) }
+        MetaService { shared, rx, map: HashMap::new(), requested: HashSet::new(), queued: HashMap::new(), seq: 0, polled_seq: 0 }
     }
 
+    /// Call once per frame: collects finished results (true when there were any).
     pub fn poll(&mut self) -> bool {
+        // What was asked for since the previous frame began is on screen.
+        self.shared.hot_from.store(self.polled_seq, Ordering::Relaxed);
+        self.polled_seq = self.seq;
         let mut any = false;
         while let Ok((p, m)) = self.rx.try_recv() {
+            self.queued.remove(&p);
             self.map.insert(p, m);
             any = true;
         }
         any
     }
 
+    /// Read `path`'s size and date in the background. Files asked for most
+    /// recently go first, so asking again every frame for what is on screen
+    /// puts it ahead of a whole folder requested for sorting.
     pub fn request(&mut self, path: &Path) {
-        if !self.requested.contains(path) && self.requested.insert(path.to_path_buf()) {
-            let _ = self.tx.send(path.to_path_buf());
+        self.seq += 1;
+        if let Some(seq) = self.queued.get(path) {
+            seq.store(self.seq, Ordering::Relaxed);
+            return;
         }
+        if self.requested.contains(path) {
+            return;
+        }
+        self.requested.insert(path.to_path_buf());
+        let seq = Arc::new(AtomicU64::new(self.seq));
+        self.queued.insert(path.to_path_buf(), seq.clone());
+        self.shared.jobs.lock().push(MetaJob { path: path.to_path_buf(), seq });
+        self.shared.cv.notify_one();
     }
 
     pub fn get(&self, path: &Path) -> Option<QuickMeta> {
@@ -217,6 +488,7 @@ impl MetaService {
     pub fn forget(&mut self, path: &Path) {
         self.map.remove(path);
         self.requested.remove(path);
+        self.queued.remove(path);
     }
 }
 
@@ -292,6 +564,182 @@ mod tests {
         assert!(s.taken_ts.is_some());
         assert_eq!(read_taken(&p), s.taken_ts);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Append a little-endian IFD with `entries` (tag, type, count, value) and
+    /// their out-of-line values; returns its offset and where each entry's
+    /// value field and the next-IFD offset are.
+    fn put_ifd(v: &mut Vec<u8>, entries: &[(u16, u16, u32, Vec<u8>)]) -> (u32, Vec<usize>, usize) {
+        let at = v.len();
+        let n = entries.len();
+        v.extend_from_slice(&(n as u16).to_le_bytes());
+        let mut data_at = at + 2 + 12 * n + 4;
+        let mut fields = Vec::new();
+        for (tag, typ, cnt, val) in entries {
+            v.extend_from_slice(&tag.to_le_bytes());
+            v.extend_from_slice(&typ.to_le_bytes());
+            v.extend_from_slice(&cnt.to_le_bytes());
+            fields.push(v.len());
+            if val.len() <= 4 {
+                let mut b = val.clone();
+                b.resize(4, 0);
+                v.extend_from_slice(&b);
+            } else {
+                v.extend_from_slice(&(data_at as u32).to_le_bytes());
+                data_at += val.len();
+            }
+        }
+        let next_at = v.len();
+        v.extend_from_slice(&0u32.to_le_bytes());
+        for (_, _, _, val) in entries {
+            if val.len() > 4 {
+                v.extend_from_slice(val);
+            }
+        }
+        (at as u32, fields, next_at)
+    }
+
+    fn patch(v: &mut [u8], at: usize, value: u32) {
+        v[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn rational(n: u32, d: u32) -> Vec<u8> {
+        [n.to_le_bytes(), d.to_le_bytes()].concat()
+    }
+
+    /// A camera-like TIFF whose directories all sit after `junk` bytes of image
+    /// data: IFD0 -> EXIF (-> interoperability) and GPS, then IFD1.
+    fn tiff_with_ifds_at_end(junk: usize) -> Vec<u8> {
+        let mut v = b"II*\0".to_vec();
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend((0..junk).map(|i| (i * 31) as u8));
+        let (ifd0, f0, next0) = put_ifd(
+            &mut v,
+            &[
+                (0x010F, 2, 6, b"Nikon\0".to_vec()),
+                (0x0110, 2, 10, b"NIKON Z 6\0".to_vec()),
+                (0x0111, 4, 3, [7u32.to_le_bytes(), 8u32.to_le_bytes(), 9u32.to_le_bytes()].concat()),
+                (0x0112, 3, 1, 6u16.to_le_bytes().to_vec()),
+                (0x0132, 2, 20, b"2020:01:02 03:04:05\0".to_vec()),
+                (0x8769, 4, 1, vec![0; 4]),
+                (0x8825, 4, 1, vec![0; 4]),
+            ],
+        );
+        patch(&mut v, 4, ifd0);
+        let (exif_at, fe, _) = put_ifd(
+            &mut v,
+            &[(0x829A, 5, 1, rational(1, 250)), (0x9003, 2, 20, b"2021:06:15 10:20:30\0".to_vec()), (0xA005, 4, 1, vec![0; 4])],
+        );
+        patch(&mut v, f0[5], exif_at);
+        let (interop, _, _) = put_ifd(&mut v, &[(0x0001, 2, 4, b"R98\0".to_vec())]);
+        patch(&mut v, fe[2], interop);
+        let (gps, _, _) = put_ifd(&mut v, &[(0x0001, 2, 2, b"N\0".to_vec()), (0x0002, 5, 3, [rational(48, 1), rational(51, 1), rational(30, 1)].concat())]);
+        patch(&mut v, f0[6], gps);
+        let (ifd1, _, _) = put_ifd(&mut v, &[(0x0201, 4, 1, 1234u32.to_le_bytes().to_vec()), (0x0202, 4, 1, 99u32.to_le_bytes().to_vec())]);
+        patch(&mut v, next0, ifd1);
+        v
+    }
+
+    /// Counts the bytes read through it.
+    struct Counting<R> {
+        inner: R,
+        read: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n;
+            Ok(n)
+        }
+    }
+
+    impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn fields(e: &exif::Exif) -> Vec<String> {
+        e.fields().map(|f| format!("{} {} {}", f.ifd_num, f.tag, f.display_value())).collect()
+    }
+
+    #[test]
+    fn tiff_exif_reads_only_the_directories() {
+        let tiff = tiff_with_ifds_at_end(3 << 20);
+        let full = exif::Reader::new().read_raw(tiff.clone()).unwrap();
+        let mut src = Counting { inner: std::io::Cursor::new(tiff.clone()), read: 0 };
+        let compact = compact_tiff(&mut src, TIFF_EXIF_CAP).unwrap().expect("plain TIFF");
+        assert!(src.read < 300 * 1024, "read {} bytes", src.read);
+        assert!(compact.len() < 1024, "{}", compact.len());
+        let small = exif::Reader::new().read_raw(compact).unwrap();
+        assert_eq!(fields(&full), fields(&small));
+        assert!(fields(&full).len() >= 12, "{:?}", fields(&full));
+        assert_eq!(taken(&small).unwrap().0, "2021-06-15 10:20:30");
+        // The same through a file, as the metadata service reads it.
+        let d = std::env::temp_dir().join(format!("lumen-meta-tiff-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("a.nef");
+        std::fs::write(&p, &tiff).unwrap();
+        assert_eq!(read_taken(&p), taken(&full).unwrap().1);
+        assert_eq!(crate::decode::exif_orientation_from_file(&p), 6);
+        assert_eq!(read_exif(&p).unwrap().camera.as_deref(), Some("NIKON Z 6"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unusual_tiffs_are_left_to_the_full_read() {
+        let good = tiff_with_ifds_at_end(100);
+        // A value pointing past the end of the file.
+        let mut bad = good.clone();
+        let ifd0 = u32::from_le_bytes(bad[4..8].try_into().unwrap()) as usize;
+        patch(&mut bad, ifd0 + 2 + 8, u32::MAX - 16);
+        assert!(compact_tiff(&mut std::io::Cursor::new(bad.clone()), TIFF_EXIF_CAP).unwrap().is_none());
+        assert!(exif::Reader::new().read_raw(bad).is_err(), "kamadak-exif refuses it too");
+        // More than the cap.
+        assert!(compact_tiff(&mut std::io::Cursor::new(good.clone()), 64).unwrap().is_none());
+        // Not a TIFF.
+        assert!(compact_tiff(&mut std::io::Cursor::new(b"\xFF\xD8\xFF\xE0 not a tiff".to_vec()), TIFF_EXIF_CAP).unwrap().is_none());
+        // No directories at all.
+        let empty = b"II*\0\0\0\0\0".to_vec();
+        let c = compact_tiff(&mut std::io::Cursor::new(empty), TIFF_EXIF_CAP).unwrap().unwrap();
+        assert_eq!(exif::Reader::new().read_raw(c).unwrap().fields().count(), 0);
+    }
+
+    fn idle_service() -> MetaService {
+        let shared = Arc::new(MetaShared { jobs: Mutex::new(Vec::new()), cv: Condvar::new(), hot_from: AtomicU64::new(0), last_repaint: Mutex::new(Instant::now()) });
+        let (_tx, rx) = unbounded();
+        MetaService { shared, rx, map: HashMap::new(), requested: HashSet::new(), queued: HashMap::new(), seq: 0, polled_seq: 0 }
+    }
+
+    #[test]
+    fn on_screen_requests_go_first() {
+        let mut s = idle_service();
+        let p = |i: usize| PathBuf::from(format!(r"C:\Photos\IMG_{i:04}.jpg"));
+        // A whole folder for sorting ...
+        for i in 0..100 {
+            s.request(&p(i));
+        }
+        s.poll();
+        s.poll();
+        let hot = |s: &MetaService, i: usize| {
+            let jobs = s.shared.jobs.lock();
+            let j = jobs.iter().find(|j| j.path == p(i)).unwrap();
+            j.seq.load(Ordering::Relaxed) >= s.shared.hot_from.load(Ordering::Relaxed)
+        };
+        assert!(!hot(&s, 3), "requested two frames ago");
+        // ... then the rows on screen, asked for again every frame.
+        s.request(&p(42));
+        s.request(&p(7));
+        {
+            let jobs = s.shared.jobs.lock();
+            assert_eq!(jobs.len(), 100, "re-requests do not queue twice");
+            assert_eq!(jobs[newest_job(&jobs).unwrap()].path, p(7));
+        }
+        s.poll();
+        assert!(hot(&s, 42) && hot(&s, 7));
+        assert!(!hot(&s, 41));
+        assert_eq!(s.pending(), 100);
     }
 
     /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`

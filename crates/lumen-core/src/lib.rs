@@ -16,6 +16,7 @@ pub mod meta;
 pub mod metaedit;
 pub mod order;
 pub mod ocr;
+pub mod persist;
 pub mod report;
 pub mod settings;
 pub mod tags;

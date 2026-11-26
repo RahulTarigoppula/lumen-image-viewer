@@ -1697,14 +1697,34 @@ impl App {
         if do_move {
             self.core.tags.moved_many(&done);
         }
+        // What `forget_file` does for each file, with one pass over the
+        // thumbnail cache and the viewer list for all of them (a move can be
+        // thousands of files).
+        let mut touched: Vec<&Path> = Vec::with_capacity(done.len() * 2);
         for (from, to) in &done {
             if do_move {
-                self.forget_file(from);
-                self.viewer.remove_path(from);
+                touched.push(from);
             } else {
                 self.core.tags.copied(from, to);
             }
-            self.forget_file(to);
+            touched.push(to);
+        }
+        for p in &touched {
+            self.core.loader.invalidate(p);
+            self.viewer.forget_stat(p);
+            self.core.meta.forget(p);
+        }
+        self.core.thumbs.forget_many(&touched.iter().copied().collect());
+        if do_move {
+            let gone: std::collections::HashSet<&Path> = done.iter().map(|(from, _)| from.as_path()).collect();
+            if let Some(last) = self.viewer.list.iter().find(|p| gone.contains(p.as_path())).cloned() {
+                // All but one in one pass; `remove_path` for the last also closes
+                // the edit session and resets the view, as it did per file.
+                let mut rest = gone.clone();
+                rest.remove(last.as_path());
+                self.viewer.index = fileops::remove_listed(&mut self.viewer.list, self.viewer.index, &rest);
+                self.viewer.remove_path(&last);
+            }
         }
         self.report_transfer(done.len(), errs, do_move);
         self.browser.tree.invalidate(&dest);
@@ -3219,8 +3239,9 @@ impl eframe::App for App {
             self.finish_file_job(res);
         }
         if self.last_save.elapsed().as_secs() > 5 {
-            self.core.tags.save_if_dirty();
-            self.core.orders.save_if_dirty();
+            // Serialized here, written to disk on the background writer.
+            self.core.tags.save_in_background();
+            self.core.orders.save_in_background();
             self.last_save = Instant::now();
         }
         if self.settings_check.elapsed() >= std::time::Duration::from_secs(1) {
@@ -3745,7 +3766,8 @@ impl App {
                 self.core.settings.window_size = Some([r.width().round(), r.height().round()]);
             }
         }
-        self.core.settings.save();
+        // On exit: written on this thread, after any background save, so nothing is lost.
+        self.core.settings.save_now();
         self.core.tags.save_if_dirty();
         self.core.orders.save_if_dirty();
     }

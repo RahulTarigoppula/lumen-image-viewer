@@ -422,6 +422,11 @@ impl Viewer {
         ThumbKey::new(path, size, mtime)
     }
 
+    /// The thumbnail key of `path` when its file size and date are cached (no file access).
+    fn cached_thumb_key(&self, path: &Path) -> Option<ThumbKey> {
+        self.stat_cache.get(path).map(|&(size, mtime)| ThumbKey::new(path, size, mtime))
+    }
+
     /// Drop cached file stats after the file changed on disk.
     pub fn forget_stat(&mut self, path: &Path) {
         self.stat_cache.remove(path);
@@ -1807,76 +1812,147 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
     }
 
     /// Thumbnails of the list, each fitted into a 64 pt tall cell at its own
-    /// aspect (40 to 96 pt wide). The wheel scrolls it sideways.
+    /// aspect (40 to 96 pt wide). The wheel scrolls it sideways. Only the cells
+    /// in view are laid out, requested and painted (folders can hold tens of
+    /// thousands of files); the others keep the width last known for them.
     fn filmstrip(&mut self, ui: &mut Ui, core: &mut Core) {
+        use egui::emath::GuiRounding as _;
         let p = core.pal;
         let h = ui.available_height().min(FILM_CELL_H).max(24.0);
         // A thin bar that shows on hover, over the thumbnails' bottom edge.
         ui.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 4.0, floating_width: 2.0, floating_allocated_width: 0.0, ..egui::style::ScrollStyle::floating() };
         let mut moved: Option<(usize, usize, bool)> = None;
-        egui::ScrollArea::horizontal().id_salt("filmstrip").auto_shrink([false, false]).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                for i in 0..self.list.len() {
-                    let path = self.list[i].clone();
-                    let key = self.thumb_key(&path);
-                    let thumb = core.thumbs.get(&key);
-                    // Natural aspect: the thumbnail once it is there, else the
-                    // known pixel size, else 4:3.
-                    let aspect = match &thumb {
-                        Thumb::Ready(t) => t.tex.size_vec2().x / t.tex.size_vec2().y.max(1.0),
-                        _ => core.meta.get(&path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32).unwrap_or(4.0 / 3.0),
+        let mut clicked: Option<usize> = None;
+        let layout_id = ui.id().with("viewer-film-layout");
+        let mut layout: FilmLayout = ui.data_mut(|d| d.remove_temp(layout_id)).unwrap_or_default();
+        layout.sync(&self.list, h, |path| core.meta.get(path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32));
+        egui::ScrollArea::horizontal().id_salt("filmstrip").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+            ui.set_min_size(Vec2::new(layout.total(), h));
+            // Top-left of the content (moved by the scroll offset), on screen.
+            let origin = ui.max_rect().min;
+            // Thumbnails for the cells in view and half a view to either side.
+            let margin = viewport.width() * 0.5;
+            let want = layout.range(viewport.min.x - margin, viewport.max.x + margin);
+            // Keys nearest the current image first; a file not seen yet costs a
+            // stat on this thread, so only a few of those per frame.
+            let mut order: Vec<usize> = want.clone().collect();
+            order.sort_by_key(|&i| i.abs_diff(self.index));
+            let mut keys: Vec<Option<ThumbKey>> = vec![None; want.len()];
+            let mut new_stats = 0;
+            for &i in &order {
+                keys[i - want.start] = match self.cached_thumb_key(&self.list[i]) {
+                    Some(k) => Some(k),
+                    None if new_stats < FILM_STATS_PER_FRAME => {
+                        new_stats += 1;
+                        let path = self.list[i].clone();
+                        Some(self.thumb_key(&path))
+                    }
+                    None => None,
+                };
+            }
+            if keys.iter().any(|k| k.is_none()) {
+                ui.ctx().request_repaint();
+            }
+            // Requested farthest first: the newest request is served first, so the
+            // current image and its neighbours come before the margins.
+            let mut thumbs = vec![FilmThumb::Pending; want.len()];
+            for &i in order.iter().rev() {
+                if let Some(key) = &keys[i - want.start] {
+                    thumbs[i - want.start] = match core.thumbs.get(key) {
+                        Thumb::Ready(t) => FilmThumb::Ready(t.tex.id(), t.tex.size_vec2()),
+                        Thumb::Failed => FilmThumb::Failed,
+                        Thumb::Pending => FilmThumb::Pending,
                     };
-                    let cell = Vec2::new((h * aspect).clamp(40.0, 96.0), h);
-                    let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
-                    // Drag a thumbnail along the strip to arrange the folder.
-                    if resp.drag_started() {
-                        resp.dnd_set_drag_payload(FilmDrag(i));
-                    }
-                    let after = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x > rect.center().x);
-                    let hover_drop = resp.dnd_hover_payload::<FilmDrag>().is_some();
-                    if let Some(src) = resp.dnd_release_payload::<FilmDrag>() {
-                        moved = Some((src.0, i, after));
-                    }
-                    if ui.is_rect_visible(rect) {
-                        let sel = i == self.index;
-                        let r4 = CornerRadius::same(theme::radius::SMALL);
-                        ui.painter().rect_filled(rect, r4, if sel { p.selected_bg } else if resp.hovered() { p.hover } else { p.faint_bg });
-                        match &thumb {
-                            Thumb::Ready(t) => {
-                                let ts = t.tex.size_vec2();
-                                let inner = rect.shrink(if sel { 3.0 } else { 0.0 });
-                                let s = (inner.width() / ts.x).min(inner.height() / ts.y);
-                                let r = Rect::from_center_size(rect.center(), ts * s);
-                                ui.painter().add(egui::epaint::RectShape::filled(r, CornerRadius::same(if sel { 2 } else { theme::radius::SMALL }), Color32::WHITE).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
-                            }
-                            // Undecodable file: a placeholder instead of an empty slot.
-                            Thumb::Failed => {
-                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional((h * 0.4).clamp(12.0, 26.0)), p.faint);
-                            }
-                            Thumb::Pending => {}
+                }
+            }
+            // Natural aspect: the thumbnail once it is there, else the known pixel
+            // size, else 4:3. A change moves the cells after it.
+            let mut changed: Option<usize> = None;
+            for i in want.clone() {
+                let path = &self.list[i];
+                let aspect = match thumbs[i - want.start] {
+                    FilmThumb::Ready(_, ts) => {
+                        let a = ts.x / ts.y.max(1.0);
+                        if layout.known.get(path) != Some(&a) {
+                            layout.known.insert(path.clone(), a);
                         }
-                        if sel {
-                            ui.painter().rect_stroke(rect, r4, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
-                        }
-                        if hover_drop {
-                            let x = if after { rect.max.x + 3.0 } else { rect.min.x - 3.0 };
-                            ui.painter().vline(x, rect.y_range(), Stroke::new(3.0, p.accent));
-                        }
+                        a
                     }
-                    if i == self.index && resp.rect.is_positive() {
-                        // Keep the current image in view.
-                        if !ui.clip_rect().contains_rect(resp.rect) {
-                            resp.scroll_to_me(Some(egui::Align::Center));
+                    _ => core.meta.get(path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32).unwrap_or(4.0 / 3.0),
+                };
+                if layout.set_aspect(i, aspect) && changed.is_none() {
+                    changed = Some(i);
+                }
+            }
+            if let Some(i) = changed {
+                layout.relayout_from(i);
+                ui.set_min_size(Vec2::new(layout.total(), h));
+            }
+            let cell_rect = |layout: &FilmLayout, i: usize| Rect::from_min_size(origin + Vec2::new(layout.x[i], 0.0), Vec2::new(layout.w[i], h)).round_ui();
+            for i in layout.range(viewport.min.x, viewport.max.x) {
+                let rect = cell_rect(&layout, i);
+                let resp = ui.interact(rect, ui.id().with(("film-cell", i)), Sense::click_and_drag());
+                // Drag a thumbnail along the strip to arrange the folder.
+                if resp.drag_started() {
+                    resp.dnd_set_drag_payload(FilmDrag(i));
+                }
+                let after = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x > rect.center().x);
+                let hover_drop = resp.dnd_hover_payload::<FilmDrag>().is_some();
+                if let Some(src) = resp.dnd_release_payload::<FilmDrag>() {
+                    moved = Some((src.0, i, after));
+                }
+                if ui.is_rect_visible(rect) {
+                    let sel = i == self.index;
+                    let r4 = CornerRadius::same(theme::radius::SMALL);
+                    ui.painter().rect_filled(rect, r4, if sel { p.selected_bg } else if resp.hovered() { p.hover } else { p.faint_bg });
+                    match thumbs.get(i.wrapping_sub(want.start)).copied().unwrap_or(FilmThumb::Pending) {
+                        FilmThumb::Ready(tex, ts) => {
+                            let inner = rect.shrink(if sel { 3.0 } else { 0.0 });
+                            let s = (inner.width() / ts.x).min(inner.height() / ts.y);
+                            let r = Rect::from_center_size(rect.center(), ts * s);
+                            ui.painter().add(egui::epaint::RectShape::filled(r, CornerRadius::same(if sel { 2 } else { theme::radius::SMALL }), Color32::WHITE).with_texture(tex, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
                         }
+                        // Undecodable file: a placeholder instead of an empty slot.
+                        FilmThumb::Failed => {
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional((h * 0.4).clamp(12.0, 26.0)), p.faint);
+                        }
+                        FilmThumb::Pending => {}
                     }
-                    let resp = resp.on_hover_text(file_name(&path));
-                    if resp.clicked() {
-                        self.go_to(i, core.settings.fit_mode);
+                    if sel {
+                        ui.painter().rect_stroke(rect, r4, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                    }
+                    if hover_drop {
+                        let x = if after { rect.max.x + 3.0 } else { rect.min.x - 3.0 };
+                        ui.painter().vline(x, rect.y_range(), Stroke::new(3.0, p.accent));
                     }
                 }
-            });
+                // The file name, built only when the tooltip shows (or a screen
+                // reader asks for it).
+                let path = &self.list[i];
+                let resp = if ui.ctx().has_accesskit_node(resp.id) {
+                    resp.on_hover_text(file_name(path))
+                } else {
+                    resp.on_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.add(egui::Label::new(file_name(path)));
+                    })
+                };
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+            }
+            // Keep the current image in view.
+            if self.index < layout.x.len() {
+                let rect = cell_rect(&layout, self.index);
+                if rect.is_positive() && !ui.clip_rect().contains_rect(rect) {
+                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                }
+            }
         });
+        ui.data_mut(|d| d.insert_temp(layout_id, layout));
+        if let Some(i) = clicked {
+            self.go_to(i, core.settings.fit_mode);
+        }
         if let Some((src, target, after)) = moved {
             if src != target && src < self.list.len() && target < self.list.len() {
                 let (moving, onto) = (self.list[src].clone(), self.list[target].clone());
@@ -2954,3 +3030,160 @@ mod tests {
 
 /// Drag payload of a filmstrip thumbnail: its index in the viewer list.
 struct FilmDrag(usize);
+
+/// At most this many files not seen before are stat()ed for the filmstrip per frame.
+const FILM_STATS_PER_FRAME: usize = 24;
+/// Space between filmstrip cells.
+const FILM_GAP: f32 = 6.0;
+
+#[derive(Clone, Copy)]
+enum FilmThumb {
+    Ready(egui::TextureId, Vec2),
+    Failed,
+    Pending,
+}
+
+/// Where the filmstrip's cells are, kept between frames so a frame only looks
+/// at the cells in view. Cells out of view keep the aspect last known for them
+/// (their thumbnail's, else the pixel size, else 4:3).
+#[derive(Clone, Default)]
+struct FilmLayout {
+    /// The list this was built for.
+    list: Vec<PathBuf>,
+    h: f32,
+    /// Per cell: aspect (width / height), left edge and width, in points.
+    aspect: Vec<f32>,
+    x: Vec<f32>,
+    w: Vec<f32>,
+    /// Aspects of thumbnails seen, by file (a rearranged list keeps them).
+    known: std::collections::HashMap<PathBuf, f32>,
+}
+
+impl FilmLayout {
+    fn cell_width(h: f32, aspect: f32) -> f32 {
+        (h * aspect).clamp(40.0, 96.0)
+    }
+
+    /// Follow `list` (rebuilt when it changed) and the cell height `h`; `guess`
+    /// gives the aspect of a file without a known thumbnail.
+    fn sync(&mut self, list: &[PathBuf], h: f32, guess: impl Fn(&PathBuf) -> Option<f32>) {
+        if self.list.as_slice() != list {
+            if self.known.len() > 4 * list.len() + 1000 {
+                let current: std::collections::HashSet<&PathBuf> = list.iter().collect();
+                self.known.retain(|p, _| current.contains(p));
+            }
+            self.list = list.to_vec();
+            self.aspect = list.iter().map(|p| self.known.get(p).copied().or_else(|| guess(p)).unwrap_or(4.0 / 3.0)).collect();
+            self.h = f32::NAN;
+        }
+        if self.h != h {
+            self.h = h;
+            self.w = self.aspect.iter().map(|&a| Self::cell_width(h, a)).collect();
+            self.x = vec![0.0; self.w.len()];
+            self.relayout_from(0);
+        }
+    }
+
+    /// Recompute the left edges from cell `i` on.
+    fn relayout_from(&mut self, i: usize) {
+        let mut x = if i == 0 { 0.0 } else { self.x[i - 1] + self.w[i - 1] + FILM_GAP };
+        for j in i..self.w.len() {
+            self.x[j] = x;
+            x += self.w[j] + FILM_GAP;
+        }
+    }
+
+    fn total(&self) -> f32 {
+        match (self.x.last(), self.w.last()) {
+            (Some(x), Some(w)) => x + w,
+            _ => 0.0,
+        }
+    }
+
+    /// Cells overlapping `lo..=hi` (content coordinates).
+    fn range(&self, lo: f32, hi: f32) -> std::ops::Range<usize> {
+        let first = |n: usize, pred: &dyn Fn(usize) -> bool| {
+            let (mut a, mut b) = (0, n);
+            while a < b {
+                let m = (a + b) / 2;
+                if pred(m) {
+                    a = m + 1;
+                } else {
+                    b = m;
+                }
+            }
+            a
+        };
+        let n = self.x.len();
+        let start = first(n, &|i| self.x[i] + self.w[i] < lo);
+        let end = first(n, &|i| self.x[i] <= hi);
+        start..end.max(start)
+    }
+
+    /// Set cell `i`'s aspect; true when its width changed (call `relayout_from`).
+    fn set_aspect(&mut self, i: usize, aspect: f32) -> bool {
+        if self.aspect[i] == aspect {
+            return false;
+        }
+        self.aspect[i] = aspect;
+        let w = Self::cell_width(self.h, aspect);
+        let changed = self.w[i] != w;
+        self.w[i] = w;
+        changed
+    }
+}
+
+#[cfg(test)]
+mod film_tests {
+    use super::*;
+
+    fn list(n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| PathBuf::from(format!(r"C:\Photos\IMG_{i:05}.jpg"))).collect()
+    }
+
+    #[test]
+    fn only_cells_in_view_are_touched() {
+        let l = list(10_000);
+        let mut f = FilmLayout::default();
+        // Every tenth file is a known portrait (40 pt), the rest 4:3 (85.3 pt).
+        f.sync(&l, 64.0, |p| p.to_string_lossy().ends_with("0.jpg").then_some(0.5));
+        let w43 = 64.0 * 4.0 / 3.0;
+        assert_eq!(f.w[0], 40.0);
+        assert!((f.w[1] - w43).abs() < 1e-4);
+        assert!((f.x[2] - (40.0 + w43 + 2.0 * FILM_GAP)).abs() < 1e-3);
+        let total: f64 = f.w.iter().map(|&w| w as f64).sum::<f64>() + FILM_GAP as f64 * 9_999.0;
+        assert!((f.total() as f64 - total).abs() < total * 1e-4, "{} vs {total}", f.total());
+        let r = f.range(50_000.0, 51_200.0);
+        assert!(r.len() < 20, "{r:?}");
+        assert!(f.x[r.start] + f.w[r.start] >= 50_000.0 && f.x[r.start] <= 50_000.0 + f.w[r.start] + FILM_GAP);
+        assert!(f.x[r.end - 1] <= 51_200.0 && (r.end == l.len() || f.x[r.end] > 51_200.0));
+        assert_eq!(f.range(-100.0, -1.0).len(), 0);
+        assert_eq!(f.range(f.total() + 10.0, f.total() + 100.0).len(), 0);
+        assert_eq!(FilmLayout::default().range(0.0, 100.0), 0..0);
+    }
+
+    #[test]
+    fn a_new_aspect_moves_only_later_cells() {
+        let l = list(50);
+        let mut f = FilmLayout::default();
+        f.sync(&l, 64.0, |_| None);
+        let before = f.x.clone();
+        assert!(f.set_aspect(10, 1.5));
+        assert!(!f.set_aspect(10, 1.5), "unchanged");
+        f.relayout_from(10);
+        assert_eq!(f.x[..11], before[..11]);
+        assert!((f.x[11] - (before[11] + 96.0 - 64.0 * 4.0 / 3.0)).abs() < 1e-3);
+        // Clamped widths do not move anything.
+        assert!(f.set_aspect(20, 3.0));
+        assert!(!f.set_aspect(20, 4.0));
+        // Known thumbnail aspects survive a rearranged list; a new height rescales.
+        f.known.insert(l[10].clone(), 1.5);
+        let mut moved = l.clone();
+        moved.swap(0, 10);
+        f.sync(&moved, 64.0, |_| None);
+        assert_eq!(f.w[0], 96.0);
+        f.sync(&moved, 32.0, |_| None);
+        assert_eq!(f.w[0], 48.0);
+        assert_eq!(f.w[1], 42.666668);
+    }
+}

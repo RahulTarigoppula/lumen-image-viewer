@@ -16,6 +16,7 @@ use anyhow::{anyhow, Context as _, Result};
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, RgbaImage};
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -139,6 +140,111 @@ pub fn guard<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
+thread_local! {
+    static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (decodes on this thread) so that they give up with an error once
+/// `flag` is set. The flag is checked between the stages of a decode (after
+/// reading the file, after decoding the pixels, after color conversion); a
+/// stage that has started always runs to its end.
+pub fn with_cancel<R>(flag: &Arc<AtomicBool>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            CANCEL.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let prev = CANCEL.with(|c| c.borrow_mut().replace(flag.clone()));
+    let _restore = Restore(prev);
+    f()
+}
+
+/// Err when the decode running on this thread is no longer wanted (see [`with_cancel`]).
+pub(crate) fn check_cancel() -> Result<()> {
+    if CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(Ordering::Relaxed))) {
+        Err(anyhow!("Decode cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Decodes of images with at least this many pixels share a few slots (see
+/// [`big_decode_permit`]): one such image needs gigabytes while it decodes.
+pub const BIG_DECODE_PIXELS: u64 = 50_000_000;
+/// At most this many big decodes run at once ...
+const BIG_DECODE_SLOTS: usize = 2;
+/// ... and together at most this many pixels (a bigger one runs alone).
+const BIG_DECODE_BUDGET: u64 = 150_000_000;
+
+struct BigDecodes {
+    /// (decodes running, their total pixels).
+    used: parking_lot::Mutex<(usize, u64)>,
+    cv: parking_lot::Condvar,
+}
+
+static BIG_DECODES: BigDecodes = BigDecodes { used: parking_lot::const_mutex((0, 0)), cv: parking_lot::Condvar::new() };
+
+/// Whether a big decode of `px` pixels may start while `running` others use `used` pixels.
+fn big_decode_may_start(running: usize, used: u64, px: u64) -> bool {
+    running == 0 || (running < BIG_DECODE_SLOTS && used + px <= BIG_DECODE_BUDGET)
+}
+
+/// Held while a big image decodes; dropping it lets the next one start.
+pub struct BigDecodePermit(u64);
+
+impl Drop for BigDecodePermit {
+    fn drop(&mut self) {
+        let mut used = BIG_DECODES.used.lock();
+        used.0 -= 1;
+        used.1 -= self.0;
+        drop(used);
+        BIG_DECODES.cv.notify_all();
+    }
+}
+
+/// For a `w` x `h` decode of [`BIG_DECODE_PIXELS`] or more: wait until few
+/// enough other big decodes run (the thumbnail threads would otherwise decode
+/// several panoramas at once and run out of memory) and return the permit to
+/// hold while decoding. None for smaller images. On a rayon pool thread it
+/// never waits (decoders run rayon jobs themselves, and a pool thread blocked
+/// here could hold up the very decode it waits for); it only counts.
+pub fn big_decode_permit(w: u32, h: u32) -> Option<BigDecodePermit> {
+    let px = w as u64 * h as u64;
+    if px < BIG_DECODE_PIXELS {
+        return None;
+    }
+    let may_wait = rayon::current_thread_index().is_none();
+    let mut used = BIG_DECODES.used.lock();
+    while may_wait && !big_decode_may_start(used.0, used.1, px) {
+        BIG_DECODES.cv.wait(&mut used);
+    }
+    used.0 += 1;
+    used.1 += px;
+    Some(BigDecodePermit(px))
+}
+
+/// [`big_decode_permit`] for the file at `path` (its size read from the header).
+pub fn big_decode_permit_for_file(path: &Path) -> Option<BigDecodePermit> {
+    let (w, h) = stored_size(path)?;
+    big_decode_permit(w, h)
+}
+
+/// Pixel size of a raster image as stored (before EXIF orientation), from its
+/// header. None for vector and document formats (rendered at a bounded size).
+fn stored_size(path: &Path) -> Option<(u32, u32)> {
+    let ext = formats::ext_of(path);
+    match ext.as_str() {
+        "psd" | "psb" => psd::probe(&read_head(path, 26)?),
+        "pcx" => pcx::probe(&read_head(path, 128)?),
+        "svg" | "svgz" | "wmf" | "emf" | "pdf" | "ico" | "cur" => None,
+        e if formats::NATIVE_EXTS.contains(&e) => image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok(),
+        e if formats::WIC_EXTS.contains(&e) => wic::stored_size(path).ok(),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct DecodeOptions {
     pub color_manage: bool,
@@ -245,6 +351,7 @@ fn decode_file_inner(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
         return wic::decode_full(path, opts.color_manage).with_context(|| missing_codec_hint(&ext));
     }
     let bytes = read_file(path)?;
+    check_cancel()?;
     if let Some(res) = decode_special(&bytes, &ext, Some(path), opts) {
         return res;
     }
@@ -254,14 +361,19 @@ fn decode_file_inner(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
         if let Ok(d) = wic::decode_full(path, opts.color_manage) {
             return Ok(d);
         }
+        check_cancel()?;
     }
     let mut d = match decode_bytes(&bytes, &ext, opts) {
         Ok(d) => d,
-        Err(native_err) => match wic::decode_full(path, opts.color_manage) {
-            Ok(d) => d,
-            Err(_) => return Err(native_err),
-        },
+        Err(native_err) => {
+            check_cancel()?;
+            match wic::decode_full(path, opts.color_manage) {
+                Ok(d) => d,
+                Err(_) => return Err(native_err),
+            }
+        }
     };
+    check_cancel()?;
     if opts.animations && d.frames.is_none() && (matches!(ext.as_str(), "tif" | "tiff") || d.format.starts_with("TIFF")) {
         add_tiff_pages(path, &mut d, opts.color_manage);
     }
@@ -372,6 +484,7 @@ fn decode_bytes_native(bytes: &[u8], ext: &str, opts: DecodeOptions) -> Result<D
     }
     let bit_depth = (color_type.bits_per_pixel() / color_type.channel_count().max(1) as u16).clamp(1, 32) as u8;
     let dynimg = DynamicImage::from_decoder(decoder)?;
+    check_cancel()?;
     let has_alpha_channel = color_type.has_alpha();
     let mut rgba = to_rgba8(dynimg);
     let mut color_info = color_type_name(color_type);
@@ -383,6 +496,7 @@ fn decode_bytes_native(bytes: &[u8], ext: &str, opts: DecodeOptions) -> Result<D
                 color::Outcome::AlreadySrgb => color_info = format!("{color_info} · sRGB"),
                 color::Outcome::Unsupported => color_info = format!("{color_info} · ICC (unmanaged)"),
             }
+            check_cancel()?;
         }
     }
     let rgba = apply_orientation(rgba, orientation);
@@ -526,30 +640,76 @@ fn collect_frames_limited(frames: image::Frames<'_>) -> Result<Vec<image::Frame>
 /// Decode a reduced-size version of the image whose longest side is at most
 /// `max_side` (used for thumbnails and instant first-paint previews).
 pub fn decode_thumbnail(path: &Path, max_side: u32) -> Result<RgbaImage> {
-    guard("thumbnail", || decode_thumbnail_inner(path, max_side))
+    guard("thumbnail", || decode_thumbnail_inner(path, max_side, false)).map(|t| t.0)
 }
 
-fn decode_thumbnail_inner(path: &Path, max_side: u32) -> Result<RgbaImage> {
+/// [`decode_thumbnail`] plus the source's size as shown (after EXIF orientation,
+/// like [`probe_dimensions`]) when known. The size comes from the same decode
+/// where possible, so the file is not opened again just to probe it.
+pub fn decode_thumbnail_sized(path: &Path, max_side: u32) -> Result<(RgbaImage, Option<(u32, u32)>)> {
+    guard("thumbnail", || decode_thumbnail_inner(path, max_side, true))
+}
+
+/// Width and height as shown for a `w` x `h` source with EXIF `orientation`.
+fn oriented_size((w, h): (u32, u32), orientation: u8) -> (u32, u32) {
+    if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+fn decode_thumbnail_inner(path: &Path, max_side: u32, want_size: bool) -> Result<(RgbaImage, Option<(u32, u32)>)> {
     let ext = formats::ext_of(path);
+    let probed = |img: RgbaImage| (img, if want_size { probe_dimensions(path) } else { None });
     if crate::video::is_video_ext(&ext) {
-        return crate::video::thumbnail(path, max_side);
+        return crate::video::thumbnail(path, max_side).map(probed);
     }
     // Vector and document formats render straight at the requested size.
     match ext.as_str() {
-        "svg" | "svgz" => return svg::render(&read_file(path)?, Some(path), Some(max_side)),
-        "pdf" => return pdf::first_page(&read_file(path)?, max_side),
-        "wmf" | "emf" => return metafile::render(&read_file(path)?, Some(max_side)).map(|r| r.0),
+        "svg" | "svgz" => return svg::render(&read_file(path)?, Some(path), Some(max_side)).map(probed),
+        "pdf" => return pdf::first_page(&read_file(path)?, max_side).map(probed),
+        "wmf" | "emf" => return metafile::render(&read_file(path)?, Some(max_side)).map(|r| probed(r.0)),
         _ => {}
     }
     // WIC can scale JPEGs during decode (DCT scaling) and pull embedded RAW previews,
     // which is dramatically faster than a full decode for large photos.
     if formats::is_jpeg_ext(&ext) || formats::WIC_EXTS.contains(&ext.as_str()) || ext == "tif" || ext == "tiff" {
-        if let Ok(img) = wic::decode_scaled(path, max_side) {
-            return Ok(img);
+        if let Ok((img, size)) = wic::decode_scaled_sized(path, max_side) {
+            return Ok((img, Some(size)));
         }
     }
+    // A full decode: big images take turns (several threads make thumbnails).
+    let _permit = big_decode_permit_for_file(path);
     let decoded = decode_file(path, DecodeOptions { color_manage: true, animations: false })?;
-    Ok(crate::imaging::resize_to_fit(&decoded.image, max_side, max_side))
+    let thumb = crate::imaging::resize_to_fit(&decoded.image, max_side, max_side);
+    let size = match ext.as_str() {
+        // Their probes read their own headers (ICO: the largest entry).
+        _ if !want_size => None,
+        "ico" | "cur" | "psd" | "psb" | "pcx" | "tif" | "tiff" => probe_dimensions(path),
+        _ => Some(oriented_size(decoded.source_size, decoded.orientation)),
+    };
+    Ok((thumb, size))
+}
+
+/// A quick low-resolution first paint for a big file, only where it costs far
+/// less than the full decode that follows: an embedded preview big enough,
+/// decoding scaled down by at least half (JPEG), or the first page of a PDF
+/// (the full decode renders every page). None otherwise, since a preview would
+/// then be a second full decode before the real one.
+pub fn decode_preview(path: &Path, max_side: u32) -> Option<RgbaImage> {
+    guard("preview", || {
+        let ext = formats::ext_of(path);
+        if ext == "pdf" {
+            return pdf::first_page(&read_file(path)?, max_side).map(Some);
+        }
+        if formats::is_jpeg_ext(&ext) || formats::WIC_EXTS.contains(&ext.as_str()) || ext == "tif" || ext == "tiff" {
+            return wic::decode_scaled_cheap(path, max_side);
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
 }
 
 fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
@@ -597,9 +757,7 @@ fn probe_dimensions_inner(path: &Path) -> Option<(u32, u32)> {
 }
 
 pub fn exif_orientation_from_file(path: &Path) -> u8 {
-    let Ok(file) = std::fs::File::open(path) else { return 1 };
-    let mut reader = std::io::BufReader::new(file);
-    let Ok(parsed) = exif::Reader::new().read_from_container(&mut reader) else { return 1 };
+    let Some(parsed) = crate::meta::exif_from_file(path) else { return 1 };
     parsed
         .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| f.value.get_uint(0))
@@ -784,6 +942,108 @@ mod tests {
             assert!(format!("{e:#}").contains("locked"), "{e:#}");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A TIFF/EXIF blob with only an Orientation tag.
+    fn orientation_exif(o: u16) -> Vec<u8> {
+        let mut v = b"II*\0".to_vec();
+        v.extend_from_slice(&8u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&0x0112u16.to_le_bytes());
+        v.extend_from_slice(&3u16.to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&(o as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
+    }
+
+    fn jpeg_with_orientation(w: u16, h: u16, o: u16) -> Vec<u8> {
+        let rgb: Vec<u8> = (0..w as usize * h as usize).flat_map(|i| [(i * 7) as u8, 128, 200]).collect();
+        let mut out = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut out, 90);
+        enc.add_exif_metadata(&orientation_exif(o)).unwrap();
+        enc.encode(&rgb, w, h, jpeg_encoder::ColorType::Rgb).unwrap();
+        out
+    }
+
+    #[test]
+    fn sized_thumbnails_report_the_probed_size() {
+        let d = tmpdir("sized");
+        let rotated = d.join("rotated.jpg");
+        std::fs::write(&rotated, jpeg_with_orientation(64, 32, 6)).unwrap();
+        let plain = d.join("plain.jpg");
+        std::fs::write(&plain, jpeg_bytes(48, 20)).unwrap();
+        let png = d.join("a.png");
+        std::fs::write(&png, png_bytes(DynamicImage::ImageRgb8(image::RgbImage::new(30, 10)))).unwrap();
+        let svg = d.join("a.svg");
+        std::fs::write(&svg, br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="#00f"/></svg>"##).unwrap();
+        let psd_path = d.join("a.psd");
+        std::fs::write(&psd_path, psd::tests::build(false, 3, 8, 4, 2, &[vec![9; 8], vec![8; 8], vec![7; 8]], true, false)).unwrap();
+        for p in [&rotated, &plain, &png, &svg, &psd_path] {
+            let (img, size) = decode_thumbnail_sized(p, 16).unwrap();
+            assert_eq!(size, probe_dimensions(p), "{}", p.display());
+            assert_eq!(img.dimensions(), decode_thumbnail(p, 16).unwrap().dimensions(), "{}", p.display());
+        }
+        assert_eq!(decode_thumbnail_sized(&rotated, 16).unwrap().1, Some((32, 64)));
+        assert!(decode_thumbnail_sized(&d.join("missing.png"), 16).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn previews_only_where_cheap() {
+        let d = tmpdir("preview");
+        let big = d.join("big.jpg");
+        std::fs::write(&big, jpeg_bytes(512, 256)).unwrap();
+        // Scaled down 8x by the decoder: cheap.
+        let prev = decode_preview(&big, 64).expect("JPEG preview");
+        assert!(prev.width() <= 64 && prev.height() <= 32, "{:?}", prev.dimensions());
+        // Less than half: the decoder cannot scale it, so no preview.
+        assert!(decode_preview(&big, 400).is_none());
+        assert!(decode_preview(&big, 1024).is_none());
+        // PNG has no scaled decode.
+        let png = d.join("a.png");
+        std::fs::write(&png, png_bytes(DynamicImage::ImageRgb8(image::RgbImage::new(512, 256)))).unwrap();
+        assert!(decode_preview(&png, 64).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancelled_decodes_stop_and_the_flag_is_scoped() {
+        let d = tmpdir("cancel");
+        let p = d.join("a.png");
+        std::fs::write(&p, png_bytes(DynamicImage::ImageRgb8(image::RgbImage::new(20, 10)))).unwrap();
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(with_cancel(&flag, || decode_file(&p, DecodeOptions::default())).is_err());
+        // Outside the scope (and with the flag cleared) decodes run normally.
+        assert!(decode_file(&p, DecodeOptions::default()).is_ok());
+        flag.store(false, Ordering::Relaxed);
+        assert!(with_cancel(&flag, || decode_file(&p, DecodeOptions::default())).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn big_decodes_take_turns() {
+        // Small images never wait.
+        assert!(big_decode_permit(4000, 3000).is_none());
+        assert!(big_decode_may_start(0, 0, 400_000_000), "a huge one runs alone");
+        assert!(big_decode_may_start(1, 60_000_000, 60_000_000));
+        assert!(!big_decode_may_start(1, 120_000_000, 60_000_000), "over the pixel budget");
+        assert!(!big_decode_may_start(2, 100_000_000, 50_000_000), "no free slot");
+        // Real permits: a second huge decode waits until the first is dropped.
+        let first = big_decode_permit(20_000, 10_000).expect("big");
+        let started = Arc::new(AtomicBool::new(false));
+        let t = {
+            let started = started.clone();
+            std::thread::spawn(move || {
+                let _p = big_decode_permit(20_000, 10_000);
+                started.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!started.load(Ordering::SeqCst));
+        drop(first);
+        t.join().unwrap();
+        assert!(started.load(Ordering::SeqCst));
     }
 
     #[test]

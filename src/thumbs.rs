@@ -9,7 +9,6 @@ use lru::LruCache;
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,12 +73,92 @@ struct Shared {
     min_seq: AtomicU64,
 }
 
-type ThumbResult = (ThumbKey, u64, Result<(image::RgbaImage, Option<(u32, u32)>), String>);
+/// Pixels ready for upload (converted on the worker) and the source size.
+type ThumbResult = (ThumbKey, u64, Result<(egui::ColorImage, Option<(u32, u32)>), String>);
+
+/// At most this many finished thumbnails become textures per frame: the GPU
+/// upload happens after the frame is built, so a time budget cannot see it.
+const UPLOADS_PER_FRAME: usize = 8;
+
+/// GPU textures, least recently used out first, but never one drawn in this or
+/// the previous frame; the cap grows to twice what the last frame drew, so a
+/// screen with more cells than `base_cap` does not evict its own thumbnails
+/// (and reload them, forever).
+struct TexCache<K: Hash + Eq, V> {
+    lru: LruCache<K, (V, u64)>,
+    base_cap: usize,
+    frame: u64,
+    used_now: usize,
+    used_last: usize,
+}
+
+impl<K: Hash + Eq, V> TexCache<K, V> {
+    fn new(base_cap: usize) -> Self {
+        TexCache { lru: LruCache::unbounded(), base_cap, frame: 1, used_now: 0, used_last: 0 }
+    }
+
+    fn begin_frame(&mut self) {
+        self.used_last = self.used_now;
+        self.used_now = 0;
+        self.frame += 1;
+    }
+
+    fn cap(&self) -> usize {
+        self.base_cap.max(2 * self.used_last).max(2 * self.used_now)
+    }
+
+    fn contains(&self, k: &K) -> bool {
+        self.lru.contains(k)
+    }
+
+    /// The entry for `k`, marked as drawn this frame.
+    fn get(&mut self, k: &K) -> Option<&V> {
+        let frame = self.frame;
+        let e = self.lru.get_mut(k)?;
+        if e.1 != frame {
+            e.1 = frame;
+            self.used_now += 1;
+        }
+        Some(&e.0)
+    }
+
+    fn put(&mut self, k: K, v: V) {
+        self.lru.put(k, (v, self.frame));
+        let cap = self.cap();
+        while self.lru.len() > cap {
+            match self.lru.peek_lru() {
+                // Everything left was drawn just now (or arrived this frame).
+                Some((_, (_, f))) if *f + 1 >= self.frame => break,
+                Some(_) => {
+                    self.lru.pop_lru();
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn pop(&mut self, k: &K) -> Option<V> {
+        self.lru.pop(k).map(|e| e.0)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.lru.iter().map(|(k, _)| k)
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lru.len()
+    }
+}
 
 pub struct ThumbService {
     shared: Arc<Shared>,
     rx: Receiver<ThumbResult>,
-    textures: LruCache<ThumbKey, ThumbInfo>,
+    textures: TexCache<ThumbKey, ThumbInfo>,
     /// Requested and not finished: the generation of the request and its
     /// sequence number (shared with the queued job).
     pending: HashMap<ThumbKey, (u64, Arc<AtomicU64>)>,
@@ -123,8 +202,9 @@ impl ThumbService {
         ThumbService {
             shared,
             rx,
-            // ~400 x (384 px RGBA + mips) is about 300 MB of VRAM: plenty for any grid.
-            textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
+            // ~400 x (384 px RGBA + mips) is about 300 MB of VRAM: plenty for most grids
+            // (the cache grows when more are on screen at once).
+            textures: TexCache::new(400),
             pending: HashMap::new(),
             failed: HashSet::new(),
             seq: 0,
@@ -140,8 +220,10 @@ impl ThumbService {
 
     /// Call once per frame before requesting thumbnails.
     pub fn begin_frame(&mut self) {
+        self.textures.begin_frame();
         // Upload finished thumbnails (bounded per frame to keep scrolling smooth).
         let started = std::time::Instant::now();
+        let mut uploads = 0;
         while let Ok((key, gen, res)) = self.rx.try_recv() {
             // A result for a request that was forgotten while it ran (the file was
             // moved, renamed or rewritten meanwhile) says nothing about the file now.
@@ -150,8 +232,8 @@ impl ThumbService {
             }
             self.pending.remove(&key);
             match res {
-                Ok((img, dims)) => {
-                    let ci = crate::render::color_image_from_rgba(&img);
+                Ok((ci, dims)) => {
+                    uploads += 1;
                     let tex = self.ctx.load_texture(
                         format!("thumb:{}", key.path.display()),
                         ci,
@@ -169,7 +251,7 @@ impl ThumbService {
                     self.failed.insert(key);
                 }
             }
-            if started.elapsed().as_millis() > 6 {
+            if uploads >= UPLOADS_PER_FRAME || started.elapsed().as_millis() > 6 {
                 self.ctx.request_repaint();
                 break;
             }
@@ -222,14 +304,22 @@ impl ThumbService {
     /// file, failure mark and any request in flight, so the next request starts over.
     /// File operations call this for both the old and the new path.
     pub fn forget(&mut self, path: &Path) {
-        let keys: Vec<ThumbKey> = self.textures.iter().filter(|(k, _)| k.path == path).map(|(k, _)| k.clone()).collect();
+        self.forget_many(&HashSet::from([path]));
+    }
+
+    /// [`forget`](Self::forget) for many files at once (one pass over the cache).
+    pub fn forget_many(&mut self, paths: &HashSet<&Path>) {
+        if paths.is_empty() {
+            return;
+        }
+        let keys: Vec<ThumbKey> = self.textures.keys().filter(|k| paths.contains(k.path.as_path())).cloned().collect();
         for k in keys {
             self.textures.pop(&k);
             let _ = std::fs::remove_file(self.cache_dir.join(k.hash_name()));
         }
-        self.failed.retain(|k| k.path != path);
-        self.pending.retain(|k, _| k.path != path);
-        self.shared.jobs.lock().retain(|j| j.key.path != path);
+        self.failed.retain(|k| !paths.contains(k.path.as_path()));
+        self.pending.retain(|k, _| !paths.contains(k.path.as_path()));
+        self.shared.jobs.lock().retain(|j| !paths.contains(j.key.path.as_path()));
     }
 
     /// Retry every thumbnail that failed in `dir` (Refresh): a file that could not be
@@ -272,8 +362,10 @@ fn worker(s: Arc<Shared>, tx: Sender<ThumbResult>, ctx: egui::Context, dir: Path
             let _ = tx.send((job.key, job.gen, Err("stale".into())));
             continue;
         }
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make_thumb(&job.key, &s, &dir)))
-            .unwrap_or_else(|_| Err("panic".into()));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            make_thumb(&job.key, &s, &dir).map(|(img, dims)| (crate::render::color_image_from_rgba(&img), dims))
+        }))
+        .unwrap_or_else(|_| Err("panic".into()));
         let _ = tx.send((job.key, job.gen, res));
         ctx.request_repaint();
     }
@@ -289,8 +381,8 @@ fn make_thumb(key: &ThumbKey, s: &Shared, dir: &Path) -> Result<(image::RgbaImag
             }
         }
     }
-    let img = decode::decode_thumbnail(&key.path, THUMB_PX).map_err(|e| e.to_string())?;
-    let dims = decode::probe_dimensions(&key.path);
+    // The source size comes from the same decode: no second open just to probe it.
+    let (img, dims) = decode::decode_thumbnail_sized(&key.path, THUMB_PX).map_err(|e| e.to_string())?;
     if use_disk {
         let _ = write_cached(&file, &img, dims);
     }
@@ -341,7 +433,7 @@ mod tests {
         ThumbService {
             shared,
             rx,
-            textures: LruCache::new(NonZeroUsize::new(400).unwrap()),
+            textures: TexCache::new(400),
             pending: HashMap::new(),
             failed: HashSet::new(),
             seq: 0,
@@ -371,6 +463,64 @@ mod tests {
         assert_eq!(jobs.len(), 10);
         let newest = jobs.iter().max_by_key(|j| job_seq(j)).unwrap();
         assert!(newest.key == key(2));
+    }
+
+    #[test]
+    fn textures_on_screen_are_never_evicted() {
+        let mut c: TexCache<usize, ()> = TexCache::new(4);
+        // Ten cells on screen, more than the base cap: every frame draws all of them.
+        for frame in 0..5 {
+            c.begin_frame();
+            for i in 0..10 {
+                if c.get(&i).is_none() {
+                    c.put(i, ());
+                }
+            }
+            if frame > 0 {
+                assert_eq!(c.len(), 10, "frame {frame}");
+            }
+        }
+        for i in 0..10 {
+            assert!(c.contains(&i));
+        }
+        assert!(c.cap() >= 20);
+        // Scrolled on: ten new cells, the old ones go (oldest first) once unused.
+        for _ in 0..3 {
+            c.begin_frame();
+            for i in 10..20 {
+                if c.get(&i).is_none() {
+                    c.put(i, ());
+                }
+            }
+        }
+        assert!((10..20).all(|i| c.contains(&i)));
+        c.begin_frame();
+        c.put(99, ());
+        assert!(c.len() <= c.cap().max(11), "{} > {}", c.len(), c.cap());
+        // With few on screen the cache shrinks back to the base cap.
+        for _ in 0..3 {
+            c.begin_frame();
+            c.get(&99);
+        }
+        c.put(100, ());
+        assert!(c.len() <= 4, "{}", c.len());
+        assert!(c.contains(&99) && c.contains(&100));
+    }
+
+    #[test]
+    fn forget_many_drops_queued_and_failed() {
+        let mut s = idle_service();
+        for i in 0..6 {
+            s.get(&key(i));
+        }
+        s.failed.insert(key(7));
+        let (a, b, c) = (key(1).path, key(4).path, key(7).path);
+        s.forget_many(&HashSet::from([a.as_path(), b.as_path(), c.as_path()]));
+        let jobs = s.shared.jobs.lock();
+        assert_eq!(jobs.len(), 4);
+        assert!(jobs.iter().all(|j| j.key != key(1) && j.key != key(4)));
+        drop(jobs);
+        assert!(s.failed.is_empty() && s.pending.len() == 4);
     }
 
     /// Frame cost of re-requesting visible thumbnails while a long queue is

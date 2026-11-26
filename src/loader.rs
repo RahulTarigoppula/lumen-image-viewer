@@ -7,6 +7,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -47,6 +48,11 @@ struct Job {
     /// Generation of the cache entry this job fills; results for an older
     /// generation (the entry was invalidated while decoding) are dropped.
     generation: u64,
+    /// Set when the image is no longer wanted: the decode stops at its next stage.
+    cancel: Arc<AtomicBool>,
+    /// The latest priority asked for (0 = on screen), shared with the entry, so a
+    /// running decode knows whether it is still a preload.
+    live: Arc<AtomicU32>,
 }
 
 enum Msg {
@@ -60,11 +66,45 @@ struct Entry {
     generation: u64,
     /// Priority of the latest request (0 = on screen).
     priority: u32,
+    /// Shared with the job decoding this entry (see `Job`).
+    cancel: Arc<AtomicBool>,
+    live: Arc<AtomicU32>,
+}
+
+impl Entry {
+    fn loading(&self) -> bool {
+        matches!(self.state, LoadState::Loading | LoadState::Preview(_))
+    }
+}
+
+struct QueueState {
+    jobs: Vec<Job>,
+    /// Latest priorities of the jobs being decoded right now.
+    running: Vec<Arc<AtomicU32>>,
 }
 
 struct Queue {
-    jobs: Mutex<Vec<Job>>,
+    jobs: Mutex<QueueState>,
     cv: Condvar,
+    workers: usize,
+}
+
+/// The job a free worker should take: the most urgent (among equals the most
+/// recently requested), but a preload (priority > 0) only while another worker
+/// stays free for the image on screen. `busy_preloads` counts running decodes
+/// that are preloads now.
+fn pick_job(priorities: impl Iterator<Item = u32>, busy_preloads: usize, workers: usize) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    for (i, p) in priorities.enumerate() {
+        if best.is_none_or(|(_, b)| p <= b) {
+            best = Some((i, p));
+        }
+    }
+    let (i, p) = best?;
+    if p > 0 && busy_preloads >= workers.saturating_sub(1).max(1) {
+        return None;
+    }
+    Some(i)
 }
 
 pub struct Loader {
@@ -84,7 +124,7 @@ pub struct Loader {
 
 impl Loader {
     pub fn new(ctx: egui::Context, threads: usize) -> Self {
-        let queue = Arc::new(Queue { jobs: Mutex::new(Vec::new()), cv: Condvar::new() });
+        let queue = Arc::new(Queue { jobs: Mutex::new(QueueState { jobs: Vec::new(), running: Vec::new() }), cv: Condvar::new(), workers: threads.max(1) });
         let (tx, rx) = unbounded();
         let opts = Arc::new(Mutex::new(DecodeOptions::default()));
         for i in 0..threads.max(1) {
@@ -108,9 +148,10 @@ impl Loader {
             // while the job can still be waiting in it.
             e.touched = Instant::now();
             e.priority = priority;
+            e.live.store(priority, Ordering::Relaxed);
             if matches!(e.state, LoadState::Loading) {
-                let mut jobs = self.queue.jobs.lock();
-                if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
+                let mut q = self.queue.jobs.lock();
+                if let Some(j) = q.jobs.iter_mut().find(|j| j.path == path) {
                     j.priority = j.priority.min(priority);
                 }
             }
@@ -121,9 +162,10 @@ impl Loader {
         }
         let generation = self.next_generation;
         self.next_generation += 1;
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation, priority });
-        let mut jobs = self.queue.jobs.lock();
-        jobs.push(Job { path: path.to_path_buf(), priority, preview_side, generation });
+        let (cancel, live) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(priority)));
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation, priority, cancel: cancel.clone(), live: live.clone() });
+        let mut q = self.queue.jobs.lock();
+        q.jobs.push(Job { path: path.to_path_buf(), priority, preview_side, generation, cancel, live });
         self.queue.cv.notify_one();
     }
 
@@ -140,25 +182,32 @@ impl Loader {
         }
     }
 
-    /// Drop queued (not yet started) jobs except those listed. `keep` is also
-    /// remembered as the protected set for the memory budget (most important
-    /// first: the image on screen, then its neighbours).
+    /// Drop jobs except those listed: queued ones at once, decodes already
+    /// running at their next stage (holding an arrow key skips through images,
+    /// and the one on screen must not wait behind the ones skipped). `keep` is
+    /// also remembered as the protected set for the memory budget (most
+    /// important first: the image on screen, then its neighbours).
     pub fn retain_queued(&mut self, keep: &[PathBuf]) {
         if self.keep.as_slice() != keep {
             self.keep = keep.to_vec();
         }
-        let mut jobs = self.queue.jobs.lock();
-        if jobs.iter().all(|j| keep.contains(&j.path)) {
+        let mut q = self.queue.jobs.lock();
+        let queued_ok = q.jobs.iter().all(|j| keep.contains(&j.path));
+        let running_ok = self.entries.iter().all(|(p, e)| !e.loading() || keep.contains(p));
+        if queued_ok && running_ok {
             return; // common case (every frame): nothing to drop, no allocation
         }
-        let removed: Vec<(PathBuf, u64)> = jobs.iter().filter(|j| !keep.contains(&j.path)).map(|j| (j.path.clone(), j.generation)).collect();
-        jobs.retain(|j| keep.contains(&j.path));
-        drop(jobs);
-        for (p, g) in removed {
-            if matches!(self.entries.get(&p), Some(e) if matches!(e.state, LoadState::Loading) && e.generation == g) {
-                self.entries.remove(&p);
+        q.jobs.retain(|j| keep.contains(&j.path));
+        drop(q);
+        // Queued or running, an unwanted load goes: a late result is dropped
+        // (its generation is gone) and a later request starts over.
+        self.entries.retain(|p, e| {
+            let unwanted = e.loading() && !keep.contains(p);
+            if unwanted {
+                e.cancel.store(true, Ordering::Relaxed);
             }
-        }
+            !unwanted
+        });
     }
 
     pub fn state(&self, path: &Path) -> Option<&LoadState> {
@@ -175,14 +224,22 @@ impl Loader {
     /// Forget `path` so the next `request` decodes it again. A decode of the old
     /// version that is still running is ignored when it finishes.
     pub fn invalidate(&mut self, path: &Path) {
-        self.entries.remove(path);
-        self.queue.jobs.lock().retain(|j| j.path != path);
+        if let Some(e) = self.entries.remove(path) {
+            e.cancel.store(true, Ordering::Relaxed);
+        }
+        self.queue.jobs.lock().jobs.retain(|j| j.path != path);
     }
 
     /// Drop every decoded image except `keep` (e.g. after the color management setting changed).
     pub fn clear_except(&mut self, keep: &[PathBuf]) {
-        self.entries.retain(|p, _| keep.contains(p));
-        self.queue.jobs.lock().clear();
+        self.entries.retain(|p, e| {
+            let kept = keep.contains(p);
+            if !kept {
+                e.cancel.store(true, Ordering::Relaxed);
+            }
+            kept
+        });
+        self.queue.jobs.lock().jobs.clear();
     }
 
     /// Insert an already-decoded image. Only tests seed the cache this way; the
@@ -191,7 +248,7 @@ impl Loader {
     pub fn insert(&mut self, path: &Path, img: LoadedImage) {
         let generation = self.next_generation;
         self.next_generation += 1;
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation, priority: u32::MAX });
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation, priority: u32::MAX, cancel: Default::default(), live: Default::default() });
     }
 
     /// Drain finished jobs. Returns paths whose state changed.
@@ -284,50 +341,78 @@ fn worker(q: Arc<Queue>, tx: Sender<Msg>, ctx: egui::Context, opts: Arc<Mutex<De
     crate::bg::background_priority();
     loop {
         let job = {
-            let mut jobs = q.jobs.lock();
-            while jobs.is_empty() {
-                q.cv.wait(&mut jobs);
-            }
-            // Most urgent first; among equals, the most recently requested.
-            let mut best = 0;
-            for (i, j) in jobs.iter().enumerate() {
-                if j.priority <= jobs[best].priority {
-                    best = i;
+            let mut st = q.jobs.lock();
+            loop {
+                let busy = st.running.iter().filter(|p| p.load(Ordering::Relaxed) > 0).count();
+                if let Some(i) = pick_job(st.jobs.iter().map(|j| j.priority), busy, q.workers) {
+                    let job = st.jobs.remove(i);
+                    st.running.push(job.live.clone());
+                    break job;
                 }
+                q.cv.wait(&mut st);
             }
-            jobs.remove(best)
         };
-        let started = Instant::now();
-        let meta = std::fs::metadata(&job.path).ok();
-        let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        // Instant low-res first paint for big files on screen.
-        if let Some(side) = job.preview_side {
-            if file_size > 6 << 20 {
-                if let Ok(prev) = decode::decode_thumbnail(&job.path, side) {
-                    let _ = tx.send(Msg::Preview(job.path.clone(), job.generation, prev));
-                    ctx.request_repaint();
-                }
+        let live = job.live.clone();
+        if let Some(msg) = run_job(job, &opts, &tx, &ctx) {
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        let mut st = q.jobs.lock();
+        if let Some(i) = st.running.iter().position(|p| Arc::ptr_eq(p, &live)) {
+            st.running.swap_remove(i);
+        }
+        drop(st);
+        // A preload may have been waiting for this worker.
+        q.cv.notify_one();
+    }
+}
+
+/// Decode one job. None when it was cancelled (nobody wants the result).
+fn run_job(job: Job, opts: &Mutex<DecodeOptions>, tx: &Sender<Msg>, ctx: &egui::Context) -> Option<Msg> {
+    let wanted = || !job.cancel.load(Ordering::Relaxed);
+    if !wanted() {
+        return None;
+    }
+    let started = Instant::now();
+    let meta = std::fs::metadata(&job.path).ok();
+    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    // Instant low-res first paint for big files on screen, where that is much
+    // cheaper than the full decode (otherwise it would only delay it).
+    if let Some(side) = job.preview_side {
+        if file_size > 6 << 20 {
+            if let Some(prev) = decode::decode_preview(&job.path, side) {
+                let _ = tx.send(Msg::Preview(job.path.clone(), job.generation, prev));
+                ctx.request_repaint();
+            }
+            if !wanted() {
+                return None;
             }
         }
-        let o = *opts.lock();
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode::decode_file(&job.path, o)));
-        let res = match res {
-            Ok(Ok(decoded)) => {
-                let pyramid = build_pyramid(decoded.image.clone());
-                Ok(LoadedImage {
+    }
+    let o = *opts.lock();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode::with_cancel(&job.cancel, || decode::decode_file(&job.path, o))));
+    if !wanted() {
+        return None;
+    }
+    let res = match res {
+        Ok(Ok(decoded)) => {
+            // A panic here must not end the worker (the image would stay on Loading).
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_pyramid(decoded.image.clone()))) {
+                Ok(pyramid) if wanted() => Ok(LoadedImage {
                     decoded,
                     pyramid,
                     load_ms: started.elapsed().as_millis(),
                     file_size,
                     modified: meta.and_then(|m| m.modified().ok()),
-                })
+                }),
+                Ok(_) => return None,
+                Err(_) => Err("Lumen could not prepare this image for display.".into()),
             }
-            Ok(Err(e)) => Err(decode::friendly_error(&e)),
-            Err(_) => Err("The decoder crashed on this file (it may be corrupt).".into()),
-        };
-        let _ = tx.send(Msg::Done(job.path, job.generation, res));
-        ctx.request_repaint();
-    }
+        }
+        Ok(Err(e)) => Err(decode::friendly_error(&e)),
+        Err(_) => Err("The decoder crashed on this file (it may be corrupt).".into()),
+    };
+    Some(Msg::Done(job.path, job.generation, res))
 }
 
 #[cfg(test)]
@@ -368,6 +453,55 @@ mod tests {
         // ... but an explicit on-screen request always goes through.
         l.request(&prev, 0, None);
         assert!(matches!(l.state(&prev), Some(LoadState::Loading)));
+    }
+
+    #[test]
+    fn a_worker_stays_free_for_the_image_on_screen() {
+        // Two workers, one busy with a preload: the next preload waits ...
+        assert_eq!(pick_job([2, 1].into_iter(), 1, 2), None);
+        // ... but the image on screen is taken at once, even behind preloads.
+        assert_eq!(pick_job([2, 0, 1].into_iter(), 1, 2), Some(1));
+        // Nothing running: the most urgent preload, the newest among equals.
+        assert_eq!(pick_job([2, 1, 1].into_iter(), 0, 2), Some(2));
+        // One worker only: preloads still run.
+        assert_eq!(pick_job([1].into_iter(), 0, 1), Some(0));
+        assert_eq!(pick_job([1].into_iter(), 1, 1), None);
+        assert_eq!(pick_job(std::iter::empty(), 0, 4), None);
+        // Four workers: up to three preloads at once.
+        assert_eq!(pick_job([3].into_iter(), 2, 4), Some(0));
+        assert_eq!(pick_job([3].into_iter(), 3, 4), None);
+    }
+
+    #[test]
+    fn unwanted_loads_are_cancelled() {
+        // The only worker sees a preload running, so it takes no preload and
+        // the queue can be inspected.
+        let mut l = Loader::new(egui::Context::default(), 1);
+        l.queue.jobs.lock().running.push(Arc::new(AtomicU32::new(1)));
+        let p = |n: &str| PathBuf::from(format!("Z:/lumen-test/{n}.png"));
+        let (a, b, c) = (p("a"), p("b"), p("c"));
+        l.request(&a, 1, None);
+        l.request(&b, 2, None);
+        let cancel_a = l.entries[&a].cancel.clone();
+        // b is being decoded (taken off the queue by a worker).
+        let running_b = {
+            let mut q = l.queue.jobs.lock();
+            let i = q.jobs.iter().position(|j| j.path == b).unwrap();
+            q.jobs.remove(i)
+        };
+        // Moved on: only c is wanted now (c is not requested, so no worker runs).
+        l.retain_queued(std::slice::from_ref(&c));
+        assert!(cancel_a.load(Ordering::Relaxed), "queued job cancelled");
+        assert!(running_b.cancel.load(Ordering::Relaxed), "running job told to stop");
+        assert!(l.state(&a).is_none() && l.state(&b).is_none());
+        assert!(l.queue.jobs.lock().jobs.is_empty());
+        // Asking again starts a fresh load.
+        l.request(&b, 1, None);
+        assert!(!l.entries[&b].cancel.load(Ordering::Relaxed));
+        assert_eq!(l.queue.jobs.lock().jobs.iter().filter(|j| j.path == b).count(), 1);
+        // Kept loads are left alone.
+        l.retain_queued(std::slice::from_ref(&b));
+        assert!(matches!(l.state(&b), Some(LoadState::Loading)));
     }
 
     #[test]
