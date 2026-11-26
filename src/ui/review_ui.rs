@@ -993,7 +993,7 @@ fn field_label(ui: &mut Ui, p: &theme::Palette, t: &str) {
 fn badge(ui: &mut Ui, letter: &str, c: Color32) {
     let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
     ui.painter().rect_filled(r, CornerRadius::same(9), c);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, letter, theme::semibold(11.0), Color32::WHITE);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, letter, theme::semibold(11.0), theme::text_on(c));
 }
 
 /// A mark number in the mark's colour; ringed when selected.
