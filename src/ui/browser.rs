@@ -1075,7 +1075,7 @@ impl Browser {
         }
         // No grid tooltips at all while a window is open: one that was already showing
         // when the window opened would otherwise stay on top of it.
-        let tips = pointer_here && self.tips_after_drag && !super::overlay_open(ui.ctx());
+        let tips = pointer_here && self.tips_after_drag && self.band.is_none() && !super::overlay_open(ui.ctx());
         // Registered before the cells so cells take precedence for clicks.
         let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click_and_drag());
         let sole = self.selected.len() <= 1;
