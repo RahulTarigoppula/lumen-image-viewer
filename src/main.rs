@@ -64,9 +64,12 @@ fn main() -> eframe::Result {
             egui::IconData { rgba: rgba.into_raw(), width: w, height: h }
         });
 
+    // The last un-maximized size, within sane bounds (a corrupt value must not
+    // open a 1x1 or 100,000-wide window).
+    let size = settings.window_size.filter(|[w, h]| (640.0..=16384.0).contains(w) && (420.0..=16384.0).contains(h)).unwrap_or([1360.0, 860.0]);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Lumen")
-        .with_inner_size([1360.0, 860.0])
+        .with_inner_size(size)
         .with_min_inner_size([640.0, 420.0])
         .with_drag_and_drop(true)
         .with_maximized(settings.window_maximized);

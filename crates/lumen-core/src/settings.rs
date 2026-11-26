@@ -207,6 +207,10 @@ pub struct Settings {
     pub show_info_overlay: bool,
     pub slideshow: SlideshowSettings,
     pub window_maximized: bool,
+    /// Size of the window when it was last closed un-maximized (points). The
+    /// position is left to Windows, so a window never opens on a monitor that
+    /// is gone or at a different scale.
+    pub window_size: Option<[f32; 2]>,
     pub first_run_done: bool,
     pub copy_move_targets: Vec<PathBuf>,
     pub external_editors: Vec<ExternalEditor>,
@@ -311,6 +315,7 @@ impl Default for Settings {
             show_info_overlay: false,
             slideshow: SlideshowSettings::default(),
             window_maximized: true,
+            window_size: None,
             first_run_done: false,
             copy_move_targets: Vec::new(),
             external_editors: Vec::new(),

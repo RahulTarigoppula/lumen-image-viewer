@@ -1490,6 +1490,7 @@ fn reset_settings(s: &mut Settings) {
     fresh.last_folder = s.last_folder.take();
     fresh.copy_move_targets = std::mem::take(&mut s.copy_move_targets);
     fresh.window_maximized = s.window_maximized;
+    fresh.window_size = s.window_size;
     fresh.first_run_done = s.first_run_done;
     *s = fresh;
 }

@@ -3591,7 +3591,13 @@ impl App {
     }
 
     fn persist(&mut self) {
-        self.core.settings.window_maximized = self.core.ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let (maximized, full, inner) = self.core.ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false), i.viewport().inner_rect));
+        self.core.settings.window_maximized = maximized;
+        if let Some(r) = inner.filter(|_| !maximized && !full) {
+            if r.width() >= 640.0 && r.height() >= 420.0 {
+                self.core.settings.window_size = Some([r.width().round(), r.height().round()]);
+            }
+        }
         self.core.settings.save();
         self.core.tags.save_if_dirty();
         self.core.orders.save_if_dirty();
