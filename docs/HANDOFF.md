@@ -1,7 +1,23 @@
-# Lumen 2.0 handoff
+# Lumen handoff
 
-State on 23 November 2026: version 2.0.0, `main` and `dev/v1.4` at the same commit, every CI job green, release
-`v2.0.0` built by `.github/workflows/build.yml` (Lumen.exe, Lumen-portable.zip, SHA256SUMS.txt).
+State on 27 November 2026: version 2.1.0, `main` and `dev/v1.4` at the same commit, every CI job green, releases
+built by `.github/workflows/build.yml` (Lumen.exe, Lumen-portable.zip, SHA256SUMS.txt).
+
+## 2.1.0 in short
+
+A review of the whole app from four angles (looks and ease of use, stability, speed, missing FastStone features),
+then fixes for what it found. Details in [CHANGELOG.md](../CHANGELOG.md):
+
+- Arrange a folder by hand (drag thumbnails, rows or filmstrip cells; per folder; undo), folder thumbnails, rubber-band
+  selection, Include subfolders, color label filter, Select flagged, address bar and mouse back / forward keys.
+- Viewer: fit that keeps the picture clear of the bars, tags in the caption, next folder at the end, next image after
+  rating (option), copy text in image (OCR), paste as a new file; edit tools remember their values.
+- Safety: no silent overwrite of files changed on disk, staged copies, real moves only across drives, permanent
+  deletes on network drives are said as such, batch Overwrite never flattens animations or 16-bit files.
+- Speed: virtualized filmstrip, thumbnail cache that never evicts what is on screen, fewer file opens, cancelled
+  decodes, background saving, bounded memory for huge images.
+- Looks: fixed pane colors, readable letters, middle-shortened names, aligned columns in Metadata, Analysis and
+  Workbench, a welcome card for FastStone users.
 
 ## What changed since 1.3
 
@@ -65,7 +81,14 @@ Details: [WORKBENCH.md](WORKBENCH.md).
   Sort, **Number the files in this order** (batch rename with a counter); **Reset this folder's custom order** goes
   back to name order.
 
-### 6. Video
+### 6. Cull fast
+- In the viewer: 1-5 rate, Q flag, 6-9 color labels (red to blue; see F1); the caption shows the tags. Turn on Settings,
+  Viewer, **Next image after rating** to move on automatically.
+- Back in the browser: Show menu, **Flagged only** or a minimum rating or a color label, then **Select the files
+  shown** (or Ctrl+Shift+F for flagged), then F7 / F8 to copy or move them.
+- At the end of a folder the viewer says so; pressing Right again opens the next folder with pictures.
+
+### 7. Video
 - Select clips, Compare (P) or Ctrl+Shift+V. Frame timing checks find drops and duplicates; **Auto-align** syncs
   start points of clips from different phones; PSNR / SSIM and whole-file analysis are in the analysis panel.
 
@@ -75,7 +98,7 @@ Details: [WORKBENCH.md](WORKBENCH.md).
   building and testing runs in GitHub Actions.
 - Push to any `dev/**` branch: `dev.yml` runs the text check, unit tests with and without FFmpeg, clippy, a debug
   build and the UI smoke test. The smoke artifact `ui-smoke` has a screenshot per step (`tools/ui-smoke/scenarios`,
-  14 scenarios).
+  15 scenarios).
 - Push to `main`: `build.yml` builds the release executable. A `v*` tag also publishes a GitHub release.
 - Before committing UI text: `python tools/scrub_text.py --check src crates` (plain punctuation only).
 
@@ -88,7 +111,11 @@ Details: [WORKBENCH.md](WORKBENCH.md).
 - Raw files: pixel size comes from the first IFD, which can be a preview.
 - The workbench has been exercised on small generated projects, not on a full real round with hundreds of captures.
 
+- Not done from the 2.1 review: cut / paste with Explorer (Ctrl+X, the clipboard's move flag), dropping files from
+  Explorer onto a folder to copy / move them, undo of a delete from the Recycle Bin, videos inline in the viewer and
+  slideshow, lossless JPEG crop, the Windows share sheet.
+
 ## Next candidates
 
-Region-aware metrics (faces, sky), HDR (Ultra HDR gain map display, HDR10 video), a company report template,
-VMAF for video pairs, remappable Compare shortcuts, full maker-note decoding for Samsung and Google.
+The items above, then region-aware metrics (faces, sky), HDR (Ultra HDR gain map display, HDR10 video), a company
+report template, VMAF for video pairs, remappable Compare shortcuts, full maker-note decoding for Samsung and Google.

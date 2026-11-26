@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 2.1.0 (27 November 2026)
+
+A full pass over looks, ease of use, stability and speed, and the FastStone-style way to arrange a folder by
+hand.
 
 ### Browser
 - Arrange by hand, like FastStone: drag thumbnails (or rows in the details view, or the viewer's filmstrip) between others to put them in any
@@ -28,6 +31,16 @@
 - Edit tools (Resize, Canvas, Border, Rotate, Levels, Curves, Sharpen, Blur, Effects, Adjust colors, Text,
   Watermark) open with the values used last time; Reset goes back to the defaults. Save as remembers the format,
   its options and the folder.
+
+### Compare, analysis and workbench
+- Pane colors no longer depend on the accent color (A is always blue), and pane letters stay readable on every color.
+- Long file names are shortened in the middle, so the part that differs (the device) stays visible.
+- The Metadata window keeps its size and aligns its columns; its third tab is now "File & encoding".
+- Blind tests hide every control that could reveal or change a side; the line profile sits in the middle of the view.
+- Analysis values and their "Show where" links line up in columns; links stay readable in the light theme.
+- Workbench: measured values in a grid with units, one reference hint, aligned columns, correct plurals.
+- Deleting a pane's file in Compare keeps device names, colors and alignment with the right panes.
+- Video: no repeated timecode or audio notice over the picture.
 
 ### General
 - A welcome card on first start: FastStone-compatible keys and what the mouse wheel does.
