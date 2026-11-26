@@ -146,6 +146,8 @@ pub enum Command {
     SelectFlagged,
     /// Type a folder path in the browser's address bar.
     FocusAddress,
+    /// Read the text in the image (OCR) and put it on the clipboard.
+    CopyImageText,
     /// Move the selected files one place earlier in the folder's custom order.
     MoveEarlier,
     /// Move the selected files one place later in the folder's custom order.
@@ -279,6 +281,7 @@ impl Command {
             CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
             SelectFlagged => "Select flagged files".into(),
             FocusAddress => "Type a folder path".into(),
+            CopyImageText => "Copy text in image (OCR)".into(),
             MoveEarlier => "Move earlier (custom order)".into(),
             MoveLater => "Move later (custom order)".into(),
         }
@@ -412,6 +415,7 @@ impl Command {
             CycleInspect => I::EYE,
             SelectFlagged => I::FLAG,
             FocusAddress => I::TEXTBOX,
+            CopyImageText => I::SCAN,
             MoveEarlier => I::ARROW_LEFT,
             MoveLater => I::ARROW_RIGHT,
         }
@@ -443,7 +447,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, MoveEarlier, MoveLater,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -478,7 +482,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, MoveEarlier, MoveLater]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

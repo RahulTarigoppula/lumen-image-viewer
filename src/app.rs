@@ -695,6 +695,29 @@ impl App {
                 self.browser.selected = self.browser.items.iter().map(|&e| &self.browser.entries[e]).filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect();
             }
             SelectNone => self.browser.selected.clear(),
+            CopyImageText => {
+                let img = match self.mode {
+                    Mode::Viewer => self.viewer.current_image(&self.core),
+                    _ => None,
+                };
+                let Some(img) = img else {
+                    self.core.toasts.info("Open an image in the viewer first");
+                    return;
+                };
+                self.file_jobs.submit("Reading the text in the image", Box::new(move |_: &JobProgress| {
+                    match lumen_core::ocr::recognize(&img, None) {
+                        Ok(o) => {
+                            let text = o.text();
+                            if text.trim().is_empty() {
+                                JobResult::Message { ok: false, text: "No text found in this image".into() }
+                            } else {
+                                JobResult::CopyText(text)
+                            }
+                        }
+                        Err(e) => JobResult::Message { ok: false, text: format!("Could not read text: {e}") },
+                    }
+                }));
+            }
             FocusAddress => {
                 if self.mode == Mode::Browser {
                     self.browser.edit_address();
@@ -1582,6 +1605,11 @@ impl App {
             JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
             JobResult::Message { ok: true, text } => self.core.toasts.success(text),
             JobResult::Message { ok: false, text } => self.core.toasts.error(text),
+            JobResult::CopyText(text) => {
+                let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+                self.core.ctx.copy_text(text);
+                self.core.toasts.success(format!("Copied {} of text", count(lines, "line")));
+            }
         }
     }
 
@@ -3653,6 +3681,8 @@ enum JobResult {
     Panicked(String),
     /// A job that only reports a line to the user.
     Message { ok: bool, text: String },
+    /// Text for the clipboard (OCR).
+    CopyText(String),
 }
 
 struct JobProgress {
