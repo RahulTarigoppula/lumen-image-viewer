@@ -1,7 +1,33 @@
 //! File-system operations and Windows shell integration.
 
 use anyhow::{anyhow, Context, Result};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+/// Size and last-write time of a file, to notice that it was changed since
+/// they were read (by another program, or by Lumen itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path` now (None when it is not a readable file).
+    pub fn of(path: &Path) -> Option<FileStamp> {
+        let m = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+        Some(FileStamp { len: m.len(), modified: m.modified().ok() })
+    }
+
+    /// The file still has the size and time read earlier; a time that could
+    /// not be read on either side compares the size alone.
+    pub fn matches(&self, len: u64, modified: Option<SystemTime>) -> bool {
+        self.len == len && (self.modified.is_none() || modified.is_none() || self.modified == modified)
+    }
+}
 
 /// Pick a non-existing destination path by appending " (2)", " (3)", ...
 pub fn unique_path(target: &Path) -> PathBuf {
@@ -24,9 +50,87 @@ pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
     trash::delete_all(paths).map_err(|e| anyhow!("Could not move to Recycle Bin: {e}"))
 }
 
+/// What deleting with [`recycle`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // for the delete messages (app.rs, compare.rs, tools.rs)
+pub enum TrashOutcome {
+    /// Everything went to the Recycle Bin.
+    Recycled,
+    /// At least one file was on a network or removable drive, which has no
+    /// Recycle Bin: those files are deleted for good.
+    DeletedPermanently,
+}
+
+/// [`delete_to_trash`], also telling whether the files really went to the
+/// Recycle Bin, so the message can say when they were deleted permanently.
+#[allow(dead_code)] // for the delete messages (app.rs, compare.rs, tools.rs)
+pub fn recycle(paths: &[PathBuf]) -> Result<TrashOutcome> {
+    let permanent = is_permanent_delete(paths);
+    delete_to_trash(paths)?;
+    Ok(if permanent { TrashOutcome::DeletedPermanently } else { TrashOutcome::Recycled })
+}
+
+/// True when deleting `paths` cannot use the Recycle Bin for all of them:
+/// network shares and removable drives have none, so the files would be
+/// deleted permanently (the delete confirmation should say so).
+#[allow(dead_code)] // for the delete confirmations (app.rs, compare.rs, tools.rs)
+pub fn is_permanent_delete(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|p| {
+        let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
+        match volume_of(&p) {
+            Volume::Share => true,
+            Volume::Drive(root) => matches!(drive_type(&root), DRIVE_REMOVABLE | DRIVE_REMOTE),
+            Volume::Unknown => false,
+        }
+    })
+}
+
+/// GetDriveTypeW results (WinBase.h) for drives without a Recycle Bin.
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_REMOTE: u32 = 4;
+
+/// The volume a path lies on, as far as the Recycle Bin is concerned.
+#[derive(Debug, PartialEq, Eq)]
+enum Volume {
+    /// A drive letter, as its root ("C:\").
+    Drive(String),
+    /// A network share (\\server\share\...).
+    Share,
+    Unknown,
+}
+
+fn volume_of(path: &Path) -> Volume {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Volume::Drive(format!("{}:\\", (d as char).to_ascii_uppercase())),
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => Volume::Share,
+            _ => Volume::Unknown,
+        },
+        _ => Volume::Unknown,
+    }
+}
+
+#[cfg(windows)]
+fn drive_type(root: &str) -> u32 {
+    // SAFETY: a valid NUL-terminated wide string for the duration of the call.
+    unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(&windows::core::HSTRING::from(root)) }
+}
+
+#[cfg(not(windows))]
+fn drive_type(_root: &str) -> u32 {
+    0
+}
+
 /// Copy or move files into `dest_dir`. Returns (source, destination) pairs that succeeded.
 /// A name that already exists in `dest_dir` gets a number appended, so nothing is
 /// ever overwritten and every move can be undone.
+///
+/// A move renames; only a move to another drive copies and then deletes the
+/// original. Any other rename failure (a file open in another program, access
+/// denied) is reported and nothing is copied. A move whose copy succeeded but
+/// whose original could not be deleted still counts as done (the copy is the
+/// moved file) and also gets a line in the errors.
 pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool) -> (Vec<(PathBuf, PathBuf)>, Vec<String>) {
     let mut done = Vec::new();
     let mut errors = Vec::new();
@@ -42,16 +146,13 @@ pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool) -> (Vec<(Path
             continue;
         }
         let dst = unique_path(&dst);
-        let res = if do_move {
-            std::fs::rename(src, &dst).or_else(|_| {
-                // Cross-volume move: copy then delete.
-                copy_any(src, &dst).and_then(|_| remove_any(src))
-            })
-        } else {
-            copy_any(src, &dst)
-        };
+        let res = if do_move { move_any(src, &dst) } else { copy_into_place(src, &dst).map(|()| Moved::Done) };
         match res {
-            Ok(()) => done.push((src.clone(), dst)),
+            Ok(Moved::Done) => done.push((src.clone(), dst)),
+            Ok(Moved::OriginalKept(e)) => {
+                errors.push(format!("{}: copied, but the original could not be deleted ({e})", src.display()));
+                done.push((src.clone(), dst));
+            }
             Err(e) => errors.push(format!("{}: {e}", src.display())),
         }
     }
@@ -68,7 +169,44 @@ pub fn move_path(src: &Path, dst: &Path) -> Result<()> {
             return Err(anyhow!("folder {} no longer exists", parent.display()));
         }
     }
-    std::fs::rename(src, dst).or_else(|_| copy_any(src, dst).and_then(|_| remove_any(src))).with_context(|| format!("{}", src.display()))
+    match move_any(src, dst).with_context(|| format!("{}", src.display()))? {
+        Moved::Done => Ok(()),
+        // The file is at its destination: that is what counts for the caller.
+        Moved::OriginalKept(e) => {
+            log::warn!("{} was copied to {}, but the original could not be deleted: {e}", src.display(), dst.display());
+            Ok(())
+        }
+    }
+}
+
+/// How [`move_any`] got a file or folder to its destination.
+enum Moved {
+    Done,
+    /// Copied to another drive, but the original could not be deleted.
+    OriginalKept(io::Error),
+}
+
+/// Rename `src` to `dst`; across drives, copy it and delete the original.
+fn move_any(src: &Path, dst: &Path) -> io::Result<Moved> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(Moved::Done),
+        Err(e) if is_cross_device(&e) => {
+            copy_into_place(src, dst)?;
+            Ok(match remove_any(src) {
+                Ok(()) => Moved::Done,
+                Err(e) => Moved::OriginalKept(e),
+            })
+        }
+        // A locked or protected file: copying it would leave two copies (or,
+        // for a folder, a half-deleted original).
+        Err(e) => Err(e),
+    }
+}
+
+/// The rename failed only because the destination is on another drive.
+fn is_cross_device(e: &io::Error) -> bool {
+    // ERROR_NOT_SAME_DEVICE on Windows, EXDEV elsewhere.
+    e.raw_os_error() == Some(if cfg!(windows) { 17 } else { 18 })
 }
 
 /// `path` is `dir` or lies below it (case-insensitive, as on NTFS).
@@ -132,7 +270,64 @@ fn disk_name(_path: &Path) -> Option<std::ffi::OsString> {
     None
 }
 
-fn copy_any(src: &Path, dst: &Path) -> std::io::Result<()> {
+// ------------------------------------------------------------------ copying
+
+/// Set when Lumen quits while a copy is still running: the file being copied
+/// stops (CopyFileExW polls this flag and deletes its partial file) and no
+/// further copy starts.
+static CANCEL_COPIES: AtomicI32 = AtomicI32::new(0);
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Staging folders of the copies in progress (see [`copy_into_place`]).
+static STAGING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn staging() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    STAGING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Stop the copy in progress and refuse new ones (Lumen is quitting).
+pub fn cancel_copies() {
+    CANCEL_COPIES.store(1, Ordering::SeqCst);
+}
+
+pub fn copies_cancelled() -> bool {
+    CANCEL_COPIES.load(Ordering::SeqCst) != 0
+}
+
+/// Delete what copies still running have written so far (best effort: a
+/// file still held open stays, inside its hidden staging folder). Returns
+/// how many staging folders are left.
+pub fn remove_partial_copies() -> usize {
+    let mut st = staging();
+    st.retain(|s| std::fs::remove_dir_all(s).is_err() && s.exists());
+    st.len()
+}
+
+/// Copy `src` (a file or a whole folder) to `dst`, which must not exist yet.
+/// The copy is written inside a hidden staging folder next to `dst` and only
+/// renamed to `dst` once complete, so a copy that fails or is cut short when
+/// Lumen quits never leaves a partial file under the real name.
+fn copy_into_place(src: &Path, dst: &Path) -> io::Result<()> {
+    if copies_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped because Lumen is closing"));
+    }
+    let (Some(parent), Some(name)) = (dst.parent(), dst.file_name()) else {
+        return Err(io::Error::other("invalid destination"));
+    };
+    let stage = parent.join(format!(".lumen-copy-{}-{}", std::process::id(), STAGE_SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir(&stage)?;
+    set_hidden(&stage);
+    staging().push(stage.clone());
+    let inner = stage.join(name);
+    let res = copy_any(src, &inner).and_then(|()| rename_no_replace(&inner, dst));
+    let _ = std::fs::remove_dir_all(&stage);
+    staging().retain(|s| s != &stage);
+    res
+}
+
+fn copy_any(src: &Path, dst: &Path) -> io::Result<()> {
+    if copies_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped because Lumen is closing"));
+    }
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
         for e in std::fs::read_dir(src)? {
@@ -141,7 +336,79 @@ fn copy_any(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
         Ok(())
     } else {
-        std::fs::copy(src, dst).map(|_| ())
+        copy_file(src, dst)
+    }
+}
+
+/// Copy one file (attributes and times included, as `std::fs::copy`); it
+/// stops early, removing the partial file, once [`cancel_copies`] is called.
+#[cfg(windows)]
+fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{CopyFileExW, COPY_FILE_FAIL_IF_EXISTS};
+    let cancel = CANCEL_COPIES.as_ptr() as *mut windows::core::BOOL;
+    // SAFETY: valid NUL-terminated wide paths for the call's duration; the
+    // cancel flag is a static i32 (BOOL) that outlives the call.
+    unsafe { CopyFileExW(&win_path(src), &win_path(dst), None, None, Some(cancel), COPY_FILE_FAIL_IF_EXISTS) }.map_err(io_error)
+}
+
+#[cfg(not(windows))]
+fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Rename `from` to `to` on the same drive, failing (instead of replacing)
+/// when `to` exists.
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    // SAFETY: valid NUL-terminated wide paths for the call's duration.
+    unsafe { MoveFileExW(&win_path(from), &win_path(to), MOVE_FILE_FLAGS(0)) }.map_err(io_error)
+}
+
+#[cfg(not(windows))]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if to.exists() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
+    }
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn set_hidden(path: &Path) {
+    use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+    // SAFETY: a valid NUL-terminated wide path for the call's duration.
+    let _ = unsafe { SetFileAttributesW(&win_path(path), FILE_ATTRIBUTE_HIDDEN) };
+}
+
+#[cfg(not(windows))]
+fn set_hidden(_path: &Path) {}
+
+/// `path` for a Win32 file call: long paths get the `\\?\` prefix (the
+/// standard library adds it on its own; the raw API stops at MAX_PATH).
+#[cfg(windows)]
+fn win_path(path: &Path) -> windows::core::HSTRING {
+    let s = path.as_os_str();
+    if s.len() < 248 || s.to_string_lossy().starts_with(r"\\?\") {
+        return windows::core::HSTRING::from(s);
+    }
+    let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = full.to_string_lossy().replace('/', "\\");
+    let verbatim = match text.strip_prefix(r"\\") {
+        Some(unc) => format!(r"\\?\UNC\{unc}"),
+        None => format!(r"\\?\{text}"),
+    };
+    windows::core::HSTRING::from(verbatim.as_str())
+}
+
+/// A Win32 error carried in a windows-rs error, as an `io::Error` with its
+/// plain error code (so `raw_os_error` and the message are the usual ones).
+#[cfg(windows)]
+fn io_error(e: windows::core::Error) -> io::Error {
+    let hr = e.code().0 as u32;
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((hr & 0xFFFF) as i32)
+    } else {
+        io::Error::other(e.to_string())
     }
 }
 
@@ -449,5 +716,99 @@ mod tests {
         // Missing components are kept as typed.
         assert_eq!(true_case(&typed.join("not there")).file_name().unwrap(), "not there");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn copies_files_and_folders_without_leftovers() {
+        let base = std::env::temp_dir().join(format!("lumen-transfer-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (src, dest) = (base.join("src"), base.join("dest"));
+        std::fs::create_dir_all(src.join("folder").join("inner")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("a.jpg"), b"AAAA").unwrap();
+        std::fs::write(src.join("folder").join("inner").join("b.png"), b"BB").unwrap();
+        std::fs::write(dest.join("a.jpg"), b"taken").unwrap();
+        let (done, errs) = transfer(&[src.join("a.jpg"), src.join("folder")], &dest, false);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(done.len(), 2);
+        // The taken name got a number; nothing was replaced and no staging folder is left.
+        assert_eq!(names_in(&dest), vec!["a (2).jpg", "a.jpg", "folder"]);
+        assert_eq!(std::fs::read(dest.join("a.jpg")).unwrap(), b"taken");
+        assert_eq!(std::fs::read(dest.join("a (2).jpg")).unwrap(), b"AAAA");
+        assert_eq!(std::fs::read(dest.join("folder").join("inner").join("b.png")).unwrap(), b"BB");
+        assert!(src.join("a.jpg").exists(), "a copy keeps the original");
+        // A folder copy that fails half-way leaves nothing under the real name.
+        assert!(copy_into_place(&src.join("missing"), &dest.join("missing")).is_err());
+        assert_eq!(names_in(&dest).len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_renames_and_reports_other_failures_without_copying() {
+        let base = std::env::temp_dir().join(format!("lumen-transfer-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (src, dest) = (base.join("src"), base.join("dest"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("a.jpg"), b"A").unwrap();
+        let (done, errs) = transfer(&[src.join("a.jpg")], &dest, true);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(done, vec![(src.join("a.jpg"), dest.join("a.jpg"))]);
+        assert!(!src.join("a.jpg").exists());
+        // A file held open without delete sharing cannot be renamed: the move
+        // is reported as failed and no copy is made.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::write(src.join("locked.jpg"), b"L").unwrap();
+            let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(src.join("locked.jpg")).unwrap();
+            let (done, errs) = transfer(&[src.join("locked.jpg")], &dest, true);
+            assert!(done.is_empty());
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert!(!dest.join("locked.jpg").exists(), "no copy of a locked file");
+            drop(held);
+            assert!(src.join("locked.jpg").exists());
+        }
+        assert!(is_cross_device(&io::Error::from_raw_os_error(if cfg!(windows) { 17 } else { 18 })));
+        assert!(!is_cross_device(&io::Error::from_raw_os_error(5)));
+        assert!(!is_cross_device(&io::Error::from_raw_os_error(32)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn volumes_without_a_recycle_bin() {
+        assert_eq!(volume_of(Path::new(r"c:\photos\a.jpg")), Volume::Drive(r"C:\".into()));
+        assert_eq!(volume_of(Path::new(r"\\?\D:\a.jpg")), Volume::Drive(r"D:\".into()));
+        assert_eq!(volume_of(Path::new(r"\\server\share\a.jpg")), Volume::Share);
+        assert_eq!(volume_of(Path::new(r"\\?\UNC\server\share\a.jpg")), Volume::Share);
+        assert_eq!(volume_of(Path::new("a.jpg")), Volume::Unknown);
+        assert!(is_permanent_delete(&[PathBuf::from(r"\\server\share\a.jpg")]));
+        // The temp folder is on a fixed drive, which has a Recycle Bin.
+        assert!(!is_permanent_delete(&[std::env::temp_dir().join("a.jpg")]));
+        assert!(!is_permanent_delete(&[]));
+    }
+
+    #[test]
+    fn file_stamps_notice_changes() {
+        let dir = std::env::temp_dir().join(format!("lumen-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.bin");
+        std::fs::write(&f, b"one").unwrap();
+        let s = FileStamp::of(&f).unwrap();
+        assert_eq!(s.len, 3);
+        assert!(s.matches(3, s.modified));
+        assert!(!s.matches(4, s.modified));
+        assert!(s.matches(3, None), "no time: size only");
+        let later = s.modified.map(|t| t + std::time::Duration::from_secs(5));
+        assert!(!s.matches(3, later));
+        assert_eq!(FileStamp::of(&dir), None, "folders have no stamp");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
