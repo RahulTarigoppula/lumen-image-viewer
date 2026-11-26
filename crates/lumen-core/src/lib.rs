@@ -14,6 +14,7 @@ pub mod imaging;
 pub mod inspect;
 pub mod meta;
 pub mod metaedit;
+pub mod order;
 pub mod ocr;
 pub mod report;
 pub mod settings;

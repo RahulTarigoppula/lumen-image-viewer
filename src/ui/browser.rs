@@ -222,7 +222,9 @@ impl Browser {
         let rating = |p: &Path| core.tags.get(p).rating;
         let flagged = |p: &Path| core.tags.get(p).flagged;
         let label = |p: &Path| core.tags.get(p).label;
-        let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label };
+        let positions = if s.sort_key == SortKey::Custom { core.orders.positions(&self.folder) } else { Default::default() };
+        let custom = |p: &Path| p.file_name().and_then(|n| positions.get(&n.to_string_lossy().to_lowercase()).copied());
+        let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label, custom: &custom };
         catalog::sort_entries(&mut self.entries, s.sort_key, s.sort_desc, s.folders_first, &cx);
         self.items = (0..self.entries.len())
             .filter(|&i| {
@@ -503,6 +505,7 @@ impl Browser {
             self.resort_needed = true;
         }
         let caret = caret.on_hover_text("Sort by");
+        let mut reset = false;
         egui::Popup::menu(&caret).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_min_width(200.0);
             for k in SortKey::ALL {
@@ -517,6 +520,10 @@ impl Browser {
                     ui.close();
                 }
             }
+            if core.settings.sort_key == SortKey::Custom && core.orders.has(&self.folder) && widgets::menu_item(ui, I::ARROW_COUNTER_CLOCKWISE, "Reset this folder's custom order", "").clicked() {
+                reset = true;
+                ui.close();
+            }
             ui.separator();
             let mut toggle = |ui: &mut Ui, on: &mut bool, label: &str| {
                 if widgets::menu_toggle(ui, *on, label, "").clicked() {
@@ -528,6 +535,9 @@ impl Browser {
             toggle(ui, &mut core.settings.folders_first, "Folders first");
             toggle(ui, &mut core.settings.show_folders_in_grid, "Show folders");
         });
+        if reset {
+            self.reset_order(core);
+        }
     }
 
     /// The thumbnail size slider at the right of the status bar (thumbnails view only).
@@ -818,6 +828,29 @@ impl Browser {
             }
             self.scroll_to_focus = false;
         }
+        // While thumbnails are dragged, holding the pointer near the top or bottom
+        // edge scrolls, so files can be arranged across a long folder.
+        let grid_rect = ui.available_rect_before_wrap();
+        let dragging = egui::DragAndDrop::has_payload_of_type::<DragFiles>(ui.ctx());
+        if dragging {
+            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()).filter(|q| grid_rect.x_range().contains(q.x)) {
+                let edge = 56.0;
+                let dy = if (grid_rect.min.y - 4.0..grid_rect.min.y + edge).contains(&pos.y) {
+                    pos.y - (grid_rect.min.y + edge)
+                } else if (grid_rect.max.y - edge..grid_rect.max.y + 4.0).contains(&pos.y) {
+                    pos.y - (grid_rect.max.y - edge)
+                } else {
+                    0.0
+                };
+                if dy != 0.0 {
+                    let id = ui.make_persistent_id(("grid", &self.folder));
+                    let offset = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
+                    scroll = scroll.vertical_scroll_offset((offset + dy * 0.35).max(0.0));
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        let mut reorder: Option<(Vec<PathBuf>, Option<usize>, bool)> = None;
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut double: Option<usize> = None;
         let mut ctx_menu_for: Option<usize> = None;
@@ -870,6 +903,19 @@ impl Browser {
                                 let copy = ui.input(|inp| inp.modifiers.ctrl);
                                 ev.push(BrowserEvent::DropFiles { target: entry.path.clone(), files: files.0.clone(), copy });
                             }
+                        } else {
+                            // Dropping on a file arranges: before it on its left half,
+                            // after it on its right half.
+                            let after = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x > rect.center().x);
+                            if resp.dnd_hover_payload::<DragFiles>().is_some() {
+                                let x = if after { rect.max.x - 1.5 } else { rect.min.x + 1.5 };
+                                let painter = ui.painter();
+                                painter.line_segment([Pos2::new(x, rect.min.y + 4.0), Pos2::new(x, rect.max.y - 4.0)], Stroke::new(3.0, p.accent));
+                                painter.circle_filled(Pos2::new(x, rect.min.y + 4.0), 4.0, p.accent);
+                            }
+                            if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
+                                reorder = Some((files.0.clone(), Some(i), after));
+                            }
                         }
                         // A folder's tooltip would only repeat its caption.
                         let folder_tip_redundant = entry.is_folder()
@@ -893,6 +939,18 @@ impl Browser {
                 });
             }
         });
+        // Dropped on the empty space after the last thumbnail: to the end.
+        if reorder.is_none() {
+            if let Some(files) = bg.dnd_release_payload::<DragFiles>() {
+                reorder = Some((files.0.clone(), None, false));
+            }
+        }
+        if let Some((files, target, after)) = reorder {
+            self.arrange(core, &files, target, after);
+        }
+        if dragging {
+            paint_drag_badge(ui, egui::DragAndDrop::payload::<DragFiles>(ui.ctx()).map(|f| f.0.len()).unwrap_or(0), &p);
+        }
         // Clicking empty space clears the selection.
         if bg.clicked() && clicked.is_none() && !ui.input(|i| i.modifiers.ctrl || i.modifiers.shift) {
             self.selected.clear();
@@ -907,6 +965,42 @@ impl Browser {
             }
         }
         self.context_menu(ui, &bg, ev, ctx_menu_for.is_some());
+    }
+
+    /// Put `files` (from this folder) before or after display item `target`, or at
+    /// the end, in the folder's custom order, and switch to that order.
+    pub fn arrange(&mut self, core: &mut Core, files: &[PathBuf], target: Option<usize>, after: bool) {
+        let target_path = target.and_then(|i| self.items.get(i)).map(|&e| self.entries[e].path.clone());
+        if target_path.as_ref().is_some_and(|t| files.contains(t)) {
+            return;
+        }
+        let moving: Vec<String> = files
+            .iter()
+            .filter(|f| f.parent() == Some(self.folder.as_path()))
+            .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        if moving.is_empty() {
+            return;
+        }
+        // The order on screen, including files hidden by a filter (they keep their places).
+        let order: Vec<String> = self.entries.iter().filter(|e| !e.is_folder()).map(|e| e.name.clone()).collect();
+        let target_name = target_path.as_ref().and_then(|t| t.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let arranged = lumen_core::order::move_names(&order, &moving, target_name.as_deref(), after);
+        core.orders.set(&self.folder, arranged);
+        if core.settings.sort_key != SortKey::Custom {
+            core.settings.sort_key = SortKey::Custom;
+            core.toasts.info("Custom order: drag thumbnails to arrange them; the viewer and slideshow follow it. Sort by name to go back.");
+        }
+        self.rebuild(core);
+    }
+
+    /// Back to name order and forget this folder's custom order.
+    pub fn reset_order(&mut self, core: &mut Core) {
+        core.orders.clear(&self.folder);
+        if core.settings.sort_key == SortKey::Custom {
+            core.settings.sort_key = SortKey::Name;
+        }
+        self.rebuild(core);
     }
 
     /// An in-app file drag (onto tree folders) that leaves the window becomes a
@@ -1677,4 +1771,18 @@ mod anchor_tests {
         assert_eq!(clamp_anchor(None, 1, 5), 1);
         assert_eq!(clamp_anchor(None, 9, 0), 0);
     }
+}
+
+/// A small "3 files" badge beside the pointer while thumbnails are dragged.
+fn paint_drag_badge(ui: &Ui, n: usize, p: &Palette) {
+    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
+    if n == 0 {
+        return;
+    }
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("browser-drag-badge")));
+    let text = if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+    let g = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
+    let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
+    painter.rect_filled(r, CornerRadius::same(8), p.accent);
+    painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
 }

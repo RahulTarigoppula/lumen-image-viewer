@@ -1,0 +1,26 @@
+# Custom order: drag thumbnails to arrange them; the viewer follows the arranged order.
+open {media}\Flat
+wait 3000
+# text_card.png (5th) onto the left half of gradient_16x9.png (1st): it becomes first.
+drag 1170 150 300 150
+wait 1500
+shot arranged.png
+# noise_iso6400.jpg dropped on the empty area below the thumbnails: it goes last.
+drag 770 150 800 500
+wait 1500
+shot to_end.png
+# Open the first thumbnail and step through in the arranged order.
+click 370 150
+wait 500
+key Enter
+wait 2500
+shot viewer_first.png
+run NextImage
+wait 2000
+shot viewer_second.png
+key Escape
+wait 1000
+run ToggleDetails
+wait 1500
+shot details_custom.png
+run ToggleDetails

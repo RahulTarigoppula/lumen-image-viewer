@@ -224,6 +224,9 @@ pub struct SortContext<'a> {
     pub flagged: &'a dyn Fn(&Path) -> bool,
     /// Color label 0..=5 (0 = none).
     pub label: &'a dyn Fn(&Path) -> u8,
+    /// Place in the folder's custom order (`SortKey::Custom`); files without
+    /// one follow the arranged files, by name.
+    pub custom: &'a dyn Fn(&Path) -> Option<usize>,
 }
 
 pub fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_first: bool, cx: &SortContext) {
@@ -233,6 +236,17 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool, folders_fir
         let ord = ord.then_with(|| natural_cmp(&a.name, &b.name));
         if desc { ord.reverse() } else { ord }
     };
+    if key == SortKey::Custom {
+        // An arranged order has no direction: Descending is ignored.
+        let pos: Vec<usize> = entries.iter().map(|e| (cx.custom)(&e.path).unwrap_or(usize::MAX)).collect();
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|&i, &j| {
+            let (a, b) = (&entries[i], &entries[j]);
+            folder_ord(a, b).unwrap_or_else(|| pos[i].cmp(&pos[j]).then_with(|| natural_cmp(&a.name, &b.name)))
+        });
+        permute(entries, &order);
+        return;
+    }
     // Keys that need a lookup by path (metadata, tags) are read once per
     // entry, not twice per comparison.
     let looked_up: Option<Vec<Option<i128>>> = match key {
@@ -445,6 +459,7 @@ mod tests {
                     let k = |l: u8| if l == 0 { u8::MAX } else { l };
                     k((cx.label)(&a.path)).cmp(&k((cx.label)(&b.path)))
                 }
+                SortKey::Custom => std::cmp::Ordering::Equal,
             }
             .then_with(|| old_natural_cmp(&a.name, &b.name));
             if desc { ord.reverse() } else { ord }
@@ -513,7 +528,7 @@ mod tests {
         let rating = |p: &Path| meta[p].2;
         let flagged = |p: &Path| meta[p].3;
         let label = |p: &Path| meta[p].4;
-        let cx = SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label };
+        let cx = SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label, custom: &|_: &Path| None };
         let keys = [SortKey::Name, SortKey::Size, SortKey::Modified, SortKey::Created, SortKey::Type, SortKey::Dimensions, SortKey::DateTaken, SortKey::Rating, SortKey::Flagged, SortKey::ColorLabel];
         for key in keys {
             for desc in [false, true] {
@@ -527,6 +542,38 @@ mod tests {
                     assert_eq!(pa, pb, "{key:?} desc={desc} folders_first={folders_first}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn custom_order_puts_arranged_files_first_and_ignores_direction() {
+        let mk = |n: &str, folder: bool| Entry {
+            ext: if folder { String::new() } else { "jpg".into() },
+            path: PathBuf::from(format!(r"C:\d\{n}")),
+            name: n.into(),
+            kind: if folder { EntryKind::Folder } else { EntryKind::Image },
+            size: 0,
+            modified: None,
+            created: None,
+            hidden: false,
+        };
+        let mut e = vec![mk("a.jpg", false), mk("b.jpg", false), mk("sub", true), mk("c.jpg", false), mk("d.jpg", false)];
+        let pos = |p: &Path| -> Option<usize> {
+            match p.file_name()?.to_str()? {
+                "c.jpg" => Some(0),
+                "a.jpg" => Some(1),
+                _ => None,
+            }
+        };
+        let none = |_: &Path| -> Option<(u32, u32)> { None };
+        let zero = |_: &Path| 0u8;
+        let no = |_: &Path| false;
+        let tk = |_: &Path| -> Option<i64> { None };
+        let cx = SortContext { dims: &none, taken: &tk, rating: &zero, flagged: &no, label: &zero, custom: &pos };
+        for desc in [false, true] {
+            sort_entries(&mut e, SortKey::Custom, desc, true, &cx);
+            let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
+            assert_eq!(names, ["sub", "c.jpg", "a.jpg", "b.jpg", "d.jpg"]);
         }
     }
 
@@ -565,7 +612,7 @@ mod tests {
         let tk = |p: &Path| taken.get(p).copied();
         let zero = |_: &Path| 0u8;
         let no = |_: &Path| false;
-        let cx = SortContext { dims: &dims, taken: &tk, rating: &zero, flagged: &no, label: &zero };
+        let cx = SortContext { dims: &dims, taken: &tk, rating: &zero, flagged: &no, label: &zero, custom: &|_: &Path| None };
         let best = |f: &dyn Fn()| {
             (0..5)
                 .map(|_| {

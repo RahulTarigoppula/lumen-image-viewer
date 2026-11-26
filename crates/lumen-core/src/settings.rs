@@ -93,6 +93,8 @@ pub enum SortKey {
     Rating,
     Flagged,
     ColorLabel,
+    /// The order the user arranged by dragging thumbnails (per folder).
+    Custom,
 }
 
 impl SortKey {
@@ -108,9 +110,10 @@ impl SortKey {
             SortKey::Rating => "Rating",
             SortKey::Flagged => "Flagged",
             SortKey::ColorLabel => "Color label",
+            SortKey::Custom => "Custom order (drag to arrange)",
         }
     }
-    pub const ALL: [SortKey; 10] = [
+    pub const ALL: [SortKey; 11] = [
         SortKey::Name,
         SortKey::Size,
         SortKey::Modified,
@@ -121,6 +124,7 @@ impl SortKey {
         SortKey::Rating,
         SortKey::Flagged,
         SortKey::ColorLabel,
+        SortKey::Custom,
     ];
 }
 

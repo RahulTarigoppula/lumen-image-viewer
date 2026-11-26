@@ -31,6 +31,8 @@ pub struct Core {
     pub settings: Settings,
     pub pal: Palette,
     pub tags: TagStore,
+    /// Custom file orders per folder (drag thumbnails to arrange).
+    pub orders: lumen_core::order::OrderStore,
     pub loader: Loader,
     pub thumbs: ThumbService,
     pub meta: MetaService,
@@ -276,6 +278,7 @@ impl App {
                 settings,
                 pal,
                 tags,
+                orders: lumen_core::order::OrderStore::load(),
                 loader,
                 thumbs,
                 meta,
@@ -1608,6 +1611,7 @@ impl App {
                         Ok(()) => {
                             ok += 1;
                             self.core.tags.moved(cur, orig);
+                            self.core.orders.rename(cur, orig);
                             self.forget_file(cur);
                             self.forget_file(orig);
                             self.viewer.replace_path(cur, orig);
@@ -2248,6 +2252,7 @@ impl App {
                                 Ok(new) => {
                                     self.push_file_undo(format!("Rename to {}", crate::ui::viewer::file_name(&new)), vec![(path.clone(), new.clone())]);
                                     self.core.tags.moved(&path, &new);
+                                    self.core.orders.rename(&path, &new);
                                     self.forget_file(&path);
                                     self.forget_file(&new);
                                     self.viewer.replace_path(&path, &new);
@@ -2403,6 +2408,7 @@ impl App {
         if let Some(w) = &mut self.batch_rename {
             let (open, renamed) = w.show(ctx, &mut self.core);
             self.core.tags.moved_many(&renamed);
+            self.core.orders.rename_many(&renamed);
             for (from, to) in &renamed {
                 self.viewer.replace_path(from, to);
             }
@@ -2890,6 +2896,7 @@ impl eframe::App for App {
         }
         if self.last_save.elapsed().as_secs() > 5 {
             self.core.tags.save_if_dirty();
+            self.core.orders.save_if_dirty();
             self.last_save = Instant::now();
         }
         if self.settings_check.elapsed() >= std::time::Duration::from_secs(1) {
@@ -3395,6 +3402,7 @@ impl App {
         self.core.settings.window_maximized = self.core.ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         self.core.settings.save();
         self.core.tags.save_if_dirty();
+        self.core.orders.save_if_dirty();
     }
 }
 
