@@ -3,14 +3,33 @@
 
 use super::{anchor_grid, color_button, combo, hint, icon_toggle, info, row, section, section_toggle, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
+use crate::edit::memory::{self, remember_methods, Remember};
 use crate::edit::text::{self as txt, Stamp, TextStyle};
 use crate::edit::{geom, EditTool, ToolUiCtx};
 use crate::ui::icons as I;
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn font_names() -> Vec<String> {
     txt::families().iter().map(|f| f.name.clone()).collect()
+}
+
+/// A font remembered by name (the list depends on the fonts installed); one
+/// that is not there any more gives the first.
+mod font_name {
+    use crate::edit::text as txt;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(family: &usize, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(txt::families().get(*family).map_or("", |f| f.name.as_str()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+        let name = String::deserialize(d)?;
+        Ok(txt::families().iter().position(|f| f.name == name).unwrap_or(0))
+    }
 }
 
 fn opacity_color_row(ui: &mut egui::Ui, label: &str, color: &mut [u8; 4], opacity: &mut f32) -> bool {
@@ -48,9 +67,12 @@ fn rotate_stamp(s: Stamp, angle: f32) -> Stamp {
 
 // ---------------------------------------------------------------- Add text
 
-#[derive(Clone)]
+/// Remembers everything, the text too.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AddText {
     text: String,
+    #[serde(rename = "font", with = "font_name")]
     family: usize,
     bold: bool,
     italic: bool,
@@ -112,6 +134,26 @@ impl Default for AddText {
             bg_pad: 30.0,
             bg_radius: 20.0,
         }
+    }
+}
+
+impl Remember for AddText {
+    const KEY: &'static str = "add_text";
+    fn recalled(&mut self) {
+        memory::clamp(&mut self.size, 0.5..=40.0);
+        memory::clamp(&mut self.opacity, 0.0..=100.0);
+        self.align = self.align.min(2);
+        memory::clamp(&mut self.spacing, 0.6..=3.0);
+        self.anchor = self.anchor.min(8);
+        memory::clamp(&mut self.margin, 0.0..=25.0);
+        memory::clamp(&mut self.off_x, -50.0..=50.0);
+        memory::clamp(&mut self.off_y, -50.0..=50.0);
+        memory::clamp(&mut self.angle, -180.0..=180.0);
+        memory::clamp(&mut self.outline_w, 0.5..=30.0);
+        memory::clamp(&mut self.shadow_dist, 0.0..=50.0);
+        memory::clamp(&mut self.shadow_blur, 0.0..=60.0);
+        memory::clamp(&mut self.bg_pad, 0.0..=150.0);
+        memory::clamp(&mut self.bg_radius, 0.0..=100.0);
     }
 }
 
@@ -214,15 +256,19 @@ impl EditTool for AddText {
     fn can_apply(&self) -> bool {
         !self.text.trim().is_empty()
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Watermark
 
-#[derive(Clone)]
+/// Remembers everything; the logo by its file, read again when the tool opens.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Watermark {
     /// 0 = text, 1 = image
     kind: usize,
     text: String,
+    #[serde(rename = "font", with = "font_name")]
     family: usize,
     bold: bool,
     /// Text: font size % of image height. Image: logo width % of image width.
@@ -238,9 +284,39 @@ pub struct Watermark {
     /// Tile gap, % of the short side.
     gap: f32,
     shadow: bool,
+    /// The file the logo came from.
+    logo_path: Option<PathBuf>,
+    #[serde(skip)]
     logo: Option<Arc<RgbaImage>>,
+    #[serde(skip)]
     logo_name: String,
+    #[serde(skip)]
     error: Option<String>,
+}
+
+impl Remember for Watermark {
+    const KEY: &'static str = "watermark";
+    fn recalled(&mut self) {
+        self.kind = self.kind.min(1);
+        memory::clamp(&mut self.size, 0.5..=30.0);
+        memory::clamp(&mut self.logo_size, 2.0..=100.0);
+        memory::clamp(&mut self.opacity, 0.0..=100.0);
+        self.layout = self.layout.min(1);
+        self.anchor = self.anchor.min(8);
+        memory::clamp(&mut self.margin, 0.0..=25.0);
+        memory::clamp(&mut self.angle, -90.0..=90.0);
+        memory::clamp(&mut self.gap, 0.0..=50.0);
+        // The logo is read from its file again; one that is gone is forgotten.
+        if let Some(path) = self.logo_path.take() {
+            if !self.load_logo(&path) {
+                self.error = None;
+            }
+        }
+    }
+    /// Reset keeps the logo.
+    fn reset_to(&self) -> Self {
+        Watermark { logo_path: self.logo_path.clone(), ..Watermark::default() }
+    }
 }
 
 impl Default for Watermark {
@@ -260,6 +336,7 @@ impl Default for Watermark {
             angle: -30.0,
             gap: 8.0,
             shadow: true,
+            logo_path: None,
             logo: None,
             logo_name: String::new(),
             error: None,
@@ -299,10 +376,15 @@ impl Watermark {
         let Some(path) = rfd::FileDialog::new().set_title("Choose a watermark image").add_filter("Images", &["png", "webp", "gif", "bmp", "tif", "tiff", "jpg", "jpeg"]).pick_file() else {
             return false;
         };
-        match image::open(&path) {
+        self.load_logo(&path)
+    }
+
+    fn load_logo(&mut self, path: &Path) -> bool {
+        match image::open(path) {
             Ok(img) => {
                 self.logo = Some(Arc::new(img.to_rgba8()));
                 self.logo_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.logo_path = Some(path.to_path_buf());
                 self.error = None;
                 true
             }
@@ -380,11 +462,12 @@ impl EditTool for Watermark {
     }
     fn reset(&mut self) {
         let (logo, logo_name) = (self.logo.take(), std::mem::take(&mut self.logo_name));
-        *self = Watermark { logo, logo_name, ..Watermark::default() };
+        *self = Watermark { logo, logo_name, ..self.reset_to() };
     }
     fn can_apply(&self) -> bool {
         if self.kind == 1 { self.logo.is_some() } else { !self.text.trim().is_empty() }
     }
+    remember_methods!();
 }
 
 #[cfg(test)]
@@ -422,6 +505,48 @@ pub mod tests {
         assert!(!AddText::default().can_apply());
         let rot = AddText { text: "Your text here".into(), angle: 30.0, bg: true, outline: true, ..Default::default() };
         assert_eq!(rot.apply(&full, 1.0).dimensions(), (400, 300));
+    }
+
+    /// Add text comes back with its text and its font, remembered by name.
+    #[test]
+    fn text_round_trip_with_font_name() {
+        let last = txt::families().len() - 1;
+        let used = AddText { text: "Summer 2026".into(), family: last, italic: true, size: 12.5, anchor: 2, outline: true, ..Default::default() };
+        let v = used.remember().unwrap();
+        assert_eq!(v["font"], txt::families()[last].name.as_str());
+        let mut t = AddText::default();
+        t.recall(&v);
+        assert_eq!(t.remember(), Some(v));
+        assert_eq!((t.text.as_str(), t.family, t.italic, t.size, t.anchor), ("Summer 2026", last, true, 12.5, 2));
+        assert!(t.can_apply() && t.differs_from_defaults());
+        // A font that is not installed any more gives the first one.
+        let mut t = AddText::default();
+        t.recall(&serde_json::json!({"text": "x", "font": "No Such Font"}));
+        assert_eq!((t.text.as_str(), t.family), ("x", 0));
+    }
+
+    /// Watermark reads its logo from the remembered file; a file that is gone
+    /// leaves no logo (and no error). Reset keeps the logo.
+    #[test]
+    fn watermark_remembers_logo_file() {
+        let f = crate::edit::memory::tests::TempFile::new("logo");
+        let png = f.0.with_extension("png");
+        RgbaImage::from_pixel(6, 3, image::Rgba([255, 0, 0, 255])).save(&png).unwrap();
+        let mut used = Watermark { kind: 1, opacity: 80.0, layout: 1, angle: 15.0, ..Default::default() };
+        assert!(used.load_logo(&png));
+        let v = used.remember().unwrap();
+        let mut t = Watermark::default();
+        t.recall(&v);
+        assert_eq!(t.logo.as_ref().map(|l| l.dimensions()), Some((6, 3)));
+        assert_eq!((t.kind, t.opacity, t.layout, t.angle), (1, 80.0, 1, 15.0));
+        assert!(!t.logo_name.is_empty() && t.can_apply());
+        t.reset();
+        assert!(t.logo.is_some() && !t.differs_from_defaults());
+        std::fs::remove_file(&png).unwrap();
+        let mut t = Watermark::default();
+        t.recall(&v);
+        assert!(t.logo.is_none() && t.logo_path.is_none() && t.error.is_none());
+        assert_eq!(t.kind, 1);
     }
 
     #[test]

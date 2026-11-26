@@ -10,14 +10,24 @@ mod retouch;
 mod text;
 mod tone;
 
+use super::memory::{self, remember_methods, Remember};
 use super::{ops, EditTool, ToolUiCtx};
 use crate::ui::commands::Command;
 use crate::ui::theme::{self, size};
 use crate::ui::widgets;
 use egui::{Color32, Rect, Sense, Vec2};
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
+/// The tool for `cmd`, with the settings it was last applied with.
 pub fn make_tool(cmd: Command) -> Option<Box<dyn EditTool>> {
+    let mut tool = new_tool(cmd)?;
+    memory::recall_tool(tool.as_mut());
+    Some(tool)
+}
+
+/// The tool for `cmd` at its defaults.
+fn new_tool(cmd: Command) -> Option<Box<dyn EditTool>> {
     Some(match cmd {
         Command::AdjustColors => Box::new(AdjustColors::default()),
         Command::Resize => Box::new(geometry::Resize::default()),
@@ -440,7 +450,8 @@ pub fn mp(w: u32, h: u32) -> String {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AdjustColors {
     pub brightness: f32,
     pub contrast: f32,
@@ -460,6 +471,18 @@ pub struct AdjustColors {
 impl Default for AdjustColors {
     fn default() -> Self {
         AdjustColors { brightness: 0.0, contrast: 0.0, gamma: 1.0, saturation: 0.0, vibrance: 0.0, hue: 0.0, temperature: 0.0, tint: 0.0, exposure: 0.0, shadows: 0.0, highlights: 0.0 }
+    }
+}
+
+impl Remember for AdjustColors {
+    const KEY: &'static str = "adjust_colors";
+    fn recalled(&mut self) {
+        for v in [&mut self.brightness, &mut self.contrast, &mut self.saturation, &mut self.vibrance, &mut self.temperature, &mut self.tint, &mut self.shadows, &mut self.highlights] {
+            memory::clamp(v, -100.0..=100.0);
+        }
+        memory::clamp(&mut self.exposure, -3.0..=3.0);
+        memory::clamp(&mut self.gamma, 0.25..=4.0);
+        memory::clamp(&mut self.hue, -180.0..=180.0);
     }
 }
 
@@ -554,6 +577,7 @@ impl EditTool for AdjustColors {
     fn can_apply(&self) -> bool {
         *self != Self::default()
     }
+    remember_methods!();
 }
 
 #[cfg(test)]
@@ -581,26 +605,28 @@ mod tests {
         save("motion", &filter::Blur::sample().apply(&img, 1.0));
     }
 
+    /// Every tool `make_tool` builds.
+    const ALL_CMDS: [Command; 12] = [
+        Command::AdjustColors,
+        Command::Resize,
+        Command::CanvasSize,
+        Command::FreeRotate,
+        Command::AddBorder,
+        Command::Levels,
+        Command::Curves,
+        Command::Sharpen,
+        Command::Blur,
+        Command::Effects,
+        Command::AddText,
+        Command::Watermark,
+    ];
+
     /// Every registered tool, at default parameters, must not panic on tiny
     /// images and must keep the size when it says it does.
     #[test]
     fn all_tools_defaults_safe() {
-        let cmds = [
-            Command::AdjustColors,
-            Command::Resize,
-            Command::CanvasSize,
-            Command::FreeRotate,
-            Command::AddBorder,
-            Command::Levels,
-            Command::Curves,
-            Command::Sharpen,
-            Command::Blur,
-            Command::Effects,
-            Command::AddText,
-            Command::Watermark,
-        ];
-        for cmd in cmds {
-            let tool = make_tool(cmd).expect("tool registered");
+        for cmd in ALL_CMDS {
+            let tool = new_tool(cmd).expect("tool registered");
             for (w, h) in [(1, 1), (3, 2), (40, 25)] {
                 let img = RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x * 9) as u8, (y * 5) as u8, 77, 255]));
                 for scale in [1.0, 0.25] {
@@ -623,13 +649,76 @@ mod tests {
     #[test]
     fn apply_needs_a_change() {
         for cmd in [Command::AdjustColors, Command::Resize, Command::CanvasSize, Command::FreeRotate, Command::Levels, Command::Curves, Command::Effects, Command::AddText] {
-            assert!(!make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
+            assert!(!new_tool(cmd).unwrap().can_apply(), "{cmd:?}");
         }
         for cmd in [Command::Sharpen, Command::Blur, Command::AddBorder, Command::Watermark] {
-            assert!(make_tool(cmd).unwrap().can_apply(), "{cmd:?}");
+            assert!(new_tool(cmd).unwrap().can_apply(), "{cmd:?}");
         }
         let changed = AdjustColors { gamma: 1.2, ..Default::default() };
         assert!(changed.can_apply());
+    }
+
+    /// Every tool remembers its settings under a key of its own; what a tool
+    /// at its defaults remembers reads back as the defaults, with nothing for
+    /// Reset to do.
+    #[test]
+    fn every_tool_remembers() {
+        let mut keys = std::collections::HashSet::new();
+        for cmd in ALL_CMDS {
+            let t = new_tool(cmd).unwrap();
+            let key = t.memory_key().unwrap_or_else(|| panic!("{cmd:?} remembers nothing"));
+            assert!(keys.insert(key), "{key} used twice");
+            let v = t.remember().unwrap_or_else(|| panic!("{cmd:?}"));
+            assert!(v.is_object(), "{cmd:?}");
+            assert!(!t.differs_from_defaults(), "{cmd:?}");
+            let mut back = new_tool(cmd).unwrap();
+            back.recall(&v);
+            assert_eq!(back.remember(), Some(v), "{cmd:?}");
+        }
+        assert!(!keys.contains("save_as"), "Save as has its own entry");
+    }
+
+    /// Adjust colors opens with the values it was applied with (through the
+    /// file); Reset goes back to the defaults.
+    #[test]
+    fn adjust_colors_round_trip_through_file() {
+        let f = memory::tests::TempFile::new("adjust-colors");
+        let used = AdjustColors { exposure: 0.5, gamma: 1.4, hue: -20.0, shadows: 30.0, ..Default::default() };
+        memory::store(&f.0, AdjustColors::KEY, used.remember().unwrap()).unwrap();
+        let mut t = new_tool(Command::AdjustColors).unwrap();
+        memory::recall_from(t.as_mut(), &memory::load(&f.0));
+        assert_eq!(t.remember(), used.remember());
+        assert!(t.differs_from_defaults());
+        assert!(t.can_apply());
+        t.reset();
+        assert_eq!(t.remember(), AdjustColors::default().remember());
+        assert!(!t.differs_from_defaults());
+    }
+
+    /// A corrupt tools.json, or a value of the wrong shape, opens every tool
+    /// at its defaults; numbers out of range are limited to the controls.
+    #[test]
+    fn corrupt_memory_gives_defaults() {
+        let f = memory::tests::TempFile::new("corrupt-tools");
+        std::fs::write(&f.0, "{\"adjust_colors\": {\"gamma\": 2.0,").unwrap();
+        let all = memory::load(&f.0);
+        assert!(all.is_empty());
+        for cmd in ALL_CMDS {
+            let mut t = new_tool(cmd).unwrap();
+            let before = t.remember();
+            memory::recall_from(t.as_mut(), &all);
+            assert_eq!(t.remember(), before, "{cmd:?}");
+            for junk in [serde_json::json!("text"), serde_json::Value::Null, serde_json::json!(42), serde_json::json!({"mode": "x", "kind": -1, "angle": "steep", "text": 5})] {
+                t.recall(&junk);
+                assert_eq!(t.remember(), before, "{cmd:?} {junk}");
+            }
+        }
+        let mut t = new_tool(Command::AdjustColors).unwrap();
+        t.recall(&serde_json::json!({"brightness": 1e9, "gamma": 0.0, "hue": -1e30}));
+        let v = t.remember().unwrap();
+        assert_eq!(v["brightness"], 100.0);
+        assert_eq!(v["gamma"], 0.25);
+        assert_eq!(v["hue"], -180.0);
     }
 
     #[test]

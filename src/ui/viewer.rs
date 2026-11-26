@@ -2047,7 +2047,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             }
         }
         let busy = t.running.is_some() || t.final_rx.is_some() || t.base_rx.is_some();
-        if tool_header(ui, &p, &t.tool.title(), busy, &t.hints, t.touched) {
+        if tool_header(ui, &p, &t.tool.title(), busy, &t.hints, t.touched || t.tool.differs_from_defaults()) {
             t.tool.reset();
             t.version += 1;
             t.touched = false;
@@ -2144,6 +2144,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             match rx.try_recv() {
                 Ok(img) => {
                     let title = t.tool.title();
+                    crate::edit::memory::remember_tool(&*t.tool);
                     self.tool = None;
                     let mut resized = false;
                     if let Some(sess) = self.ensure_edit(core) {

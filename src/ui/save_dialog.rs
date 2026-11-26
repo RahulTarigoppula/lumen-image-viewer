@@ -6,10 +6,70 @@ use crossbeam_channel::Receiver;
 use super::icons as I;
 use super::theme::{self, size, text};
 use super::widgets;
+use crate::edit::memory;
 use egui::{RichText, Vec2};
 use image::RgbaImage;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Entry of the last-used choices in `tools.json`.
+const MEMORY_KEY: &str = "save_as";
+
+/// What Save as remembers between uses: the format and its options, and the
+/// folder when it was not the image's own (saving next to the image keeps
+/// doing that). The JPEG quality is kept in the settings, which other saves use too.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct LastUsed {
+    /// `None`: the format of the image being saved.
+    format: Option<SaveFormat>,
+    jpeg_progressive: bool,
+    jpeg_chroma: Chroma,
+    webp_quality: f32,
+    webp_lossless: bool,
+    png_best_compression: bool,
+    /// `None`: the folder of the image being saved.
+    folder: Option<PathBuf>,
+}
+
+impl Default for LastUsed {
+    fn default() -> Self {
+        let o = SaveOptions::default();
+        LastUsed { format: None, jpeg_progressive: o.jpeg_progressive, jpeg_chroma: o.jpeg_chroma, webp_quality: o.webp_quality, webp_lossless: o.webp_lossless, png_best_compression: o.png_best_compression, folder: None }
+    }
+}
+
+impl LastUsed {
+    /// The remembered choices; the defaults when there are none or they do not fit.
+    fn load() -> Self {
+        memory::get(MEMORY_KEY).and_then(|v| memory::from_value(&v)).unwrap_or_default()
+    }
+
+    /// The choices of `dlg` as it saves.
+    fn of(dlg: &SaveDialog) -> Self {
+        let o = &dlg.opts;
+        // Windows paths: the same folder whatever the case.
+        let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+        let own = dlg.original.parent().map(lower);
+        let folder = dlg.path.parent().filter(|&f| Some(lower(f)) != own).map(Path::to_path_buf);
+        LastUsed { format: Some(o.format), jpeg_progressive: o.jpeg_progressive, jpeg_chroma: o.jpeg_chroma, webp_quality: o.webp_quality, webp_lossless: o.webp_lossless, png_best_compression: o.png_best_compression, folder }
+    }
+
+    /// Put the choices into `opts`; the remembered folder if it is still there.
+    fn apply(self, opts: &mut SaveOptions) -> Option<PathBuf> {
+        if let Some(f) = self.format {
+            opts.format = f;
+        }
+        opts.jpeg_progressive = self.jpeg_progressive;
+        opts.jpeg_chroma = self.jpeg_chroma;
+        opts.webp_quality = self.webp_quality;
+        memory::clamp(&mut opts.webp_quality, 1.0..=100.0);
+        opts.webp_lossless = self.webp_lossless;
+        opts.png_best_compression = self.png_best_compression;
+        self.folder.filter(|d| d.is_dir())
+    }
+}
 
 pub struct SaveDialog {
     pub path: PathBuf,
@@ -37,12 +97,21 @@ pub enum SaveOutcome {
 }
 
 impl SaveDialog {
-    pub fn new(path: PathBuf, image: Arc<RgbaImage>, mut opts: SaveOptions) -> Self {
+    /// Opens with the format, options and folder used last time.
+    pub fn new(path: PathBuf, image: Arc<RgbaImage>, opts: SaveOptions) -> Self {
+        Self::with_last_used(path, image, opts, LastUsed::load())
+    }
+
+    fn with_last_used(path: PathBuf, image: Arc<RgbaImage>, mut opts: SaveOptions, last: LastUsed) -> Self {
         if let Some(f) = SaveFormat::from_ext(&crate::formats::ext_of(&path)) {
             opts.format = f;
         }
         let original = path.clone();
-        let path = path.with_extension(opts.format.ext());
+        let folder = last.apply(&mut opts);
+        let mut path = path.with_extension(opts.format.ext());
+        if let (Some(dir), Some(name)) = (folder, path.file_name().map(|n| n.to_os_string())) {
+            path = dir.join(name);
+        }
         SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false, focused: false, name: String::new() }.with_name()
     }
 
@@ -273,9 +342,58 @@ impl SaveDialog {
             if self.overwrites_other() && !self.confirm_replace {
                 self.confirm_replace = true;
             } else {
+                if let Some(v) = memory::to_value(&LastUsed::of(self)) {
+                    memory::set(MEMORY_KEY, v);
+                }
                 out = SaveOutcome::Save(self.path.clone(), self.opts.clone());
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image() -> Arc<RgbaImage> {
+        Arc::new(RgbaImage::new(2, 2))
+    }
+
+    #[test]
+    fn first_use_keeps_the_image_format_and_folder() {
+        let p = std::env::temp_dir().join("photo.png");
+        let d = SaveDialog::with_last_used(p.clone(), image(), SaveOptions::default(), LastUsed::default());
+        assert_eq!(d.path, p);
+        assert_eq!(d.opts.format, SaveFormat::Png);
+        assert_eq!(d.name, "photo.png");
+    }
+
+    /// The next Save as opens with the format, options and other folder used;
+    /// saving next to the image remembers no folder.
+    #[test]
+    fn remembers_format_options_and_folder() {
+        let own = std::env::temp_dir();
+        let other = own.join(format!("lumen-test-{}-exports", std::process::id()));
+        std::fs::create_dir_all(&other).unwrap();
+        let mut d = SaveDialog::with_last_used(own.join("photo.jpg"), image(), SaveOptions::default(), LastUsed::default());
+        d.opts.format = SaveFormat::WebP;
+        d.opts.webp_quality = 70.0;
+        d.opts.webp_lossless = false;
+        d.path = other.join("photo.webp");
+        let last: LastUsed = memory::from_value(&memory::to_value(&LastUsed::of(&d)).unwrap()).unwrap();
+        let next = SaveDialog::with_last_used(own.join("next.jpg"), image(), SaveOptions::default(), last);
+        assert_eq!(next.opts.format, SaveFormat::WebP);
+        assert_eq!(next.opts.webp_quality, 70.0);
+        assert_eq!(next.path, other.join("next.webp"));
+        assert_eq!(next.original, own.join("next.jpg"));
+        let mut d = next;
+        d.path = own.join("next.webp");
+        assert!(LastUsed::of(&d).folder.is_none());
+        // A remembered folder that is gone is not used.
+        let gone = LastUsed { folder: Some(other.join("gone")), format: Some(SaveFormat::Png), ..Default::default() };
+        let d = SaveDialog::with_last_used(own.join("a.jpg"), image(), SaveOptions::default(), gone);
+        assert_eq!(d.path, own.join("a.png"));
+        let _ = std::fs::remove_dir(&other);
     }
 }

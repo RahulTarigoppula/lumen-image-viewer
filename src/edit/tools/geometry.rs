@@ -3,10 +3,12 @@
 use super::{anchor_grid, color_button, color_presets, color_row, combo, drag_px, hint, indented, info, mp, row, section, section_toggle, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
 use crate::edit::geom::{self, clamp_dim, BorderSpec, MAX_DIM};
+use crate::edit::memory::{self, remember_methods, Remember};
 use crate::edit::{EditTool, ToolUiCtx};
 use crate::imaging::Filter;
 use crate::ui::icons as I;
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
 fn src_size(src: (u32, u32), img: &RgbaImage, scale: f32) -> (f64, f64) {
     if src.0 > 0 && src.1 > 0 {
@@ -19,16 +21,31 @@ fn src_size(src: (u32, u32), img: &RgbaImage, scale: f32) -> (f64, f64) {
 
 // ---------------------------------------------------------------- Resize
 
-#[derive(Clone)]
+/// Remembers the mode, percentage, aspect lock and filter; the pixel size
+/// starts from the image's own each time.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Resize {
     /// 0 = pixels, 1 = percent
     mode: usize,
+    #[serde(skip)]
     w: i64,
+    #[serde(skip)]
     h: i64,
     pct: f32,
     lock: bool,
     filter: usize,
+    #[serde(skip)]
     src: (u32, u32),
+}
+
+impl Remember for Resize {
+    const KEY: &'static str = "resize";
+    fn recalled(&mut self) {
+        self.mode = self.mode.min(1);
+        memory::clamp(&mut self.pct, 1.0..=400.0);
+        self.filter = self.filter.min(Filter::ALL.len() - 1);
+    }
 }
 
 impl Default for Resize {
@@ -155,21 +172,40 @@ impl EditTool for Resize {
     fn can_apply(&self) -> bool {
         self.src.0 > 0 && self.w > 0 && self.target() != self.src
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Canvas size
 
-#[derive(Clone)]
+/// Remembers the mode, margins, anchor and fill; the new size starts from
+/// the image's own each time.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CanvasSize {
     /// 0 = absolute size, 1 = margins
     mode: usize,
+    #[serde(skip)]
     w: i64,
+    #[serde(skip)]
     h: i64,
     /// top, right, bottom, left
     margins: [i64; 4],
     anchor: u8,
     fill: [u8; 4],
+    #[serde(skip)]
     src: (u32, u32),
+}
+
+impl Remember for CanvasSize {
+    const KEY: &'static str = "canvas_size";
+    fn recalled(&mut self) {
+        self.mode = self.mode.min(1);
+        self.anchor = self.anchor.min(8);
+        let lim = MAX_DIM as i64 / 2;
+        for m in &mut self.margins {
+            *m = (*m).clamp(-lim, lim);
+        }
+    }
 }
 
 impl Default for CanvasSize {
@@ -295,18 +331,32 @@ impl EditTool for CanvasSize {
             self.src.0 > 0 && (self.w, self.h) != (self.src.0 as i64, self.src.1 as i64)
         }
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Free rotate
 
-#[derive(Clone)]
+/// Remembers the angle, the corner mode and the background; quarter turns
+/// start at none each time.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FreeRotate {
     angle: f32,
+    #[serde(skip)]
     quarter: i32,
     /// 0 = auto-crop, 1 = expand canvas
     mode: usize,
     bg: [u8; 4],
+    #[serde(skip)]
     src: (u32, u32),
+}
+
+impl Remember for FreeRotate {
+    const KEY: &'static str = "free_rotate";
+    fn recalled(&mut self) {
+        memory::clamp(&mut self.angle, -45.0..=45.0);
+        self.mode = self.mode.min(1);
+    }
 }
 
 impl Default for FreeRotate {
@@ -396,11 +446,13 @@ impl EditTool for FreeRotate {
     fn can_apply(&self) -> bool {
         self.angle.abs() >= 1e-4 || self.quarter.rem_euclid(4) != 0
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Border / frame
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AddBorder {
     /// 0 = pixels, 1 = percent of the short side
     unit: usize,
@@ -417,7 +469,22 @@ pub struct AddBorder {
     shadow_offset: f32,
     shadow_opacity: f32,
     shadow_bg: [u8; 4],
+    #[serde(skip)]
     src: (u32, u32),
+}
+
+impl Remember for AddBorder {
+    const KEY: &'static str = "add_border";
+    fn recalled(&mut self) {
+        self.unit = self.unit.min(1);
+        memory::clamp(&mut self.width_px, 0.0..=1000.0);
+        memory::clamp(&mut self.width_pct, 0.0..=25.0);
+        memory::clamp(&mut self.radius, 0.0..=1000.0);
+        memory::clamp(&mut self.line_w, 0.5..=50.0);
+        memory::clamp(&mut self.shadow_blur, 0.0..=300.0);
+        memory::clamp(&mut self.shadow_offset, 0.0..=300.0);
+        memory::clamp(&mut self.shadow_opacity, 0.0..=100.0);
+    }
 }
 
 impl Default for AddBorder {
@@ -532,6 +599,7 @@ impl EditTool for AddBorder {
         let width = if self.unit == 1 { self.width_pct } else { self.width_px };
         width > 0.0 || self.radius > 0.0 || self.line || self.shadow
     }
+    remember_methods!();
 }
 
 #[cfg(test)]
@@ -591,6 +659,40 @@ pub mod tests {
         assert_eq!(q.apply(&full, 1.0).dimensions(), (40, 60));
         let e = FreeRotate { angle: 5.0, mode: 1, ..Default::default() };
         assert!(e.apply(&full, 1.0).width() > 60);
+    }
+
+    /// Resize remembers how it was used but not the size it made: the pixel
+    /// size and the source come from the next image.
+    #[test]
+    fn resize_remembers_choices_not_sizes() {
+        let used = Resize { mode: 1, pct: 50.0, lock: false, filter: 2, w: 640, h: 480, src: (1280, 960) };
+        let v = used.remember().unwrap();
+        assert!(v.get("w").is_none() && v.get("src").is_none(), "{v}");
+        let mut t = Resize::default();
+        t.recall(&v);
+        assert_eq!((t.mode, t.pct, t.lock, t.filter), (1, 50.0, false, 2));
+        assert_eq!((t.w, t.h, t.src), (0, 0, (0, 0)));
+        assert!(t.differs_from_defaults());
+        t.reset();
+        assert!(!t.differs_from_defaults());
+    }
+
+    #[test]
+    fn border_canvas_rotate_round_trip() {
+        let used = AddBorder { unit: 0, width_px: 25.0, color: [10, 20, 30, 255], polaroid: true, shadow: true, shadow_opacity: 70.0, src: (300, 200), ..Default::default() };
+        let mut t = AddBorder::default();
+        t.recall(&used.remember().unwrap());
+        assert_eq!(t.remember(), used.remember());
+        assert_eq!(t.src, (0, 0));
+        let c = CanvasSize { mode: 1, margins: [5, 6, 7, 8], anchor: 2, fill: [0, 0, 0, 0], w: 99, h: 98, src: (90, 80) };
+        let mut t = CanvasSize::default();
+        t.recall(&c.remember().unwrap());
+        assert_eq!((t.mode, t.margins, t.anchor, t.fill), (1, [5, 6, 7, 8], 2, [0, 0, 0, 0]));
+        assert_eq!((t.w, t.h, t.src), (0, 0, (0, 0)));
+        let r = FreeRotate { angle: 2.5, quarter: 1, mode: 1, bg: [1, 2, 3, 255], src: (5, 5) };
+        let mut t = FreeRotate::default();
+        t.recall(&r.remember().unwrap());
+        assert_eq!((t.angle, t.quarter, t.mode, t.bg), (2.5, 0, 1, [1, 2, 3, 255]));
     }
 
     #[test]

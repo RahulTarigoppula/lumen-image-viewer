@@ -2,10 +2,12 @@
 
 use super::{combo, hint, info, paint_histogram, row, segmented, section, tipped};
 use crate::ui::widgets;
+use crate::edit::memory::{self, remember_methods, Remember};
 use crate::edit::tone::{self, LevelsParams, CHANNEL_NAMES};
 use crate::edit::{EditTool, Histogram, ToolUiCtx};
 use egui::{pos2, vec2, Color32, Pos2, Rect, Sense, Shape, Stroke};
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
 fn channel_color(ch: usize, dark: bool) -> Color32 {
     match ch {
@@ -50,12 +52,49 @@ fn triangle(painter: &egui::Painter, x: f32, top: f32, fill: Color32, stroke: Co
 
 // ---------------------------------------------------------------- Levels
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Levels {
     ch: usize,
+    #[serde(with = "levels_params")]
     p: [LevelsParams; 4],
     /// Handle being dragged: 0 black, 1 gamma, 2 white, 3 out black, 4 out white.
+    #[serde(skip)]
     drag: Option<u8>,
+}
+
+/// [`LevelsParams`] (lumen-core, no serde) as `[in black, in white, gamma,
+/// out black, out white]` per channel.
+mod levels_params {
+    use crate::edit::tone::LevelsParams;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(p: &[LevelsParams; 4], s: S) -> Result<S::Ok, S::Error> {
+        let p: [LevelsParams; 4] = *p;
+        p.map(|q| [q.in_black, q.in_white, q.gamma, q.out_black, q.out_white]).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[LevelsParams; 4], D::Error> {
+        let a = <[[f32; 5]; 4]>::deserialize(d)?;
+        Ok(a.map(|[in_black, in_white, gamma, out_black, out_white]| LevelsParams { in_black, in_white, gamma, out_black, out_white }))
+    }
+}
+
+impl Remember for Levels {
+    const KEY: &'static str = "levels";
+    fn recalled(&mut self) {
+        self.ch = self.ch.min(3);
+        for p in &mut self.p {
+            memory::clamp(&mut p.in_black, 0.0..=253.0);
+            memory::clamp(&mut p.in_white, 2.0..=255.0);
+            if p.in_white < p.in_black + 2.0 {
+                p.in_white = p.in_black + 2.0;
+            }
+            memory::clamp(&mut p.gamma, 0.1..=9.99);
+            memory::clamp(&mut p.out_black, 0.0..=255.0);
+            memory::clamp(&mut p.out_white, 0.0..=255.0);
+        }
+    }
 }
 
 impl Levels {
@@ -210,15 +249,36 @@ impl EditTool for Levels {
     fn can_apply(&self) -> bool {
         self.p != [LevelsParams::default(); 4]
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Curves
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Curves {
     ch: usize,
     pts: [Vec<[f32; 2]>; 4],
+    #[serde(skip)]
     drag: Option<usize>,
+}
+
+impl Remember for Curves {
+    const KEY: &'static str = "curves";
+    fn recalled(&mut self) {
+        self.ch = self.ch.min(3);
+        for pts in &mut self.pts {
+            for q in pts.iter_mut() {
+                memory::clamp(&mut q[0], 0.0..=1.0);
+                memory::clamp(&mut q[1], 0.0..=1.0);
+            }
+            pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            // The graph needs both ends; a curve that does not fit starts straight.
+            if !(2..=64).contains(&pts.len()) {
+                *pts = tone::identity_curve();
+            }
+        }
+    }
 }
 
 impl Default for Curves {
@@ -368,6 +428,7 @@ impl EditTool for Curves {
         // Points on the diagonal leave the image as it is.
         self.pts.iter().flatten().any(|[x, y]| (x - y).abs() > 1e-3)
     }
+    remember_methods!();
 }
 
 #[cfg(test)]
@@ -392,6 +453,29 @@ pub mod tests {
         let out = t.apply(&img, 1.0);
         assert!(out.pixels().any(|p| p[0] > 250));
         assert!(out.pixels().any(|p| p[0] < 5));
+    }
+
+    #[test]
+    fn levels_and_curves_round_trip() {
+        let mut lv = Levels { ch: 2, ..Default::default() };
+        lv.p[0] = LevelsParams { in_black: 12.0, in_white: 240.0, gamma: 1.3, out_black: 5.0, out_white: 250.0 };
+        lv.p[3].gamma = 0.8;
+        let mut t = Levels::default();
+        t.recall(&lv.remember().unwrap());
+        assert_eq!(t.ch, 2);
+        assert_eq!(t.p, lv.p);
+        assert!(t.differs_from_defaults() && t.can_apply());
+
+        let cv = Curves::sample();
+        let mut t = Curves::default();
+        t.recall(&cv.remember().unwrap());
+        assert_eq!(t.pts, cv.pts);
+        assert!(t.differs_from_defaults() && t.can_apply());
+        // Points out of order or range are put right; too few starts straight.
+        t.recall(&serde_json::json!({"ch": 9, "pts": [[[1.0, 1.0], [0.0, -3.0]], [[0.5, 0.5]], [], []]}));
+        assert_eq!(t.ch, 3);
+        assert_eq!(t.pts[0], vec![[0.0, 0.0], [1.0, 1.0]]);
+        assert_eq!(t.pts[1], tone::identity_curve());
     }
 
     #[test]

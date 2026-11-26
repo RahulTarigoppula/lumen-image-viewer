@@ -2,9 +2,11 @@
 
 use super::{color_row, combo, hint, info, row, section, segmented_tips, slider, slider_ex, tipped};
 use crate::ui::widgets;
+use crate::edit::memory::{self, remember_methods, Remember};
 use crate::edit::{effects as fx, filters, EditTool, ToolUiCtx};
 use egui::{vec2, Color32, Sense, Stroke};
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
 /// Spatial radius for a render at `scale` (preview size / full size). Kernels
 /// treat sigma < 0.2 as a no-op, so on a downscaled preview tiny radii are
@@ -38,7 +40,8 @@ fn fine_detail_note(ui: &mut egui::Ui, cx: &ToolUiCtx, radius: f32) {
 
 // ---------------------------------------------------------------- Sharpen
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sharpen {
     amount: f32,
     radius: f32,
@@ -48,6 +51,15 @@ pub struct Sharpen {
 impl Default for Sharpen {
     fn default() -> Self {
         Sharpen { amount: 80.0, radius: 1.0, threshold: 2.0 }
+    }
+}
+
+impl Remember for Sharpen {
+    const KEY: &'static str = "sharpen";
+    fn recalled(&mut self) {
+        memory::clamp(&mut self.amount, 0.0..=500.0);
+        memory::clamp(&mut self.radius, 0.1..=100.0);
+        memory::clamp(&mut self.threshold, 0.0..=255.0);
     }
 }
 
@@ -93,11 +105,13 @@ impl EditTool for Sharpen {
     fn can_apply(&self) -> bool {
         self.amount > 0.0
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Blur
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Blur {
     /// 0 Gaussian, 1 Box, 2 Motion, 3 Surface
     mode: usize,
@@ -110,6 +124,17 @@ pub struct Blur {
 impl Default for Blur {
     fn default() -> Self {
         Blur { mode: 0, radius: 4.0, angle: 0.0, distance: 30.0, threshold: 25.0 }
+    }
+}
+
+impl Remember for Blur {
+    const KEY: &'static str = "blur";
+    fn recalled(&mut self) {
+        self.mode = self.mode.min(3);
+        memory::clamp(&mut self.radius, 0.1..=250.0);
+        memory::clamp(&mut self.angle, -180.0..=180.0);
+        memory::clamp(&mut self.distance, 1.0..=500.0);
+        memory::clamp(&mut self.threshold, 1.0..=100.0);
     }
 }
 
@@ -168,6 +193,7 @@ impl EditTool for Blur {
     fn reset(&mut self) {
         *self = Blur::default();
     }
+    remember_methods!();
 }
 
 // ---------------------------------------------------------------- Effects
@@ -212,7 +238,9 @@ const NO_EFFECT: usize = usize::MAX;
 
 const BW_FILTERS: [&str; 6] = ["Neutral", "Red", "Orange", "Yellow", "Green", "Blue"];
 
-#[derive(Clone)]
+/// Remembers the effect picked and every setting.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Effects {
     kind: usize,
     strength: f32,
@@ -230,7 +258,30 @@ pub struct Effects {
     bw: usize,
     dark: [u8; 4],
     light: [u8; 4],
+    #[serde(skip)]
     thumbs: Option<Vec<egui::TextureHandle>>,
+}
+
+impl Remember for Effects {
+    const KEY: &'static str = "effects";
+    fn recalled(&mut self) {
+        if self.kind >= EFFECTS.len() {
+            self.kind = NO_EFFECT;
+        }
+        memory::clamp(&mut self.strength, 0.0..=100.0);
+        memory::clamp(&mut self.levels, 2.0..=16.0);
+        memory::clamp(&mut self.threshold, 0.0..=255.0);
+        memory::clamp(&mut self.depth, 0.5..=20.0);
+        memory::clamp(&mut self.oil_radius, 1.0..=16.0);
+        memory::clamp(&mut self.block, 2.0..=200.0);
+        memory::clamp(&mut self.vig_mid, 0.0..=1.0);
+        memory::clamp(&mut self.vig_feather, 0.05..=1.0);
+        memory::clamp(&mut self.grain_size, 1.0..=8.0);
+        self.grain_seed = self.grain_seed.min(9999);
+        self.nr_radius = self.nr_radius.min(1);
+        memory::clamp(&mut self.nr_smooth, 0.0..=6.0);
+        self.bw = self.bw.min(BW_FILTERS.len() - 1);
+    }
 }
 
 impl Default for Effects {
@@ -450,6 +501,7 @@ impl EditTool for Effects {
     fn can_apply(&self) -> bool {
         self.kind != NO_EFFECT
     }
+    remember_methods!();
 }
 
 #[cfg(test)]
@@ -497,6 +549,31 @@ pub mod tests {
         assert_ne!(s.apply(&img, 0.28), img, "preview must show something");
         assert_eq!(scaled_radius(0.5, 1.0), 0.5);
         assert_eq!(scaled_radius(0.1, 0.25), 0.025);
+    }
+
+    #[test]
+    fn filters_round_trip() {
+        let used = Effects { kind: 13, strength: 60.0, dark: [1, 2, 3, 255], light: [200, 210, 220, 255], grain_seed: 77, ..Default::default() };
+        let mut t = Effects::default();
+        t.recall(&used.remember().unwrap());
+        assert_eq!(t.remember(), used.remember());
+        assert!(t.can_apply() && t.differs_from_defaults());
+        assert!(t.thumbs.is_none());
+        // An effect that does not exist (any more) opens with none picked.
+        t.recall(&serde_json::json!({"kind": 99, "bw": 40}));
+        assert_eq!((t.kind, t.bw), (NO_EFFECT, BW_FILTERS.len() - 1));
+        assert!(!t.can_apply());
+
+        let s = Sharpen { amount: 150.0, radius: 0.7, threshold: 4.0 };
+        let mut t = Sharpen::default();
+        t.recall(&s.remember().unwrap());
+        assert_eq!((t.amount, t.radius, t.threshold), (150.0, 0.7, 4.0));
+        let b = Blur::sample();
+        let mut t = Blur::default();
+        t.recall(&b.remember().unwrap());
+        assert_eq!((t.mode, t.angle, t.distance), (2, 20.0, 60.0));
+        t.reset();
+        assert!(!t.differs_from_defaults());
     }
 
     #[test]
