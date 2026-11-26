@@ -25,12 +25,23 @@
 - Past the last image a notice appears; pressing again opens the next folder with pictures.
 - Copy text in image (Ctrl+T): reads the text with OCR and puts it on the clipboard.
 - Ctrl+V saves the clipboard picture as a new PNG next to the current one instead of replacing its pixels.
+- Edit tools (Resize, Canvas, Border, Rotate, Levels, Curves, Sharpen, Blur, Effects, Adjust colors, Text,
+  Watermark) open with the values used last time; Reset goes back to the defaults. Save as remembers the format,
+  its options and the folder.
 
 ### General
 - A welcome card on first start: FastStone-compatible keys and what the mouse wheel does.
 - The window size is remembered between runs.
 
 ### Stability and speed
+- Saving in place asks first when the file changed on disk since it was opened (e.g. edited in another program);
+  undoing a rotation skips files changed since.
+- Moves copy and delete only across drives (a locked file is no longer duplicated); copies are written under a
+  temporary name and renamed into place when complete, so quitting never leaves a half-written file.
+- Deleting on a network or removable drive (no Recycle Bin) is confirmed and reported as permanent.
+- Batch convert with Overwrite skips animated, multi-page and high bit depth originals instead of flattening them;
+  batch rename keeps one recovery journal per run.
+- Slideshow with subfolders searches in the background; rotating lossless WebP in the browser stays lossless.
 - A damaged color label in the tags file no longer crashes the browser.
 - The folder is checked for changes on a background thread, and the Move / Copy dialog no longer checks every
   recent folder on every frame (offline network drives froze the app).
