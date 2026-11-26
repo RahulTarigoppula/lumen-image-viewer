@@ -24,6 +24,8 @@ use crate::settings::FitMode;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- transitions
@@ -488,6 +490,90 @@ fn fmt_secs(v: f32) -> String {
     }
 }
 
+// ------------------------------------------------------------ subfolders
+
+/// Limits of the "include subfolders" walk: it runs off the UI thread, but a
+/// slideshow started at the top of a huge tree (a whole drive, a NAS share)
+/// must still not search for minutes.
+const WALK_MAX_IMAGES: usize = 50_000;
+const WALK_MAX_FOLDERS: usize = 20_000;
+const WALK_MAX_TIME: Duration = Duration::from_secs(20);
+
+/// Image files under `dir`, its subfolders included. Stops (the bool is
+/// true) after `max_images` images or `max_folders` folders, at `deadline`
+/// or when `cancel` is set.
+fn walk_images(dir: &Path, max_images: usize, max_folders: usize, deadline: Instant, cancel: &AtomicBool) -> (Vec<PathBuf>, bool) {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut folders = 0;
+    while let Some(d) = stack.pop() {
+        if folders >= max_folders || Instant::now() >= deadline || cancel.load(Ordering::Relaxed) {
+            return (out, true);
+        }
+        folders += 1;
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for item in rd.flatten() {
+            let Ok(ft) = item.file_type() else { continue };
+            let path = item.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if crate::formats::is_image_path(&path) {
+                out.push(path);
+                if out.len() >= max_images {
+                    return (out, true);
+                }
+            }
+        }
+    }
+    (out, false)
+}
+
+/// `base` (the folder's pictures in the browser's order) followed by the
+/// pictures of its subfolders from `all`, by folder and then by name. None
+/// when `base` is a hand-picked selection (fewer pictures than the folder
+/// holds) or the subfolders add nothing.
+fn merge_subfolders(base: &[PathBuf], mut all: Vec<PathBuf>, dir: &Path) -> Option<Vec<PathBuf>> {
+    let direct = all.iter().filter(|p| p.parent() == Some(dir)).count();
+    if base.len() < direct || all.len() <= base.len() {
+        return None;
+    }
+    all.sort_by(|a, b| {
+        let da = a.parent().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let db = b.parent().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
+        (a.parent() != Some(dir))
+            .cmp(&(b.parent() != Some(dir)))
+            .then_with(|| crate::catalog::natural_cmp(&da, &db))
+            .then_with(|| crate::catalog::natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()))
+    });
+    let mut merged = base.to_vec();
+    merged.extend(all.into_iter().filter(|p| p.parent() != Some(dir)));
+    Some(merged)
+}
+
+/// What the background walk found.
+struct FolderWalk {
+    dir: PathBuf,
+    images: Vec<PathBuf>,
+    /// A limit stopped the walk before it saw every subfolder.
+    truncated: bool,
+}
+
+/// The subfolder walk in progress ("Finding images..." on screen).
+struct SubfolderScan {
+    rx: crossbeam_channel::Receiver<FolderWalk>,
+    cancel: Arc<AtomicBool>,
+    /// Say how many pictures the slideshow has once the walk lands (the user
+    /// just turned the option on).
+    announce: bool,
+}
+
+impl Drop for SubfolderScan {
+    /// Leaving the slideshow (or turning the option off) stops the walk.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------- slideshow
 
 struct Slide {
@@ -537,6 +623,8 @@ pub struct Slideshow {
     popup_was_open: bool,
     pending_since: Instant,
     exit_requested: bool,
+    /// Searching the subfolders in the background ("include subfolders").
+    scan: Option<SubfolderScan>,
 }
 
 impl Slideshow {
@@ -573,40 +661,88 @@ impl Slideshow {
             popup_was_open: false,
             pending_since: Instant::now(),
             exit_requested: false,
+            scan: None,
         };
         if core.settings.slideshow.include_subfolders {
-            s.rebuild_list(true, start_path.as_deref());
+            // The folder's own pictures play while the subfolders are searched.
+            s.rebuild_list(true, start_path.as_deref(), &core.ctx, false, false);
         }
         s.reorder(core.settings.slideshow.random_order);
         s.pending = if s.order.is_empty() { None } else { Some((s.pos, 1)) };
         s
     }
 
-    fn rebuild_list(&mut self, include_sub: bool, keep: Option<&Path>) {
-        let mut list = self.base_list.clone();
-        if include_sub {
-            if let Some(dir) = keep.or(self.base_list.first().map(|p| p.as_path())).and_then(|p| p.parent()) {
-                let mut all: Vec<PathBuf> = crate::catalog::list_recursive(dir, 50_000).into_iter().map(|e| e.path).collect();
-                let direct = all.iter().filter(|p| p.parent() == Some(dir)).count();
-                // Only expand when the whole folder was being shown (not a hand-picked selection).
-                if self.base_list.len() >= direct && all.len() > self.base_list.len() {
-                    all.sort_by(|a, b| {
-                        let da = a.parent().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
-                        let db = b.parent().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
-                        (a.parent() != Some(dir))
-                            .cmp(&(b.parent() != Some(dir)))
-                            .then_with(|| crate::catalog::natural_cmp(&da, &db))
-                            .then_with(|| crate::catalog::natural_cmp(&a.file_name().unwrap_or_default().to_string_lossy(), &b.file_name().unwrap_or_default().to_string_lossy()))
-                    });
-                    // Keep the browser's order for the top folder.
-                    let mut merged = self.base_list.clone();
-                    merged.extend(all.into_iter().filter(|p| p.parent() != Some(dir)));
-                    list = merged;
-                }
-            }
+    /// Apply "include subfolders": off goes back to the pictures the
+    /// slideshow started with; on keeps showing them while the subfolders
+    /// are searched on a background thread (`poll_scan` adds what it finds).
+    fn rebuild_list(&mut self, include_sub: bool, keep: Option<&Path>, ctx: &egui::Context, random: bool, announce: bool) {
+        // A walk still running stops (see `SubfolderScan`'s Drop).
+        self.scan = None;
+        if !include_sub {
+            self.replace_list(self.base_list.clone(), random);
+            return;
         }
-        self.index = keep.and_then(|k| list.iter().position(|p| p == k)).unwrap_or(0);
+        let Some(dir) = keep.or(self.base_list.first().map(|p| p.as_path())).and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (stop, ctx) = (cancel.clone(), ctx.clone());
+        let spawned = std::thread::Builder::new().name("lumen-slideshow-scan".into()).spawn(move || {
+            let (images, truncated) = walk_images(&dir, WALK_MAX_IMAGES, WALK_MAX_FOLDERS, Instant::now() + WALK_MAX_TIME, &stop);
+            if !stop.load(Ordering::Relaxed) {
+                let _ = tx.send(FolderWalk { dir, images, truncated });
+                ctx.request_repaint();
+            }
+        });
+        if spawned.is_ok() {
+            self.scan = Some(SubfolderScan { rx, cancel, announce });
+        }
+    }
+
+    /// Take the result of the subfolder walk once it is there.
+    fn poll_scan(&mut self, core: &mut Core) {
+        let Some(scan) = &self.scan else { return };
+        let announce = scan.announce;
+        let walk = match scan.rx.try_recv() {
+            Ok(w) => w,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.scan = None;
+                return;
+            }
+        };
+        self.scan = None;
+        if let Some(list) = merge_subfolders(&self.base_list, walk.images, &walk.dir) {
+            self.replace_list(list, core.settings.slideshow.random_order);
+        }
+        if walk.truncated {
+            core.toasts.info(format!("{} images in the slideshow (the subfolders hold too many to search them all)", self.list.len()));
+        } else if announce {
+            core.toasts.info(format!("{} images in the slideshow", self.list.len()));
+        }
+    }
+
+    /// Position of `path` in the play order.
+    fn pos_of(&self, path: &Path) -> Option<usize> {
+        let i = self.list.iter().position(|p| p == path)?;
+        self.order.iter().position(|&o| o == i)
+    }
+
+    /// Play `list` from now on: the slide on screen keeps its place and a
+    /// move to another slide that is under way keeps its target.
+    fn replace_list(&mut self, list: Vec<PathBuf>, random: bool) {
+        let target = self.pending.and_then(|(p, d)| self.path_at(p).cloned().map(|path| (path, d)));
+        let keep = self.current.as_ref().map(|c| c.path.clone()).or_else(|| target.as_ref().map(|t| t.0.clone())).or_else(|| self.list.get(self.index).cloned());
+        self.index = keep.and_then(|k| list.iter().position(|p| *p == k)).unwrap_or(0);
         self.list = list;
+        self.reorder(random);
+        let pending = target.and_then(|(path, d)| self.pos_of(&path).map(|pos| (pos, d)));
+        self.pending = pending;
+        if self.current.is_none() && self.pending.is_none() && !self.order.is_empty() {
+            // Nothing on screen yet (or every picture so far failed): start again.
+            self.pending = Some((self.pos, 1));
+            self.pending_since = Instant::now();
+            self.all_failed = false;
+        }
     }
 
     fn reorder(&mut self, random: bool) {
@@ -968,6 +1104,7 @@ impl Slideshow {
         while let Ok((p, d)) = self.caption_rx.try_recv() {
             self.captions.insert(p, d);
         }
+        self.poll_scan(core);
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
@@ -1067,7 +1204,8 @@ impl Slideshow {
 
         // ---- Status / placeholders
         if self.current.is_none() {
-            if self.all_failed || self.order.is_empty() {
+            // (While the subfolders are searched, more pictures may still come.)
+            if (self.all_failed || self.order.is_empty()) && self.scan.is_none() {
                 painter.text(view.center() - Vec2::new(0.0, 16.0), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(44.0), p.faint);
                 painter.text(view.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, "None of these images could be shown", FontId::proportional(15.0), Color32::from_gray(200));
                 painter.text(view.center() + Vec2::new(0.0, 48.0), Align2::CENTER_CENTER, "Press Esc to leave the slideshow", FontId::proportional(12.5), Color32::from_gray(140));
@@ -1078,6 +1216,14 @@ impl Slideshow {
         } else if self.pending.is_some() && self.pending_since.elapsed() > Duration::from_millis(400) {
             let r = Rect::from_center_size(view.right_top() + Vec2::new(-28.0, 28.0), Vec2::splat(18.0));
             egui::Spinner::new().size(18.0).color(Color32::from_gray(180)).paint_at(ui, r);
+        }
+        if self.scan.is_some() {
+            let g = ui.painter().layout_no_wrap("Finding images in subfolders...".into(), FontId::proportional(13.0), Color32::from_white_alpha(230));
+            let r = Rect::from_min_size(view.left_top() + Vec2::new(18.0, 18.0), g.size() + Vec2::new(44.0, 14.0));
+            ui.painter().rect_filled(r, CornerRadius::same(9), Color32::from_black_alpha(150));
+            // The spinner keeps frames coming, so the result is picked up as soon as it lands.
+            egui::Spinner::new().size(14.0).color(Color32::from_gray(200)).paint_at(ui, Rect::from_center_size(r.left_center() + Vec2::new(17.0, 0.0), Vec2::splat(14.0)));
+            ui.painter().galley(r.min + Vec2::new(32.0, 7.0), g, Color32::WHITE);
         }
 
         // ---- Overlays
@@ -1257,10 +1403,12 @@ impl Slideshow {
         }
         if let Some(sub) = subfolders {
             let keep = self.current.as_ref().map(|c| c.path.clone()).or_else(|| self.list.get(self.index).cloned());
-            self.rebuild_list(sub, keep.as_deref());
             let r = core.settings.slideshow.random_order;
-            self.reorder(r);
-            core.toasts.info(format!("{} images in the slideshow", self.list.len()));
+            // Turning it on reports the count once the subfolders are searched.
+            self.rebuild_list(sub, keep.as_deref(), &core.ctx, r, true);
+            if !sub {
+                core.toasts.info(format!("{} images in the slideshow", self.list.len()));
+            }
         }
     }
 
@@ -1451,5 +1599,41 @@ mod tests {
         assert!((fit_zoom(FitMode::FitLarge, (960, 540), v) - 1.0).abs() < 1e-6);
         assert!((fit_zoom(FitMode::FitAlways, (960, 540), v) - 2.0).abs() < 1e-6);
         assert!((fit_zoom(FitMode::Fill, (1000, 1000), v) - 1.92).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subfolder_walk_has_limits() {
+        let d = std::env::temp_dir().join(format!("lumen-ss-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("s1").join("s2")).unwrap();
+        for f in [d.join("a.jpg"), d.join("s1").join("b.png"), d.join("s1").join("s2").join("c.gif"), d.join("s1").join("notes.txt")] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let far = Instant::now() + Duration::from_secs(60);
+        let go = AtomicBool::new(false);
+        let (mut all, cut) = walk_images(&d, 100, 100, far, &go);
+        all.sort();
+        assert!(!cut);
+        assert_eq!(all, vec![d.join("a.jpg"), d.join("s1").join("b.png"), d.join("s1").join("s2").join("c.gif")]);
+        // One folder read: only the top folder's own pictures, marked as cut short.
+        assert_eq!(walk_images(&d, 100, 1, far, &go), (vec![d.join("a.jpg")], true));
+        assert!(walk_images(&d, 2, 100, far, &go).1, "image limit");
+        assert_eq!(walk_images(&d, 100, 100, Instant::now(), &go), (Vec::new(), true), "time limit");
+        let stop = AtomicBool::new(true);
+        assert!(walk_images(&d, 100, 100, far, &stop).1, "cancelled");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn subfolder_pictures_follow_the_folder() {
+        let d = PathBuf::from(r"C:\pics");
+        let (a, b) = (d.join("b.jpg"), d.join("a.jpg"));
+        let (x, y, z) = (d.join("sub 10").join("x.jpg"), d.join("sub 2").join("y2.jpg"), d.join("sub 2").join("y10.jpg"));
+        let all = vec![x.clone(), a.clone(), z.clone(), b.clone(), y.clone()];
+        // The folder keeps the browser's order; subfolders follow in natural order.
+        assert_eq!(merge_subfolders(&[a.clone(), b.clone()], all.clone(), &d), Some(vec![a.clone(), b.clone(), y.clone(), z.clone(), x.clone()]));
+        // A hand-picked selection is not expanded.
+        assert_eq!(merge_subfolders(&[a.clone()], all, &d), None);
+        assert_eq!(merge_subfolders(&[a.clone(), b.clone()], vec![a, b], &d), None, "nothing to add");
     }
 }
