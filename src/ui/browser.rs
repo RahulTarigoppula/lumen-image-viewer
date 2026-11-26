@@ -22,6 +22,18 @@ const CAPTION_NAME: f32 = 12.5;
 const PREVIEW_MAX_H: f32 = 180.0;
 const PREVIEW_TEXT_H: f32 = 92.0;
 
+/// Files shown at most with "Include subfolders".
+const MAX_TREE_FILES: usize = 50_000;
+
+/// A folder listing from the background thread.
+struct Listing {
+    folder: PathBuf,
+    res: std::io::Result<Vec<Entry>>,
+    mtime: Option<SystemTime>,
+    /// "Include subfolders" stopped at its limit.
+    cut: bool,
+}
+
 pub enum BrowserEvent {
     Navigate(PathBuf),
     Open(usize),
@@ -59,7 +71,11 @@ pub struct Browser {
     counts: (usize, usize),
     pub loading: bool,
     pub error: Option<String>,
-    list_rx: Option<Receiver<(PathBuf, std::io::Result<Vec<Entry>>, Option<SystemTime>)>>,
+    list_rx: Option<Receiver<Listing>>,
+    /// Show every picture and video under the folder, subfolders included.
+    pub recursive: bool,
+    /// The subfolder listing hit its limit (only the first files are shown).
+    truncated: bool,
     /// The folder's modified time, read on a background thread (a slow or
     /// offline network folder must not stall the UI every 1.5 s).
     poll_rx: Option<Receiver<Option<SystemTime>>>,
@@ -75,6 +91,8 @@ pub struct Browser {
     /// Path to select once the listing arrives (e.g. after opening a file).
     pub pending_select: Option<PathBuf>,
     resort_needed: bool,
+    /// List the folder again (e.g. "Include subfolders" changed).
+    reload_needed: bool,
     right_w: f32,
     /// Set by the app while a modal dialog or tool window owns the keyboard.
     pub suppress_keys: bool,
@@ -112,6 +130,8 @@ impl Browser {
             loading: false,
             error: None,
             list_rx: None,
+            recursive: false,
+            truncated: false,
             poll_rx: None,
             back: Vec::new(),
             forward: Vec::new(),
@@ -124,6 +144,7 @@ impl Browser {
             typeahead: (String::new(), Instant::now()),
             pending_select: None,
             resort_needed: false,
+            reload_needed: false,
             right_w: 600.0,
             suppress_keys: false,
             tips_after_drag: true,
@@ -141,6 +162,8 @@ impl Browser {
             self.focus = None;
             self.anchor = None;
             self.filter.clear();
+            // A whole tree can be huge: "Include subfolders" is for the folder it was turned on in.
+            self.recursive = false;
         }
         self.folder = folder.clone();
         self.loading = true;
@@ -149,11 +172,17 @@ impl Browser {
         self.poll_rx = None;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let c = ctx.clone();
+        let recursive = self.recursive;
         std::thread::spawn(move || {
             // Read before listing, so a change during the listing is seen by the next poll.
             let mtime = std::fs::metadata(&folder).and_then(|m| m.modified()).ok();
-            let res = catalog::list_folder(&folder, show_hidden);
-            let _ = tx.send((folder, res, mtime));
+            let (res, cut) = if recursive {
+                let (v, cut) = catalog::list_tree(&folder, show_hidden, MAX_TREE_FILES);
+                (Ok(v), cut)
+            } else {
+                (catalog::list_folder(&folder, show_hidden), false)
+            };
+            let _ = tx.send(Listing { folder, res, mtime, cut });
             c.request_repaint();
         });
         self.list_rx = Some(rx);
@@ -341,11 +370,12 @@ impl Browser {
     /// Called every frame: receive listings, poll for folder changes.
     pub fn tick(&mut self, core: &mut Core) {
         if let Some(rx) = &self.list_rx {
-            if let Ok((folder, res, mtime)) = rx.try_recv() {
+            if let Ok(Listing { folder, res, mtime, cut }) = rx.try_recv() {
                 self.list_rx = None;
                 if folder == self.folder {
                     self.loading = false;
                     self.dir_mtime = mtime;
+                    self.truncated = cut;
                     match res {
                         Ok(entries) => {
                             // Old item indices point into the old entry list:
@@ -383,6 +413,10 @@ impl Browser {
         if self.resort_needed {
             self.resort_needed = false;
             self.rebuild(core);
+        }
+        if self.reload_needed {
+            self.reload_needed = false;
+            self.reload(&core.ctx, core.settings.show_hidden_files);
         }
         // Cheap change detection: a folder's mtime changes when files are added/removed/renamed.
         if let Some(rx) = &self.poll_rx {
@@ -482,7 +516,7 @@ impl Browser {
             ui.add_space(2.0);
 
             // Media type + flag/rating filters
-            let filtered = self.tag_filter_on() || self.media_filter != MediaFilter::All;
+            let filtered = self.tag_filter_on() || self.media_filter != MediaFilter::All || self.recursive;
             let filt = widgets::icon_button(ui, I::FUNNEL_SIMPLE, "Show: media type, flag, rating and color label", filtered);
             egui::Popup::menu(&filt).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.set_min_width(220.0);
@@ -492,6 +526,9 @@ impl Browser {
                         self.media_filter = f;
                         self.resort_needed = true;
                     }
+                }
+                if widgets::checkbox(ui, &mut self.recursive, "Include subfolders").on_hover_text("Every picture and video under this folder in one view (phone DCIM folders, events split by day)").changed() {
+                    self.reload_needed = true;
                 }
                 ui.separator();
                 if widgets::checkbox(ui, &mut self.flagged_only, "Flagged only").on_hover_text(crate::ui::tips::command_tip(Command::ShowFlaggedOnly)).changed() {
@@ -533,6 +570,10 @@ impl Browser {
                             self.label_filter = 0;
                             self.media_filter = MediaFilter::All;
                             self.resort_needed = true;
+                            if self.recursive {
+                                self.recursive = false;
+                                self.reload_needed = true;
+                            }
                         }
                     });
                 }
@@ -1097,8 +1138,12 @@ impl Browser {
                         }
                         let dims = core.meta.get(&entry.path).and_then(|m| m.dims);
                         let tip_entry = entry;
+                        let sub = tip_entry.path.parent().filter(|d| *d != self.folder.as_path()).and_then(|d| d.strip_prefix(&self.folder).ok()).map(|d| d.display().to_string());
                         resp.on_hover_ui_at_pointer(|ui| {
                             ui.label(RichText::new(&tip_entry.name).strong());
+                            if let Some(sub) = &sub {
+                                ui.label(format!("in {sub}"));
+                            }
                             if let Some((w, h)) = dims {
                                 ui.label(format!("{w} × {h}"));
                             }
@@ -1184,6 +1229,10 @@ impl Browser {
     /// Put `files` (from this folder) before or after display item `target`, or at
     /// the end, in the folder's custom order, and switch to that order.
     pub fn arrange(&mut self, core: &mut Core, files: &[PathBuf], target: Option<usize>, after: bool) {
+        if self.recursive {
+            core.toasts.info("Arranging works inside one folder: turn off Include subfolders first.");
+            return;
+        }
         let target_path = target.and_then(|i| self.items.get(i)).map(|&e| self.entries[e].path.clone());
         if target_path.as_ref().is_some_and(|t| files.contains(t)) {
             return;
@@ -1837,6 +1886,9 @@ impl Browser {
             (n, 0) => plural(n, "file"),
             (n, f) => format!("{}, {}", plural(n, "file"), plural(f, "folder")),
         };
+        if self.recursive {
+            s += if self.truncated { "   ·   with subfolders (first 50,000)" } else { "   ·   with subfolders" };
+        }
         if self.tag_filter_on() || self.media_filter != MediaFilter::All || !self.filter.is_empty() {
             s += "   ·   filtered";
         }

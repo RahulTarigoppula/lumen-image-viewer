@@ -145,6 +145,36 @@ pub fn list_folder(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>>
 }
 
 /// Recursively collect media files under `dir` (used by slideshow / batch "include subfolders").
+/// Every image and video under `dir`, subfolders included (breadth first, the
+/// same hidden-file rules as [`list_folder`]), at most `max_files` files and
+/// 20,000 folders, 32 levels deep (linked folders cannot loop forever). The
+/// bool is true when a limit cut the listing short.
+pub fn list_tree(dir: &Path, show_hidden: bool, max_files: usize) -> (Vec<Entry>, bool) {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0usize)]);
+    let mut folders = 0usize;
+    while let Some((d, depth)) = queue.pop_front() {
+        folders += 1;
+        if folders > 20_000 {
+            return (out, true);
+        }
+        let Ok(items) = list_folder(&d, show_hidden) else { continue };
+        for e in items {
+            if e.is_folder() {
+                if depth < 32 {
+                    queue.push_back((e.path, depth + 1));
+                }
+            } else {
+                out.push(e);
+                if out.len() >= max_files {
+                    return (out, true);
+                }
+            }
+        }
+    }
+    (out, false)
+}
+
 pub fn list_recursive(dir: &Path, limit: usize) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -543,6 +573,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn list_tree_finds_media_in_subfolders_and_stops_at_the_limit() {
+        let root = std::env::temp_dir().join(format!("lumen-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, files) in [("", &["a.jpg", "notes.txt"][..]), ("sub", &["b.png", "c.mp4"][..]), ("sub/deep", &["d.jpg"][..])] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in files {
+                std::fs::write(d.join(f), b"x").unwrap();
+            }
+        }
+        let (all, cut) = list_tree(&root, false, 100);
+        let mut names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["a.jpg", "b.png", "c.mp4", "d.jpg"]);
+        assert!(!cut);
+        let (some, cut) = list_tree(&root, false, 2);
+        assert_eq!(some.len(), 2);
+        assert!(cut);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
