@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// At most this many folders keep a custom order; the oldest are dropped first.
 const MAX_FOLDERS: usize = 2000;
@@ -20,6 +22,9 @@ pub struct OrderStore {
     inactive: std::collections::HashSet<String>,
     #[serde(skip)]
     dirty: bool,
+    /// Set by the background writer when a save failed (saved again next time).
+    #[serde(skip)]
+    write_failed: Arc<AtomicBool>,
 }
 
 fn key(folder: &Path) -> String {
@@ -44,19 +49,33 @@ impl OrderStore {
         }
     }
 
+    /// Save now on this thread (on exit), after any background save still running.
     pub fn save_if_dirty(&mut self) {
+        crate::persist::flush();
+        if self.write_failed.swap(false, Ordering::Relaxed) {
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
-        let path = Self::file();
-        if let Some(d) = path.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
         if let Ok(text) = serde_json::to_string(self) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            if crate::persist::write_now(&Self::file(), text.as_bytes()).is_ok() {
                 self.dirty = false;
             }
+        }
+    }
+
+    /// Save changes on the background writer thread (the periodic save).
+    pub fn save_in_background(&mut self) {
+        if self.write_failed.swap(false, Ordering::Relaxed) {
+            self.dirty = true;
+        }
+        if !self.dirty {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(self) {
+            crate::persist::write_later(Self::file(), text.into_bytes(), Some(&self.write_failed));
+            self.dirty = false;
         }
     }
 

@@ -433,9 +433,68 @@ pub fn drag_out(files: &[PathBuf]) -> Result<DragOutcome> {
     }
 }
 
+/// Take every path in `gone` out of `list` in one pass, leaving the current
+/// item (`index`) where removing them one by one would (in any order): the
+/// first remaining item after it, else the last remaining one before it.
+/// Returns the new index.
+pub fn remove_listed(list: &mut Vec<PathBuf>, index: usize, gone: &std::collections::HashSet<&Path>) -> usize {
+    if gone.is_empty() {
+        return index;
+    }
+    let keep: Vec<bool> = list.iter().map(|p| !gone.contains(p.as_path())).collect();
+    let n = keep.len();
+    let target = if index >= n {
+        None
+    } else if keep[index] {
+        Some(index)
+    } else {
+        (index + 1..n).find(|&i| keep[i]).or_else(|| (0..index).rev().find(|&i| keep[i]))
+    };
+    let new_index = target.map(|t| keep[..t].iter().filter(|k| **k).count()).unwrap_or(index);
+    let mut i = 0;
+    list.retain(|_| {
+        i += 1;
+        keep[i - 1]
+    });
+    new_index.min(list.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_many_matches_removing_one_by_one() {
+        // What the viewer's remove_path does for one file.
+        fn one_by_one(list: &mut Vec<PathBuf>, mut index: usize, gone: &[PathBuf]) -> usize {
+            for g in gone {
+                if let Some(pos) = list.iter().position(|p| p == g) {
+                    list.remove(pos);
+                    if index > pos || index >= list.len() {
+                        index = index.saturating_sub(1).min(list.len().saturating_sub(1));
+                    }
+                }
+            }
+            index
+        }
+        for n in 0..7usize {
+            let all: Vec<PathBuf> = (0..n).map(|i| PathBuf::from(format!(r"C:\x\{i}.jpg"))).collect();
+            for mask in 0..(1u32 << n) {
+                let gone: Vec<PathBuf> = all.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, p)| p.clone()).collect();
+                for index in 0..n.max(1) {
+                    let mut a = all.clone();
+                    let set: std::collections::HashSet<&Path> = gone.iter().map(|p| p.as_path()).collect();
+                    let ia = remove_listed(&mut a, index, &set);
+                    for order in [gone.clone(), gone.iter().rev().cloned().collect()] {
+                        let mut b = all.clone();
+                        let ib = one_by_one(&mut b, index, &order);
+                        assert_eq!(a, b);
+                        assert_eq!(ia, ib, "n {n} mask {mask:b} index {index}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn true_case_restores_the_spelling_on_disk() {

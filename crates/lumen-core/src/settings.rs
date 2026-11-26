@@ -388,17 +388,19 @@ impl Settings {
         }
     }
 
+    /// Save on the background writer thread. The file is replaced atomically
+    /// with its content flushed to disk first, so a crash or power cut never
+    /// leaves a damaged or empty settings.json.
     pub fn save(&self) {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            // Write atomically so a crash mid-write never corrupts settings.
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+            crate::persist::write_later(Self::path(), text.into_bytes(), None);
+        }
+    }
+
+    /// Save now on this thread (on exit), after any background save still running.
+    pub fn save_now(&self) {
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = crate::persist::write_now(&Self::path(), text.as_bytes());
         }
     }
 
