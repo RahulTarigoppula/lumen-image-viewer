@@ -357,8 +357,11 @@ impl BarPart {
 }
 
 /// Width of the Difference view's Amplify slider and its value box ("×50").
-const AMP_RAIL_W: f32 = 80.0;
-const AMP_VALUE_W: f32 = 40.0;
+const AMP_RAIL_W: f32 = 64.0;
+const AMP_VALUE_W: f32 = 36.0;
+
+/// Width of the toolbar's zoom percentage ("100%").
+const ZOOM_LABEL_W: f32 = 46.0;
 
 /// What a mode is for, for its tooltip.
 fn mode_tip(m: CmpMode) -> String {
@@ -2441,7 +2444,7 @@ impl Compare {
                         0.0
                     }
                 }
-                BarPart::Zoom => 2.0 * icon + 52.0 + s,
+                BarPart::Zoom => 2.0 * icon + ZOOM_LABEL_W + s,
                 BarPart::Review => sep + button(MARKUP_LABEL, labels) + button(REVIEW_LABEL, labels),
                 BarPart::Extras => match self.mode {
                     CmpMode::Difference if pair => sep + if plan.amp_label { text_w("Amplify", FontId::proportional(text::SMALL)) + s } else { 0.0 } + AMP_RAIL_W + 4.0 + AMP_VALUE_W + s,
@@ -2579,7 +2582,7 @@ impl Compare {
                     self.zoom_step(src, &rects, ppp, 0.8, None);
                 }
                 let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
-                let zl = ui.add_sized([52.0, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
+                let zl = ui.add_sized([ZOOM_LABEL_W, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
                 if zl.on_hover_text("Zoom of the selected image. Click for 100% (actual pixels)  (Z)").clicked() && !rects.is_empty() {
                     self.actual_size(&rects, ppp);
                 }
