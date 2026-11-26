@@ -11,6 +11,31 @@
   touched), follows renames, and can be made permanent with "Number the files in this order" (batch rename) or
   reset from the same menu.
 - Folder thumbnails show the first pictures inside each folder.
+- Custom order is per folder: arranging one folder no longer changes how other folders are sorted.
+- Include subfolders (Show menu): every picture and video under a folder in one view, e.g. a phone's DCIM folder.
+- Rubber-band selection: drag on empty space to select a box of thumbnails (Ctrl adds).
+- Filters: color label chips, "Select the files shown" and "Clear filters"; Select flagged files (Ctrl+Shift+F).
+- Ctrl+L, Alt+D or F4 to type a folder path; mouse back / forward buttons go through folders.
+- A short window keeps room for the folder tree; the sort button keeps its label when space is short.
+
+### Viewer
+- Fit leaves room for the caption and the bottom bar, so the whole picture is visible in a window.
+- The caption shows rating, flag and color label; flagging and labelling show a short notice.
+- Optional: next image after rating, flagging or labelling (Settings, Viewer), for fast culling.
+- Past the last image a notice appears; pressing again opens the next folder with pictures.
+- Copy text in image (Ctrl+T): reads the text with OCR and puts it on the clipboard.
+- Ctrl+V saves the clipboard picture as a new PNG next to the current one instead of replacing its pixels.
+
+### General
+- A welcome card on first start: FastStone-compatible keys and what the mouse wheel does.
+- The window size is remembered between runs.
+
+### Stability and speed
+- A damaged color label in the tags file no longer crashes the browser.
+- The folder is checked for changes on a background thread, and the Move / Copy dialog no longer checks every
+  recent folder on every frame (offline network drives froze the app).
+- Folder thumbnails list only part of a large folder and can no longer get stuck loading.
+- Arranging many selected files is no longer slow.
 
 ## 2.0.0 (23 November 2026)
 
