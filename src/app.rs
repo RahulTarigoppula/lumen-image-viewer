@@ -2907,6 +2907,14 @@ impl eframe::App for App {
             self.set_fullscreen(false);
         }
         crate::analysis_ui::tick(&mut self.core);
+        if let Some((moved, onto, after)) = self.viewer.film_arranged.take() {
+            // Saved like a drag in the browser (same folder only; other lists are just shown arranged).
+            if moved.parent() == Some(self.browser.folder.as_path()) {
+                if let Some(t) = self.browser.index_of(&onto) {
+                    self.browser.arrange(&mut self.core, &[moved], Some(t), after);
+                }
+            }
+        }
         if let Some((folder, previous, sort)) = self.browser.arranged.take() {
             self.push_undo(FileUndo { label: "Arrange".into(), change: FileChange::Order { folder, previous, sort } });
         }

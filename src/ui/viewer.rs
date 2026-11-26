@@ -306,6 +306,9 @@ pub struct Viewer {
     pub inspect: super::inspect_view::InspectMode,
     inspect_cache: super::inspect_view::InspectCache,
     pub show_filmstrip: bool,
+    /// A filmstrip thumbnail was dragged to a new place: (moved file, the file it
+    /// was dropped on, after it). The app saves it as the folder's custom order.
+    pub film_arranged: Option<(PathBuf, PathBuf, bool)>,
     pub magnifier_locked: bool,
     magnifier_active: bool,
     last_activity: Instant,
@@ -361,6 +364,7 @@ impl Viewer {
             inspect: super::inspect_view::InspectMode::Off,
             inspect_cache: Default::default(),
             show_filmstrip: false,
+            film_arranged: None,
             magnifier_locked: false,
             magnifier_active: false,
             last_activity: Instant::now(),
@@ -1768,6 +1772,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         let h = ui.available_height().min(FILM_CELL_H).max(24.0);
         // A thin bar that shows on hover, over the thumbnails' bottom edge.
         ui.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 4.0, floating_width: 2.0, floating_allocated_width: 0.0, ..egui::style::ScrollStyle::floating() };
+        let mut moved: Option<(usize, usize, bool)> = None;
         egui::ScrollArea::horizontal().id_salt("filmstrip").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -1782,7 +1787,16 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
                         _ => core.meta.get(&path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32).unwrap_or(4.0 / 3.0),
                     };
                     let cell = Vec2::new((h * aspect).clamp(40.0, 96.0), h);
-                    let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
+                    // Drag a thumbnail along the strip to arrange the folder.
+                    if resp.drag_started() {
+                        resp.dnd_set_drag_payload(FilmDrag(i));
+                    }
+                    let after = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.x > rect.center().x);
+                    let hover_drop = resp.dnd_hover_payload::<FilmDrag>().is_some();
+                    if let Some(src) = resp.dnd_release_payload::<FilmDrag>() {
+                        moved = Some((src.0, i, after));
+                    }
                     if ui.is_rect_visible(rect) {
                         let sel = i == self.index;
                         let r4 = CornerRadius::same(theme::radius::SMALL);
@@ -1804,6 +1818,10 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
                         if sel {
                             ui.painter().rect_stroke(rect, r4, Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
                         }
+                        if hover_drop {
+                            let x = if after { rect.max.x + 3.0 } else { rect.min.x - 3.0 };
+                            ui.painter().vline(x, rect.y_range(), Stroke::new(3.0, p.accent));
+                        }
                     }
                     if i == self.index && resp.rect.is_positive() {
                         // Keep the current image in view.
@@ -1818,6 +1836,19 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
                 }
             });
         });
+        if let Some((src, target, after)) = moved {
+            if src != target && src < self.list.len() && target < self.list.len() {
+                let (moving, onto) = (self.list[src].clone(), self.list[target].clone());
+                let current = self.current().cloned();
+                self.list.remove(src);
+                let t = self.list.iter().position(|p| *p == onto).unwrap_or(self.list.len());
+                self.list.insert(if after { t + 1 } else { t }.min(self.list.len()), moving.clone());
+                if let Some(c) = current {
+                    self.index = self.list.iter().position(|p| *p == c).unwrap_or(self.index);
+                }
+                self.film_arranged = Some((moving, onto, after));
+            }
+        }
     }
 
     fn info_panel(&mut self, ui: &mut Ui, core: &mut Core, _ev: &mut Vec<ViewerEvent>) {
@@ -2878,3 +2909,6 @@ mod tests {
         assert_eq!(next, now + Duration::from_millis(100));
     }
 }
+
+/// Drag payload of a filmstrip thumbnail: its index in the viewer list.
+struct FilmDrag(usize);

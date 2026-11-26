@@ -38,3 +38,10 @@ shot undone.png
 open {media}\RoundA
 wait 3500
 shot folder_thumbs.png
+# The viewer's filmstrip shows the arranged order (thumbnails there can be dragged too).
+open {media}\Flat\gradient_16x9.png
+wait 2500
+run ToggleFilmstrip
+wait 2500
+shot viewer_filmstrip.png
+run ToggleFilmstrip
