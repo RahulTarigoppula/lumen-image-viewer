@@ -1175,7 +1175,7 @@ pub struct BatchRename {
 /// the journal in the data folder). Returns messages for the user; call once
 /// at startup. The batch rename window also calls it when it opens.
 pub fn recover_pending_renames() -> Vec<String> {
-    logic::recover_journal(&logic::journal_path())
+    logic::recover_all_journals(&crate::settings::data_dir())
 }
 
 fn list_dir_names(dirs: impl Iterator<Item = PathBuf>) -> HashMap<PathBuf, HashSet<String>> {
@@ -1371,8 +1371,8 @@ impl BatchRename {
         let progress = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = crossbeam_channel::bounded(1);
         let (pr, c) = (progress.clone(), ctx.clone());
+        let journal = logic::journal_path(&tag);
         std::thread::spawn(move || {
-            let journal = logic::journal_path();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 logic::execute_plan_journaled(&plan, Some(&journal), |n| {
                     pr.store(n, Ordering::Relaxed);

@@ -69,6 +69,9 @@ enum Confirm {
     Delete(Vec<PathBuf>),
     /// Rotate / flip non-JPEG files by decoding and re-encoding them in place.
     Reencode { files: Vec<PathBuf>, jpegs: Vec<PathBuf>, t: Transform },
+    /// Saving in place over a file that changed on disk after it was opened
+    /// (Save anyway / Save as copy / Cancel). `then` waited for the save.
+    SaveChanged { path: PathBuf, opts: SaveOptions, then: Option<PendingAction> },
 }
 
 /// An action that would discard unsaved edits; held while the user decides.
@@ -93,16 +96,27 @@ enum FileChange {
     /// `t` was applied to files on disk. Each file is restored from its
     /// previous bytes when they were kept; without them (only for JPEGs whose
     /// EXIF orientation alone changed) the inverse transform turns it back.
-    Transform { t: Transform, files: Vec<(PathBuf, Option<Vec<u8>>)> },
+    Transform { t: Transform, files: Vec<Transformed> },
     /// A folder was arranged by hand: its previous custom order (none) and sort key.
     Order { folder: PathBuf, previous: Option<Vec<String>>, active: bool },
+}
+
+/// One file rotated / flipped on disk, as kept for undo.
+struct Transformed {
+    path: PathBuf,
+    /// The previous contents, when kept (see `FileChange::Transform`).
+    before: Option<Vec<u8>>,
+    /// Size and time just before and just after the change: undo leaves a
+    /// file alone that no longer matches `after` (changed again since).
+    was: Option<fileops::FileStamp>,
+    after: Option<fileops::FileStamp>,
 }
 
 impl FileUndo {
     /// Memory held by saved file contents.
     fn bytes(&self) -> usize {
         match &self.change {
-            FileChange::Transform { files, .. } => files.iter().filter_map(|(_, b)| b.as_ref()).map(Vec::len).sum(),
+            FileChange::Transform { files, .. } => files.iter().filter_map(|f| f.before.as_ref()).map(Vec::len).sum(),
             FileChange::Moves(_) | FileChange::Order { .. } => 0,
         }
     }
@@ -1399,9 +1413,10 @@ impl App {
         for p in jpegs {
             // The file as it was, for an exact undo.
             let before = std::fs::read(p).ok().filter(|b| b.len() <= UNDO_BYTES_BUDGET);
+            let was = fileops::FileStamp::of(p);
             match crate::encode::lossless_jpeg_transform(p, t) {
                 Ok(_) => {
-                    done.push((p.clone(), before));
+                    done.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) });
                     self.forget_file(p);
                 }
                 Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
@@ -1455,6 +1470,25 @@ impl App {
     }
 
     fn do_save(&mut self, path: &Path, img: &image::RgbaImage, opts: &SaveOptions) -> bool {
+        // Saving over the open file: when it changed on disk after it was loaded
+        // (edited in another program), ask before replacing that change.
+        if self.viewer.current().is_some_and(|c| fileops::same_path(c, path)) {
+            // (Only when the load recorded the file's time: otherwise nothing to compare.)
+            let loaded = self.viewer.loaded(&self.core).filter(|l| l.modified.is_some());
+            let changed = loaded.is_some_and(|l| fileops::FileStamp::of(path).is_some_and(|now| !now.matches(l.file_size, l.modified)));
+            if changed {
+                // From Save as: the question replaces the dialog. From the
+                // unsaved-edits question: its action waits for the answer.
+                self.save_dialog = None;
+                self.confirm = Some(Confirm::SaveChanged { path: path.to_path_buf(), opts: opts.clone(), then: self.pending_guard.take() });
+                return false;
+            }
+        }
+        self.write_save(path, img, opts)
+    }
+
+    /// Save `img` to `path` (no questions asked) and refresh what shows it.
+    fn write_save(&mut self, path: &Path, img: &image::RgbaImage, opts: &SaveOptions) -> bool {
         // The open file is the source of the comment / XMP / IPTC carried into a JPEG.
         let source = self.viewer.current().cloned();
         match crate::encode::save_from(img, path, opts, source.as_deref()) {
@@ -1576,8 +1610,8 @@ impl App {
         match res {
             JobResult::Transfer { done, errs, dest, do_move } => self.finish_transfer(done, errs, dest, do_move),
             JobResult::Rotate { t, lossless, reencoded, skipped, errs } => {
-                for (p, _) in lossless.iter().chain(&reencoded) {
-                    self.forget_file(p);
+                for f in lossless.iter().chain(&reencoded) {
+                    self.forget_file(&f.path);
                 }
                 if !skipped.is_empty() {
                     self.core.toasts.info(format!("Skipped {}: {}", count(skipped.len(), "file"), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
@@ -1590,7 +1624,7 @@ impl App {
                     let how = if reencoded.is_empty() { " - lossless" } else { "" };
                     // A re-encoded file is undone from its previous bytes only: when
                     // those were too large to keep, the change cannot be undone.
-                    let undoable = reencoded.iter().all(|(_, b)| b.is_some());
+                    let undoable = reencoded.iter().all(|f| f.before.is_some());
                     let note = if undoable { "" } else { " (too large to undo)" };
                     self.core.toasts.info(format!("{}{how}{}{note}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
                     if undoable {
@@ -1814,20 +1848,43 @@ impl App {
                 ok += 1;
             }
             FileChange::Transform { t, files } => {
-                for (p, bytes) in files {
-                    let res = match bytes {
+                // (path, its stamp before this change, its stamp once restored)
+                let mut restored: Vec<(&Path, fileops::FileStamp, Option<fileops::FileStamp>)> = Vec::new();
+                for f in files {
+                    let p = &f.path;
+                    // Changed again since (saved from another program, edited
+                    // here): writing the old contents back would lose that.
+                    let changed = f.after.is_some() && fileops::FileStamp::of(p) != f.after;
+                    let res = match &f.before {
                         _ if !p.is_file() => Err(anyhow::anyhow!("the file no longer exists")),
+                        _ if changed => Err(anyhow::anyhow!("the file was modified since, so it was left as it is")),
                         Some(b) => crate::encode::write_atomic(p, b),
                         None => crate::encode::lossless_jpeg_transform(p, inverse(*t)).map(|_| ()),
                     };
                     match res {
-                        Ok(()) => ok += 1,
+                        Ok(()) => {
+                            ok += 1;
+                            if let Some(was) = f.was {
+                                restored.push((p.as_path(), was, fileops::FileStamp::of(p)));
+                            }
+                        }
                         Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
                     }
                     self.forget_file(p);
                 }
+                // An older rotation of the same file expects it as this change
+                // found it: it is that again, with a new time.
+                for older in self.file_undo.iter_mut() {
+                    if let FileChange::Transform { files: older_files, .. } = &mut older.change {
+                        for f in older_files.iter_mut() {
+                            if let Some((_, _, now)) = restored.iter().find(|(p, was, _)| *p == f.path && f.after == Some(*was)) {
+                                f.after = *now;
+                            }
+                        }
+                    }
+                }
                 // The viewer shows the restored file (unless it holds edits of its own).
-                let shown = self.viewer.current().is_some_and(|c| files.iter().any(|(p, _)| p == c));
+                let shown = self.viewer.current().is_some_and(|c| files.iter().any(|f| &f.path == c));
                 if shown && !self.viewer.is_dirty() {
                     self.viewer.edit = None;
                     self.viewer.reset_view(self.core.settings.fit_mode);
@@ -2515,6 +2572,45 @@ impl App {
                 }
                 Some(false) => self.confirm = None,
                 None => {}
+            }
+        }
+        if let Some(Confirm::SaveChanged { path, .. }) = &self.confirm {
+            let name = crate::ui::viewer::file_name(path);
+            let mut choice: Option<u8> = None; // 0 cancel, 1 save anyway, 2 save as copy
+            widgets::modal(ctx, egui::Id::unique("save-changed"), 420.0, |ui| {
+                widgets::modal_title(ui, "File changed on disk");
+                widgets::modal_body(ui, &format!("\"{name}\" was changed by another program after it was opened here. Saving replaces that version with your edits."));
+                ui.add_space(theme::space::BUTTONS_GAP);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // [Save anyway] [Cancel] [Save as copy]: the safe choice is the primary.
+                    if widgets::primary_button_enabled(ui, &p, true, "Save as copy").clicked() {
+                        choice = Some(2);
+                    }
+                    if widgets::secondary_button(ui, "Cancel").clicked() {
+                        choice = Some(0);
+                    }
+                    if widgets::danger_button(ui, &p, "Save anyway").clicked() {
+                        choice = Some(1);
+                    }
+                });
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(0);
+                }
+            });
+            if let Some(c) = choice {
+                if let Some(Confirm::SaveChanged { path, opts, then }) = self.confirm.take() {
+                    match (c, self.viewer.current_image(&self.core)) {
+                        (1, Some(img)) => {
+                            if self.write_save(&path, &img, &opts) {
+                                if let Some(a) = then {
+                                    self.perform_pending(a);
+                                }
+                            }
+                        }
+                        (2, Some(img)) => self.save_dialog = Some(SaveDialog::new(edited_copy_name(&path), img, opts)),
+                        _ => {}
+                    }
+                }
             }
         }
         self.transfer_dialog(ctx);
@@ -3492,7 +3588,8 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Let running copy / move jobs finish (bounded) so their tags and undo
         // records are not lost.
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut stopped = false;
         while self.file_jobs.queued > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.file_jobs.rx.recv_timeout(left) {
@@ -3500,7 +3597,21 @@ impl eframe::App for App {
                     self.file_jobs.queued -= 1;
                     self.finish_file_job(res);
                 }
+                // Still copying: stop. The file being copied is dropped (copies are
+                // made under a hidden temporary name and only renamed when complete)
+                // and the job still reports what it finished.
+                Err(_) if !stopped => {
+                    fileops::cancel_copies();
+                    stopped = true;
+                    deadline = Instant::now() + std::time::Duration::from_secs(3);
+                }
                 Err(_) => break,
+            }
+        }
+        if stopped {
+            let left = fileops::remove_partial_copies();
+            if left > 0 {
+                log::warn!("{left} unfinished copies could not be removed (hidden .lumen-copy folders)");
             }
         }
         self.persist();
@@ -3677,7 +3788,7 @@ enum JobResult {
     Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool },
     /// Changed files with their previous bytes for undo (`None` once the
     /// budget for keeping them is used up).
-    Rotate { t: Transform, lossless: Vec<(PathBuf, Option<Vec<u8>>)>, reencoded: Vec<(PathBuf, Option<Vec<u8>>)>, skipped: Vec<String>, errs: Vec<String> },
+    Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String> },
     Panicked(String),
     /// A job that only reports a line to the user.
     Message { ok: bool, text: String },
@@ -3770,6 +3881,10 @@ fn transfer_job(files: Vec<PathBuf>, dest: PathBuf, do_move: bool) -> FileJob {
         let total = files.len();
         let (mut done, mut errs) = (Vec::new(), Vec::new());
         for (i, f) in files.iter().enumerate() {
+            // Lumen is closing: stop between files (the one being copied is dropped).
+            if fileops::copies_cancelled() {
+                break;
+            }
             pr.set(i, total);
             let (d, e) = fileops::transfer(std::slice::from_ref(f), &dest, do_move);
             done.extend(d);
@@ -3796,8 +3911,9 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
         for (i, p) in jpegs.iter().enumerate() {
             pr.set(i, total);
             let before = keep(p);
+            let was = fileops::FileStamp::of(p);
             match crate::encode::lossless_jpeg_transform(p, t) {
-                Ok(_) => lossless.push((p.clone(), before)),
+                Ok(_) => lossless.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) }),
                 Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
             }
         }
@@ -3830,10 +3946,13 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
                 continue;
             }
             let before = keep(p);
+            let was = fileops::FileStamp::of(p);
             let out = t.apply(&d.image);
-            let opts = SaveOptions { format: fmt, jpeg_quality, exif: d.exif.clone(), ..Default::default() };
+            // A lossless WebP stays lossless (re-encoding it lossy would lose quality).
+            let webp_lossless = fmt == crate::formats::SaveFormat::WebP && crate::encode::webp_file_is_lossless(p);
+            let opts = SaveOptions { format: fmt, jpeg_quality, webp_lossless, exif: d.exif.clone(), ..Default::default() };
             match crate::encode::save_from(&out, p, &opts, Some(p)) {
-                Ok(()) => reencoded.push((p.clone(), before)),
+                Ok(()) => reencoded.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) }),
                 Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
