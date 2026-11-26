@@ -44,6 +44,10 @@ shot nudged.png
 run Undo
 wait 2000
 shot undone.png
+# Rubber band: drag on the empty area up over the first three thumbnails to select them.
+drag 820 520 300 120
+wait 800
+shot band_selected.png
 # Folder thumbnails show the first pictures inside each folder.
 open {media}\RoundA
 wait 3500

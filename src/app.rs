@@ -179,6 +179,8 @@ pub struct App {
     /// When the viewer last said "last image" / "first image" (and which way):
     /// a second press soon after goes on to the next / previous folder.
     end_notice: Option<(Instant, isize)>,
+    /// "Next image after rating": when to step on (a short pause shows the new tag first).
+    advance_at: Option<Instant>,
     /// Debounced settings autosave: the JSON last written (or loaded), the
     /// JSON seen at the previous check, and when that check ran.
     settings_saved: String,
@@ -329,6 +331,7 @@ impl App {
             viewer_from_browser: false,
             last_save: Instant::now(),
             end_notice: None,
+            advance_at: None,
             settings_saved: String::new(),
             settings_seen: String::new(),
             settings_check: Instant::now(),
@@ -901,6 +904,7 @@ impl App {
                 if !t.is_empty() && self.mode != Mode::Browser {
                     self.core.toasts.info(if all_flagged { "Flag removed" } else { "Flagged" });
                 }
+                self.schedule_advance();
                 if self.browser.flagged_only || self.core.settings.sort_key == crate::settings::SortKey::Flagged {
                     self.browser.mark_resort();
                 }
@@ -913,6 +917,7 @@ impl App {
                 if !t.is_empty() {
                     self.core.toasts.info(if n == 0 { "Rating cleared".to_string() } else { format!("Rated {}", "★".repeat(n as usize)) });
                 }
+                self.schedule_advance();
                 if self.core.settings.sort_key == crate::settings::SortKey::Rating || self.browser.min_rating > 0 {
                     self.browser.mark_resort();
                 }
@@ -925,6 +930,7 @@ impl App {
                 if !t.is_empty() && self.mode != Mode::Browser {
                     self.core.toasts.info(if n == 0 { "Color label cleared".to_string() } else { format!("Color label: {}", crate::tags::LABEL_NAMES[(n as usize).min(5)]) });
                 }
+                self.schedule_advance();
                 if self.core.settings.sort_key == crate::settings::SortKey::ColorLabel || self.browser.label_filter > 0 {
                     self.browser.mark_resort();
                 }
@@ -1647,6 +1653,14 @@ impl App {
         // Saved file contents are bounded: forget the oldest history first.
         while self.file_undo.len() > 1 && self.file_undo.iter().map(FileUndo::bytes).sum::<usize>() > UNDO_BYTES_BUDGET {
             self.file_undo.remove(0);
+        }
+    }
+
+    /// "Next image after rating" (viewer only): step on after a short pause.
+    fn schedule_advance(&mut self) {
+        if self.core.settings.advance_after_tag && self.mode == Mode::Viewer {
+            self.advance_at = Some(Instant::now() + std::time::Duration::from_millis(350));
+            self.core.ctx.request_repaint_after(std::time::Duration::from_millis(360));
         }
     }
 
@@ -2998,6 +3012,16 @@ impl eframe::App for App {
             self.set_fullscreen(false);
         }
         crate::analysis_ui::tick(&mut self.core);
+        if let Some(t) = self.advance_at {
+            if Instant::now() >= t {
+                self.advance_at = None;
+                if self.mode == Mode::Viewer {
+                    self.run(Command::NextImage);
+                }
+            } else {
+                self.core.ctx.request_repaint_after(t - Instant::now());
+            }
+        }
         if let Some((moved, onto, after)) = self.viewer.film_arranged.take() {
             // Saved like a drag in the browser (same folder only; other lists are just shown arranged).
             if moved.parent() == Some(self.browser.folder.as_path()) {

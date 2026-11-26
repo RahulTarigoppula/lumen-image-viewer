@@ -80,6 +80,12 @@ pub struct Browser {
     pub suppress_keys: bool,
     /// A few images from inside each folder in the grid, for folder thumbnails.
     peek: FolderPeek,
+    /// Rubber-band selection in the grid: start point in content coordinates and
+    /// the selection it started from (Ctrl adds to it).
+    band: Option<(Pos2, HashSet<PathBuf>)>,
+    /// Screen position of the grid content's top-left corner last frame (content
+    /// coordinates = screen - origin; rows are virtualized).
+    grid_origin: Pos2,
     /// Set by `arrange`: the folder, its previous custom order and sort key, for
     /// the app's undo list.
     pub arranged: Option<(PathBuf, Option<Vec<String>>, bool)>,
@@ -122,6 +128,8 @@ impl Browser {
             suppress_keys: false,
             tips_after_drag: true,
             arranged: None,
+            band: None,
+            grid_origin: Pos2::ZERO,
             peek: FolderPeek::new(),
         }
     }
@@ -944,6 +952,9 @@ impl Browser {
 
     fn grid(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
+        // Rows are exactly one cell apart (scrolling to the focus and the
+        // rubber band compute row positions from this).
+        ui.spacing_mut().item_spacing.y = 0.0;
         let ts = core.settings.thumb_size.clamp(64.0, 512.0);
         let captions = core.settings.caption();
         let caption_h = match captions {
@@ -967,9 +978,12 @@ impl Browser {
         }
 
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("grid", &self.folder));
-        if ctrl {
-            scroll = scroll.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::DRAG);
-        }
+        // Dragging empty space draws a selection rectangle, so it does not scroll.
+        scroll = if ctrl {
+            scroll.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::DRAG)
+        } else {
+            scroll.scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL)
+        };
         if self.scroll_to_focus {
             if let Some(f) = self.focus {
                 let row = f / cols;
@@ -989,7 +1003,7 @@ impl Browser {
         // edge scrolls, so files can be arranged across a long folder.
         let grid_rect = ui.available_rect_before_wrap();
         let dragging = egui::DragAndDrop::has_payload_of_type::<DragFiles>(ui.ctx());
-        if dragging {
+        if dragging || self.band.is_some() {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()).filter(|q| grid_rect.x_range().contains(q.x)) {
                 let edge = 56.0;
                 let dy = if (grid_rect.min.y - 4.0..grid_rect.min.y + edge).contains(&pos.y) {
@@ -1022,9 +1036,9 @@ impl Browser {
         // when the window opened would otherwise stay on top of it.
         let tips = pointer_here && self.tips_after_drag && !super::overlay_open(ui.ctx());
         // Registered before the cells so cells take precedence for clicks.
-        let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click());
+        let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click_and_drag());
         let sole = self.selected.len() <= 1;
-        scroll.show_rows(ui, cell.y, rows, |ui, range| {
+        let out = scroll.show_rows(ui, cell.y, rows, |ui, range| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for row in range {
                 ui.horizontal(|ui| {
@@ -1096,6 +1110,8 @@ impl Browser {
                 });
             }
         });
+        self.grid_origin = out.inner_rect.min - out.state.clamped_offset();
+        self.rubber_band(ui, &bg, cell, cols, &p);
         // Dropped on the empty space after the last thumbnail: to the end.
         if reorder.is_none() {
             if let Some(files) = bg.dnd_release_payload::<DragFiles>() {
@@ -1122,6 +1138,47 @@ impl Browser {
             }
         }
         self.context_menu(ui, &bg, ev, ctx_menu_for.is_some());
+    }
+
+    /// Drag on empty grid space draws a rectangle and selects the thumbnails it
+    /// touches (Ctrl keeps the earlier selection). Works across virtualized rows
+    /// from cell geometry, and the grid scrolls when the pointer nears an edge.
+    fn rubber_band(&mut self, ui: &Ui, bg: &egui::Response, cell: Vec2, cols: usize, p: &Palette) {
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        if bg.drag_started() {
+            if let Some(pos) = pointer {
+                let base = if ui.input(|i| i.modifiers.ctrl) { self.selected.clone() } else { HashSet::new() };
+                self.band = Some((pos - self.grid_origin.to_vec2(), base));
+            }
+        }
+        let Some((start, base)) = &self.band else { return };
+        if !bg.dragged() && !bg.drag_started() {
+            self.band = None;
+            return;
+        }
+        let Some(pos) = pointer else { return };
+        let now = pos - self.grid_origin.to_vec2();
+        let band = Rect::from_two_pos(*start, now);
+        // Cell (row, col) covers x 6 + col*w .. +w, y row*h .. +h in content coordinates.
+        let col_of = |x: f32| (((x - 6.0) / cell.x).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let (c0, c1) = (col_of(band.min.x), col_of(band.max.x));
+        let (r0, r1) = ((band.min.y / cell.y).floor().max(0.0) as usize, (band.max.y / cell.y).floor().max(0.0) as usize);
+        let mut sel = base.clone();
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                let i = r * cols + c;
+                if let Some(e) = self.items.get(i).map(|&e| &self.entries[e]) {
+                    if !e.is_folder() && Rect::from_min_size(Pos2::new(6.0 + c as f32 * cell.x, r as f32 * cell.y), cell).shrink(8.0).intersects(band) {
+                        sel.insert(e.path.clone());
+                    }
+                }
+            }
+        }
+        self.selected = sel;
+        let screen = band.translate(self.grid_origin.to_vec2());
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("grid-band")));
+        let clip = bg.rect;
+        painter.with_clip_rect(clip).rect(screen, CornerRadius::same(2), p.accent.gamma_multiply(0.12), Stroke::new(1.0, p.accent), egui::StrokeKind::Inside);
     }
 
     /// Put `files` (from this folder) before or after display item `target`, or at

@@ -718,7 +718,8 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
             c
         });
         changed |= toggle_row(ui, p, "Open viewer in full screen", "Images opened from the browser or Explorer fill the screen.", &mut s.open_viewer_fullscreen);
-        changed |= toggle_row(ui, p, "Loop at folder end", "Going past the last image wraps to the first.", &mut s.loop_navigation);
+        changed |= toggle_row(ui, p, "Loop at folder end", "Going past the last image wraps to the first. Off: a notice, and pressing again opens the next folder.", &mut s.loop_navigation);
+        changed |= toggle_row(ui, p, "Next image after rating", "Rating, flagging or labelling an image moves on to the next one, for fast culling.", &mut s.advance_after_tag);
         changed |= toggle_row(ui, p, "Preload neighbours", "Decode the next and previous images in the background for instant switching.", &mut s.preload_neighbors);
         changed |= toggle_row(ui, p, "Show info overlay", "File name, size and EXIF summary over the image.", &mut s.show_info_overlay);
         changed |= toggle_row(ui, p, "Show panels when the mouse touches a screen edge", "Edit tools on the left, file info on the right, thumbnails at the bottom.", &mut s.edge_panels);

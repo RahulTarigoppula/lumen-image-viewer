@@ -178,6 +178,8 @@ pub struct Settings {
     pub smooth_zoom_in: bool,
     pub animate_zoom: bool,
     pub loop_navigation: bool,
+    /// Viewer: after rating, flagging or labelling, go on to the next image.
+    pub advance_after_tag: bool,
     pub preload_neighbors: bool,
     pub cache_budget_mb: u64,
     pub thumb_size: f32,
@@ -281,6 +283,7 @@ impl Default for Settings {
             smooth_zoom_in: true,
             animate_zoom: true,
             loop_navigation: false,
+            advance_after_tag: false,
             preload_neighbors: true,
             cache_budget_mb: 1536,
             thumb_size: 168.0,
