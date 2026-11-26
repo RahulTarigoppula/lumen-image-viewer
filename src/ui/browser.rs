@@ -469,9 +469,18 @@ impl Browser {
     fn sort_button(&mut self, ui: &mut Ui, core: &mut Core, icon_only: bool, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
         let desc = core.settings.sort_desc;
-        let arrow = if desc { I::ARROW_DOWN } else { I::ARROW_UP };
+        // An arranged order has no direction: a grip instead of the arrow.
+        let custom = core.settings.sort_key == SortKey::Custom;
+        let arrow = if custom {
+            I::DOTS_SIX_VERTICAL
+        } else if desc {
+            I::ARROW_DOWN
+        } else {
+            I::ARROW_UP
+        };
         let h = size::CONTROL;
-        let key_g = (!icon_only).then(|| ui.painter().layout_no_wrap(core.settings.sort_key.label().to_string(), text::body(), p.text));
+        let key_text = if custom { "Custom order" } else { core.settings.sort_key.label() };
+        let key_g = (!icon_only).then(|| ui.painter().layout_no_wrap(key_text.to_string(), text::body(), p.text));
         let arrow_g = ui.painter().layout_no_wrap(arrow.to_string(), FontId::proportional(size::ICON_CARET), p.muted);
         let main_w = key_g.as_ref().map_or(0.0, |g| g.size().x + 6.0) + arrow_g.size().x + 20.0;
         let caret_w = 22.0;
@@ -508,7 +517,9 @@ impl Browser {
         }
         let dir = if desc { "descending" } else { "ascending" };
         let key = core.settings.sort_key.label().to_lowercase();
-        if main.on_hover_text(format!("Sorted by {key}, {dir}. Click to reverse.")).clicked() {
+        if custom {
+            main.on_hover_text("Arranged by hand: drag thumbnails to change the order (Ctrl+Alt+Left / Right moves the selection)");
+        } else if main.on_hover_text(format!("Sorted by {key}, {dir}. Click to reverse.")).clicked() {
             core.settings.sort_desc = !desc;
             self.resort_needed = true;
         }
@@ -1122,14 +1133,14 @@ impl Browser {
                 // Like FastStone: the first pictures inside, fanned out on the folder.
                 match self.peek.get(&entry.path) {
                     Some(imgs) if !imgs.is_empty() => {
-                        let side = ts * 0.30;
+                        let side = ts * 0.34;
                         let n = imgs.len() as f32;
                         for (k, e) in imgs.iter().enumerate() {
                             let key = ThumbKey::new(&e.path, e.size, e.modified);
                             let Thumb::Ready(t) = core.thumbs.get(&key) else { continue };
                             let tsz = t.tex.size_vec2();
                             let s = (side / tsz.x).min(side / tsz.y);
-                            let c = img_area.center() + Vec2::new((k as f32 - (n - 1.0) / 2.0) * side * 0.62, ts * 0.05 + (k as f32 - (n - 1.0) / 2.0).abs() * ts * 0.02);
+                            let c = img_area.center() + Vec2::new((k as f32 - (n - 1.0) / 2.0) * side * 0.72, ts * 0.06 + (k as f32 - (n - 1.0) / 2.0).abs() * ts * 0.02);
                             let r = Rect::from_center_size(c, tsz * s);
                             painter.rect_filled(r.expand(2.5).translate(Vec2::new(0.0, 1.5)), CornerRadius::same(3), Color32::from_black_alpha(80));
                             painter.rect_filled(r.expand(2.0), CornerRadius::same(2), Color32::WHITE);

@@ -5,7 +5,7 @@ wait 3000
 drag 1170 150 300 150
 wait 1500
 shot arranged.png
-# noise_iso6400.jpg dropped on the empty area below the thumbnails: it goes last.
+# The third thumbnail (now icon_alpha.png) dropped on the empty area below: it goes last.
 drag 770 150 800 500
 wait 1500
 shot to_end.png
