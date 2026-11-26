@@ -42,6 +42,16 @@
 - Batch convert with Overwrite skips animated, multi-page and high bit depth originals instead of flattening them;
   batch rename keeps one recovery journal per run.
 - Slideshow with subfolders searches in the background; rotating lossless WebP in the browser stays lossless.
+- The viewer's filmstrip lays out and loads only the thumbnails in view (fast with 10,000 images), and thumbnails
+  near the current image load first.
+- Thumbnails on screen are never thrown out and reloaded (large or 4K windows with small thumbnails), uploads are
+  spread over frames, and a JPEG thumbnail opens its file twice instead of four times.
+- Images with a color profile get thumbnails by scaling first, then converting the small result.
+- The viewer skips a second full decode for a "preview" when no cheap preview exists, and stops decoding images
+  you have already stepped past; one worker always stays free for the image on screen.
+- Metadata for files on screen is read first; EXIF of TIFF-based raw files no longer reads the whole file.
+- Very large images are decoded for thumbnails at most two at a time, so a folder of panoramas cannot exhaust memory.
+- Ratings, custom orders and settings are written on a background thread, atomically (a power cut cannot empty them).
 - A damaged color label in the tags file no longer crashes the browser.
 - The folder is checked for changes on a background thread, and the Move / Copy dialog no longer checks every
   recent folder on every frame (offline network drives froze the app).
