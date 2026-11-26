@@ -53,9 +53,16 @@ pub struct Browser {
     pub media_filter: MediaFilter,
     pub flagged_only: bool,
     pub min_rating: u8,
+    /// Show only files with this color label (0 = any).
+    pub label_filter: u8,
+    /// Files and folders among `items`, counted in `rebuild` (the status bar reads them every frame).
+    counts: (usize, usize),
     pub loading: bool,
     pub error: Option<String>,
-    list_rx: Option<Receiver<(PathBuf, std::io::Result<Vec<Entry>>)>>,
+    list_rx: Option<Receiver<(PathBuf, std::io::Result<Vec<Entry>>, Option<SystemTime>)>>,
+    /// The folder's modified time, read on a background thread (a slow or
+    /// offline network folder must not stall the UI every 1.5 s).
+    poll_rx: Option<Receiver<Option<SystemTime>>>,
     pub back: Vec<PathBuf>,
     pub forward: Vec<PathBuf>,
     address: Option<String>,
@@ -94,9 +101,12 @@ impl Browser {
             media_filter: MediaFilter::All,
             flagged_only: false,
             min_rating: 0,
+            label_filter: 0,
+            counts: (0, 0),
             loading: false,
             error: None,
             list_rx: None,
+            poll_rx: None,
             back: Vec::new(),
             forward: Vec::new(),
             address: None,
@@ -127,12 +137,15 @@ impl Browser {
         self.folder = folder.clone();
         self.loading = true;
         self.error = None;
-        self.dir_mtime = std::fs::metadata(&folder).and_then(|m| m.modified()).ok();
+        self.dir_mtime = None;
+        self.poll_rx = None;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let c = ctx.clone();
         std::thread::spawn(move || {
+            // Read before listing, so a change during the listing is seen by the next poll.
+            let mtime = std::fs::metadata(&folder).and_then(|m| m.modified()).ok();
             let res = catalog::list_folder(&folder, show_hidden);
-            let _ = tx.send((folder, res));
+            let _ = tx.send((folder, res, mtime));
             c.request_repaint();
         });
         self.list_rx = Some(rx);
@@ -216,6 +229,22 @@ impl Browser {
         }
     }
 
+    /// Start typing in the address bar (Ctrl+L, Alt+D, F4).
+    pub fn edit_address(&mut self) {
+        self.address = Some(self.folder.display().to_string());
+    }
+
+    /// True when a flag, rating or color label filter hides files.
+    pub fn tag_filter_on(&self) -> bool {
+        self.flagged_only || self.min_rating > 0 || self.label_filter > 0
+    }
+
+    /// Select the flagged files among those shown.
+    pub fn select_flagged(&mut self, core: &Core) -> usize {
+        self.selected = self.items.iter().map(|&e| &self.entries[e]).filter(|e| !e.is_folder() && core.tags.get(&e.path).flagged).map(|e| e.path.clone()).collect();
+        self.selected.len()
+    }
+
     /// The sort in effect for the open folder: its own arrangement when it has an
     /// active one, otherwise the sort chosen in the toolbar (custom order is per
     /// folder, so a folder without one falls back to name).
@@ -266,11 +295,13 @@ impl Browser {
         let custom = |p: &Path| p.file_name().and_then(|n| positions.get(&n.to_string_lossy().to_lowercase()).copied());
         let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label, custom: &custom };
         catalog::sort_entries(&mut self.entries, key, s.sort_desc, s.folders_first, &cx);
+        // Tags are only looked up when a flag, rating or label filter is on.
+        let tag_filter = self.flagged_only || self.min_rating > 0 || self.label_filter > 0;
         self.items = (0..self.entries.len())
             .filter(|&i| {
                 let e = &self.entries[i];
                 if e.is_folder() {
-                    return s.show_folders_in_grid && self.filter.is_empty() && !self.flagged_only && self.min_rating == 0;
+                    return s.show_folders_in_grid && self.filter.is_empty() && !tag_filter;
                 }
                 let kind_ok = match self.media_filter {
                     MediaFilter::All => true,
@@ -280,10 +311,15 @@ impl Browser {
                 if !kind_ok || !catalog::matches_filter(&e.name, &self.filter) {
                     return false;
                 }
+                if !tag_filter {
+                    return true;
+                }
                 let t = core.tags.get(&e.path);
-                (!self.flagged_only || t.flagged) && t.rating >= self.min_rating
+                (!self.flagged_only || t.flagged) && t.rating >= self.min_rating && (self.label_filter == 0 || t.label == self.label_filter)
             })
             .collect();
+        let folders = self.items.iter().filter(|&&e| self.entries[e].is_folder()).count();
+        self.counts = (self.items.len() - folders, folders);
         self.focus = focus_path.and_then(|p| self.index_of(&p)).or(if self.items.is_empty() { None } else { self.focus.map(|f| f.min(self.items.len() - 1)) });
         // Re-resolve the Shift-selection anchor by path: indices are stale after
         // a re-sort, filter change or reload. Fall back to the focus.
@@ -297,10 +333,11 @@ impl Browser {
     /// Called every frame: receive listings, poll for folder changes.
     pub fn tick(&mut self, core: &mut Core) {
         if let Some(rx) = &self.list_rx {
-            if let Ok((folder, res)) = rx.try_recv() {
+            if let Ok((folder, res, mtime)) = rx.try_recv() {
                 self.list_rx = None;
                 if folder == self.folder {
                     self.loading = false;
+                    self.dir_mtime = mtime;
                     match res {
                         Ok(entries) => {
                             // Old item indices point into the old entry list:
@@ -340,11 +377,27 @@ impl Browser {
             self.rebuild(core);
         }
         // Cheap change detection: a folder's mtime changes when files are added/removed/renamed.
-        if !self.loading && self.last_poll.elapsed().as_millis() > 1500 {
+        if let Some(rx) = &self.poll_rx {
+            if let Ok(m) = rx.try_recv() {
+                self.poll_rx = None;
+                if !self.loading && m.is_some() && m != self.dir_mtime {
+                    self.reload(&core.ctx, core.settings.show_hidden_files);
+                }
+            }
+        } else if !self.loading && self.last_poll.elapsed().as_millis() > 1500 {
             self.last_poll = Instant::now();
-            let m = std::fs::metadata(&self.folder).and_then(|m| m.modified()).ok();
-            if m.is_some() && m != self.dir_mtime {
-                self.reload(&core.ctx, core.settings.show_hidden_files);
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (dir, known) = (self.folder.clone(), self.dir_mtime);
+            let ctx = core.ctx.clone();
+            let spawned = std::thread::Builder::new().name("lumen-folder-poll".into()).spawn(move || {
+                let m = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                // Wake the UI only when something changed.
+                if tx.send(m).is_ok() && m.is_some() && m != known {
+                    ctx.request_repaint();
+                }
+            });
+            if spawned.is_ok() {
+                self.poll_rx = Some(rx);
             }
         }
     }
@@ -421,9 +474,8 @@ impl Browser {
             ui.add_space(2.0);
 
             // Media type + flag/rating filters
-            let filtered = self.flagged_only || self.min_rating > 0 || self.media_filter != MediaFilter::All;
-            let filt_icon = if filtered { I::FUNNEL_SIMPLE } else { I::FUNNEL_SIMPLE_X };
-            let filt = widgets::icon_button(ui, filt_icon, "Show: media type, flag and rating", filtered);
+            let filtered = self.tag_filter_on() || self.media_filter != MediaFilter::All;
+            let filt = widgets::icon_button(ui, I::FUNNEL_SIMPLE, "Show: media type, flag, rating and color label", filtered);
             egui::Popup::menu(&filt).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.set_min_width(220.0);
                 ui.label(RichText::new("Show").font(text::caption()).color(p.muted));
@@ -444,6 +496,38 @@ impl Browser {
                         self.resort_needed = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Color label").on_hover_text("Show only files with this label; click it again to clear");
+                    for l in 1..=5u8 {
+                        let [r, g, b] = crate::tags::LABEL_COLORS[l as usize];
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                        let on = self.label_filter == l;
+                        ui.painter().circle_filled(rect.center(), if on || resp.hovered() { 7.0 } else { 6.0 }, Color32::from_rgb(r, g, b));
+                        if on {
+                            ui.painter().circle_stroke(rect.center(), 8.5, Stroke::new(1.5, p.text));
+                        }
+                        if resp.on_hover_text(crate::tags::LABEL_NAMES[l as usize]).clicked() {
+                            self.label_filter = if on { 0 } else { l };
+                            self.resort_needed = true;
+                        }
+                    }
+                });
+                if filtered {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Select the files shown").on_hover_text("Select every file that passes the filter, ready to copy, move or compare").clicked() {
+                            ev.push(BrowserEvent::Command(Command::SelectAll));
+                            ui.close();
+                        }
+                        if ui.button("Clear filters").clicked() {
+                            self.flagged_only = false;
+                            self.min_rating = 0;
+                            self.label_filter = 0;
+                            self.media_filter = MediaFilter::All;
+                            self.resort_needed = true;
+                        }
+                    });
+                }
             });
 
             let details = core.settings.browser_view == BrowserView::Details;
@@ -513,8 +597,9 @@ impl Browser {
         };
         let h = size::CONTROL;
         let key_text = if custom { "Custom order" } else { effective.label() };
-        let key_g = (!icon_only).then(|| ui.painter().layout_no_wrap(key_text.to_string(), text::body(), p.text));
-        let arrow_g = ui.painter().layout_no_wrap(arrow.to_string(), FontId::proportional(size::ICON_CARET), p.muted);
+        // When room is short the arrow goes first: the sort key is what people read.
+        let key_g = Some(ui.painter().layout_no_wrap(key_text.to_string(), text::body(), p.text));
+        let arrow_g = ui.painter().layout_no_wrap(if icon_only { String::new() } else { arrow.to_string() }, FontId::proportional(size::ICON_CARET), p.muted);
         let main_w = key_g.as_ref().map_or(0.0, |g| g.size().x + 6.0) + arrow_g.size().x + 20.0;
         let caret_w = 22.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(main_w + caret_w, h), Sense::hover());
@@ -685,7 +770,8 @@ impl Browser {
         let p = core.pal;
         let favs = core.settings.favorites.clone();
         // A short sidebar (large interface size, small window) keeps the tree only.
-        let show_preview = core.settings.show_preview_pane && ui.available_height() >= 300.0;
+        // A short window keeps the room for the folder tree.
+        let show_preview = core.settings.show_preview_pane && ui.available_height() >= 460.0;
         let mut tree_bottom: Option<f32> = None;
         if show_preview {
             // Never let the preview take more than ~60% of a short sidebar.
@@ -819,6 +905,16 @@ impl Browser {
 
     pub fn central(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
+        // Mouse back / forward buttons go back and forward through folders, as in Explorer.
+        if !self.suppress_keys && !super::overlay_open(ui.ctx()) {
+            let (back, fwd) = ui.input(|i| (i.pointer.button_clicked(egui::PointerButton::Extra1), i.pointer.button_clicked(egui::PointerButton::Extra2)));
+            if back {
+                ev.push(BrowserEvent::Command(Command::GoBack));
+            }
+            if fwd {
+                ev.push(BrowserEvent::Command(Command::GoForward));
+            }
+        }
         // Drop target for files dragged in from Explorer is handled by the app.
         if let Some(err) = &self.error {
             ui.centered_and_justified(|ui| {
@@ -1063,20 +1159,21 @@ impl Browser {
     /// or later in the custom order, past the neighbouring file.
     pub fn nudge(&mut self, core: &mut Core, step: i32) {
         let is_file = |b: &Browser, i: usize| !b.entries[b.items[i]].is_folder();
-        let mut files = self.selected_paths();
-        files.retain(|f| self.index_of(f).is_some_and(|i| is_file(self, i)));
-        if files.is_empty() {
+        // Display positions of the moving files, found in one pass (selections can be large).
+        let mut idx: Vec<usize> = (0..self.items.len()).filter(|&i| is_file(self, i) && self.selected.contains(&self.entries[self.items[i]].path)).collect();
+        if idx.is_empty() {
             match self.focus.filter(|&i| i < self.items.len() && is_file(self, i)) {
-                Some(i) => files.push(self.entries[self.items[i]].path.clone()),
+                Some(i) => idx.push(i),
                 None => return,
             }
         }
-        let idx: Vec<usize> = files.iter().filter_map(|f| self.index_of(f)).collect();
-        let (Some(&first), Some(&last)) = (idx.iter().min(), idx.iter().max()) else { return };
+        let files: Vec<PathBuf> = idx.iter().map(|&i| self.entries[self.items[i]].path.clone()).collect();
+        let moving: HashSet<usize> = idx.iter().copied().collect();
+        let (first, last) = (idx[0], idx[idx.len() - 1]);
         let target = if step < 0 {
-            (0..first).rev().find(|&i| is_file(self, i) && !files.contains(&self.entries[self.items[i]].path))
+            (0..first).rev().find(|&i| is_file(self, i) && !moving.contains(&i))
         } else {
-            (last + 1..self.items.len()).find(|&i| is_file(self, i) && !files.contains(&self.entries[self.items[i]].path))
+            (last + 1..self.items.len()).find(|&i| is_file(self, i) && !moving.contains(&i))
         };
         let Some(t) = target else { return };
         self.arrange(core, &files, Some(t), step > 0);
@@ -1166,14 +1263,14 @@ impl Browser {
                 // Like FastStone: the first pictures inside, fanned out on the folder.
                 match self.peek.get(&entry.path) {
                     Some(imgs) if !imgs.is_empty() => {
-                        let side = ts * 0.34;
+                        let side = ts * 0.28;
                         let n = imgs.len() as f32;
                         for (k, e) in imgs.iter().enumerate() {
                             let key = ThumbKey::new(&e.path, e.size, e.modified);
                             let Thumb::Ready(t) = core.thumbs.get(&key) else { continue };
                             let tsz = t.tex.size_vec2();
                             let s = (side / tsz.x).min(side / tsz.y);
-                            let c = img_area.center() + Vec2::new((k as f32 - (n - 1.0) / 2.0) * side * 0.72, ts * 0.06 + (k as f32 - (n - 1.0) / 2.0).abs() * ts * 0.02);
+                            let c = img_area.center() + Vec2::new((k as f32 - (n - 1.0) / 2.0) * side * 0.66, ts * 0.06 + (k as f32 - (n - 1.0) / 2.0).abs() * ts * 0.02);
                             let r = Rect::from_center_size(c, tsz * s);
                             painter.rect_filled(r.expand(2.5).translate(Vec2::new(0.0, 1.5)), CornerRadius::same(3), Color32::from_black_alpha(80));
                             painter.rect_filled(r.expand(2.0), CornerRadius::same(2), Color32::WHITE);
@@ -1242,7 +1339,7 @@ impl Browser {
                     x += 16.0;
                 }
                 if tag.label > 0 {
-                    let c = crate::tags::LABEL_COLORS[tag.label as usize];
+                    let c = crate::tags::LABEL_COLORS[tag.label as usize % 6];
                     painter.circle_filled(Pos2::new(x + 7.0, pill.center().y), 5.0, Color32::from_rgb(c[0], c[1], c[2]));
                 }
             }
@@ -1576,6 +1673,7 @@ impl Browser {
                 item(ui, Command::NewFolder, ev);
                 item(ui, Command::Refresh, ev);
                 item(ui, Command::SelectAll, ev);
+                item(ui, Command::SelectFlagged, ev);
                 item(ui, Command::AddFavorite, ev);
             }
         };
@@ -1675,11 +1773,15 @@ impl Browser {
     }
 
     pub fn status_text(&self, core: &Core) -> String {
-        let folders = self.items.iter().filter(|&&e| self.entries[e].is_folder()).count();
-        let files = self.items.len() - folders;
-        let mut s = format!("{files} file{}", if files == 1 { "" } else { "s" });
-        if folders > 0 {
-            s += &format!(", {folders} folder{}", if folders == 1 { "" } else { "s" });
+        let (files, folders) = self.counts;
+        let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+        let mut s = match (files, folders) {
+            (0, f) if f > 0 => plural(f, "folder"),
+            (n, 0) => plural(n, "file"),
+            (n, f) => format!("{}, {}", plural(n, "file"), plural(f, "folder")),
+        };
+        if self.tag_filter_on() || self.media_filter != MediaFilter::All || !self.filter.is_empty() {
+            s += "   ·   filtered";
         }
         if !self.selected.is_empty() {
             let (n, bytes) = selection_totals(&self.entries, &self.selected);
@@ -1926,8 +2028,9 @@ fn paint_drag_badge(ui: &Ui, n: usize, p: &Palette) {
 /// background thread so slow (network) folders never block painting.
 struct FolderPeek {
     tx: Option<crossbeam_channel::Sender<PathBuf>>,
-    found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<Entry>>>>,
-    asked: parking_lot::Mutex<HashSet<PathBuf>>,
+    /// Listed folders (`None` while asked but not listed yet), one map so the
+    /// two can never disagree.
+    found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<Vec<Entry>>>>>>,
 }
 
 impl FolderPeek {
@@ -1936,47 +2039,50 @@ impl FolderPeek {
 
     fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
-        let found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<Entry>>>> = Default::default();
+        let found: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<Vec<Entry>>>>>> = Default::default();
         let out = found.clone();
         let spawned = std::thread::Builder::new().name("lumen-folder-peek".into()).spawn(move || {
             crate::bg::background_priority();
             for dir in rx {
-                let imgs = std::panic::catch_unwind(|| {
-                    let mut v: Vec<Entry> = catalog::list_folder(&dir, false).unwrap_or_default().into_iter().filter(|e| e.kind == EntryKind::Image).collect();
-                    v.sort_by(|a, b| catalog::natural_cmp(&a.name, &b.name));
-                    v.truncate(Self::COUNT);
-                    v
-                })
-                .unwrap_or_default();
-                let mut map = out.lock();
-                if map.len() > 4000 {
-                    map.clear();
+                // Forgotten meanwhile (Refresh, or the cache was trimmed): skip.
+                if !out.lock().contains_key(&dir) {
+                    continue;
                 }
-                map.insert(dir, imgs);
+                let imgs = std::panic::catch_unwind(|| Self::first_images(&dir)).unwrap_or_default();
+                if let Some(slot) = out.lock().get_mut(&dir) {
+                    *slot = Some(std::sync::Arc::new(imgs));
+                }
             }
         });
-        FolderPeek { tx: spawned.ok().map(|_| tx), found, asked: Default::default() }
+        FolderPeek { tx: spawned.ok().map(|_| tx), found }
+    }
+
+    /// The first images of `dir` by name, looking at no more than a few thousand
+    /// entries (a huge or slow folder still shows something quickly).
+    fn first_images(dir: &Path) -> Vec<Entry> {
+        let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+        let mut names: Vec<PathBuf> = rd.take(3000).filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| crate::formats::is_image_path(p)).collect();
+        names.sort_by(|a, b| catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+        names.iter().filter_map(|p| Entry::from_path(p)).filter(|e| !e.hidden).take(Self::COUNT).collect()
     }
 
     /// The images of `dir` once listed; the first call asks for them.
-    fn get(&self, dir: &Path) -> Option<Vec<Entry>> {
-        if let Some(v) = self.found.lock().get(dir) {
-            return Some(v.clone());
+    fn get(&self, dir: &Path) -> Option<std::sync::Arc<Vec<Entry>>> {
+        let mut map = self.found.lock();
+        if let Some(v) = map.get(dir) {
+            return v.clone();
         }
-        let Some(tx) = &self.tx else { return Some(Vec::new()) };
-        let mut asked = self.asked.lock();
-        if asked.len() > 4000 {
-            asked.clear();
+        let Some(tx) = &self.tx else { return Some(Default::default()) };
+        if map.len() > 4000 {
+            map.clear();
         }
-        if asked.insert(dir.to_path_buf()) {
-            let _ = tx.send(dir.to_path_buf());
-        }
+        map.insert(dir.to_path_buf(), None);
+        let _ = tx.send(dir.to_path_buf());
         None
     }
 
     /// Forget the folders inside `parent` so they are listed again (Refresh).
     fn forget_under(&self, parent: &Path) {
         self.found.lock().retain(|d, _| d.parent() != Some(parent));
-        self.asked.lock().retain(|d| d.parent() != Some(parent));
     }
 }

@@ -18,6 +18,16 @@ shot viewer_first.png
 run NextImage
 wait 2000
 shot viewer_second.png
+# Flagging in the viewer shows in the caption; past the last image a notice offers the next folder.
+run ToggleFlag
+wait 800
+shot viewer_flagged.png
+run ToggleFlag
+run LastImage
+wait 1500
+run NextImage
+wait 800
+shot viewer_end.png
 key Escape
 wait 1000
 run ToggleDetails

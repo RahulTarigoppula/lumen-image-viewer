@@ -142,6 +142,10 @@ pub enum Command {
     TogglePixelValues,
     /// Next inspect view (clipping, false color, peaking, channels).
     CycleInspect,
+    /// Select the flagged files in the browser.
+    SelectFlagged,
+    /// Type a folder path in the browser's address bar.
+    FocusAddress,
     /// Move the selected files one place earlier in the folder's custom order.
     MoveEarlier,
     /// Move the selected files one place later in the folder's custom order.
@@ -194,7 +198,7 @@ impl Command {
             Rate(0) => "Clear rating".into(),
             Rate(n) => format!("Rate {n} star{}", if n == 1 { "" } else { "s" }),
             Label(0) => "Clear color label".into(),
-            Label(n) => format!("Color label: {}", crate::tags::LABEL_NAMES[n as usize]),
+            Label(n) => format!("Color label: {}", crate::tags::LABEL_NAMES[n as usize % 6]),
             ShowFlaggedOnly => "Show flagged only".into(),
             OpenVideoMode => "Video mode (play & compare videos)".into(),
             OpenViewer => "View image".into(),
@@ -273,6 +277,8 @@ impl Command {
             ExportMetadataCsv => "Export metadata of images as CSV".into(),
             TogglePixelValues => "Pixel values under the pointer".into(),
             CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
+            SelectFlagged => "Select flagged files".into(),
+            FocusAddress => "Type a folder path".into(),
             MoveEarlier => "Move earlier (custom order)".into(),
             MoveLater => "Move later (custom order)".into(),
         }
@@ -404,6 +410,8 @@ impl Command {
             ExportMetadataCsv => I::FILE_CSV,
             TogglePixelValues => I::EYEDROPPER,
             CycleInspect => I::EYE,
+            SelectFlagged => I::FLAG,
+            FocusAddress => I::TEXTBOX,
             MoveEarlier => I::ARROW_LEFT,
             MoveLater => I::ARROW_RIGHT,
         }
@@ -435,7 +443,7 @@ impl Command {
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
-            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, MoveEarlier, MoveLater,
+            CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, MoveEarlier, MoveLater,
         ]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
@@ -470,7 +478,7 @@ impl Command {
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
-        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, MoveEarlier, MoveLater]);
+        v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, MoveEarlier, MoveLater]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

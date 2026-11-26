@@ -135,6 +135,11 @@ struct TransferDialog {
     do_move: bool,
     /// The destination field (filled with the most recent target when it opens).
     dest: Option<String>,
+    /// Recent and favorite folders that exist, checked once when the dialog
+    /// opens (an offline network folder must not stall every frame).
+    recents: Option<Vec<PathBuf>>,
+    /// The typed destination and whether it is an existing folder (checked when it changes).
+    typed_dir: Option<(String, bool)>,
 }
 
 pub struct App {
@@ -171,6 +176,9 @@ pub struct App {
     fullscreen: bool,
     viewer_from_browser: bool,
     last_save: Instant,
+    /// When the viewer last said "last image" / "first image" (and which way):
+    /// a second press soon after goes on to the next / previous folder.
+    end_notice: Option<(Instant, isize)>,
     /// Debounced settings autosave: the JSON last written (or loaded), the
     /// JSON seen at the previous check, and when that check ran.
     settings_saved: String,
@@ -320,6 +328,7 @@ impl App {
             fullscreen: false,
             viewer_from_browser: false,
             last_save: Instant::now(),
+            end_notice: None,
             settings_saved: String::new(),
             settings_seen: String::new(),
             settings_check: Instant::now(),
@@ -683,6 +692,17 @@ impl App {
                 self.browser.selected = self.browser.items.iter().map(|&e| &self.browser.entries[e]).filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect();
             }
             SelectNone => self.browser.selected.clear(),
+            FocusAddress => {
+                if self.mode == Mode::Browser {
+                    self.browser.edit_address();
+                }
+            }
+            SelectFlagged => {
+                let n = self.browser.select_flagged(&self.core);
+                if n == 0 {
+                    self.core.toasts.info("No flagged files here. Flag with Q (or the flag button), then select them all at once.");
+                }
+            }
             InvertSelection => {
                 let all: Vec<PathBuf> = self.browser.items.iter().map(|&e| &self.browser.entries[e]).filter(|e| !e.is_folder()).map(|e| e.path.clone()).collect();
                 let cur = std::mem::take(&mut self.browser.selected);
@@ -691,7 +711,7 @@ impl App {
             CopyTo | MoveTo => {
                 let files = self.targets();
                 if !files.is_empty() {
-                    self.transfer = Some(TransferDialog { files, do_move: cmd == MoveTo, dest: None });
+                    self.transfer = Some(TransferDialog { files, do_move: cmd == MoveTo, dest: None, recents: None, typed_dir: None });
                 }
             }
             Delete => {
@@ -878,6 +898,9 @@ impl App {
                 for p in &t {
                     self.core.tags.update(p, |tag| tag.flagged = !all_flagged);
                 }
+                if !t.is_empty() && self.mode != Mode::Browser {
+                    self.core.toasts.info(if all_flagged { "Flag removed" } else { "Flagged" });
+                }
                 if self.browser.flagged_only || self.core.settings.sort_key == crate::settings::SortKey::Flagged {
                     self.browser.mark_resort();
                 }
@@ -895,10 +918,14 @@ impl App {
                 }
             }
             Label(n) => {
-                for p in &self.media_targets() {
+                let t = self.media_targets();
+                for p in &t {
                     self.core.tags.update(p, |tag| tag.label = n);
                 }
-                if self.core.settings.sort_key == crate::settings::SortKey::ColorLabel {
+                if !t.is_empty() && self.mode != Mode::Browser {
+                    self.core.toasts.info(if n == 0 { "Color label cleared".to_string() } else { format!("Color label: {}", crate::tags::LABEL_NAMES[(n as usize).min(5)]) });
+                }
+                if self.core.settings.sort_key == crate::settings::SortKey::ColorLabel || self.browser.label_filter > 0 {
                     self.browser.mark_resort();
                 }
             }
@@ -921,11 +948,20 @@ impl App {
                 Mode::Browser => {}
                 _ => self.mode = Mode::Browser,
             },
-            NextImage => {
-                self.viewer.step(1, wrap, fit);
-            }
-            PrevImage => {
-                self.viewer.step(-1, wrap, fit);
+            NextImage | PrevImage => {
+                let d: isize = if cmd == NextImage { 1 } else { -1 };
+                let at_end = if d > 0 { self.viewer.index + 1 >= self.viewer.list.len() } else { self.viewer.index == 0 };
+                if wrap || !at_end || self.mode != Mode::Viewer {
+                    self.end_notice = None;
+                    self.viewer.step(d, wrap, fit);
+                } else if self.end_notice.is_some_and(|(t, dir)| dir == d && t.elapsed() < std::time::Duration::from_millis(2000)) {
+                    self.end_notice = None;
+                    self.open_sibling_folder(d);
+                } else {
+                    self.end_notice = Some((Instant::now(), d));
+                    let (which, key) = if d > 0 { ("Last", "Right") } else { ("First", "Left") };
+                    self.core.toasts.info(format!("{which} image in this folder. Press {key} again for the {} folder.", if d > 0 { "next" } else { "previous" }));
+                }
             }
             FirstImage => {
                 let d = -(self.viewer.index as isize);
@@ -1052,9 +1088,21 @@ impl App {
             PasteImage => match fileops::paste_image_from_clipboard() {
                 Ok(img) => {
                     if self.mode == Mode::Viewer && self.viewer.current().is_some() {
-                        if let Some(sess) = self.viewer.ensure_edit(&self.core) {
-                            sess.push(img, "Paste");
-                            self.viewer.reset_view(fit);
+                        // A new file next to the photo, never an edit of it: a later
+                        // Ctrl+S must not overwrite the original with the clipboard.
+                        let dir = self.viewer.current().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| self.browser.folder.clone());
+                        let name = chrono::Local::now().format("Pasted %Y-%m-%d %H%M%S.png").to_string();
+                        let path = fileops::unique_path(&dir.join(name));
+                        let opts = SaveOptions { format: crate::formats::SaveFormat::Png, ..Default::default() };
+                        match crate::encode::save(&img, &path, &opts) {
+                            Ok(()) => {
+                                self.core.toasts.success(format!("Clipboard image saved as {}", crate::ui::viewer::file_name(&path)));
+                                if dir == self.browser.folder {
+                                    self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+                                }
+                                self.open_file(&path);
+                            }
+                            Err(e) => self.core.toasts.error(e.to_string()),
                         }
                     } else {
                         self.run(PasteFiles);
@@ -1602,6 +1650,36 @@ impl App {
         }
     }
 
+    /// From the viewer at the end of a folder: open the first (or, going back,
+    /// the last) picture of the next (`d` > 0) or previous sibling folder that
+    /// has pictures, in natural name order.
+    fn open_sibling_folder(&mut self, d: isize) {
+        let Some(cur) = self.viewer.current().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
+        let Some(parent) = cur.parent() else { return };
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent)
+            .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        dirs.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+        let Some(at) = dirs.iter().position(|p| fileops::same_path(p, &cur)) else { return };
+        let candidates: Vec<&PathBuf> = if d > 0 { dirs[at + 1..].iter().take(50).collect() } else { dirs[..at].iter().rev().take(50).collect() };
+        for dir in candidates {
+            let mut pics: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| crate::formats::is_image_path(p)).take(20000).collect())
+                .unwrap_or_default();
+            if pics.is_empty() {
+                continue;
+            }
+            pics.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+            let pick = if d > 0 { pics.first() } else { pics.last() };
+            if let Some(p) = pick.cloned() {
+                self.core.toasts.info(format!("Folder: {}", crate::ui::viewer::file_name(dir)));
+                self.open_file(&p);
+            }
+            return;
+        }
+        self.core.toasts.info(if d > 0 { "No later folder with pictures" } else { "No earlier folder with pictures" });
+    }
+
     /// Ctrl+Z with no edit to undo: put the last moved / renamed files back, or
     /// turn the last rotated / flipped files back.
     fn undo_file_op(&mut self) {
@@ -2100,13 +2178,16 @@ impl App {
         let n = t.files.len();
         let what = if n == 1 { format!("\"{}\"", crate::ui::viewer::file_name(&t.files[0])) } else { format!("{n} items") };
         let title = format!("{} {what} to folder", if t.do_move { "Move" } else { "Copy" });
-        let mut recents: Vec<PathBuf> = Vec::new();
-        for d in self.core.settings.copy_move_targets.iter().chain(self.core.settings.favorites.iter()) {
-            if d.is_dir() && !recents.iter().any(|r| fileops::same_path(r, d)) {
-                recents.push(d.clone());
+        if t.recents.is_none() {
+            let mut recents: Vec<PathBuf> = Vec::new();
+            for d in self.core.settings.copy_move_targets.iter().chain(self.core.settings.favorites.iter()) {
+                if recents.len() < 9 && !recents.iter().any(|r| fileops::same_path(r, d)) && d.is_dir() {
+                    recents.push(d.clone());
+                }
             }
+            t.recents = Some(recents);
         }
-        recents.truncate(9);
+        let recents = t.recents.clone().unwrap_or_default();
         // Start from the most recent target; with none, an empty field to type into.
         let first_frame = t.dest.is_none();
         if first_frame {
@@ -2138,8 +2219,16 @@ impl App {
                     }
                 }
             });
+            let typed_exists = match &t.typed_dir {
+                Some((s, ok)) if s == dest.trim() => *ok,
+                _ => {
+                    let ok = PathBuf::from(dest.trim()).is_dir();
+                    t.typed_dir = Some((dest.trim().to_string(), ok));
+                    ok
+                }
+            };
             let typed = PathBuf::from(dest.trim());
-            if !dest.trim().is_empty() && !typed.is_dir() {
+            if !dest.trim().is_empty() && !typed_exists {
                 ui.add_space(2.0);
                 ui.label(RichText::new(format!("{}  This folder does not exist yet; it will be created.", I::INFO)).size(theme::text::SMALL).color(p.muted));
             }

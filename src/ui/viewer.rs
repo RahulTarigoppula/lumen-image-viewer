@@ -689,6 +689,16 @@ impl Viewer {
         self.crop = Some(CropState { roi, initial });
     }
 
+    /// Where a fitted picture goes. In a window the caption (top) and the bottom
+    /// bar always show, so "fit" leaves room for them and the whole picture stays
+    /// visible; full screen (bars hide) and small windows use the whole view.
+    fn fit_area(&self, view: Rect, mode: FitMode) -> Rect {
+        if self.is_fullscreen || view.height() < 360.0 || !matches!(mode, FitMode::FitLarge | FitMode::FitAlways) {
+            return view;
+        }
+        Rect::from_min_max(view.min + Vec2::new(0.0, 40.0), view.max - Vec2::new(0.0, 62.0))
+    }
+
     fn fit_zoom(&self, mode: FitMode, img: (u32, u32), view: Vec2, ppp: f32) -> f32 {
         let (w, h) = (img.0.max(1) as f32, img.1.max(1) as f32);
         let vw = view.x * ppp;
@@ -1056,7 +1066,8 @@ impl Viewer {
                         let dims = core.meta.get(&path).and_then(|m| m.dims);
                         let target = match dims {
                             Some((w, h)) => {
-                                let z = self.fit_zoom(self.auto_fit.unwrap_or(FitMode::FitLarge), (w, h), view.size(), ppp);
+                                let mode = self.auto_fit.unwrap_or(FitMode::FitLarge);
+                                let z = self.fit_zoom(mode, (w, h), self.fit_area(view, mode).size(), ppp);
                                 Vec2::new(w as f32, h as f32) * z / ppp
                             }
                             None => {
@@ -1064,7 +1075,7 @@ impl Viewer {
                                 ts * s
                             }
                         };
-                        let r = Rect::from_center_size(view.center(), target);
+                        let r = Rect::from_center_size(self.fit_area(view, self.auto_fit.unwrap_or(FitMode::FitLarge)).center(), target);
                         let mut mesh = egui::Mesh::with_texture(tex.id());
                         mesh.add_rect_with_uv(r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                         ui.painter().add(egui::Shape::mesh(mesh));
@@ -1114,7 +1125,7 @@ impl Viewer {
         let (w, h) = (img.0 as f32, img.1 as f32);
         self.zoom = sane_zoom(self.zoom);
         if let Some(mode) = self.auto_fit {
-            self.zoom = self.fit_zoom(mode, img, view.size(), ppp);
+            self.zoom = self.fit_zoom(mode, img, self.fit_area(view, mode).size(), ppp);
             self.center = Vec2::new(w / 2.0, h / 2.0);
             if matches!(mode, FitMode::FitWidth) {
                 self.center.y = (view.height() * ppp / self.zoom / 2.0).min(h / 2.0);
@@ -1166,6 +1177,13 @@ impl Viewer {
         let half_vh = view.height() * ppp / self.zoom / 2.0;
         self.center.x = if w <= half_vw * 2.0 { w / 2.0 } else { safe_clamp(self.center.x, half_vw, w - half_vw) };
         self.center.y = if h <= half_vh * 2.0 { h / 2.0 } else { safe_clamp(self.center.y, half_vh, h - half_vh) };
+        // A fitted picture sits in the middle of the room left by the caption and the bar.
+        if let Some(mode) = self.auto_fit {
+            let area = self.fit_area(view, mode);
+            if h <= half_vh * 2.0 {
+                self.center.y += (view.center().y - area.center().y) * ppp / self.zoom;
+            }
+        }
     }
 
     /// Edit-tool canvas hook: an interactive tool owns primary clicks/drags
@@ -1617,7 +1635,28 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         // Wrap inside the image area: a long name at a large UI scale must not
         // run under the tool / info panel beside it.
         let wrap = (view.width() - 44.0).max(40.0);
-        let galley = ui.painter().layout(text, FontId::proportional(12.5), Color32::from_white_alpha(230), wrap);
+        let base = egui::TextFormat { font_id: FontId::proportional(12.5), color: Color32::from_white_alpha(230), ..Default::default() };
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap;
+        job.append(&text, 0.0, base.clone());
+        // Rating, flag and color label, so culling full screen is not blind.
+        let tag = core.tags.get(path);
+        let mut tag_part = |s: String, color: Color32| {
+            job.append("   \u{00B7}   ", 0.0, base.clone());
+            job.append(&s, 0.0, egui::TextFormat { color, ..base.clone() });
+        };
+        if tag.rating > 0 {
+            tag_part("\u{2605}".repeat(tag.rating.min(5) as usize), Color32::from_rgb(250, 196, 60));
+        }
+        if tag.flagged {
+            tag_part(format!("{} flagged", I::FLAG), Color32::from_rgb(255, 170, 90));
+        }
+        if tag.label > 0 {
+            if let Some(&[r, g, b]) = crate::tags::LABEL_COLORS.get(tag.label as usize) {
+                tag_part(format!("\u{25CF} {}", crate::tags::LABEL_NAMES[tag.label as usize]), Color32::from_rgb(r, g, b));
+            }
+        }
+        let galley = ui.painter().layout_job(job);
         let r = Rect::from_min_size(view.min + Vec2::new(12.0, 12.0), galley.size() + Vec2::new(20.0, 10.0));
         let painter = ui.painter().with_clip_rect(view);
         painter.rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(150));
