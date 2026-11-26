@@ -89,6 +89,10 @@ pub struct WorkbenchUi {
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
 const NAME_W: f32 = 210.0;
 
+/// Left edge of a device column's content (name, thumbnails, measure lines)
+/// from the column's start; the header's color bar hangs left of it.
+const COL_INSET: f32 = 14.0;
+
 fn exif_of(path: &Path) -> (Option<String>, Option<i64>) {
     match crate::meta::read_exif(path) {
         Some(e) => (e.camera, e.taken_ts),
@@ -380,7 +384,7 @@ impl WorkbenchUi {
             labels: Vec::new(),
             colors: Vec::new(),
             blind: true,
-            progress: format!("Trial {}  ·  {} votes in the project", b.count + 1, self.ws.project.votes.len()),
+            progress: format!("Trial {}  ·  {} in the project", b.count + 1, plural(self.ws.project.votes.len(), "vote")),
             done: false,
         };
         Some((vec![self.ws.abs(&left.path), self.ws.abs(&right.path)], link))
@@ -404,28 +408,33 @@ impl WorkbenchUi {
 
     // ------------------------------------------------------------ overview
 
-    fn thumb(&self, core: &mut Core, ui: &Ui, path: &Path, rect: Rect) {
+    /// The thumbnail of `path` in the top-left of `rect` (so it lines up with
+    /// the column's header and caption); returns where it was drawn.
+    fn thumb(&self, core: &mut Core, ui: &Ui, path: &Path, rect: Rect) -> Rect {
         let p = core.pal;
         let Some((size, mtime)) = self.meta.get(path).copied() else {
             ui.painter().rect_filled(rect, CornerRadius::same(6), p.faint_bg);
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(20.0), p.faint);
-            return;
+            return rect;
         };
         let key = ThumbKey::new(path, size, mtime);
         match core.thumbs.get(&key) {
             Thumb::Ready(t) => {
                 let ts = t.tex.size_vec2();
                 let s = (rect.width() / ts.x.max(1.0)).min(rect.height() / ts.y.max(1.0));
-                let r = Rect::from_center_size(rect.center(), ts * s);
+                let r = Rect::from_min_size(rect.min, ts * s);
                 ui.painter().add(egui::epaint::RectShape::filled(r, CornerRadius::same(4), Color32::WHITE).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))));
+                r
             }
             Thumb::Pending => {
                 ui.painter().rect_filled(rect, CornerRadius::same(6), p.faint_bg);
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::HOURGLASS, FontId::proportional(18.0), p.faint);
+                rect
             }
             Thumb::Failed => {
                 ui.painter().rect_filled(rect, CornerRadius::same(6), p.faint_bg);
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(20.0), p.faint);
+                rect
             }
         }
     }
@@ -501,7 +510,7 @@ impl WorkbenchUi {
             let name = if self.ws.project.name.trim().is_empty() { "Project".to_string() } else { self.ws.project.name.clone() };
             ui.label(RichText::new(name).font(text::title()).color(p.text)).on_hover_text(self.ws.file().display().to_string());
             let pr = &self.ws.project;
-            ui.label(RichText::new(format!("{} devices  ·  {} scenes", pr.devices.len(), pr.scenes.len())).size(text::SMALL).color(p.muted));
+            ui.label(RichText::new(format!("{}  ·  {}", plural(pr.devices.len(), "device"), plural(pr.scenes.len(), "scene"))).size(text::SMALL).color(p.muted));
             ui.add_space(10.0);
             ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(format!("{}  Filter scenes", I::FUNNEL)).desired_width(170.0)).on_hover_text("Show only scenes whose name or comment contains this text");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -660,45 +669,82 @@ impl WorkbenchUi {
                         ui.label(RichText::new(self.ws.project.display(&r.device)).color(p.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new(format!("{:.0}", r.score)).font(text::body_strong()).color(color))
-                                .on_hover_text(format!("Chance of being preferred over an average device: {:.0} (90% range {:.0} to {:.0}), from {} votes", r.score, r.low, r.high, r.votes));
+                                .on_hover_text(format!("Chance of being preferred over an average device: {:.0} (90% range {:.0} to {:.0}), from {}", r.score, r.low, r.high, plural(r.votes, "vote")));
                         });
                     });
                 }
-                ui.label(RichText::new(format!("{} votes", self.ws.project.votes.len())).size(text::SMALL).color(p.muted));
+                ui.label(RichText::new(plural(self.ws.project.votes.len(), "vote")).size(text::SMALL).color(p.muted));
             }
             let ids = self.ws.project.measured_ids();
             if !ids.is_empty() {
                 ui.add_space(6.0);
                 widgets::section_title(ui, &p, "MEASURED (MEAN OVER SCENES)");
                 let means = self.ws.project.measure_means();
-                for id in &ids {
-                    let vals: Vec<(String, f64)> = means.iter().filter_map(|(d, m)| m.iter().find(|(k, _)| k == id).map(|(_, v)| (d.clone(), *v))).collect();
-                    if vals.is_empty() {
-                        continue;
+                // A table: one column per device (its color on top), the unit
+                // in the row name, the numbers right-aligned in equal columns,
+                // so a value never wraps away from its device or unit.
+                let devices: Vec<String> = means.iter().filter(|(_, m)| !m.is_empty()).map(|(d, _)| d.clone()).collect();
+                let rows: Vec<(&String, Vec<Option<f64>>)> = ids
+                    .iter()
+                    .map(|id| (id, devices.iter().map(|d| means.iter().find(|(x, _)| x == d).and_then(|(_, m)| m.iter().find(|(k, _)| k == id).map(|(_, v)| *v))).collect::<Vec<_>>()))
+                    .filter(|(_, vals)| vals.iter().any(|v| v.is_some()))
+                    .collect();
+                let font = FontId::proportional(text::SMALL);
+                let val_w = rows
+                    .iter()
+                    .flat_map(|(_, vals)| vals.iter().flatten().map(|v| plain_number(*v)))
+                    .map(|t| ui.painter().layout_no_wrap(t, font.clone(), p.text).size().x)
+                    .fold(16.0f32, f32::max)
+                    .ceil();
+                let row_h = 18.0;
+                // Short names when four or more devices leave little room.
+                let compact = devices.len() > 3;
+                egui::Grid::new("wb-measured").num_columns(devices.len() + 1).spacing(Vec2::new(8.0, 2.0)).min_row_height(row_h).show(ui, |ui| {
+                    ui.label("");
+                    for d in &devices {
+                        let color = rgb(self.ws.project.device_color(d));
+                        let display = self.ws.project.display(d).to_string();
+                        right_cell(ui, val_w, row_h, |ui| {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(14.0, 12.0), Sense::hover());
+                            ui.painter().rect_filled(Rect::from_center_size(r.center(), Vec2::new(6.0, 12.0)), CornerRadius::same(2), color);
+                            resp.on_hover_text(display.as_str());
+                        });
                     }
-                    let best = match measure::higher_is_better(id) {
-                        Some(true) => vals.iter().map(|(_, v)| *v).fold(f64::MIN, f64::max),
-                        Some(false) => vals.iter().map(|(_, v)| *v).fold(f64::MAX, f64::min),
-                        None => f64::NAN,
-                    };
-                    let dir = match measure::higher_is_better(id) {
-                        Some(true) => "higher is better",
-                        Some(false) => "lower is better",
-                        None => "",
-                    };
-                    let tip = format!("{} ({dir}). The best device is in green.", lumen_analysis::metrics::get(id).map(|m| m.info().name).unwrap_or(id));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new(measure::name_of(id)).size(text::SMALL).color(p.text)).on_hover_text(tip.as_str());
-                        for (d, v) in vals {
-                            let is_best = v == best;
-                            let (r, _) = ui.allocate_exact_size(Vec2::new(6.0, 12.0), Sense::hover());
-                            ui.painter().rect_filled(r, CornerRadius::same(2), rgb(self.ws.project.device_color(&d)));
-                            let t = RichText::new(measure::fmt_value(id, v)).size(text::SMALL);
-                            ui.label(if is_best { t.color(p.ok).strong() } else { t.color(p.muted) }).on_hover_text(self.ws.project.display(&d).to_string());
+                    ui.end_row();
+                    for (id, vals) in &rows {
+                        let id = id.as_str();
+                        let present: Vec<f64> = vals.iter().flatten().copied().collect();
+                        let best = match measure::higher_is_better(id) {
+                            Some(true) => present.iter().copied().fold(f64::MIN, f64::max),
+                            Some(false) => present.iter().copied().fold(f64::MAX, f64::min),
+                            None => f64::NAN,
+                        };
+                        let dir = match measure::higher_is_better(id) {
+                            Some(true) => "higher is better",
+                            Some(false) => "lower is better",
+                            None => "",
+                        };
+                        let tip = format!("{} ({dir}). The best device is in green.", lumen_analysis::metrics::get(id).map(|m| m.info().name).unwrap_or(id));
+                        let name = if compact { short(measure::name_of(id)) } else { measure::name_of(id).to_string() };
+                        let name = match measure::unit_of(id) {
+                            "" => name,
+                            u => format!("{name} ({u})"),
+                        };
+                        ui.label(RichText::new(name).size(text::SMALL).color(p.text)).on_hover_text(tip.as_str());
+                        for (d, v) in devices.iter().zip(vals) {
+                            let display = self.ws.project.display(d).to_string();
+                            right_cell(ui, val_w, row_h, |ui| {
+                                let (t, best) = match v {
+                                    Some(v) => (plain_number(*v), *v == best),
+                                    None => ("-".to_string(), false),
+                                };
+                                let t = RichText::new(t).size(text::SMALL);
+                                ui.label(if best { t.color(p.ok).strong() } else { t.color(p.muted) }).on_hover_text(display.as_str());
+                            });
                         }
-                    });
-                }
+                        ui.end_row();
+                    }
+                });
                 let left = self.ws.project.unmeasured().len();
                 if left > 0 {
                     ui.label(RichText::new(format!("{left} capture{} not measured yet", if left == 1 { "" } else { "s" })).size(text::SMALL).color(p.faint));
@@ -733,9 +779,12 @@ impl WorkbenchUi {
         let (hr, _) = ui.allocate_exact_size(Vec2::new(avail, 26.0), Sense::hover());
         ui.painter().text(Pos2::new(hr.min.x + 8.0, hr.center().y), Align2::LEFT_CENTER, "Scene", text::body_strong(), p.muted);
         for (j, d) in devices.iter().enumerate() {
+            // The device's color bar hangs left of the column; its name starts
+            // at the column's one left edge (`COL_INSET`), with the thumbnails
+            // and the measure lines below.
             let x = hr.min.x + NAME_W + j as f32 * col_w;
             let c = rgb(self.ws.project.device_color(d));
-            let r = Rect::from_min_size(Pos2::new(x + 4.0, hr.min.y + 4.0), Vec2::new(col_w - 8.0, 18.0));
+            let r = Rect::from_min_size(Pos2::new(x + COL_INSET - 10.0, hr.min.y + 4.0), Vec2::new(col_w - COL_INSET + 2.0, 18.0));
             ui.painter().rect_filled(Rect::from_min_size(r.min, Vec2::new(4.0, 18.0)), CornerRadius::same(2), c);
             let mut label = self.ws.project.display(d).to_string();
             if self.ws.project.reference.as_deref() == Some(d.as_str()) {
@@ -784,13 +833,15 @@ impl WorkbenchUi {
                 }
                 // Device columns.
                 for (j, d) in devices.iter().enumerate() {
-                    let cell = Rect::from_min_size(Pos2::new(row.min.x + NAME_W + j as f32 * col_w + 4.0, row.min.y + 6.0), Vec2::new(col_w - 8.0, row_h - 12.0));
+                    let cell = Rect::from_min_size(Pos2::new(row.min.x + NAME_W + j as f32 * col_w + COL_INSET, row.min.y + 6.0), Vec2::new(col_w - COL_INSET - 4.0, row_h - 12.0));
                     let tr = Rect::from_min_size(cell.min, Vec2::new(cell.width(), thumb_h));
+                    // Where the picture is drawn (the verdict sits on its corner).
+                    let mut shown = tr;
                     match scene.shot(d) {
                         Some(sh) => {
                             let path = self.ws.abs(&sh.path);
                             if ui.is_rect_visible(tr) {
-                                self.thumb(core, ui, &path, tr);
+                                shown = self.thumb(core, ui, &path, tr);
                             }
                         }
                         None => {
@@ -802,7 +853,7 @@ impl WorkbenchUi {
                     if let Some(v) = sc.and_then(|s| s.verdict) {
                         let label = v.label();
                         let w = ui.painter().layout_no_wrap(label.into(), FontId::proportional(10.5), Color32::WHITE).size().x + 12.0;
-                        let br = Rect::from_min_size(Pos2::new(tr.max.x - w - 4.0, tr.min.y + 4.0), Vec2::new(w, 17.0));
+                        let br = Rect::from_min_size(Pos2::new(shown.max.x - w - 4.0, shown.min.y + 4.0), Vec2::new(w, 17.0));
                         ui.painter().rect_filled(br, CornerRadius::same(8), rgb(v.color()));
                         ui.painter().text(br.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.5), Color32::WHITE);
                     }
@@ -812,13 +863,13 @@ impl WorkbenchUi {
                         let line = measure::MEASURES.iter().filter_map(|(id, name)| m.values.get(*id).map(|v| format!("{} {}", short(name), measure::fmt_value(id, *v)))).take(3).collect::<Vec<_>>().join("  ");
                         let g = ui.painter().layout_no_wrap(line, FontId::proportional(text::CAPTION), p.faint);
                         let clip = Rect::from_min_max(Pos2::new(cell.min.x, tr.max.y + 2.0), Pos2::new(cell.max.x, cell.max.y));
-                        ui.painter().with_clip_rect(clip).galley(Pos2::new(cell.min.x + 2.0, tr.max.y + 4.0), g, p.faint);
+                        ui.painter().with_clip_rect(clip).galley(Pos2::new(cell.min.x, tr.max.y + 4.0), g, p.faint);
                     }
                     if let Some(s) = sc.filter(|s| !s.attrs.is_empty()) {
                         let line = attrs.iter().filter_map(|a| s.attrs.get(a).map(|v| format!("{} {v}", short(a)))).collect::<Vec<_>>().join("  ");
                         let g = ui.painter().layout_no_wrap(line, FontId::proportional(text::CAPTION), p.muted);
                         let clip = Rect::from_min_max(Pos2::new(cell.min.x, tr.max.y + 2.0), Pos2::new(cell.max.x, cell.max.y));
-                        ui.painter().with_clip_rect(clip).galley(Pos2::new(cell.min.x + 2.0, tr.max.y + 4.0), g, p.muted);
+                        ui.painter().with_clip_rect(clip).galley(Pos2::new(cell.min.x, tr.max.y + 4.0), g, p.muted);
                     }
                 }
                 let resp = resp.on_hover_text("Double-click (or Enter) to compare this scene");
@@ -858,6 +909,11 @@ impl WorkbenchUi {
         let mut changed = false;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(ui.available_width() - 8.0);
+            // Once for all devices, not under each of them.
+            if reference.is_none() {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new("Pick a reference device (star in the project's device list) to give Win / Par / Lose").size(text::SMALL).color(p.faint)).wrap());
+            }
             for d in devices {
                 let color = rgb(self.ws.project.device_color(d));
                 let display = self.ws.project.display(d).to_string();
@@ -884,12 +940,15 @@ impl WorkbenchUi {
                             }
                         }
                     });
-                } else {
-                    ui.label(RichText::new("Pick a reference device (star in the project's device list) to give Win / Par / Lose").size(text::SMALL).color(p.faint));
                 }
                 for a in &attrs {
                     ui.horizontal(|ui| {
-                        ui.add_sized(Vec2::new(92.0, 22.0), egui::Label::new(RichText::new(a).size(text::SMALL).color(p.muted)).truncate());
+                        // Left-aligned in a fixed column (`add_sized` would centre it).
+                        ui.allocate_ui_with_layout(Vec2::new(92.0, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.set_min_width(92.0);
+                            ui.set_max_width(92.0);
+                            ui.add(egui::Label::new(RichText::new(a).size(text::SMALL).color(p.muted)).truncate());
+                        });
                         for v in lo..=hi {
                             let on = sc.attrs.get(a) == Some(&v);
                             let label = if scale == Scale::Relative3 && v > 0 { format!("+{v}") } else { v.to_string() };
@@ -1182,13 +1241,39 @@ fn relative_path(base: &Path, target: &Path) -> String {
     }
 }
 
+/// "1 vote", "3 votes".
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A cell `w` points wide with its content right-aligned (numbers in a table).
+fn right_cell(ui: &mut Ui, w: f32, h: f32, add: impl FnOnce(&mut Ui)) {
+    ui.allocate_ui_with_layout(Vec2::new(w, h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.set_min_width(w);
+        add(ui);
+    });
+}
+
+/// A measured value rounded like `measure::fmt_value`, without its unit
+/// (the table has the unit in the row name).
+fn plain_number(v: f64) -> String {
+    let a = v.abs();
+    if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 fn short(a: &str) -> String {
     match a {
         "Exposure" => "Exp".into(),
         "Dynamic range" => "DR".into(),
         "Artifacts" => "Art".into(),
         "Sharpness" => "Sharp".into(),
-        "Visual noise" => "VN".into(),
+        "Visual noise" => "Vis. noise".into(),
         "White balance" => "WB".into(),
         "Clipping" => "Clip".into(),
         "Banding" => "Band".into(),

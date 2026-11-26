@@ -70,6 +70,12 @@ fn darken(c: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
+/// Colors of the compared images A, B, C and D (pane badges, plot lines,
+/// metadata columns) in image compare, video compare and the Analysis panel.
+/// Fixed, not the user's accent: an orange, green or purple accent would
+/// make A look like B, C or D. Draw letters on them in [`text_on`].
+pub const PANE_COLORS: [Color32; 4] = [Color32::from_rgb(86, 156, 255), Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)];
+
 /// The text color with the better contrast on `fill` (near-black or white).
 pub fn text_on(fill: Color32) -> Color32 {
     // Above this luminance dark text has more contrast than white (both are equal at 0.179).

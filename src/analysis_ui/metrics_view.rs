@@ -2636,7 +2636,7 @@ impl MetricsTab {
                 }
                 let c = egui::pos2(rect.min.x + 8.0, rect.center().y);
                 painter.circle_filled(c, 8.0, look::pane_color(p, i));
-                painter.text(c, egui::Align2::CENTER_CENTER, LETTERS[i.min(3)], theme::semibold(10.5), egui::Color32::WHITE);
+                painter.text(c, egui::Align2::CENTER_CENTER, LETTERS[i.min(3)], theme::semibold(10.5), look::pane_text(i));
                 // Right: verdict dot and number (or what is happening).
                 let (dot, right) = match (head, running) {
                     (_, true) => (None, "Analyzing".to_string()),
@@ -2733,7 +2733,7 @@ impl MetricsTab {
                     ui.label(RichText::new("Cuts at").size(11.5).color(p.muted));
                     for &c in s.cuts.iter().take(16) {
                         let t = summary::fmt_clock(c as f64 / self.fps.max(1.0));
-                        if ui.add(egui::Button::new(RichText::new(t).size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text(format!("Show frame {c}")).clicked() {
+                        if ui.add(egui::Button::new(RichText::new(t).size(theme::text::SMALL).color(p.accent_text)).frame(false)).on_hover_text(format!("Show frame {c}")).clicked() {
                             seek = Some(c);
                         }
                     }
@@ -2915,6 +2915,11 @@ impl MetricsTab {
         // Live rows (while running) have no summary yet: thresholds only.
         let summary = self.summary.clone().filter(|_| self.report.is_some());
         let verdict = |key: &str| summary.as_ref().and_then(|s| s.verdict(key));
+        let head_text = |c: &Cell| c.value.map(|v| fmt_value(v, c.unit)).unwrap_or_else(|| "-".into());
+        // The values sit right-aligned in one column as wide as the widest,
+        // so the heatmap buttons left of it line up in a column of their own.
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let value_w = rows.iter().filter_map(|r| r.cells.first()).map(|c| ui.painter().layout_no_wrap(head_text(c), body.clone(), text).size().x).fold(0.0f32, f32::max).ceil() + 2.0;
         ui.spacing_mut().item_spacing.y = 2.0;
         for row in &rows {
             let Some(head) = row.cells.first() else { continue };
@@ -2926,17 +2931,27 @@ impl MetricsTab {
                 Self::chip(ui, p, &head.key, head.value, stale, verdict(&head.key));
                 ui.with_layout(right, |ui| {
                     Self::arrow(ui, p, head.direction);
-                    let v = ui.label(RichText::new(head.value.map(|v| fmt_value(v, head.unit)).unwrap_or_else(|| "-".into())).color(text).strong());
+                    let v = ui
+                        .allocate_ui_with_layout(Vec2::new(value_w, 20.0), right, |ui| {
+                            ui.set_min_width(value_w);
+                            ui.label(RichText::new(head_text(head)).color(text).strong())
+                        })
+                        .inner;
                     if let Some(t) = &head.tip {
                         if v.on_hover_text(t).clicked() {
                             seek = head.worst;
                         }
                     }
+                    // The heatmap button's column stays even on rows without one.
+                    let (map_w, map_h) = (22.0, 20.0);
                     if row.has_map {
                         let on = self.heat.visible && self.heat.id() == Some(row.id.as_str());
-                        if ui.add(egui::Button::new(RichText::new(I::SELECTION).size(12.0)).selected(on).small()).on_hover_text("Show its heatmap on the image").clicked() {
+                        let b = egui::Button::new(RichText::new(I::SELECTION).size(12.0)).selected(on).small().min_size(Vec2::new(map_w, map_h));
+                        if ui.add(b).on_hover_text("Show its heatmap on the image").clicked() {
                             show_map = Some(row.id.clone());
                         }
+                    } else {
+                        ui.allocate_exact_size(Vec2::new(map_w, map_h), Sense::hover());
                     }
                     if row.preview {
                         ui.label(RichText::new("preview").size(10.0).color(p.warn));

@@ -354,7 +354,7 @@ impl TextView {
                         };
                         ui.label(RichText::new(what).size(theme::text::SMALL).color(p.muted));
                         ui.label(RichText::new(format!("{:.0} s", job.started.elapsed().as_secs_f32())).size(theme::text::SMALL).color(p.faint));
-                        ui.add(egui::Button::new(RichText::new("Cancel").size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text("Stop reading").clicked()
+                        ui.add(egui::Button::new(RichText::new("Cancel").size(theme::text::SMALL).color(p.accent_text)).frame(false)).on_hover_text("Stop reading").clicked()
                     });
                     if resp.inner {
                         self.cancel();
@@ -419,7 +419,7 @@ impl TextView {
                 let c = rect.left_center();
                 let badge = Rect::from_center_size(c + Vec2::new(9.0, 0.0), Vec2::splat(18.0));
                 painter.rect_filled(badge, CornerRadius::same(4), look::pane_color(p, i));
-                painter.text(badge.center(), Align2::CENTER_CENTER, LETTERS[i.min(3)], FontId::proportional(11.0), Color32::WHITE);
+                painter.text(badge.center(), Align2::CENTER_CENTER, LETTERS[i.min(3)], FontId::proportional(11.0), look::pane_text(i));
                 let r = &reports[i];
                 let (score, score_c) = match r.as_ref().and_then(|r| r.score) {
                     Some(s) => (s.to_string(), look::level_color(p, score_level(s))),

@@ -192,7 +192,7 @@ impl AiView {
             if let Some(e) = &ai.host_error {
                 ui.add(egui::Label::new(RichText::new(format!("{}  {e}", I::WARNING)).size(11.5).color(p.danger)).wrap());
             }
-            if ui.add(egui::Button::new(RichText::new("All AI settings").size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text("API key, HTTPS, timeouts and privacy options").clicked() {
+            if ui.add(egui::Button::new(RichText::new("All AI settings").size(theme::text::SMALL).color(p.accent_text)).frame(false)).on_hover_text("API key, HTTPS, timeouts and privacy options").clicked() {
                 out.push(PanelAction::OpenSettings("Ai"));
             }
         });
@@ -220,7 +220,7 @@ impl AiView {
                 }
                 if ai.testing() {
                     ui.spinner();
-                } else if server.is_some() && ui.add(egui::Button::new(RichText::new("Test").size(theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text("Test the connection and list the models").clicked() {
+                } else if server.is_some() && ui.add(egui::Button::new(RichText::new("Test").size(theme::text::SMALL).color(p.accent_text)).frame(false)).on_hover_text("Test the connection and list the models").clicked() {
                     ai.test_connection();
                 }
             });
@@ -571,8 +571,8 @@ impl AiView {
             Some(c) => {
                 ui.horizontal(|ui| {
                     let (text, col) = match c.preferred {
-                        Preference::A => ("A".to_string(), p.accent),
-                        Preference::B => ("B".to_string(), Color32::from_rgb(232, 120, 60)),
+                        Preference::A => ("A".to_string(), theme::PANE_COLORS[0]),
+                        Preference::B => ("B".to_string(), theme::PANE_COLORS[1]),
                         Preference::Tie => ("=".to_string(), p.muted),
                     };
                     badge(ui, p, &text, col);
@@ -749,8 +749,8 @@ fn verdict_color(p: &Palette, r: &AiReport) -> Color32 {
     }
     match &r.comparison {
         Some(c) => match c.preferred {
-            Preference::A => p.accent,
-            Preference::B => Color32::from_rgb(232, 120, 60),
+            Preference::A => theme::PANE_COLORS[0],
+            Preference::B => theme::PANE_COLORS[1],
             Preference::Tie => p.muted,
         },
         None => r.overall.map(|s| score_color(p, s)).unwrap_or(p.muted),
@@ -771,8 +771,8 @@ fn overall_text(r: &AiReport) -> Option<String> {
 }
 
 /// Pane badge colors A to D, the same as compare's.
-pub fn label_color(p: &Palette, l: ImageLabel) -> Color32 {
-    [p.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][l.index()]
+pub fn label_color(_p: &Palette, l: ImageLabel) -> Color32 {
+    theme::PANE_COLORS[l.index() % 4]
 }
 
 /// One place of a ranking: number, the pane's letter badge, the score bar,
@@ -786,7 +786,7 @@ fn rank_row(ui: &mut Ui, p: &Palette, place: usize, e: &RankEntry) {
         let (r, _) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::hover());
         ui.painter().circle_filled(r.center(), 11.5, col);
         ui.painter().circle_stroke(r.center(), 11.5, Stroke::new(1.0, Color32::from_black_alpha(90)));
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, e.image.as_str(), semibold(12.5), Color32::WHITE);
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, e.image.as_str(), semibold(12.5), theme::text_on(col));
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             score_bar(ui, p, "Overall", e.overall, "", Some(52.0), false);

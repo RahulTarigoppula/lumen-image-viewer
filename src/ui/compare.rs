@@ -334,11 +334,14 @@ impl CmpMode {
 
 /// Toolbar parts that move into the "..." menu when the toolbar is too
 /// narrow (the Analysis panel open, a large UI scale), first to go first.
+/// Help goes after the view toggles and the framing choice: the mode's own
+/// controls (Difference's Amplify) widen the bar, and the "?" button
+/// should not be what comes and goes when the mode changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BarPart {
-    Help,
     Views,
     Basis,
+    Help,
     Extras,
     Cull,
     Swap,
@@ -350,8 +353,15 @@ enum BarPart {
 }
 
 impl BarPart {
-    const ALL: [BarPart; 9] = [BarPart::Help, BarPart::Views, BarPart::Basis, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync, BarPart::Zoom, BarPart::Review];
+    const ALL: [BarPart; 9] = [BarPart::Views, BarPart::Basis, BarPart::Help, BarPart::Extras, BarPart::Cull, BarPart::Swap, BarPart::Sync, BarPart::Zoom, BarPart::Review];
 }
+
+/// Width of the Difference view's Amplify slider and its value box ("×50").
+const AMP_RAIL_W: f32 = 64.0;
+const AMP_VALUE_W: f32 = 36.0;
+
+/// Width of the toolbar's zoom percentage ("100%").
+const ZOOM_LABEL_W: f32 = 46.0;
 
 /// What a mode is for, for its tooltip.
 fn mode_tip(m: CmpMode) -> String {
@@ -378,9 +388,24 @@ struct BarPlan {
     labels: bool,
     /// Sync, the view toggles and Swap with their names next to the icons.
     icon_labels: bool,
+    /// Difference's "Amplify" word before its slider (the tooltip says it too).
+    amp_label: bool,
     /// The last resort: the mode buttons become one menu.
     modes_menu: bool,
+    /// Parts moved into the "..." menu.
     hidden: Vec<BarPart>,
+    /// Parts not offered at all, not even in the "..." menu: in a blind test
+    /// culling, swapping, mark up and review (and the camera, EXIF and
+    /// Metadata buttons of Views) would show what is hidden or change the
+    /// sides being voted on.
+    omitted: Vec<BarPart>,
+}
+
+impl BarPlan {
+    /// The part is on the toolbar itself.
+    fn shown(&self, b: BarPart) -> bool {
+        !self.hidden.contains(&b) && !self.omitted.contains(&b)
+    }
 }
 
 struct Pane {
@@ -403,8 +428,11 @@ struct Pane {
 
 // ---------------------------------------------------------------- culling
 
-/// The per-pane culling button (shown on hover, in the caption row).
-const KEEP_TEXT: &str = "Keep, reject others";
+/// The per-pane culling button (shown on hover, in the caption row): the
+/// same words as the toolbar's Keep.
+fn keep_text(i: usize) -> String {
+    format!("Keep {}", LETTERS[i.min(3)])
+}
 
 /// Between the parts of a pane caption (name, size, file size, zoom).
 const CAPTION_SEP: &str = "  ·  ";
@@ -546,6 +574,35 @@ pub struct Compare {
 
 fn name_of(p: &std::path::Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// `text` shortened in the middle ("scene_0...DeviceY.jpg") to fit `max_w`
+/// points in `font`: compared files often share their start, so the end
+/// (device, number, extension) stays visible. Empty when not even the dots fit.
+pub fn middle_ellipsis(ui: &Ui, text: &str, font: &FontId, max_w: f32) -> String {
+    let w = |s: &str| ui.painter().layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x;
+    if w(text) <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // About a third of the kept characters for the start, the rest for the end.
+    let cut = |keep: usize| -> String {
+        let head = keep / 3;
+        chars[..head].iter().chain(['.', '.', '.'].iter()).chain(chars[chars.len() - (keep - head)..].iter()).collect()
+    };
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let keep = (lo + hi).div_ceil(2);
+        if w(&cut(keep)) <= max_w {
+            lo = keep;
+        } else {
+            hi = keep - 1;
+        }
+    }
+    if lo == 0 && w("...") > max_w {
+        return String::new();
+    }
+    cut(lo)
 }
 
 fn fmt_size(b: u64) -> String {
@@ -712,17 +769,8 @@ impl Compare {
                 core.thumbs.forget(&path);
                 core.meta.forget(&path);
                 core.tags.removed(&path);
-                self.panes.remove(i);
-                self.views.remove(i);
-                self.paths.remove(i);
-                self.rv.set_paths(&self.paths);
+                self.drop_pane(i);
                 self.deleted.push(path.clone());
-                self.diff = DiffState::default();
-                if self.panes.len() != 2 {
-                    self.mode = CmpMode::SideBySide;
-                }
-                self.selected = self.selected.min(self.panes.len().saturating_sub(1));
-                self.hover_pane = None;
                 core.toasts.success(format!("Moved {} to the Recycle Bin", name_of(&path)));
                 if self.panes.is_empty() {
                     self.exit = true;
@@ -1242,8 +1290,20 @@ impl Compare {
         self.apply(src, |v| pan_by(v, basis, d, r.size() * ppp, fr, delta_pt * ppp));
     }
 
+    /// Take pane `i` out of the comparison (the remove button; at least two stay).
     fn remove_pane(&mut self, i: usize) {
-        if self.panes.len() <= 2 || i >= self.panes.len() {
+        if self.panes.len() <= 2 {
+            return;
+        }
+        self.drop_pane(i);
+    }
+
+    /// Everything that goes with pane `i` when it leaves (removed or its file
+    /// deleted): its view and path, its device name and color in a project
+    /// scene, and the alignment, whose results are kept by pane index (a
+    /// running alignment is dropped, so none lands on the wrong pane).
+    fn drop_pane(&mut self, i: usize) {
+        if i >= self.panes.len() {
             return;
         }
         self.reset_alignment();
@@ -1259,7 +1319,9 @@ impl Compare {
             }
         }
         self.rv.set_paths(&self.paths);
-        self.selected = self.selected.min(self.panes.len() - 1);
+        self.diff = DiffState::default();
+        self.selected = self.selected.min(self.panes.len().saturating_sub(1));
+        self.hover_pane = None;
         if self.panes.len() != 2 {
             self.mode = CmpMode::SideBySide;
         }
@@ -1314,8 +1376,9 @@ impl Compare {
                         self.link_requests.push(LinkRequest::Vote(v));
                     }
                 }
-                // No culling, ratings or mark up in a blind test.
-                for k in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Q, Key::K, Key::Delete, Key::M, Key::C, Key::H] {
+                // No culling, ratings or mark up in a blind test, and no swap:
+                // the votes are recorded by side.
+                for k in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Q, Key::Backtick, Key::K, Key::Delete, Key::M, Key::C, Key::H, Key::X] {
                     take(k);
                 }
             } else if take(Key::S) {
@@ -1746,31 +1809,28 @@ impl Compare {
         }
     }
 
+    /// Font of the caption pills.
+    fn pill_font() -> FontId {
+        FontId::proportional(12.0)
+    }
+
+    /// Width of a caption pill showing all of `text` (and a letter badge).
+    fn pill_width(ui: &Ui, text: &str, badge: bool) -> f32 {
+        ui.painter().layout_no_wrap(text.to_string(), Self::pill_font(), Color32::WHITE).size().x + 20.0 + if badge { 22.0 } else { 0.0 }
+    }
+
     /// A caption pill at most `max_w` points wide, so captions never run
     /// into a neighbour's: trailing "  ·  " parts are left out first (the
-    /// file name stays), then the name is cut at the end with "...".
+    /// file name stays), then the name is shortened in the middle with
+    /// "...", so its end (where compared names differ) stays readable.
     fn pill(ui: &Ui, pos: Pos2, anchor: Align2, text: &str, badge: Option<(&str, Color32)>, max_w: f32) -> Rect {
-        let font = FontId::proportional(12.0);
+        let font = Self::pill_font();
         let badge_w = if badge.is_some() { 22.0 } else { 0.0 };
         let layout = |t: String| ui.painter().layout_no_wrap(t, font.clone(), Color32::from_white_alpha(235));
         let room = (max_w - 20.0 - badge_w).max(0.0);
         let parts: Vec<&str> = text.split(CAPTION_SEP).collect();
         let fitting = (1..=parts.len()).rev().map(|n| layout(parts[..n].join(CAPTION_SEP))).find(|g| g.size().x <= room);
-        let g = fitting.unwrap_or_else(|| {
-            // The longest start of the name that fits with the dots.
-            let chars: Vec<char> = parts[0].chars().collect();
-            let cut = |n: usize| format!("{}...", chars[..n].iter().collect::<String>().trim_end());
-            let (mut lo, mut hi) = (0, chars.len());
-            while lo < hi {
-                let mid = (lo + hi).div_ceil(2);
-                if layout(cut(mid)).size().x <= room {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            layout(if lo == 0 { String::new() } else { cut(lo) })
-        });
+        let g = fitting.unwrap_or_else(|| layout(middle_ellipsis(ui, parts[0], &font, room)));
         let size = Vec2::new(g.size().x + 20.0 + badge_w, 24.0);
         let r = anchor.anchor_size(pos, size);
         ui.painter().rect_filled(r, CornerRadius::same(12), Color32::from_black_alpha(150));
@@ -1778,7 +1838,7 @@ impl Compare {
         if let Some((b, col)) = badge {
             let br = Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(18.0));
             ui.painter().rect_filled(br, CornerRadius::same(9), col);
-            ui.painter().text(br.center(), Align2::CENTER_CENTER, b, super::theme::semibold(11.0), Color32::WHITE);
+            ui.painter().text(br.center(), Align2::CENTER_CENTER, b, super::theme::semibold(11.0), theme::text_on(col));
             x += badge_w - 2.0;
         }
         ui.painter().galley(Pos2::new(x, r.center().y - g.size().y / 2.0), g, Color32::WHITE);
@@ -1794,11 +1854,11 @@ impl Compare {
         link.labels.get(i).cloned()
     }
 
-    fn pane_color(&self, core: &Core, i: usize) -> Color32 {
+    fn pane_color(&self, _core: &Core, i: usize) -> Color32 {
         match &self.link {
             Some(l) if l.blind => Color32::from_rgb(110, 116, 128),
-            Some(l) => l.colors.get(i).map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or_else(|| Self::badge_color(core, i)),
-            None => Self::badge_color(core, i),
+            Some(l) => l.colors.get(i).map(|c| Color32::from_rgb(c[0], c[1], c[2])).unwrap_or_else(|| Self::badge_color(i)),
+            None => Self::badge_color(i),
         }
     }
 
@@ -1883,8 +1943,8 @@ impl Compare {
         parts.join(CAPTION_SEP)
     }
 
-    fn badge_color(core: &Core, i: usize) -> Color32 {
-        [core.pal.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][i % 4]
+    fn badge_color(i: usize) -> Color32 {
+        theme::PANE_COLORS[i % 4]
     }
 
     /// Where each pane's image is drawn (`clips` per pane).
@@ -1923,17 +1983,20 @@ impl Compare {
                 self.rv.paint(ui, i, g);
             }
             self.view_input(ui, core, &resp, i, rects, ppp, &geos);
-            // Caption pill; while the pointer is on the pane it makes room in
-            // its row for "Keep, reject others" (and the remove button).
+            // Caption pill. While the pointer is on the pane, "Keep A" joins
+            // its row (left of the remove button), but only when the whole
+            // caption still fits beside it: it never pushes the name out.
             let text = self.caption_text(i, zoom);
             let reserve = if self.panes.len() > 2 { 34.0 } else { 0.0 };
-            let keep = if self.shows_keep(i, rect) { Self::keep_size(ui).x + 8.0 } else { 0.0 };
-            let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], self.pane_color(core, i))), rect.width() - 20.0 - reserve - keep);
+            let room = rect.width() - 20.0 - reserve;
+            let keep_w = Self::keep_size(ui, i).x + 8.0;
+            let show_keep = self.shows_keep(i, rect) && Self::pill_width(ui, &text, true) + keep_w <= room;
+            let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], self.pane_color(core, i))), room);
             if self.show_hist {
                 let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
                 self.paint_hist(ui, core, i, hr);
             }
-            self.pane_overlays(ui, core, i, rect, caption, reserve);
+            self.pane_overlays(ui, core, i, rect, caption, reserve, show_keep);
             if self.panes.len() > 2 {
                 let br = Rect::from_min_size(Pos2::new(rect.max.x - 34.0, rect.min.y + 8.0), Vec2::splat(26.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
@@ -1950,9 +2013,6 @@ impl Compare {
         if self.probe {
             self.paint_probe(ui, &geos);
         }
-        if self.profile_mode {
-            self.paint_profile(ui, core, &geos);
-        }
         // Thin separators.
         for (i, r) in rects.iter().enumerate() {
             if i > 0 {
@@ -1966,6 +2026,9 @@ impl Compare {
                     ui.painter().line_segment([Pos2::new(full.min.x, y), Pos2::new(full.max.x, y)], Stroke::new(1.0, p.border));
                 }
             }
+        }
+        if self.profile_mode {
+            self.paint_profile(ui, core, &geos);
         }
         if let Some(i) = remove {
             self.remove_pane(i);
@@ -2062,9 +2125,11 @@ impl Compare {
         if data.is_empty() {
             return;
         }
-        let plot = Rect::from_min_size(Pos2::new(area.min.x + 16.0, area.max.y - 252.0), Vec2::new((area.width() - 32.0).min(760.0), 186.0));
+        // One plot for every pane, so it is centred on the whole compare area
+        // (painted after the pane dividers, which then never cross it).
+        let plot = Rect::from_center_size(Pos2::new(area.center().x, area.max.y - 159.0), Vec2::new((area.width() - 32.0).min(760.0), 186.0));
         let painter = ui.painter();
-        painter.rect_filled(plot, CornerRadius::same(10), Color32::from_black_alpha(205));
+        painter.rect_filled(plot, CornerRadius::same(10), Color32::from_black_alpha(225));
         let inner = Rect::from_min_max(plot.min + Vec2::new(14.0, 30.0), plot.max - Vec2::new(14.0, 26.0));
         painter.text(plot.min + Vec2::new(14.0, 8.0), Align2::LEFT_TOP, "Brightness along the line", super::theme::semibold(12.0), Color32::WHITE);
         for frac in [0.0f32, 0.5, 1.0] {
@@ -2093,22 +2158,25 @@ impl Compare {
         painter.text(Pos2::new(plot.min.x + 14.0, plot.max.y - 8.0), Align2::LEFT_BOTTOM, "Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper). P to leave.", FontId::proportional(10.5), Color32::from_white_alpha(200));
     }
 
-    /// "Keep, reject others" shows on the pane under the pointer only.
+    /// The pane's "Keep" button shows on the pane under the pointer only
+    /// (never in a blind test: no culling there).
     fn shows_keep(&self, i: usize, rect: Rect) -> bool {
-        self.hover_pane == Some(i) && self.panes.len() >= 2 && rect.width() > 260.0 && !self.popup_open
+        self.hover_pane == Some(i) && self.panes.len() >= 2 && rect.width() > 260.0 && !self.popup_open && !self.blind()
     }
 
-    /// Size of the "Keep, reject others" button.
-    fn keep_size(ui: &Ui) -> Vec2 {
-        let g = ui.painter().layout_no_wrap(KEEP_TEXT.into(), FontId::proportional(12.5), Color32::WHITE);
+    /// Size of pane `i`'s "Keep" button.
+    fn keep_size(ui: &Ui, i: usize) -> Vec2 {
+        let g = ui.painter().layout_no_wrap(keep_text(i), FontId::proportional(12.5), Color32::WHITE);
         Vec2::new(12.0 + size::ICON + 6.0 + g.size().x + 12.0, size::CONTROL)
     }
 
     /// Culling overlays for pane `i` drawn inside `rect`: reject frame, rating /
-    /// flag / reject status, the optional EXIF strip and the "Keep" button in
-    /// the caption row (`caption` is the caption pill, `reserve` the points
-    /// kept free at the row's right end for the remove button).
-    fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect, caption: Rect, reserve: f32) {
+    /// flag / reject status, the optional EXIF strip and, with `keep`, the
+    /// "Keep" button in the caption row (`caption` is the caption pill,
+    /// `reserve` the points kept free at the row's right end for the remove
+    /// button).
+    #[allow(clippy::too_many_arguments)]
+    fn pane_overlays(&mut self, ui: &mut Ui, core: &mut Core, i: usize, rect: Rect, caption: Rect, reserve: f32, keep: bool) {
         if i >= self.panes.len() || !rect.is_positive() || self.blind() {
             return;
         }
@@ -2165,13 +2233,14 @@ impl Compare {
                 x += gw + 14.0;
             }
         }
-        // "Keep, reject others" only on the pane under the pointer: a neutral
-        // pill in the caption row, so it never covers the image or competes
-        // with it (the toolbar's Keep is the filled one). It goes at the row's
-        // right end, or left of a caption that is there (Split's B).
-        if self.shows_keep(i, rect) {
+        // "Keep A" only on the pane under the pointer: a neutral pill in the
+        // caption row, so it never covers the image or competes with it (the
+        // toolbar's Keep is the filled one). It goes at the row's right end,
+        // or left of a caption that is there (Split's B), and stays away
+        // when neither spot is clear of the caption.
+        if keep {
             let p = core.pal;
-            let size = Self::keep_size(ui);
+            let size = Self::keep_size(ui, i);
             let gap = 8.0;
             let clear = |x: f32| x >= rect.min.x + 10.0 && (x + size.x + gap <= caption.min.x || x >= caption.max.x + gap);
             let x = [rect.max.x - 10.0 - reserve - size.x, caption.min.x - gap - size.x].into_iter().find(|&x| clear(x));
@@ -2182,7 +2251,7 @@ impl Compare {
                 let r = CornerRadius::same((size::CONTROL / 2.0) as u8);
                 painter.rect(br, r, if resp.hovered() { theme::mix(p.raised, p.text, 0.08) } else { p.overlay }, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
                 painter.text(Pos2::new(br.min.x + 12.0 + size::ICON / 2.0, br.center().y), Align2::CENTER_CENTER, I::CHECK_CIRCLE, FontId::proportional(size::ICON), p.ok);
-                let g = painter.layout_no_wrap(KEEP_TEXT.into(), FontId::proportional(12.5), p.text);
+                let g = painter.layout_no_wrap(keep_text(i), FontId::proportional(12.5), p.text);
                 painter.galley(Pos2::new(br.min.x + 12.0 + size::ICON + 6.0, br.center().y - g.size().y / 2.0), g, p.text);
                 if resp.on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
                     self.selected = i;
@@ -2280,8 +2349,9 @@ impl Compare {
                     let left_hist = Rect::from_min_max(ha.min, Pos2::new(ha.min.x + 240.0, ha.max.y));
                     self.paint_hist(ui, core, 0, left_hist);
                 }
-                self.pane_overlays(ui, core, 0, left, cap_a, 0.0);
-                self.pane_overlays(ui, core, 1, right, cap_b, 0.0);
+                let (keep_a, keep_b) = (self.shows_keep(0, left), self.shows_keep(1, right));
+                self.pane_overlays(ui, core, 0, left, cap_a, 0.0, keep_a);
+                self.pane_overlays(ui, core, 1, right, cap_b, 0.0, keep_b);
                 if !hresp.dragged() {
                     self.view_input(ui, core, &resp, 0, rects, ppp, &geos);
                 }
@@ -2353,9 +2423,13 @@ impl Compare {
         let modes_compact = if pair { n_modes * (text_w(I::COLUMNS, body.clone()) + 24.0) + 4.0 + s } else { 0.0 };
         let title = text_w("Compare", text::title()) + s;
         let count = text_w(&format!("{} images", self.panes.len()), FontId::proportional(text::SMALL)) + s;
-        let part = |b: BarPart, labels: bool| -> f32 {
+        let blind = self.blind();
+        let part = |b: BarPart, plan: &BarPlan| -> f32 {
+            let labels = plan.icon_labels;
             match b {
                 BarPart::Help => icon,
+                // A blind test keeps only the histograms.
+                BarPart::Views if blind => sep + button(HIST_LABEL, labels),
                 BarPart::Views => sep + button(HIST_LABEL, labels) + button(EXIF_LABEL, labels) + button(TAGS_LABEL, labels) + button(META_LABEL, labels),
                 BarPart::Basis => 126.0 + s,
                 BarPart::Sync => sep + button(SYNC_LABEL, labels),
@@ -2370,10 +2444,10 @@ impl Compare {
                         0.0
                     }
                 }
-                BarPart::Zoom => 2.0 * icon + 52.0 + s,
+                BarPart::Zoom => 2.0 * icon + ZOOM_LABEL_W + s,
                 BarPart::Review => sep + button(MARKUP_LABEL, labels) + button(REVIEW_LABEL, labels),
                 BarPart::Extras => match self.mode {
-                    CmpMode::Difference if pair => sep + text_w("Amplify", FontId::proportional(12.0)) + s + 170.0 + s,
+                    CmpMode::Difference if pair => sep + if plan.amp_label { text_w("Amplify", FontId::proportional(text::SMALL)) + s } else { 0.0 } + AMP_RAIL_W + 4.0 + AMP_VALUE_W + s,
                     CmpMode::Split if pair => sep + text_w("Divider 100%", FontId::proportional(12.0)) + s,
                     _ => 0.0,
                 },
@@ -2382,13 +2456,15 @@ impl Compare {
         // Back, Fit, Analysis and "..." always stay.
         let fixed = icon + 4.0 + sep + sep + icon + sep + icon + icon;
         let modes_menu = text_w(&format!("{}  {}", I::COLUMNS, I::CARET_DOWN), body.clone()) + pad + s;
-        let mut plan = BarPlan { count: true, title: true, labels: true, icon_labels: true, modes_menu: false, hidden: Vec::new() };
+        let omitted = if blind { vec![BarPart::Cull, BarPart::Swap, BarPart::Review] } else { Vec::new() };
+        let mut plan = BarPlan { count: true, title: true, labels: true, icon_labels: true, amp_label: true, modes_menu: false, hidden: Vec::new(), omitted };
         let width = |p: &BarPlan| -> f32 {
             let mut w = fixed + if p.modes_menu { modes_menu } else if p.labels { modes_full } else { modes_compact };
             w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
-            w + BarPart::ALL.iter().filter(|b| !p.hidden.contains(b)).map(|b| part(*b, p.icon_labels)).sum::<f32>()
+            w + BarPart::ALL.iter().filter(|b| p.shown(**b)).map(|b| part(*b, p)).sum::<f32>()
         };
-        for step in 0..5 + BarPart::ALL.len() {
+        let hideable: Vec<BarPart> = BarPart::ALL.iter().copied().filter(|b| !plan.omitted.contains(b)).collect();
+        for step in 0..6 + hideable.len() {
             if width(&plan) <= avail {
                 break;
             }
@@ -2396,8 +2472,11 @@ impl Compare {
                 0 => plan.count = false,
                 1 => plan.icon_labels = false,
                 2 => plan.labels = false,
-                3 => plan.title = false,
-                n if n - 4 < BarPart::ALL.len() => plan.hidden.push(BarPart::ALL[n - 4]),
+                // Difference's "Amplify" goes before the title, so the bar
+                // keeps its left part when the mode changes.
+                3 => plan.amp_label = false,
+                4 => plan.title = false,
+                n if n - 5 < hideable.len() => plan.hidden.push(hideable[n - 5]),
                 _ => plan.modes_menu = true,
             }
         }
@@ -2405,6 +2484,10 @@ impl Compare {
         if !plan.title {
             plan.title = true;
             plan.title = width(&plan) <= avail;
+        }
+        if plan.title && !plan.amp_label {
+            plan.amp_label = true;
+            plan.amp_label = width(&plan) <= avail;
         }
         if plan.title && !plan.icon_labels {
             plan.icon_labels = true;
@@ -2432,7 +2515,8 @@ impl Compare {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let plan = self.bar_plan(ui, ui.available_width());
-            let shown = |b: BarPart| !plan.hidden.contains(&b);
+            let shown = |b: BarPart| plan.shown(b);
+            let blind = self.blind();
             if widgets::icon_button(ui, I::ARROW_LEFT, "Back  (Esc)", false).clicked() {
                 self.exit = true;
             }
@@ -2498,7 +2582,7 @@ impl Compare {
                     self.zoom_step(src, &rects, ppp, 0.8, None);
                 }
                 let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
-                let zl = ui.add_sized([52.0, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
+                let zl = ui.add_sized([ZOOM_LABEL_W, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
                 if zl.on_hover_text("Zoom of the selected image. Click for 100% (actual pixels)  (Z)").clicked() && !rects.is_empty() {
                     self.actual_size(&rects, ppp);
                 }
@@ -2515,14 +2599,17 @@ impl Compare {
                 if bar_button(ui, I::CHART_BAR, HIST_LABEL, "Histograms  (G)", self.show_hist, plan.icon_labels).clicked() {
                     self.show_hist = !self.show_hist;
                 }
-                if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
-                    self.show_exif = !self.show_exif;
-                }
-                if bar_button(ui, I::APERTURE, TAGS_LABEL, "EXIF of every image side by side, differences marked  (Ctrl+Shift+X)", false, plan.icon_labels).clicked() {
-                    self.info_request = Some(InfoRequest::Exif);
-                }
-                if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, "Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP  (Ctrl+Shift+I)", false, plan.icon_labels).clicked() {
-                    self.info_request = Some(InfoRequest::Metadata);
+                // Camera data and file names stay hidden in a blind test.
+                if !blind {
+                    if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
+                        self.show_exif = !self.show_exif;
+                    }
+                    if bar_button(ui, I::APERTURE, TAGS_LABEL, "EXIF of every image side by side, differences marked  (Ctrl+Shift+X)", false, plan.icon_labels).clicked() {
+                        self.info_request = Some(InfoRequest::Exif);
+                    }
+                    if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, "Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP  (Ctrl+Shift+I)", false, plan.icon_labels).clicked() {
+                        self.info_request = Some(InfoRequest::Metadata);
+                    }
                 }
             }
             // Culling on the selected pane (keys act on the pane under the pointer).
@@ -2556,7 +2643,7 @@ impl Compare {
             // Mode-specific controls.
             if shown(BarPart::Extras) && pair && self.mode != CmpMode::SideBySide {
                 widgets::separator_v(ui);
-                self.mode_controls(ui, &p);
+                self.mode_controls(ui, &p, plan.amp_label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
@@ -2583,13 +2670,16 @@ impl Compare {
         ui.selectable_value(basis, Basis::Pixel, "Match pixels").on_hover_text("Same pixel scale: 100% in one pane is 100% in all");
     }
 
-    /// The difference gain or the divider position.
-    fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette) {
+    /// The difference gain (with its "Amplify" word when `label`) or the
+    /// divider position.
+    fn mode_controls(&mut self, ui: &mut Ui, p: &super::theme::Palette, label: bool) {
         match self.mode {
             CmpMode::Difference => {
                 let tip = "Amplify: multiplies the difference so small changes become visible (does not change the numbers)";
-                ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted)).on_hover_text(tip);
-                ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(110.0).value_width(52.0)).on_hover_text(tip);
+                if label {
+                    ui.label(RichText::new("Amplify").size(text::SMALL).color(p.muted)).on_hover_text(tip);
+                }
+                ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(AMP_RAIL_W).value_width(AMP_VALUE_W)).on_hover_text(tip);
             }
             CmpMode::Split => {
                 ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted)).on_hover_text("Where the divider is; drag it on the image  (Tab jumps it to one side)");
@@ -2630,12 +2720,15 @@ impl Compare {
             self.toggle_alignment(core);
             ui.close();
         }
-        ui.separator();
-        let exporting = self.rv.exporting();
-        let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, "Ctrl+Shift+E")).inner;
-        if r.on_hover_text("Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page").clicked() {
-            self.rv.open_export();
-            ui.close();
+        // No report of a blind test: it would show the files.
+        if !self.blind() {
+            ui.separator();
+            let exporting = self.rv.exporting();
+            let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, "Ctrl+Shift+E")).inner;
+            if r.on_hover_text("Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page").clicked() {
+                self.rv.open_export();
+                ui.close();
+            }
         }
         for part in BarPart::ALL.iter().rev().filter(|b| plan.hidden.contains(b)) {
             let sep = |ui: &mut Ui| {
@@ -2672,6 +2765,9 @@ impl Compare {
                     if item(ui, I::CHART_BAR, "Histograms", "G", Some(self.show_hist)) {
                         self.show_hist = !self.show_hist;
                     }
+                    if self.blind() {
+                        continue;
+                    }
                     if item(ui, I::CAMERA, "Camera info strip", "H", Some(self.show_exif)) {
                         self.show_exif = !self.show_exif;
                     }
@@ -2703,7 +2799,7 @@ impl Compare {
                 }
                 BarPart::Extras if pair && self.mode != CmpMode::SideBySide => {
                     sep(ui);
-                    ui.horizontal(|ui| self.mode_controls(ui, &p));
+                    ui.horizontal(|ui| self.mode_controls(ui, &p, true));
                 }
                 BarPart::Help => {
                     if item(ui, I::QUESTION, "Shortcuts", "?", Some(self.help)) {
@@ -2763,7 +2859,7 @@ impl Compare {
         let mut rows: Vec<(&str, &str)> = rows.to_vec();
         match &self.link {
             Some(l) if l.blind => {
-                rows.retain(|(k, _)| !matches!(*k, "M" | "C" | "Ctrl+Z  /  Ctrl+Y" | "Del" | "Ctrl+Shift+E" | "0 - 5" | "Q  or  `" | "K" | "H" | "+ / -  arrows"));
+                rows.retain(|(k, _)| !matches!(*k, "M" | "C" | "Ctrl+Z  /  Ctrl+Y" | "Del" | "Ctrl+Shift+E" | "0 - 5" | "Q  or  `" | "K" | "H" | "X" | "P" | "+ / -  arrows"));
                 rows.insert(0, ("Left / Right", "The left / right image is better"));
                 rows.insert(1, ("Down  or  Space", "About the same"));
             }

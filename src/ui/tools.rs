@@ -1427,7 +1427,7 @@ fn dup_tile(ui: &mut Ui, p: &Palette, core: &mut Core, it: &ScanItem, marked: &m
         let folder = it.path.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         ui.add(egui::Label::new(RichText::new(format!("{} · {folder}", crate::catalog::format_time(it.modified))).size(11.0).color(p.faint)).truncate());
         if let Some(note) = note {
-            ui.add(egui::Label::new(RichText::new(format!("{}  {note}", I::LINK_SIMPLE)).size(11.0).color(p.accent)).truncate());
+            ui.add(egui::Label::new(RichText::new(format!("{}  {note}", I::LINK_SIMPLE)).size(11.0).color(p.accent_text)).truncate());
         }
     });
     changed

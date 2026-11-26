@@ -186,7 +186,7 @@ impl AnalysisPanel {
         let pad = Margin { left: 0, right: 8, top: 0, bottom: 0 };
         egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(I::CHART_LINE).size(15.0).color(p.accent));
+                ui.label(RichText::new(I::CHART_LINE).size(15.0).color(p.accent_text));
                 ui.label(RichText::new("Analysis").font(crate::ui::theme::text::title()).color(p.text));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let tip = format!("Close ({})", crate::ui::commands::Command::ToggleAnalysis.shortcut());
@@ -264,7 +264,7 @@ impl AnalysisPanel {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let (text, color) = match rect {
-                _ if self.drawing => ("Drag on the image to select a region".to_string(), p.accent),
+                _ if self.drawing => ("Drag on the image to select a region".to_string(), p.accent_text),
                 Some((_, _, w, h)) => (format!("Region {w} × {h} px"), p.text),
                 None => (whole, p.muted),
             };
@@ -275,7 +275,7 @@ impl AnalysisPanel {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(crate::ui::theme::text::SMALL).color(p.accent)).frame(false)).on_hover_text(tip).clicked();
+                let link = |ui: &mut Ui, text: &str, tip: &str| ui.add(egui::Button::new(RichText::new(text).size(crate::ui::theme::text::SMALL).color(p.accent_text)).frame(false)).on_hover_text(tip).clicked();
                 if self.drawing {
                     if link(ui, "Cancel", "Esc") {
                         self.drawing = false;

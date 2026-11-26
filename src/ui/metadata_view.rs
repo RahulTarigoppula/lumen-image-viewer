@@ -6,14 +6,14 @@
 //!   multi-frame merges, portrait depth, zoom, lens), interpreted in plain
 //!   words by `lumen_core::inspect`.
 //! - EXIF: every EXIF tag by group.
-//! - Metadata: file and encoding details (JPEG quality estimate, chroma
+//! - File & encoding: file and encoding details (JPEG quality estimate, chroma
 //!   subsampling), color profile, XMP, maker trailers, embedded images,
 //!   PNG text (AI generator settings), comments.
 //!
 //! Files are read on background threads; results are kept per path.
 
 use super::icons as I;
-use super::theme::{text, Palette};
+use super::theme::{size, text, Palette};
 use super::widgets;
 use crossbeam_channel::Receiver;
 use egui::{Color32, RichText, Vec2};
@@ -34,7 +34,7 @@ impl MetaTab {
         match self {
             MetaTab::Capture => "Capture",
             MetaTab::Exif => "EXIF",
-            MetaTab::Other => "Metadata",
+            MetaTab::Other => "File & encoding",
         }
     }
     fn tip(self) -> &'static str {
@@ -203,15 +203,20 @@ impl MetadataWindow {
         self.poll();
         let mut open = true;
         let title = if self.items.len() > 1 { format!("Metadata of {} images", self.items.len()) } else { "Metadata".to_string() };
-        let w = (420.0 + 220.0 * self.items.len().max(1) as f32).min(1100.0);
-        widgets::app_window("metadata-window", title).open(&mut open).default_size(w, 620.0).min_size(380.0, 300.0).show(ctx, |ui| self.body(ui, p));
+        let n = self.items.len().clamp(1, 4);
+        let w = (420.0 + 220.0 * n as f32).min(1100.0);
+        // One window (and remembered size) per number of files: two images
+        // open at the two-image width, not at the size last used for one.
+        widgets::app_window(("metadata-window", n), title).open(&mut open).default_size(w, 620.0).min_size(380.0, 300.0).show(ctx, |ui| self.body(ui, p));
         if !open {
             self.open = false;
         }
     }
 
     fn body(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.horizontal(|ui| {
+        // The controls wrap onto a second line in a narrow window rather than
+        // running under the Copy button.
+        ui.horizontal_wrapped(|ui| {
             let mut idx = [MetaTab::Capture, MetaTab::Exif, MetaTab::Other].iter().position(|t| *t == self.tab).unwrap_or(0);
             let labels = [MetaTab::Capture.label(), MetaTab::Exif.label(), MetaTab::Other.label()];
             let tips = [MetaTab::Capture.tip(), MetaTab::Exif.tip(), MetaTab::Other.tip()];
@@ -219,23 +224,30 @@ impl MetadataWindow {
                 self.tab = [MetaTab::Capture, MetaTab::Exif, MetaTab::Other][idx.min(2)];
             }
             ui.add_space(8.0);
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(format!("{}  Find a tag or value", I::MAGNIFYING_GLASS)).desired_width(180.0)).on_hover_text("Show only rows whose name or value contains this text");
+            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(format!("{}  Find a tag or value", I::MAGNIFYING_GLASS)).desired_width(170.0)).on_hover_text("Show only rows whose name or value contains this text");
             if self.items.len() > 1 {
                 widgets::checkbox(ui, &mut self.only_diff, "Only differences").on_hover_text("Hide the rows where every image has the same value");
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::icon_button(ui, I::COPY, "Copy this tab as text (tab separated, pastes into a spreadsheet)", false).clicked() {
-                    ui.ctx().copy_text(self.as_text());
-                }
-            });
+            let copy = |ui: &mut egui::Ui| widgets::icon_button(ui, I::COPY, "Copy this tab as text (tab separated, pastes into a spreadsheet)", false).clicked();
+            // At the right end when there is room on this line, else next in line.
+            let clicked = if ui.available_width() >= size::CONTROL + 12.0 { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), copy).inner } else { copy(ui) };
+            if clicked {
+                ui.ctx().copy_text(self.as_text());
+            }
         });
         ui.add_space(6.0);
         let n = self.items.len().max(1);
         let name_w = 190.0f32;
-        let avail = ui.available_width();
-        let col_w = ((avail - name_w - 16.0) / n as f32).max(120.0);
-        // Column headers.
+        // Rows sit inside the group headers' indent, with a gap before every
+        // value column: size the columns from what is left, so a row is never
+        // wider than the window (a wider row made the window grow every frame).
+        let indent = ui.spacing().indent;
+        let gap = ui.spacing().item_spacing.x;
+        let avail = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let col_w = ((avail - indent - name_w - gap * n as f32 - 4.0) / n as f32).max(120.0);
+        // Column headers, indented like the rows so each sits over its values.
         ui.horizontal(|ui| {
+            ui.add_space(indent);
             cell(ui, name_w, 22.0, egui::Label::new(RichText::new("").size(text::SMALL)));
             for it in &self.items {
                 let name = it.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
