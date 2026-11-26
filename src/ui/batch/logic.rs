@@ -398,6 +398,10 @@ pub struct RenameStep {
 
 /// Build a two-phase plan. Pairs whose source and target are byte-identical
 /// are dropped; case-only renames are kept.
+///
+/// The temporary names keep the file's extension and are not hidden, so a
+/// file left with one (a crash, a repair that failed) still shows up in the
+/// browser, recognisably named, instead of disappearing.
 pub fn plan_two_phase(pairs: &[(PathBuf, PathBuf)], tag: &str) -> Vec<RenameStep> {
     pairs
         .iter()
@@ -405,7 +409,8 @@ pub fn plan_two_phase(pairs: &[(PathBuf, PathBuf)], tag: &str) -> Vec<RenameStep
         .enumerate()
         .map(|(i, (from, to))| {
             let dir = from.parent().unwrap_or(Path::new("."));
-            let tmp = dir.join(format!(".lumen-rename-{tag}-{i}.tmp"));
+            let ext = from.extension().map(|e| e.to_string_lossy().to_string()).filter(|e| !e.is_empty()).unwrap_or_else(|| "tmp".into());
+            let tmp = dir.join(format!("lumen-rename-{tag}-{i}.{ext}"));
             RenameStep { from: from.clone(), tmp, to: to.clone() }
         })
         .collect()
@@ -424,11 +429,47 @@ pub fn execute_plan(plan: &[RenameStep], progress: impl FnMut(usize)) -> RenameO
     execute_plan_journaled(plan, None, progress)
 }
 
+/// Rename, retrying briefly while another program (a thumbnailer, an
+/// antivirus scan) holds the file open.
+fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut res = std::fs::rename(from, to);
+    for attempt in 1..=4u64 {
+        // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+        if !matches!(&res, Err(e) if matches!(e.raw_os_error(), Some(5 | 32))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+        res = std::fs::rename(from, to);
+    }
+    res
+}
+
+/// Journals of the renames running in this process: never "recovered" from
+/// under a running rename (the batch rename window recovers when it opens).
+static ACTIVE_JOURNALS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn active_journals() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    ACTIVE_JOURNALS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Marks a journal as in use for as long as it lives (also when unwinding).
+struct ActiveJournal(PathBuf);
+
+impl Drop for ActiveJournal {
+    fn drop(&mut self) {
+        active_journals().retain(|j| j != &self.0);
+    }
+}
+
 /// Like `execute_plan`, but first writes the plan to `journal` so a crash or
 /// power cut between the phases can be repaired with `recover_journal`. The
 /// journal is removed once every file has its final (or original) name.
 pub fn execute_plan_journaled(plan: &[RenameStep], journal: Option<&Path>, mut progress: impl FnMut(usize)) -> RenameOutcome {
     let mut errors = Vec::new();
+    let _active = journal.map(|j| {
+        active_journals().push(j.to_path_buf());
+        ActiveJournal(j.to_path_buf())
+    });
     if let Some(j) = journal {
         if let Err(e) = write_journal(j, plan) {
             return RenameOutcome { done: Vec::new(), errors: vec![format!("Cannot write the rename journal ({e}); nothing was renamed")] };
@@ -436,10 +477,10 @@ pub fn execute_plan_journaled(plan: &[RenameStep], journal: Option<&Path>, mut p
     }
     // Phase 1
     for (i, s) in plan.iter().enumerate() {
-        if let Err(e) = std::fs::rename(&s.from, &s.tmp) {
+        if let Err(e) = rename_retry(&s.from, &s.tmp) {
             errors.push(format!("{}: {e}", s.from.display()));
             for r in plan[..i].iter().rev() {
-                if let Err(e) = std::fs::rename(&r.tmp, &r.from) {
+                if let Err(e) = rename_retry(&r.tmp, &r.from) {
                     errors.push(format!("Could not restore {} (it is still named {}): {e}", r.from.display(), r.tmp.display()));
                 }
             }
@@ -460,7 +501,7 @@ pub fn execute_plan_journaled(plan: &[RenameStep], journal: Option<&Path>, mut p
         let res = if s.to.exists() {
             Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "target already exists"))
         } else {
-            std::fs::rename(&s.tmp, &s.to)
+            rename_retry(&s.tmp, &s.to)
         };
         match res {
             Ok(()) => done.push((s.from.clone(), s.to.clone())),
@@ -468,7 +509,7 @@ pub fn execute_plan_journaled(plan: &[RenameStep], journal: Option<&Path>, mut p
                 errors.push(format!("{} -> {}: {e}", s.from.display(), s.to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
                 // Put it back under its original name (or a unique variant).
                 let back = if s.from.exists() { crate::fileops::unique_path(&s.from) } else { s.from.clone() };
-                match std::fs::rename(&s.tmp, &back) {
+                match rename_retry(&s.tmp, &back) {
                     Ok(()) if back != s.from => done.push((s.from.clone(), back)),
                     Ok(()) => {}
                     Err(e) => errors.push(format!("Could not restore {} (it is still named {}): {e}", s.from.display(), s.tmp.display())),
@@ -485,9 +526,33 @@ pub fn execute_plan_journaled(plan: &[RenameStep], journal: Option<&Path>, mut p
     RenameOutcome { done, errors }
 }
 
-/// Where the rename journal lives.
-pub fn journal_path() -> PathBuf {
-    crate::settings::data_dir().join("rename-journal.json")
+/// Where the journal of the rename run `tag` lives. Every run has its own
+/// journal, so a journal kept after a failed repair is never overwritten by
+/// the next run (which would orphan the files it still lists).
+pub fn journal_path(tag: &str) -> PathBuf {
+    crate::settings::data_dir().join(format!("{JOURNAL_PREFIX}-{tag}.json"))
+}
+
+/// File names of rename journals: `rename-journal-<tag>.json`, and
+/// `rename-journal.json` from before journals were per run.
+const JOURNAL_PREFIX: &str = "rename-journal";
+
+fn is_journal_name(name: &str) -> bool {
+    name.starts_with(JOURNAL_PREFIX) && name.ends_with(".json")
+}
+
+/// Repair every interrupted rename whose journal is in `dir` (oldest first),
+/// except runs still going on in this process. Returns messages for the user.
+pub fn recover_all_journals(dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut journals: Vec<(Option<std::time::SystemTime>, PathBuf)> = rd
+        .flatten()
+        .filter(|e| is_journal_name(&e.file_name().to_string_lossy()))
+        .map(|e| (e.metadata().ok().and_then(|m| m.modified().ok()), e.path()))
+        .collect();
+    journals.sort();
+    let active = active_journals().clone();
+    journals.into_iter().filter(|(_, j)| !active.contains(j)).flat_map(|(_, j)| recover_journal(&j)).collect()
 }
 
 pub fn write_journal(path: &Path, plan: &[RenameStep]) -> std::io::Result<()> {
@@ -526,7 +591,7 @@ pub fn recover_journal(path: &Path) -> Vec<String> {
         } else {
             crate::fileops::unique_path(&s.from)
         };
-        match std::fs::rename(&s.tmp, &target) {
+        match rename_retry(&s.tmp, &target) {
             Ok(()) => fixed += 1,
             Err(e) => msgs.push(format!("Could not repair {} (still named {}): {e}", s.from.display(), s.tmp.display())),
         }
@@ -697,6 +762,43 @@ mod journal_tests {
         assert!(out.errors.is_empty());
         assert!(!journal.exists());
         assert!(dir.join("c.jpg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_journal_is_recovered_and_temporary_names_stay_visible() {
+        let dir = std::env::temp_dir().join(format!("lumen-journals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let (a, b) = (files.join("a.jpg"), files.join("b.png"));
+        std::fs::write(&a, b"A").unwrap();
+        std::fs::write(&b, b"B").unwrap();
+        let p1 = plan_two_phase(&[(a.clone(), files.join("a2.jpg"))], "r1");
+        let p2 = plan_two_phase(&[(b.clone(), files.join("b2.png"))], "r2");
+        // Not hidden, and still an image to the browser.
+        let tmp_name = p1[0].tmp.file_name().unwrap().to_string_lossy().to_string();
+        assert!(tmp_name.starts_with("lumen-rename-r1-"), "{tmp_name}");
+        assert_eq!(p1[0].tmp.extension().unwrap(), "jpg");
+        // Two interrupted runs: one per-run journal and one from older versions.
+        let (j1, j2) = (dir.join("rename-journal-r1.json"), dir.join("rename-journal.json"));
+        write_journal(&j1, &p1).unwrap();
+        write_journal(&j2, &p2).unwrap();
+        for s in p1.iter().chain(&p2) {
+            std::fs::rename(&s.from, &s.tmp).unwrap();
+        }
+        // The journal of a rename still running in this process is left alone.
+        let busy = dir.join("rename-journal-busy.json");
+        write_journal(&busy, &[]).unwrap();
+        active_journals().push(busy.clone());
+        let msgs = recover_all_journals(&dir);
+        active_journals().retain(|j| j != &busy);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(std::fs::read(files.join("a2.jpg")).unwrap(), b"A");
+        assert_eq!(std::fs::read(files.join("b2.png")).unwrap(), b"B");
+        assert!(!j1.exists() && !j2.exists());
+        assert!(busy.exists());
+        assert_eq!(journal_path("x-1").file_name().unwrap(), "rename-journal-x-1.json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -414,6 +414,50 @@ fn resolve(target: PathBuf, policy: ConflictPolicy, input: &Path, claims: &Claim
     Ok((final_path, other_input))
 }
 
+/// What a decoded source held beyond the one 8-bit frame the batch writes.
+struct SourceDepth {
+    bits: u8,
+    frames: usize,
+    color_info: String,
+}
+
+/// Why writing the converted image over its own source would lose data
+/// (frames of an animation, pages, more than 8 bits per channel), or `None`
+/// when replacing it in place is safe. Mirrors the viewer's check before an
+/// in-place save. The batch decodes the first frame only, so animations and
+/// pages are also looked for in the file itself.
+fn in_place_loss_reason(input: &Path, d: &SourceDepth) -> Option<String> {
+    let ci = d.color_info.to_ascii_lowercase();
+    if d.bits > 8 || ci.contains("16-bit") || ci.contains("32-bit") || ci.contains("float") {
+        return Some("Not overwritten: it has more than 8 bits per channel, the output would have 8".into());
+    }
+    let ext = crate::formats::ext_of(input);
+    let frames = d.frames.max(file_frame_count(input, &ext));
+    if frames > 1 {
+        return Some(match ext.as_str() {
+            "gif" | "webp" | "png" | "apng" => "Not overwritten: it is animated, only the first frame would be kept".into(),
+            "tif" | "tiff" | "pdf" => format!("Not overwritten: it has {frames} pages, only the first would be kept"),
+            _ => format!("Not overwritten: it holds {frames} images, only one would be kept"),
+        });
+    }
+    None
+}
+
+/// Frames of an animated GIF / WebP / PNG (2 meaning "more than one") or
+/// pages of a TIFF, read from the file; 1 when it has one or cannot be read.
+fn file_frame_count(path: &Path, ext: &str) -> usize {
+    use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+    use image::AnimationDecoder;
+    let open = || std::fs::File::open(path).ok().map(std::io::BufReader::new);
+    match ext {
+        "gif" => open().and_then(|r| GifDecoder::new(r).ok()).map_or(1, |d| d.into_frames().take(2).count().max(1)),
+        "webp" => open().and_then(|r| WebPDecoder::new(r).ok()).map_or(1, |d| if d.has_animation() { 2 } else { 1 }),
+        "png" | "apng" => open().and_then(|r| PngDecoder::new(r).ok()).map_or(1, |d| if d.is_apng().unwrap_or(false) { 2 } else { 1 }),
+        "tif" | "tiff" => decode::wic::frame_count(path).unwrap_or(1),
+        _ => 1,
+    }
+}
+
 fn process_one(input: &Path, index: usize, s: &ConvertSettings, claims: &Claims) -> FileStatus {
     let meta = match std::fs::metadata(input) {
         Ok(m) => m,
@@ -425,6 +469,7 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, claims: &Claims)
     };
     let exif = dec.exif.clone();
     let taken = taken_from_exif(exif.as_ref());
+    let depth = SourceDepth { bits: dec.bit_depth, frames: dec.frame_count, color_info: dec.color_info.clone() };
     let img = Arc::try_unwrap(dec.image).unwrap_or_else(|a| (*a).clone());
     let cx = StepCtx::for_file(input, s.start + index as i64, taken);
     let img = match render(img, s, &cx) {
@@ -442,6 +487,13 @@ fn process_one(input: &Path, index: usize, s: &ConvertSettings, claims: &Claims)
         Ok(p) => p,
         Err(why) => return FileStatus::Skipped(why),
     };
+    // Overwrite in place writes one 8-bit frame: never over an animation, a
+    // multi-page file or a high bit depth original.
+    if path_key(&out) == path_key(input) {
+        if let Some(why) = in_place_loss_reason(input, &depth) {
+            return FileStatus::Skipped(why);
+        }
+    }
     let bytes = match encode_output(&img, s, fmt, exif) {
         Ok(b) => b,
         Err(e) => return FileStatus::Failed(e),
@@ -681,6 +733,47 @@ mod tests {
                 assert!(!inputs.iter().any(|i| path_key(i) == path_key(&p)), "{policy:?} -> {}", p.display());
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_in_place_skips_animations_and_deep_images() {
+        let dir = std::env::temp_dir().join(format!("lumen-conv-inplace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two-frame GIF.
+        let anim = dir.join("anim.gif");
+        {
+            use image::codecs::gif::GifEncoder;
+            let f = std::fs::File::create(&anim).unwrap();
+            let frames = (0..2u8).map(|i| image::Frame::new(RgbaImage::from_pixel(8, 8, image::Rgba([i * 200, 0, 0, 255]))));
+            GifEncoder::new(f).encode_frames(frames).unwrap();
+        }
+        // 16 bits per channel PNG and an ordinary 8-bit one.
+        let deep = dir.join("deep.png");
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(8, 8, image::Rgba([40000, 1000, 2, 65535])).save(&deep).unwrap();
+        let flat = dir.join("flat.png");
+        RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255])).save(&flat).unwrap();
+        let inputs = vec![anim.clone(), deep.clone(), flat.clone()];
+        let before: Vec<Vec<u8>> = inputs.iter().map(|p| std::fs::read(p).unwrap()).collect();
+        let s = ConvertSettings { keep_format: true, dest: DestMode::Same, conflict: ConflictPolicy::Overwrite, sharpen: false, ..Default::default() };
+        let claims = Claims::new(&inputs);
+        match process_one(&anim, 0, &s, &claims) {
+            FileStatus::Skipped(why) => assert!(why.contains("animated"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        match process_one(&deep, 1, &s, &claims) {
+            FileStatus::Skipped(why) => assert!(why.contains("8 bits"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(&anim).unwrap(), before[0], "animation untouched");
+        assert_eq!(std::fs::read(&deep).unwrap(), before[1], "16-bit original untouched");
+        match process_one(&flat, 2, &s, &claims) {
+            FileStatus::Done { out, .. } => assert_eq!(path_key(&out), path_key(&flat)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(file_frame_count(&flat, "png"), 1);
+        assert_eq!(file_frame_count(&anim, "gif"), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
