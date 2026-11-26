@@ -75,7 +75,7 @@ pub struct Browser {
     peek: FolderPeek,
     /// Set by `arrange`: the folder, its previous custom order and sort key, for
     /// the app's undo list.
-    pub arranged: Option<(PathBuf, Option<Vec<String>>, SortKey)>,
+    pub arranged: Option<(PathBuf, Option<Vec<String>>, bool)>,
     /// Grid tooltips are held back after an in-app file drag until the pointer moves,
     /// so the drop target's name does not pop up like a leftover drag label.
     tips_after_drag: bool,
@@ -216,6 +216,37 @@ impl Browser {
         }
     }
 
+    /// The sort in effect for the open folder: its own arrangement when it has an
+    /// active one, otherwise the sort chosen in the toolbar (custom order is per
+    /// folder, so a folder without one falls back to name).
+    pub fn sort_key(&self, core: &Core) -> SortKey {
+        if core.orders.is_active(&self.folder) {
+            SortKey::Custom
+        } else if core.settings.sort_key == SortKey::Custom {
+            SortKey::Name
+        } else {
+            core.settings.sort_key
+        }
+    }
+
+    /// Pick `k` for the open folder: custom order turns this folder's
+    /// arrangement on (starting from what is on screen); any other key is the
+    /// toolbar sort and hides, but keeps, the arrangement.
+    fn choose_sort(&mut self, core: &mut Core, k: SortKey) {
+        if k == SortKey::Custom {
+            if core.orders.has(&self.folder) {
+                core.orders.set_active(&self.folder, true);
+            } else {
+                let names: Vec<String> = self.entries.iter().filter(|e| !e.is_folder()).map(|e| e.name.clone()).collect();
+                core.orders.set(&self.folder, names);
+            }
+        } else {
+            core.settings.sort_key = k;
+            core.orders.set_active(&self.folder, false);
+        }
+        self.resort_needed = true;
+    }
+
     pub fn mark_resort(&mut self) {
         self.resort_needed = true;
     }
@@ -230,10 +261,11 @@ impl Browser {
         let rating = |p: &Path| core.tags.get(p).rating;
         let flagged = |p: &Path| core.tags.get(p).flagged;
         let label = |p: &Path| core.tags.get(p).label;
-        let positions = if s.sort_key == SortKey::Custom { core.orders.positions(&self.folder) } else { Default::default() };
+        let key = self.sort_key(core);
+        let positions = if key == SortKey::Custom { core.orders.positions(&self.folder) } else { Default::default() };
         let custom = |p: &Path| p.file_name().and_then(|n| positions.get(&n.to_string_lossy().to_lowercase()).copied());
         let cx = catalog::SortContext { dims: &dims, taken: &taken, rating: &rating, flagged: &flagged, label: &label, custom: &custom };
-        catalog::sort_entries(&mut self.entries, s.sort_key, s.sort_desc, s.folders_first, &cx);
+        catalog::sort_entries(&mut self.entries, key, s.sort_desc, s.folders_first, &cx);
         self.items = (0..self.entries.len())
             .filter(|&i| {
                 let e = &self.entries[i];
@@ -470,7 +502,8 @@ impl Browser {
         let p = core.pal;
         let desc = core.settings.sort_desc;
         // An arranged order has no direction: a grip instead of the arrow.
-        let custom = core.settings.sort_key == SortKey::Custom;
+        let effective = self.sort_key(core);
+        let custom = effective == SortKey::Custom;
         let arrow = if custom {
             I::DOTS_SIX_VERTICAL
         } else if desc {
@@ -479,7 +512,7 @@ impl Browser {
             I::ARROW_UP
         };
         let h = size::CONTROL;
-        let key_text = if custom { "Custom order" } else { core.settings.sort_key.label() };
+        let key_text = if custom { "Custom order" } else { effective.label() };
         let key_g = (!icon_only).then(|| ui.painter().layout_no_wrap(key_text.to_string(), text::body(), p.text));
         let arrow_g = ui.painter().layout_no_wrap(arrow.to_string(), FontId::proportional(size::ICON_CARET), p.muted);
         let main_w = key_g.as_ref().map_or(0.0, |g| g.size().x + 6.0) + arrow_g.size().x + 20.0;
@@ -516,7 +549,7 @@ impl Browser {
             painter.text(caret_r.center() - Vec2::new(1.0, 0.0), Align2::CENTER_CENTER, I::CARET_DOWN, FontId::proportional(size::ICON_CARET), caret_color);
         }
         let dir = if desc { "descending" } else { "ascending" };
-        let key = core.settings.sort_key.label().to_lowercase();
+        let key = effective.label().to_lowercase();
         if custom {
             main.on_hover_text("Arranged by hand: drag thumbnails to change the order (Ctrl+Alt+Left / Right moves the selection)");
         } else if main.on_hover_text(format!("Sorted by {key}, {dir}. Click to reverse.")).clicked() {
@@ -525,21 +558,21 @@ impl Browser {
         }
         let caret = caret.on_hover_text("Sort by");
         let mut reset = false;
+        let mut chosen: Option<SortKey> = None;
         egui::Popup::menu(&caret).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             ui.set_min_width(200.0);
             for k in SortKey::ALL {
-                if widgets::menu_toggle(ui, core.settings.sort_key == k, k.label(), "").clicked() {
-                    core.settings.sort_key = k;
+                if widgets::menu_toggle(ui, effective == k, k.label(), "").clicked() {
                     if matches!(k, SortKey::Dimensions | SortKey::DateTaken) {
                         for e in self.entries.iter().filter(|e| e.kind == EntryKind::Image) {
                             core.meta.request(&e.path);
                         }
                     }
-                    self.resort_needed = true;
+                    chosen = Some(k);
                     ui.close();
                 }
             }
-            if core.settings.sort_key == SortKey::Custom && core.orders.has(&self.folder) {
+            if custom && core.orders.has(&self.folder) {
                 if widgets::menu_item(ui, I::TEXTBOX, "Number the files in this order...", "").on_hover_text("Batch rename keeps this order, so a counter in the name makes it permanent").clicked() {
                     ev.push(BrowserEvent::Command(Command::BatchRename));
                     ui.close();
@@ -560,6 +593,9 @@ impl Browser {
             toggle(ui, &mut core.settings.folders_first, "Folders first");
             toggle(ui, &mut core.settings.show_folders_in_grid, "Show folders");
         });
+        if let Some(k) = chosen {
+            self.choose_sort(core, k);
+        }
         if reset {
             self.reset_order(core);
         }
@@ -1011,14 +1047,14 @@ impl Browser {
         let order: Vec<String> = self.entries.iter().filter(|e| !e.is_folder()).map(|e| e.name.clone()).collect();
         let target_name = target_path.as_ref().and_then(|t| t.file_name()).map(|n| n.to_string_lossy().into_owned());
         let arranged = lumen_core::order::move_names(&order, &moving, target_name.as_deref(), after);
-        if arranged == order && core.settings.sort_key == SortKey::Custom {
+        let was_active = core.orders.is_active(&self.folder);
+        if arranged == order && was_active {
             return;
         }
-        self.arranged = Some((self.folder.clone(), core.orders.get(&self.folder).map(|v| v.to_vec()), core.settings.sort_key));
+        self.arranged = Some((self.folder.clone(), core.orders.get(&self.folder).map(|v| v.to_vec()), was_active));
         core.orders.set(&self.folder, arranged);
-        if core.settings.sort_key != SortKey::Custom {
-            core.settings.sort_key = SortKey::Custom;
-            core.toasts.info("Custom order: drag thumbnails to arrange them; the viewer and slideshow follow it. Sort by name to go back.");
+        if !was_active {
+            core.toasts.info("This folder now has a custom order: the viewer and slideshow follow it. Other folders keep their sort.");
         }
         self.rebuild(core);
     }
@@ -1053,9 +1089,6 @@ impl Browser {
     /// Back to name order and forget this folder's custom order.
     pub fn reset_order(&mut self, core: &mut Core) {
         core.orders.clear(&self.folder);
-        if core.settings.sort_key == SortKey::Custom {
-            core.settings.sort_key = SortKey::Name;
-        }
         self.rebuild(core);
     }
 
@@ -1310,7 +1343,7 @@ impl Browser {
                 }
                 self.scroll_to_focus = false;
             }
-            let sk = core.settings.sort_key;
+            let sk = self.sort_key(core);
             let desc = core.settings.sort_desc;
             table
                 .header(size::CONTROL, |mut h| {
@@ -1434,10 +1467,10 @@ impl Browser {
             ui.painter().hline(full_x, y, Stroke::new(1.0, p.border));
         }
         if let Some(k) = sort_click {
-            if core.settings.sort_key == k {
+            if self.sort_key(core) == k {
                 core.settings.sort_desc = !core.settings.sort_desc;
             } else {
-                core.settings.sort_key = k;
+                self.choose_sort(core, k);
                 core.settings.sort_desc = false;
             }
             self.resort_needed = true;

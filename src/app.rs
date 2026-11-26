@@ -95,7 +95,7 @@ enum FileChange {
     /// EXIF orientation alone changed) the inverse transform turns it back.
     Transform { t: Transform, files: Vec<(PathBuf, Option<Vec<u8>>)> },
     /// A folder was arranged by hand: its previous custom order (none) and sort key.
-    Order { folder: PathBuf, previous: Option<Vec<String>>, sort: crate::settings::SortKey },
+    Order { folder: PathBuf, previous: Option<Vec<String>>, active: bool },
 }
 
 impl FileUndo {
@@ -1641,12 +1641,14 @@ impl App {
                     }
                 }
             }
-            FileChange::Order { folder, previous, sort } => {
+            FileChange::Order { folder, previous, active } => {
                 match previous {
-                    Some(v) => self.core.orders.set(folder, v.clone()),
+                    Some(v) => {
+                        self.core.orders.set(folder, v.clone());
+                        self.core.orders.set_active(folder, *active);
+                    }
                     None => self.core.orders.clear(folder),
                 }
-                self.core.settings.sort_key = *sort;
                 self.browser.mark_resort();
                 ok += 1;
             }
@@ -2915,8 +2917,8 @@ impl eframe::App for App {
                 }
             }
         }
-        if let Some((folder, previous, sort)) = self.browser.arranged.take() {
-            self.push_undo(FileUndo { label: "Arrange".into(), change: FileChange::Order { folder, previous, sort } });
+        if let Some((folder, previous, active)) = self.browser.arranged.take() {
+            self.push_undo(FileUndo { label: "Arrange".into(), change: FileChange::Order { folder, previous, active } });
         }
         while let Ok(res) = self.file_jobs.rx.try_recv() {
             self.file_jobs.queued = self.file_jobs.queued.saturating_sub(1);

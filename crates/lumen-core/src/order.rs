@@ -16,6 +16,8 @@ pub struct OrderStore {
     folders: HashMap<String, Vec<String>>,
     /// Lower-cased folder paths, least recently changed first (for the cap).
     recent: Vec<String>,
+    /// Folders whose arrangement is kept but not shown (another sort was picked there).
+    inactive: std::collections::HashSet<String>,
     #[serde(skip)]
     dirty: bool,
 }
@@ -67,6 +69,19 @@ impl OrderStore {
         self.folders.contains_key(&key(folder))
     }
 
+    /// True when `folder` has an arrangement and it is the folder's sort.
+    pub fn is_active(&self, folder: &Path) -> bool {
+        let k = key(folder);
+        self.folders.contains_key(&k) && !self.inactive.contains(&k)
+    }
+
+    /// Show (or stop showing) the folder's arrangement; it is kept either way.
+    pub fn set_active(&mut self, folder: &Path, on: bool) {
+        let k = key(folder);
+        let changed = if on { self.inactive.remove(&k) } else { self.folders.contains_key(&k) && self.inactive.insert(k) };
+        self.dirty |= changed;
+    }
+
     /// Position of each saved name in `folder` (lower-cased name -> index).
     pub fn positions(&self, folder: &Path) -> HashMap<String, usize> {
         self.get(folder).map(|v| v.iter().enumerate().map(|(i, n)| (n.to_lowercase(), i)).collect()).unwrap_or_default()
@@ -76,10 +91,12 @@ impl OrderStore {
         let k = key(folder);
         self.recent.retain(|r| r != &k);
         self.recent.push(k.clone());
+        self.inactive.remove(&k);
         self.folders.insert(k, names);
         while self.recent.len() > MAX_FOLDERS {
             let old = self.recent.remove(0);
             self.folders.remove(&old);
+            self.inactive.remove(&old);
         }
         self.dirty = true;
     }
@@ -88,6 +105,7 @@ impl OrderStore {
         let k = key(folder);
         if self.folders.remove(&k).is_some() {
             self.recent.retain(|r| r != &k);
+            self.inactive.remove(&k);
             self.dirty = true;
         }
     }
@@ -177,8 +195,13 @@ mod tests {
         // A swap applied together keeps both places.
         s.rename_many(&[(dir.join("b.jpg"), dir.join("z.jpg")), (dir.join("z.jpg"), dir.join("b.jpg"))]);
         assert_eq!(s.get(dir).unwrap(), &v(&["z.jpg", "b.jpg"])[..]);
+        assert!(s.is_active(dir));
+        s.set_active(dir, false);
+        assert!(s.has(dir) && !s.is_active(dir));
+        s.set(dir, v(&["b.jpg", "z.jpg"]));
+        assert!(s.is_active(dir), "arranging again shows the order");
         s.clear(dir);
-        assert!(!s.has(dir));
+        assert!(!s.has(dir) && !s.is_active(dir));
         for i in 0..MAX_FOLDERS + 5 {
             s.set(Path::new(&format!(r"C:\f{i}")), v(&["x"]));
         }
