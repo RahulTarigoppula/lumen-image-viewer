@@ -597,8 +597,8 @@ const PANE_GAP: f32 = 2.0;
 const CAP_H: f32 = 28.0;
 
 /// A-D colors, the same as Compare's badges (so image and video compare match).
-fn letter_color(p: &Palette, i: usize) -> Color32 {
-    [p.accent, Color32::from_rgb(232, 120, 60), Color32::from_rgb(80, 180, 120), Color32::from_rgb(170, 110, 230)][i % MAX_VIDEOS]
+fn letter_color(_p: &Palette, i: usize) -> Color32 {
+    theme::PANE_COLORS[i % theme::PANE_COLORS.len()]
 }
 
 fn letter(i: usize) -> &'static str {
@@ -610,7 +610,7 @@ fn letter(i: usize) -> &'static str {
 fn paint_badge(painter: &egui::Painter, center: Pos2, label: &str, color: Color32, r: f32) {
     painter.circle_filled(center, r + 1.0, Color32::from_black_alpha(70));
     painter.circle_filled(center, r, color);
-    painter.text(center, Align2::CENTER_CENTER, label, theme::semibold(r + 1.5), Color32::WHITE);
+    painter.text(center, Align2::CENTER_CENTER, label, theme::semibold(r + 1.5), theme::text_on(color));
 }
 
 /// Horizontal padding of the picture's readout pills.
@@ -2434,8 +2434,8 @@ impl VideoMode {
         }
     }
 
-    /// Readouts over the picture: zoom (and for one video its frame), a
-    /// "Seeking" badge for slow seeks, and audio output errors.
+    /// Readouts over the picture: zoom (and for one video its frame) and a
+    /// "Seeking" badge for slow seeks.
     fn hud(&mut self, ui: &Ui, painter: &egui::Painter, p: &Palette, view: Rect, eff: &[(f32, Vec2)]) {
         let lead = self.lead();
         let a = &self.sources[lead];
@@ -2443,18 +2443,15 @@ impl VideoMode {
         if self.sources.len() == 1 {
             let f = a.frame_of(a.pts());
             let kind = a.current.as_ref().map(|c| c.kind as char).unwrap_or('?');
-            // One pill: the timecode (monospace), then frame, type and zoom.
+            // One pill: frame, type and zoom. No timecode: the caption and the
+            // transport bar already show it.
             let mut rest = format!("Frame {f}  ·  {}  ·  {zoom}", kind_name(kind));
             if let Some(e) = &a.error {
                 rest = format!("{rest}  ·  {} {e}", I::WARNING);
             }
-            let job = |time: bool, rest: &str| {
+            let job = |rest: &str| {
                 let mut job = egui::text::LayoutJob::default();
                 let fmt = |font: FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: egui::Align::Center, ..Default::default() };
-                if time {
-                    job.append(&fmt_time(a.pts()), 0.0, fmt(theme::text::mono(), p.text));
-                    job.append("  ·  ", 0.0, fmt(theme::text::small(), p.muted));
-                }
                 job.append(rest, 0.0, fmt(theme::text::small(), p.text));
                 job
             };
@@ -2464,7 +2461,7 @@ impl VideoMode {
                 let g = painter.layout_job(job);
                 (g.size().x + 2.0 * OSD_PAD + 24.0 <= view.width()).then_some(g)
             };
-            if let Some(g) = fits(job(true, &rest)).or_else(|| fits(job(false, &format!("Frame {f}  ·  {}", kind_name(kind))))) {
+            if let Some(g) = fits(job(&rest)).or_else(|| fits(job(&format!("Frame {f}  ·  {}", kind_name(kind))))) {
                 osd_pill(painter, p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
             }
         } else if !(self.shared_pane() && self.mode == CompareMode::Difference) {
@@ -2489,11 +2486,8 @@ impl VideoMode {
                 ui.ctx().request_repaint_after(delay.saturating_sub(t0.elapsed()));
             }
         }
-        if self.audio.is_none() {
-            if let Some(e) = &self.audio_error {
-                painter.text(view.left_bottom() + Vec2::new(14.0, -20.0), Align2::LEFT_CENTER, format!("{}  {}", I::SPEAKER_SLASH, if e.to_lowercase().starts_with("no audio") { e.to_string() } else { format!("No audio output: {e}") }), FontId::proportional(11.5), p.muted);
-            }
-        }
+        // An audio output error is not repeated here: the transport bar says
+        // "no audio" and its tooltip gives the reason.
     }
 
     /// The picture's right-click menu, laid out like the viewer's: the
@@ -2801,10 +2795,15 @@ impl VideoMode {
                     if widgets::icon_button(ui, vi, &tip, self.muted).clicked() {
                         self.toggle_mute();
                     }
-                } else if fit.volume {
-                    ui.label(RichText::new(format!("{} no audio", I::SPEAKER_SLASH)).size(11.5).color(p.faint)).on_hover_text(format!("No sound{who}"));
                 } else {
-                    ui.label(RichText::new(I::SPEAKER_SLASH).size(11.5).color(p.faint)).on_hover_text("No audio");
+                    // Why there is no sound: no output device, or no audio track.
+                    let why = match (&self.audio, &self.audio_error) {
+                        (None, Some(e)) if e.to_lowercase().starts_with("no audio") => e.clone(),
+                        (None, Some(e)) => format!("No audio output: {e}"),
+                        _ => format!("No sound{who}"),
+                    };
+                    let text = if fit.volume { format!("{} no audio", I::SPEAKER_SLASH) } else { I::SPEAKER_SLASH.to_string() };
+                    ui.label(RichText::new(text).size(11.5).color(p.faint)).on_hover_text(why);
                 }
                 widgets::separator_v(ui);
                 let speed = ui.menu_button(RichText::new(format!("{}×  {}", self.speed, I::CARET_DOWN)).size(12.5), |ui| {
