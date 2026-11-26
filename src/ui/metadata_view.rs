@@ -6,7 +6,7 @@
 //!   multi-frame merges, portrait depth, zoom, lens), interpreted in plain
 //!   words by `lumen_core::inspect`.
 //! - EXIF: every EXIF tag by group.
-//! - Metadata: file and encoding details (JPEG quality estimate, chroma
+//! - File & encoding: file and encoding details (JPEG quality estimate, chroma
 //!   subsampling), color profile, XMP, maker trailers, embedded images,
 //!   PNG text (AI generator settings), comments.
 //!
@@ -34,7 +34,7 @@ impl MetaTab {
         match self {
             MetaTab::Capture => "Capture",
             MetaTab::Exif => "EXIF",
-            MetaTab::Other => "Metadata",
+            MetaTab::Other => "File & encoding",
         }
     }
     fn tip(self) -> &'static str {
@@ -232,10 +232,16 @@ impl MetadataWindow {
         ui.add_space(6.0);
         let n = self.items.len().max(1);
         let name_w = 190.0f32;
-        let avail = ui.available_width();
-        let col_w = ((avail - name_w - 16.0) / n as f32).max(120.0);
-        // Column headers.
+        // Rows sit inside the group headers' indent, with a gap before every
+        // value column: size the columns from what is left, so a row is never
+        // wider than the window (a wider row made the window grow every frame).
+        let indent = ui.spacing().indent;
+        let gap = ui.spacing().item_spacing.x;
+        let avail = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let col_w = ((avail - indent - name_w - gap * n as f32 - 4.0) / n as f32).max(120.0);
+        // Column headers, indented like the rows so each sits over its values.
         ui.horizontal(|ui| {
+            ui.add_space(indent);
             cell(ui, name_w, 22.0, egui::Label::new(RichText::new("").size(text::SMALL)));
             for it in &self.items {
                 let name = it.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
