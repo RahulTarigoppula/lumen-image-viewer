@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Browser
+- Arrange by hand, like FastStone: drag thumbnails (or rows in the details view) between others to put them in any
+  order. A line shows where they will land; dropping on the empty area puts them last; the view scrolls when the
+  pointer is held near the top or bottom. Ctrl+Alt+Left / Right move the selected files one place, Ctrl+Z undoes an
+  arrangement. The viewer, slideshow, compare, batch tools and exports follow the arranged order.
+- "Custom order" in the sort menu; the order is kept per folder in Lumen's private data (files are never renamed or
+  touched), follows renames, and can be made permanent with "Number the files in this order" (batch rename) or
+  reset from the same menu.
+- Folder thumbnails show the first pictures inside each folder.
+
 ## 2.0.0 (23 November 2026)
 
 Lumen becomes an image quality workbench: whole camera comparison rounds,

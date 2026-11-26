@@ -25,7 +25,7 @@ FastStone Image Viewer is loved for being fast and complete, but it shows its ag
 
 ## Features
 
-**Browser**: folder tree with favorites and drives, thumbnail grid with a persistent cache, details view, natural sort by name, size, dates, date taken, dimensions, rating, flag or label, instant filter, flags, 0-5 star ratings and color labels, copy, move, rename and delete, drag files onto folders or out to Explorer, copy and paste files with Explorer, preview pane, type-ahead.
+**Browser**: folder tree with favorites and drives, thumbnail grid with a persistent cache and folder thumbnails, details view, natural sort by name, size, dates, date taken, dimensions, rating, flag or label, arrange by hand (drag thumbnails into any order; the viewer and slideshow follow it), instant filter, flags, 0-5 star ratings and color labels, copy, move, rename and delete, drag files onto folders or out to Explorer, copy and paste files with Explorer, preview pane, type-ahead.
 
 **Viewer**: fit modes (fit large, fit all, fill, width, height, 100%), smooth zoom at the cursor, lock zoom across images, press-and-hold magnifier, animated GIF/WebP/APNG playback with frame stepping, multi-page documents, filmstrip, info panel with histogram, full EXIF and GPS, FastStone-style pop-out panels at the screen edges, full screen with auto-hiding controls, touchpad pinch and pan.
 

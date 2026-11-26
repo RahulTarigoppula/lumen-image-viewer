@@ -385,7 +385,7 @@ impl Browser {
                 filter_resp.surrender_focus();
             }
             ui.add_space(4.0);
-            self.sort_button(ui, core, sort_icon_only);
+            self.sort_button(ui, core, sort_icon_only, ev);
             ui.add_space(2.0);
 
             // Media type + flag/rating filters
@@ -466,7 +466,7 @@ impl Browser {
 
     /// Sort as one split button: the left part shows the key and direction and
     /// reverses the direction on click; the caret opens the keys and options.
-    fn sort_button(&mut self, ui: &mut Ui, core: &mut Core, icon_only: bool) {
+    fn sort_button(&mut self, ui: &mut Ui, core: &mut Core, icon_only: bool, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
         let desc = core.settings.sort_desc;
         let arrow = if desc { I::ARROW_DOWN } else { I::ARROW_UP };
@@ -528,9 +528,15 @@ impl Browser {
                     ui.close();
                 }
             }
-            if core.settings.sort_key == SortKey::Custom && core.orders.has(&self.folder) && widgets::menu_item(ui, I::ARROW_COUNTER_CLOCKWISE, "Reset this folder's custom order", "").clicked() {
-                reset = true;
-                ui.close();
+            if core.settings.sort_key == SortKey::Custom && core.orders.has(&self.folder) {
+                if widgets::menu_item(ui, I::TEXTBOX, "Number the files in this order...", "").on_hover_text("Batch rename keeps this order, so a counter in the name makes it permanent").clicked() {
+                    ev.push(BrowserEvent::Command(Command::BatchRename));
+                    ui.close();
+                }
+                if widgets::menu_item(ui, I::ARROW_COUNTER_CLOCKWISE, "Reset this folder's custom order", "").clicked() {
+                    reset = true;
+                    ui.close();
+                }
             }
             ui.separator();
             let mut toggle = |ui: &mut Ui, on: &mut bool, label: &str| {
@@ -1250,6 +1256,8 @@ impl Browser {
     }
 
     fn details(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
+        let mut reorder: Option<(Vec<PathBuf>, Option<usize>, bool)> = None;
+        let mut folder_drop: Option<(PathBuf, Vec<PathBuf>, bool)> = None;
         use egui_extras::TableBuilder;
         let p = core.pal;
         let n = self.items.len();
@@ -1386,9 +1394,31 @@ impl Browser {
                             let files = if selected { self.selected_paths() } else { vec![entry.path.clone()] };
                             resp.dnd_set_drag_payload(DragFiles(files));
                         }
+                        if entry.is_folder() {
+                            if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
+                                folder_drop = Some((entry.path.clone(), files.0.clone(), resp.ctx.input(|inp| inp.modifiers.ctrl)));
+                            }
+                        } else {
+                            // Dropping on a row arranges: above it on its upper half, below on its lower half.
+                            let after = resp.ctx.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| q.y > resp.rect.center().y);
+                            if resp.dnd_hover_payload::<DragFiles>().is_some() {
+                                let y = if after { resp.rect.max.y } else { resp.rect.min.y };
+                                let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("details-insert"));
+                                resp.ctx.layer_painter(layer).hline(resp.rect.x_range(), y, Stroke::new(2.5, p.accent));
+                            }
+                            if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
+                                reorder = Some((files.0.clone(), Some(i), after));
+                            }
+                        }
                     });
                 });
         });
+        if let Some((target, files, copy)) = folder_drop {
+            ev.push(BrowserEvent::DropFiles { target, files, copy });
+        }
+        if let Some((files, target, after)) = reorder {
+            self.arrange(core, &files, target, after);
+        }
         if let Some(y) = head_bottom {
             ui.painter().hline(full_x, y, Stroke::new(1.0, p.border));
         }

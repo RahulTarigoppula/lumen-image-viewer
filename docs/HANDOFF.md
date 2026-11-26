@@ -57,7 +57,15 @@ Details: [WORKBENCH.md](WORKBENCH.md).
 - **AI review** (optional, off by default): set a server in Settings, AI review; **Rank devices** sends 2 to 4
   images and returns a ranking with findings drawn on the panes.
 
-### 5. Video
+### 5. Arrange a folder by hand
+- In the thumbnail grid (or details view), drag files between others; a line shows where they land. The sort switches
+  to **Custom order**, kept per folder in Lumen's own data (the files are not touched).
+- Ctrl+Alt+Left / Right move the selection one place; Ctrl+Z undoes the last arrangement.
+- The viewer (Enter), slideshow, compare and batch tools use this order. To make it permanent in the file names, use
+  Sort, **Number the files in this order** (batch rename with a counter); **Reset this folder's custom order** goes
+  back to name order.
+
+### 6. Video
 - Select clips, Compare (P) or Ctrl+Shift+V. Frame timing checks find drops and duplicates; **Auto-align** syncs
   start points of clips from different phones; PSNR / SSIM and whole-file analysis are in the analysis panel.
 
