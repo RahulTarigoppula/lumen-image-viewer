@@ -139,10 +139,15 @@ fn source_to_rgba(source: &IWICBitmapSource) -> Result<RgbaImage> {
     }
 }
 
-/// Wrap `source` in a color transform to sRGB when the frame carries a non-sRGB profile.
+/// Wrap the frame in a color transform to sRGB when it carries a non-sRGB profile.
 fn color_managed(factory: &IWICImagingFactory, frame: &IWICBitmapFrameDecode) -> Result<(IWICBitmapSource, String)> {
+    color_managed_source(factory, frame, frame.cast()?)
+}
+
+/// Wrap `source` (the frame, or a scaled copy of it) in a color transform to
+/// sRGB when `frame` carries a non-sRGB profile.
+fn color_managed_source(factory: &IWICImagingFactory, frame: &IWICBitmapFrameDecode, source: IWICBitmapSource) -> Result<(IWICBitmapSource, String)> {
     unsafe {
-        let source: IWICBitmapSource = frame.cast()?;
         let mut count = 0u32;
         if frame.GetColorContexts(&mut [], &mut count).is_err() || count == 0 {
             return Ok((source, String::new()));
@@ -216,7 +221,9 @@ pub fn decode_full(path: &Path, color_manage: bool) -> Result<Decoded> {
         } else {
             (frame.cast()?, String::new())
         };
+        super::check_cancel()?;
         let rgba = source_to_rgba(&source)?;
+        super::check_cancel()?;
         let orientation = if needs_exif_orientation(path) { exif_orientation_from_file(path) } else { 1 };
         let rgba = apply_orientation(rgba, orientation);
         let has_alpha = pixel_format_has_alpha(&pf) && image_has_alpha(&rgba);
@@ -244,40 +251,125 @@ pub fn decode_full(path: &Path, color_manage: bool) -> Result<Decoded> {
 /// Decode scaled so the longest side is ≤ `max_side`. Uses embedded thumbnails
 /// when they are large enough and DCT-domain scaling for JPEG.
 pub fn decode_scaled(path: &Path, max_side: u32) -> Result<RgbaImage> {
+    decode_scaled_sized(path, max_side).map(|r| r.0)
+}
+
+/// [`decode_scaled`] plus the source size as shown (after EXIF orientation, as
+/// [`probe_dimensions`] reports it), from the same open of the file.
+pub fn decode_scaled_sized(path: &Path, max_side: u32) -> Result<(RgbaImage, (u32, u32))> {
     with_factory(|factory| unsafe {
         let (_decoder, frame) = open_frame(factory, path)?;
         let (mut w, mut h) = (0u32, 0u32);
         frame.GetSize(&mut w, &mut h)?;
         let orientation = if needs_exif_orientation(path) { exif_orientation_from_file(path) } else { 1 };
-
-        // Embedded preview (RAW files, many JPEGs) when it is big enough.
-        if let Ok(thumb) = frame.GetThumbnail() {
-            let (mut tw, mut th) = (0u32, 0u32);
-            if thumb.GetSize(&mut tw, &mut th).is_ok() && tw.max(th) >= max_side && tw > 0 {
-                // Only trust it when its aspect matches the main image (some cameras pad).
-                let a1 = w as f32 / h.max(1) as f32;
-                let a2 = tw as f32 / th.max(1) as f32;
-                if (a1 - a2).abs() < 0.03 || (a1 - 1.0 / a2).abs() < 0.03 {
-                    let img = source_to_rgba(&thumb)?;
-                    let img = crate::imaging::resize_to_fit(&img, max_side, max_side);
-                    return Ok(apply_orientation(img, orientation));
-                }
-            }
-        }
-
-        let (source, _) = color_managed(factory, &frame)?;
-        let scale = (max_side as f32 / w.max(h) as f32).min(1.0);
-        let source: IWICBitmapSource = if scale < 1.0 {
-            let tw = ((w as f32 * scale).round() as u32).max(1);
-            let th = ((h as f32 * scale).round() as u32).max(1);
-            let scaler = factory.CreateBitmapScaler()?;
-            scaler.Initialize(&source, tw, th, WICBitmapInterpolationModeFant)?;
-            scaler.cast()?
-        } else {
-            source
+        let size = super::oriented_size((w, h), orientation);
+        let img = match embedded_preview(&frame, (w, h), max_side)? {
+            Some(img) => img,
+            None => scaled_rgba(factory, &frame, (w, h), max_side)?,
         };
-        let img = source_to_rgba(&source)?;
-        Ok(apply_orientation(img, orientation))
+        Ok((apply_orientation(img, orientation), size))
+    })
+}
+
+/// [`decode_scaled`] only where it is cheap: an embedded preview at least
+/// `max_side` big, or a decoder that scales natively to half the size or less
+/// (JPEG). Ok(None) when the image would have to be decoded at full size.
+pub fn decode_scaled_cheap(path: &Path, max_side: u32) -> Result<Option<RgbaImage>> {
+    with_factory(|factory| unsafe {
+        let (_decoder, frame) = open_frame(factory, path)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        let img = match embedded_preview(&frame, (w, h), max_side)? {
+            Some(img) => img,
+            None if scales_natively(&frame, (w, h), max_side) => scaled_rgba(factory, &frame, (w, h), max_side)?,
+            None => return Ok(None),
+        };
+        let orientation = if needs_exif_orientation(path) { exif_orientation_from_file(path) } else { 1 };
+        Ok(Some(apply_orientation(img, orientation)))
+    })
+}
+
+/// The frame's embedded preview (RAW files, many JPEGs) fitted into `max_side`,
+/// when it is at least that big and has the main image's aspect (some cameras pad).
+fn embedded_preview(frame: &IWICBitmapFrameDecode, (w, h): (u32, u32), max_side: u32) -> Result<Option<RgbaImage>> {
+    unsafe {
+        let Ok(thumb) = frame.GetThumbnail() else { return Ok(None) };
+        let (mut tw, mut th) = (0u32, 0u32);
+        if thumb.GetSize(&mut tw, &mut th).is_err() || tw.max(th) < max_side || tw == 0 {
+            return Ok(None);
+        }
+        let a1 = w as f32 / h.max(1) as f32;
+        let a2 = tw as f32 / th.max(1) as f32;
+        if (a1 - a2).abs() >= 0.03 && (a1 - 1.0 / a2).abs() >= 0.03 {
+            return Ok(None);
+        }
+        let img = source_to_rgba(&thumb)?;
+        Ok(Some(crate::imaging::resize_to_fit(&img, max_side, max_side)))
+    }
+}
+
+/// Size of a `w` x `h` frame scaled to fit `max_side` (None when it already fits).
+fn scaled_size((w, h): (u32, u32), max_side: u32) -> Option<(u32, u32)> {
+    let scale = (max_side as f32 / w.max(h) as f32).min(1.0);
+    if scale >= 1.0 {
+        return None;
+    }
+    Some((((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1)))
+}
+
+/// True when the decoder itself can produce the frame at half its size or less
+/// for `max_side` (JPEG decodes at 1/2, 1/4 or 1/8 in the DCT domain).
+fn scales_natively(frame: &IWICBitmapFrameDecode, (w, h): (u32, u32), max_side: u32) -> bool {
+    let long = w.max(h) as u64;
+    if max_side as u64 * 2 > long {
+        return false;
+    }
+    let Some((mut tw, mut th)) = scaled_size((w, h), max_side) else { return false };
+    unsafe {
+        let Ok(t) = frame.cast::<IWICBitmapSourceTransform>() else { return false };
+        t.GetClosestSize(&mut tw, &mut th).is_ok() && tw.max(th) as u64 * 2 <= long
+    }
+}
+
+/// The frame fitted into `max_side` and converted to sRGB. It is scaled first and
+/// the small result color-converted: a color transform between the decoder and
+/// the scaler hides the decoder's own scaling (JPEG DCT scaling), so the whole
+/// image would be decoded and converted at full size.
+fn scaled_rgba(factory: &IWICImagingFactory, frame: &IWICBitmapFrameDecode, (w, h): (u32, u32), max_side: u32) -> Result<RgbaImage> {
+    let Some((tw, th)) = scaled_size((w, h), max_side) else {
+        let (source, _) = color_managed(factory, frame)?;
+        return source_to_rgba(&source);
+    };
+    if let Ok(img) = scale_then_convert(factory, frame, tw, th) {
+        return Ok(img);
+    }
+    // Pixel formats the scaler cannot take straight from the decoder: convert
+    // first, as before.
+    unsafe {
+        let (source, _) = color_managed(factory, frame)?;
+        let scaler = factory.CreateBitmapScaler()?;
+        scaler.Initialize(&source, tw, th, WICBitmapInterpolationModeFant)?;
+        source_to_rgba(&scaler.cast()?)
+    }
+}
+
+fn scale_then_convert(factory: &IWICImagingFactory, frame: &IWICBitmapFrameDecode, tw: u32, th: u32) -> Result<RgbaImage> {
+    unsafe {
+        let scaler = factory.CreateBitmapScaler()?;
+        let source: IWICBitmapSource = frame.cast()?;
+        scaler.Initialize(&source, tw, th, WICBitmapInterpolationModeFant)?;
+        let (source, _) = color_managed_source(factory, frame, scaler.cast()?)?;
+        source_to_rgba(&source)
+    }
+}
+
+/// Pixel size of the first frame as stored (before EXIF orientation).
+pub fn stored_size(path: &Path) -> Result<(u32, u32)> {
+    with_factory(|factory| unsafe {
+        let (_d, frame) = open_frame(factory, path)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        Ok((w, h))
     })
 }
 
