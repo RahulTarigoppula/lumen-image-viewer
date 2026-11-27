@@ -17,7 +17,7 @@ wait 800
 open {media}\Explorer\Target
 wait 2000
 key Ctrl+V
-wait 3000
+wait 1500
 shot pasted.png
 # Ctrl+Z puts them back.
 run Undo
@@ -40,15 +40,30 @@ osdrag 770 150 none {media}\Explorer\Outside\dropped.png
 wait 1000
 shot drop_hover.png
 osdrop
-wait 3000
+wait 1500
 shot dropped.png
 # With Ctrl over the empty area: a copy into the folder shown.
 osdrag 900 500 ctrl {media}\Explorer\Target\dropped.png
 wait 1000
 shot drop_ctrl_hover.png
 osdrop
-wait 3000
+wait 1500
 shot drop_ctrl.png
+# Held over a row of the folder tree with Shift: "Move to Source"; then taken away.
+osdrag 150 365 shift {media}\Explorer\Target\dropped.png
+wait 1000
+shot drop_tree_hover.png
+osleave
+wait 500
+# Over a folder row of the details list with Ctrl: "Copy to Source".
+run ToggleDetails
+wait 1500
+osdrag 400 119 ctrl {media}\Explorer\Target\dropped.png
+wait 1000
+shot drop_details_hover.png
+osleave
+run ToggleDetails
+wait 800
 open {media}\Explorer\Target
 wait 2500
 shot target_after.png

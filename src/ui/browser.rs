@@ -91,6 +91,9 @@ pub struct Browser {
     typeahead: (String, Instant),
     /// Path to select once the listing arrives (e.g. after opening a file).
     pub pending_select: Option<PathBuf>,
+    /// Paths to select once the listing arrives, after `pending_select`
+    /// (files just pasted or dropped here).
+    pub pending_selection: Option<HashSet<PathBuf>>,
     resort_needed: bool,
     /// List the folder again (e.g. "Include subfolders" changed).
     reload_needed: bool,
@@ -155,6 +158,7 @@ impl Browser {
             last_poll: Instant::now(),
             typeahead: (String::new(), Instant::now()),
             pending_select: None,
+            pending_selection: None,
             resort_needed: false,
             reload_needed: false,
             right_w: 600.0,
@@ -176,6 +180,7 @@ impl Browser {
     pub fn load(&mut self, folder: PathBuf, ctx: &egui::Context, show_hidden: bool) {
         if folder != self.folder {
             self.selected.clear();
+            self.pending_selection = None;
             self.focus = None;
             self.anchor = None;
             self.filter.clear();
@@ -428,6 +433,9 @@ impl Browser {
                             }
                             if let Some(i) = anchor_path.and_then(|p| self.index_of(&p)) {
                                 self.anchor = Some(i);
+                            }
+                            if let Some(sel) = self.pending_selection.take() {
+                                self.selected = sel;
                             }
                         }
                         Err(e) => {
@@ -1016,7 +1024,7 @@ impl Browser {
         if let Some(h) = &self.os_drop {
             self.drop_zones.push((area.intersect(ui.clip_rect()), Zone::Background(self.folder.clone())));
             if h.on_background(area) {
-                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("browser-drop-area")));
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("browser-drop-area")));
                 painter.with_clip_rect(area).rect(area.shrink(3.0), CornerRadius::same(radius::CARD), p.accent.gamma_multiply(0.08), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
             }
         }
@@ -1730,7 +1738,7 @@ impl Browser {
                                 drop_here |= h.on_folder(&entry.path, shown);
                             }
                             if drop_here {
-                                let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("details-drop"));
+                                let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("details-drop"));
                                 let painter = resp.ctx.layer_painter(layer).with_clip_rect(shown.unwrap_or(resp.rect));
                                 painter.rect_stroke(resp.rect.shrink(1.0), CornerRadius::same(radius::SMALL), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
                             }
@@ -2231,7 +2239,7 @@ fn paint_drag_badge(ui: &Ui, n: usize, p: &Palette) {
 /// A small accent badge beside the pointer at `pos`: what a drag carries, or
 /// what dropping it does ("Move to Holiday").
 pub fn pointer_badge(ctx: &egui::Context, pos: Pos2, text: &str, p: &Palette) {
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("browser-drag-badge")));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("browser-drag-badge")));
     let g = painter.layout_no_wrap(text.to_string(), FontId::proportional(12.0), Color32::WHITE);
     let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
     painter.rect_filled(r, CornerRadius::same(8), p.accent);

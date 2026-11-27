@@ -1761,8 +1761,8 @@ impl App {
         }
         // Pasted or dropped into the folder shown: select what arrived, as Explorer does.
         if !done.is_empty() && fileops::same_path(&dest, &self.browser.folder) {
-            self.browser.selected = done.iter().map(|(_, to)| to.clone()).collect();
             self.browser.pending_select = done.first().map(|(_, to)| to.clone());
+            self.browser.pending_selection = Some(done.iter().map(|(_, to)| to.clone()).collect());
         }
         if do_move {
             self.core.tags.moved_many(&done);
