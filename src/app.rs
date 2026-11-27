@@ -872,7 +872,7 @@ impl App {
                         self.compare = None;
                     }
                     if let Some(w) = &mut self.workbench {
-                        w.save_now(&mut self.core.toasts);
+                        w.save_soon();
                         w.open_export();
                     }
                     self.mode = Mode::Workbench;
