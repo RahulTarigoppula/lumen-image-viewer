@@ -716,6 +716,26 @@ impl Viewer {
         self.gpu = None;
     }
 
+    /// [`replace_path`](Self::replace_path) for many (from, to) pairs at
+    /// once: one pass over the list, and names swapped between files stay right.
+    pub fn replace_paths(&mut self, moves: &[(PathBuf, PathBuf)]) {
+        if moves.is_empty() {
+            return;
+        }
+        let to: std::collections::HashMap<&Path, &Path> = moves.iter().map(|(f, t)| (f.as_path(), t.as_path())).collect();
+        for p in self.list.iter_mut() {
+            if let Some(t) = to.get(p.as_path()) {
+                *p = t.to_path_buf();
+            }
+        }
+        if let Some(e) = &mut self.edit {
+            if let Some(t) = to.get(e.path.as_path()) {
+                e.path = t.to_path_buf();
+            }
+        }
+        self.gpu = None;
+    }
+
     /// The image currently displayed (edited version if any).
     pub fn current_image(&self, core: &Core) -> Option<Arc<RgbaImage>> {
         let path = self.current()?;
@@ -3202,6 +3222,18 @@ mod tests {
         assert_eq!(v.preload_set(&l, false), vec![v.list[1].clone()]);
         // protected_paths falls back to the current image before any request.
         assert_eq!(v.protected_paths(), vec![v.list[1].clone()]);
+    }
+
+    #[test]
+    fn many_paths_replaced_at_once() {
+        let p = |n: &str| PathBuf::from(format!("Z:/lumen-test/{n}.png"));
+        let mut v = Viewer::new();
+        v.list = vec![p("a"), p("b"), p("c")];
+        v.edit = Some(EditSession::new(p("b"), Arc::new(RgbaImage::new(1, 1))));
+        // a and b swap names; c is left alone.
+        v.replace_paths(&[(p("a"), p("b")), (p("b"), p("a"))]);
+        assert_eq!(v.list, vec![p("b"), p("a"), p("c")]);
+        assert_eq!(v.edit.as_ref().map(|e| e.path.clone()), Some(p("a")));
     }
 
     fn view() -> Rect {
