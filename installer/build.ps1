@@ -30,13 +30,15 @@ New-Item -ItemType Directory -Force $Out | Out-Null
 $outPath = (Resolve-Path $Out).Path
 
 function Find-Iscc {
-    $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+    # The install folder first: the iscc.exe on PATH of the GitHub images is a
+    # Chocolatey shim without version information.
     foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, (Join-Path $env:LOCALAPPDATA "Programs"))) {
         if (-not $base) { continue }
         $p = Join-Path $base "Inno Setup 6\ISCC.exe"
         if (Test-Path $p) { return $p }
     }
+    $cmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
     return $null
 }
 
@@ -45,9 +47,10 @@ function Get-IsccVersion([string] $path) {
     return [version]::new($v.FileMajorPart, $v.FileMinorPart, $v.FileBuildPart)
 }
 
-# x64compatible needs Inno Setup 6.3 or later.
+# x64compatible needs Inno Setup 6.3 or later (0.0.0: no version information, assume it is new enough).
 $iscc = Find-Iscc
-if (-not $iscc -or (Get-IsccVersion $iscc) -lt [version]"6.3.0") {
+$old = $iscc -and (Get-IsccVersion $iscc) -gt [version]"0.0.0" -and (Get-IsccVersion $iscc) -lt [version]"6.3.0"
+if (-not $iscc -or $old) {
     Write-Host "Inno Setup 6.3+ not found (have: $iscc), installing it with Chocolatey"
     choco upgrade innosetup -y --no-progress
     if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup failed (exit code $LASTEXITCODE)" }
