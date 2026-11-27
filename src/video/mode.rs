@@ -21,7 +21,7 @@ use image::RgbaImage;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -125,15 +125,57 @@ impl<K: PartialEq + Clone + Send + 'static, T: Send + 'static> Bg<K, T> {
         self.started = Some(Instant::now());
     }
 
+    /// Forget the result shown and the job running (both are for videos
+    /// that changed).
     fn reset(&mut self) {
         self.key = None;
+        self.running = None;
     }
 }
 
 /// (frame pts, frame pixels, scope, histogram mode): what a scope image shows.
 type ScopeKey = (u64, usize, u8, u8);
 
+/// (A's and B's source ids, A's and B's frame pts): what a quality
+/// measurement of the frames on screen is of.
+type MetricsKey = (u64, u64, u64, u64);
+
+/// ((A's, B's source id), A's frame pts, B's frame pts, gain, B's frame
+/// size): what a difference image shows.
+type DiffKey = ((u64, u64), u64, u64, u32, (u32, u32));
+
+/// Id of the next video that joins (results made for one video must not
+/// show for another that takes its place, even at the same frame).
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A video whose decoder opens and probes the file on its own thread, so a
+/// slow disk or share never stalls the UI; it joins as a `Source` once its
+/// media info arrives (see `VideoMode::poll_opening`).
+struct Opening {
+    path: PathBuf,
+    player: Player,
+    index: engine::SharedIndex,
+    info: Receiver<anyhow::Result<MediaInfo>>,
+    /// Its decoder was given the sound output.
+    audio: bool,
+}
+
+impl Opening {
+    fn start(path: &Path, audio: Option<Arc<super::audio::AudioShared>>, ctx: &egui::Context) -> Opening {
+        let index: engine::SharedIndex = Arc::new(Mutex::new(None));
+        let with_audio = audio.is_some();
+        let (player, info) = Player::open_async(path, audio, index.clone(), ctx.clone());
+        Opening { path: path.to_path_buf(), player, index, info, audio: with_audio }
+    }
+
+    fn name(&self) -> String {
+        crate::ui::viewer::file_name(&self.path)
+    }
+}
+
 struct Source {
+    /// Unique among the videos of this session (see `NEXT_SOURCE_ID`).
+    id: u64,
     path: PathBuf,
     info: MediaInfo,
     player: Player,
@@ -169,15 +211,15 @@ struct Source {
 }
 
 impl Source {
-    fn open(path: &Path, audio: Option<Arc<super::audio::AudioShared>>, ctx: &egui::Context) -> anyhow::Result<Source> {
-        let info = engine::probe(path)?;
-        let index: engine::SharedIndex = Arc::new(Mutex::new(None));
-        let player = Player::open(path, audio, index.clone(), ctx.clone())?;
+    /// The video `o` opened, with its media `info`: starts building the frame
+    /// index (and from it the frame timing checks).
+    fn new(o: Opening, info: MediaInfo, ctx: &egui::Context) -> Source {
+        let Opening { path, player, index, .. } = o;
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let timing_slot: Arc<Mutex<Option<Arc<TimingReport>>>> = Arc::new(Mutex::new(None));
         {
-            let (index, progress, cancel, path, ctx, timing_slot) = (index.clone(), progress.clone(), cancel.clone(), path.to_path_buf(), ctx.clone(), timing_slot.clone());
+            let (index, progress, cancel, path, ctx, timing_slot) = (index.clone(), progress.clone(), cancel.clone(), path.clone(), ctx.clone(), timing_slot.clone());
             // The rate the file states: r_frame_rate unless it is a time base
             // in disguise (90000), else the average.
             let declared = if info.fps > 0.0 && info.fps <= 1000.0 { info.fps } else { info.avg_fps };
@@ -194,8 +236,9 @@ impl Source {
             });
         }
         let out = (info.width.max(2), info.height.max(2));
-        Ok(Source {
-            path: path.to_path_buf(),
+        Source {
+            id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
+            path,
             info,
             player,
             gen: 0,
@@ -219,7 +262,7 @@ impl Source {
             start: None,
             scope_job: Bg::new(),
             scope_tex: None,
-        })
+        }
     }
 
     fn name(&self) -> String {
@@ -345,14 +388,19 @@ impl Source {
     }
 
     fn remember(&mut self, f: VFrame) {
+        // Only the picture is kept: the native planes (for metrics, often ten
+        // times its size) stay with the current frame alone. A step back to a
+        // remembered frame decodes it again at once (see `step`), which
+        // brings its planes back.
+        let f = VFrame { native: None, ..f };
         let pos = self.history.partition_point(|h| h.pts < f.pts - 1e-6);
         if self.history.get(pos).map(|h| (h.pts - f.pts).abs() < 1e-6).unwrap_or(false) {
             self.history[pos] = f;
         } else {
             self.history.insert(pos, f);
         }
-        // Bound memory (160 MB of display frames; the decoder keeps its own
-        // cache of decoded frames for stepping further back).
+        // Bound memory (160 MB of display frames per video; the decoder keeps
+        // its own cache of decoded frames for stepping further back).
         let bytes_per = self.history.front().map(|h| h.rgba.as_raw().len()).unwrap_or(1).max(1);
         let cap = ((160usize << 20) / bytes_per).clamp(8, 240);
         let cur = self.pts();
@@ -517,13 +565,82 @@ impl Clock {
     }
 }
 
+/// Worst frames listed in the Info panel.
+const WORST_FRAMES: usize = 8;
+
 struct Analysis {
+    /// Filled by the analysis thread, in A's frame order.
     rows: Arc<Mutex<Vec<(usize, FrameMetrics)>>>,
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     bit_max: f64,
+    /// The UI's copy of `rows` (A's frame numbers and their metrics),
+    /// brought up to date by `sync`.
+    frames: Vec<usize>,
+    metrics: Vec<FrameMetrics>,
+    /// Summary and worst frames of the copy.
+    summary: metrics::Summary,
+    worst: Vec<(usize, FrameMetrics)>,
+    synced: Option<Instant>,
+    /// The copy holds every row of the finished analysis.
+    complete: bool,
+}
+
+impl Analysis {
+    /// Copy the rows measured since the last call, a few times a second while
+    /// the analysis runs (the thread's lock is held only for the copy), and
+    /// update the summary and the worst frames when they changed.
+    fn sync(&mut self) {
+        if self.complete {
+            return;
+        }
+        // Read before the rows: once it is done, every row is in.
+        let done = self.done.load(Ordering::Acquire);
+        if !done && self.synced.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            return;
+        }
+        let before = self.frames.len();
+        {
+            let rows = self.rows.lock();
+            for (i, m) in rows.iter().skip(before) {
+                self.frames.push(*i);
+                self.metrics.push(*m);
+            }
+        }
+        self.synced = Some(Instant::now());
+        self.complete = done;
+        if self.frames.len() != before {
+            self.summary = metrics::summarize(&self.metrics, self.bit_max);
+            self.worst = worst_frames(&self.frames, &self.metrics, WORST_FRAMES);
+        }
+    }
+
+    /// The metrics of A's frame `f`, once measured.
+    fn row(&self, f: usize) -> Option<FrameMetrics> {
+        self.frames.binary_search(&f).ok().map(|k| self.metrics[k])
+    }
+}
+
+impl Drop for Analysis {
+    fn drop(&mut self) {
+        // A discarded analysis stops, so its decoders do not go on reading
+        // (and holding open) both files.
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The `n` frames with the lowest PSNR-Y, worst first (ties in frame order).
+fn worst_frames(frames: &[usize], ms: &[FrameMetrics], n: usize) -> Vec<(usize, FrameMetrics)> {
+    let by_psnr = |a: &usize, b: &usize| ms[*a].psnr_y.total_cmp(&ms[*b].psnr_y).then(a.cmp(b));
+    let mut order: Vec<usize> = (0..ms.len().min(frames.len())).collect();
+    if order.len() > n {
+        order.select_nth_unstable_by(n, by_psnr);
+        order.truncate(n);
+    }
+    order.sort_unstable_by(by_psnr);
+    order.into_iter().map(|k| (frames[k], ms[k])).collect()
 }
 
 /// The last auto-align: what it found, and the start points before and
@@ -617,13 +734,14 @@ fn paint_badge(painter: &egui::Painter, center: Pos2, label: &str, color: Color3
 const OSD_PAD: f32 = 12.0;
 
 /// A readout pill over the picture (overlay fill, 1 pt border, radius 8),
-/// anchored at `pos` by `align`.
-fn osd_pill(painter: &egui::Painter, p: &Palette, pos: Pos2, align: Align2, g: Arc<egui::Galley>) {
+/// anchored at `pos` by `align`; returns where it was drawn.
+fn osd_pill(painter: &egui::Painter, p: &Palette, pos: Pos2, align: Align2, g: Arc<egui::Galley>) -> Rect {
     let size = Vec2::new(g.size().x + 2.0 * OSD_PAD, (g.size().y + 10.0).max(size::COMPACT + 4.0));
     let r = align.anchor_size(pos, size);
     painter.add(theme::popover_shadow(p).as_shape(r, CornerRadius::same(theme::radius::CARD)));
     painter.rect(r, CornerRadius::same(theme::radius::CARD), p.overlay, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
     painter.galley(Pos2::new(r.min.x + OSD_PAD, r.center().y - g.size().y / 2.0), g, p.text);
+    r
 }
 
 /// `name` cut to `max` characters, keeping its start and its extension.
@@ -793,6 +911,8 @@ impl Default for TransportFit {
 
 pub struct VideoMode {
     sources: Vec<Source>,
+    /// Videos being opened, in the order they join `sources`.
+    opening: VecDeque<Opening>,
     audio: Option<AudioOut>,
     audio_error: Option<String>,
     /// The video whose sound plays.
@@ -812,11 +932,12 @@ pub struct VideoMode {
     show_scopes: bool,
     scope: Scope,
     hist_mode: HistMode,
-    diff: Bg<(u64, u64, u32, (u32, u32)), (egui::ColorImage, f64, f64)>,
+    diff: Bg<DiffKey, (egui::ColorImage, f64, f64)>,
     diff_tex: Option<egui::TextureHandle>,
     diff_stats: Option<(f64, f64)>,
-    metrics_now: Option<((u64, u64), FrameMetrics)>,
-    metrics_rx: Option<crossbeam_channel::Receiver<((u64, u64), Option<FrameMetrics>)>>,
+    metrics_now: Option<(MetricsKey, FrameMetrics)>,
+    /// The quality measurement being made.
+    metrics_rx: Option<crossbeam_channel::Receiver<(MetricsKey, Option<FrameMetrics>)>>,
     analysis: Option<Analysis>,
     loop_ab: Loop,
     /// The video whose time the loop is in.
@@ -836,8 +957,9 @@ pub struct VideoMode {
     save_dialog: Option<SaveDialog>,
     /// Frames saved for image Compare, for the app to open.
     compare_request: Option<Vec<PathBuf>>,
-    /// (index entries, columns, per-column bars from `timeline_columns`, built at)
-    timeline_cache: Option<(usize, usize, Vec<TimelineColumn>, Instant)>,
+    /// (the video's id, index entries, columns, per-column bars from
+    /// `timeline_columns`, built at)
+    timeline_cache: Option<(u64, usize, usize, Vec<TimelineColumn>, Instant)>,
     /// Frame number most recently requested by stepping (until it arrives).
     pending_step: Option<usize>,
     /// A text field had keyboard focus at the end of the last frame. egui drops
@@ -866,6 +988,7 @@ impl VideoMode {
         };
         let mut vm = VideoMode {
             sources: Vec::new(),
+            opening: VecDeque::new(),
             audio,
             audio_error,
             audio_src: 0,
@@ -924,41 +1047,72 @@ impl VideoMode {
         self.compare_request.take()
     }
 
-    /// Add `path` as the next video (A, B, C, D). A failure is kept in
-    /// `open_error` for the empty view's card (or a toast, see `ui`).
+    /// Start opening `path` as the next video (A, B, C, D); it joins once its
+    /// decoder has read the file (see `poll_opening`).
     fn add_source(&mut self, path: &Path, ctx: &egui::Context) -> bool {
-        if self.sources.len() >= MAX_VIDEOS {
+        if self.sources.len() + self.opening.len() >= MAX_VIDEOS {
             return false;
         }
-        let first = self.sources.is_empty();
-        let audio = if first { self.audio_shared() } else { None };
-        match Source::open(path, audio, ctx) {
-            Ok(mut s) => {
-                self.open_error = None;
-                if first {
-                    self.audio_src = 0;
-                } else {
-                    // A new video joins at A's moment (it has no start point yet).
-                    let t = self.sources[0].pts();
-                    s.seek(t, true);
-                    if self.playing {
-                        self.pause();
-                    }
+        // The first video plays its sound.
+        let audio = if self.sources.is_empty() && self.opening.is_empty() { self.audio_shared() } else { None };
+        self.open_error = None;
+        self.opening.push_back(Opening::start(path, audio, ctx));
+        true
+    }
+
+    /// Videos whose decoders have read their files join, in the order they
+    /// were opened (A before B even when B was quicker). A failure is kept in
+    /// `open_error` for the empty view's card (or a toast, see `ui`).
+    fn poll_opening(&mut self, ctx: &egui::Context) {
+        while let Some(o) = self.opening.front() {
+            let res = match o.info.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => {
+                    // The decoder asks for a repaint when it is ready; this is a fallback.
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    return;
                 }
-                self.sources.push(s);
-                if self.sources.len() != 2 {
-                    self.mode = CompareMode::SideBySide;
+                Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("The video decoder failed to start")),
+            };
+            let Some(o) = self.opening.pop_front() else { return };
+            match res {
+                Ok(info) => self.join(o, info, ctx),
+                Err(e) => {
+                    let name = o.name();
+                    self.open_error = Some((if name.is_empty() { o.path.display().to_string() } else { name }, open_reason(&e)));
                 }
-                self.view = View::default();
-                self.update_native();
-                true
-            }
-            Err(e) => {
-                let name = crate::ui::viewer::file_name(path);
-                self.open_error = Some((if name.is_empty() { path.display().to_string() } else { name }, open_reason(&e)));
-                false
             }
         }
+    }
+
+    /// Add the opened video `o` after the others.
+    fn join(&mut self, o: Opening, info: MediaInfo, ctx: &egui::Context) {
+        let had_audio = o.audio;
+        let mut s = Source::new(o, info, ctx);
+        if self.sources.is_empty() {
+            self.audio_src = 0;
+            if !had_audio {
+                // The video opened before it failed (or was closed): this one
+                // plays the sound, from its first frame.
+                if let Some(a) = self.audio_shared() {
+                    s.player.send(Cmd::Audio(Some(a)));
+                    s.seek(0.0, true);
+                }
+            }
+        } else {
+            // A new video joins at A's moment (it has no start point yet).
+            let t = self.sources[0].pts();
+            s.seek(t, true);
+            if self.playing {
+                self.pause();
+            }
+        }
+        self.sources.push(s);
+        if self.sources.len() != 2 {
+            self.mode = CompareMode::SideBySide;
+        }
+        self.view = View::default();
+        self.update_native();
     }
 
     /// Add videos from a file dialog, up to four in all.
@@ -974,7 +1128,7 @@ impl VideoMode {
         if paths.is_empty() {
             return;
         }
-        if self.sources.len() + paths.len() > MAX_VIDEOS {
+        if self.sources.len() + self.opening.len() + paths.len() > MAX_VIDEOS {
             self.clear_sources();
         }
         for p in paths.into_iter().take(MAX_VIDEOS) {
@@ -985,11 +1139,14 @@ impl VideoMode {
     fn clear_sources(&mut self) {
         self.pause();
         self.sources.clear();
+        self.opening.clear();
         self.audio_src = 0;
         self.selected = 0;
         self.loop_ab = Loop::default();
         self.analysis = None;
         self.metrics_now = None;
+        self.metrics_rx = None;
+        self.reset_diff();
         self.mode = CompareMode::SideBySide;
         if let Some(a) = self.audio_shared() {
             a.flush();
@@ -1031,6 +1188,7 @@ impl VideoMode {
         if i < 2 {
             self.analysis = None;
             self.metrics_now = None;
+            self.metrics_rx = None;
         }
         if n != 2 {
             self.mode = CompareMode::SideBySide;
@@ -1038,8 +1196,20 @@ impl VideoMode {
         if n < 2 {
             self.sync = SyncMode::Linked;
         }
-        self.diff.reset();
+        self.reset_diff();
         self.update_native();
+    }
+
+    /// Drop the difference image (and the one being made): it was of other videos.
+    fn reset_diff(&mut self) {
+        self.diff.reset();
+        self.diff_tex = None;
+        self.diff_stats = None;
+    }
+
+    /// The ids of A and B.
+    fn pair_ids(&self) -> Option<(u64, u64)> {
+        Some((self.sources.first()?.id, self.sources.get(1)?.id))
     }
 
     /// Native planes for metrics: A and B when comparing, A alone while the
@@ -1249,9 +1419,8 @@ impl VideoMode {
     }
 
     fn cancel_auto_align(&mut self) {
-        if let Some(job) = self.align_job.take() {
-            job.cancel();
-        }
+        // Dropping the job stops it.
+        self.align_job = None;
     }
 
     /// Apply a finished auto-align (once).
@@ -1659,12 +1828,13 @@ impl VideoMode {
     }
 
     /// Open the Save frames dialog (folder: the last one used, else next
-    /// to the videos, else Pictures).
+    /// to the videos, else Pictures). Whether the folder takes files is not
+    /// tested here: the save finds out off the UI thread and says so.
     fn open_save_dialog(&mut self) {
         if self.sources.is_empty() {
             return;
         }
-        let beside = self.sources[0].path.parent().map(Path::to_path_buf).filter(|d| dir_writable(d));
+        let beside = self.sources[0].path.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf);
         let dir = last_snapshot_dir().or(beside).or_else(dirs::picture_dir).unwrap_or_else(|| PathBuf::from("."));
         self.save_dialog = Some(SaveDialog { dir, composite: self.sources.len() > 1 });
     }
@@ -1753,10 +1923,24 @@ impl VideoMode {
                 if let Err(e) = r {
                     *error.lock() = Some(e.to_string());
                 }
-                done.store(true, Ordering::Relaxed);
+                // After the last row (see `Analysis::sync`).
+                done.store(true, Ordering::Release);
             });
         }
-        self.analysis = Some(Analysis { rows, progress, cancel, done, error, bit_max });
+        self.analysis = Some(Analysis {
+            rows,
+            progress,
+            cancel,
+            done,
+            error,
+            bit_max,
+            frames: Vec::new(),
+            metrics: Vec::new(),
+            summary: metrics::Summary::default(),
+            worst: Vec::new(),
+            synced: None,
+            complete: false,
+        });
     }
 
     fn export_csv(&self, core: &mut Core) {
@@ -1790,6 +1974,7 @@ impl VideoMode {
             self.dev_commands(core);
         }
 
+        self.poll_opening(&ctx);
         self.poll_snapshot(core);
         self.poll_auto_align(core);
         // Poll decoders.
@@ -1798,11 +1983,22 @@ impl VideoMode {
             s.poll(playing);
         }
         if let Some(rx) = &self.metrics_rx {
-            if let Ok((k, m)) = rx.try_recv() {
-                self.metrics_rx = None;
-                if let Some(m) = m {
-                    self.metrics_now = Some((k, m));
+            match rx.try_recv() {
+                Ok((k, m)) => {
+                    self.metrics_rx = None;
+                    // Not for videos swapped or closed meanwhile.
+                    if let Some(m) = m.filter(|_| self.pair_ids() == Some((k.0, k.1))) {
+                        self.metrics_now = Some((k, m));
+                    }
                 }
+                Err(TryRecvError::Disconnected) => self.metrics_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(an) = &mut self.analysis {
+            an.sync();
+            if !an.complete {
+                ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
         self.advance_playback(&ctx);
@@ -1878,9 +2074,10 @@ impl VideoMode {
                 ui.label(RichText::new(title).font(theme::text::title()));
                 widgets::separator_v(ui);
             }
-            if n < MAX_VIDEOS {
-                let tip = if n == 0 { "Open one video to play it, or up to four to compare them (or drop files here)" } else { "Add another video to compare, up to four (or drop files here)" };
-                let label = if n == 0 { "Open video" } else { "Add video" };
+            let total = n + self.opening.len();
+            if total < MAX_VIDEOS {
+                let tip = if total == 0 { "Open one video to play it, or up to four to compare them (or drop files here)" } else { "Add another video to compare, up to four (or drop files here)" };
+                let label = if total == 0 { "Open video" } else { "Add video" };
                 let r = if avail >= 760.0 { widgets::labeled_icon_button(ui, I::PLUS, label, tip, false) } else { widgets::icon_button(ui, I::PLUS, tip, false) };
                 if r.clicked() {
                     self.pick_videos(&core.ctx);
@@ -2087,6 +2284,7 @@ impl VideoMode {
         self.loop_lead = flip(self.loop_lead);
         self.analysis = None;
         self.metrics_now = None;
+        self.metrics_rx = None;
         self.diff.reset();
         self.update_native();
     }
@@ -2281,6 +2479,13 @@ impl VideoMode {
             job.halign = egui::Align::Center;
             painter.layout_job(job)
         };
+        if let Some(o) = self.opening.front() {
+            // A video is being opened: a spinner and its name until it shows.
+            let c = view.center();
+            egui::Spinner::new().size(28.0).paint_at(ui, Rect::from_center_size(c - Vec2::new(0.0, 16.0), Vec2::splat(28.0)));
+            painter.galley(Pos2::new(c.x, c.y + 10.0), line(&format!("Opening {}...", shorten(&o.name(), 60)), 13.0, p.muted), p.muted);
+            return;
+        }
         let hint = line("Drop one video to play it, or up to four videos to compare them", 15.0, p.text);
         let sub = line("Frame-accurate stepping · side by side, wipe and difference · start points · PSNR & SSIM · scopes", 12.5, p.muted);
         let card = self.open_error.as_ref().map(|(name, why)| ErrorCard::layout(&painter, &p, name, why, wrap.min(440.0)));
@@ -2356,12 +2561,15 @@ impl VideoMode {
 
     /// A video's caption at the top of its pane (`right`: at the top right):
     /// its letter, name, own time and frame, start point, and buttons for
-    /// its sound, start point and closing it.
+    /// its sound, start point and closing it. A single video's caption is
+    /// only its name and time (the transport bar and the readout have its
+    /// frame).
     fn caption(&mut self, ui: &mut Ui, p: &Palette, i: usize, area: Rect, right: bool, core: &mut Core) {
         if area.width() < 40.0 || area.height() < CAP_H {
             return;
         }
         let n = self.sources.len();
+        let single = n == 1;
         let s = &self.sources[i];
         let f = s.frame_of(s.pts());
         let independent = self.sync == SyncMode::Independent && n > 1;
@@ -2370,9 +2578,11 @@ impl VideoMode {
         let buttons = sound as usize + start_btn as usize + (n > 1) as usize;
         let btn_w = 24.0;
         let font = theme::text::small();
-        let fixed = 8.0 + 2.0 * BADGE_R + 6.0 + 8.0 + buttons as f32 * btn_w + if buttons > 0 { 4.0 } else { 0.0 };
+        // Left padding and the letter badge, where the text starts.
+        let lead_w = if single { 10.0 } else { 8.0 + 2.0 * BADGE_R + 6.0 };
+        let fixed = lead_w + if single { 10.0 } else { 8.0 } + buttons as f32 * btn_w + if buttons > 0 { 4.0 } else { 0.0 };
         let max_text = (area.width() - fixed).max(0.0);
-        let time = format!("{}  ·  frame {f}", fmt_time(s.pts()));
+        let time = if single { fmt_time(s.pts()) } else { format!("{}  ·  frame {f}", fmt_time(s.pts())) };
         let start = s.start.map(|t| format!("  ·  {} {}", I::FLAG, fmt_time(t))).unwrap_or_default();
         let name = s.name();
         let painter = ui.painter().clone();
@@ -2385,6 +2595,10 @@ impl VideoMode {
             g = layout(fmt_time(s.pts()));
         }
         let text_w = if g.size().x > max_text { 0.0 } else { g.size().x };
+        if single && text_w <= 0.0 {
+            // Nothing fits: no empty chip.
+            return;
+        }
         let w = (fixed + text_w).min(area.width());
         let min = if right { Pos2::new(area.max.x - w, area.min.y) } else { area.min };
         let r = Rect::from_min_size(min, Vec2::new(w, CAP_H));
@@ -2392,12 +2606,15 @@ impl VideoMode {
         let stroke = if sel { Stroke::new(1.5, p.accent) } else { Stroke::new(1.0, p.border) };
         painter.add(theme::popover_shadow(p).as_shape(r, CornerRadius::same(theme::radius::CARD)));
         painter.rect(r, CornerRadius::same(theme::radius::CARD), p.overlay, stroke, egui::StrokeKind::Inside);
-        paint_badge(&painter, Pos2::new(r.min.x + 8.0 + BADGE_R, r.center().y), letter(i), letter_color(p, i), BADGE_R - 1.0);
-        let text_rect = Rect::from_min_max(r.min, Pos2::new(r.min.x + 8.0 + 2.0 * BADGE_R + 6.0 + text_w + 4.0, r.max.y));
-        if text_w > 0.0 {
-            painter.galley(Pos2::new(r.min.x + 8.0 + 2.0 * BADGE_R + 6.0, r.center().y - g.size().y / 2.0), g, p.text);
+        if !single {
+            paint_badge(&painter, Pos2::new(r.min.x + 8.0 + BADGE_R, r.center().y), letter(i), letter_color(p, i), BADGE_R - 1.0);
         }
-        let mut tip = format!("{}: {name}\n{} / {}  ·  frame {f}", letter(i), fmt_time(s.pts()), fmt_time(s.duration()));
+        let text_rect = Rect::from_min_max(r.min, Pos2::new(r.min.x + lead_w + text_w + 4.0, r.max.y));
+        if text_w > 0.0 {
+            painter.galley(Pos2::new(r.min.x + lead_w, r.center().y - g.size().y / 2.0), g, p.text);
+        }
+        let who = if single { name.clone() } else { format!("{}: {name}", letter(i)) };
+        let mut tip = format!("{who}\n{} / {}  ·  frame {f}", fmt_time(s.pts()), fmt_time(s.duration()));
         if let Some(t) = s.start {
             tip += &format!("\nStart point {} (frame {})", fmt_time(t), s.frame_of(t));
         }
@@ -2434,8 +2651,8 @@ impl VideoMode {
         }
     }
 
-    /// Readouts over the picture: zoom (and for one video its frame) and a
-    /// "Seeking" badge for slow seeks.
+    /// Readouts over the picture: zoom (and for one video its frame), the
+    /// videos still opening and a "Seeking" badge for slow seeks.
     fn hud(&mut self, ui: &Ui, painter: &egui::Painter, p: &Palette, view: Rect, eff: &[(f32, Vec2)]) {
         let lead = self.lead();
         let a = &self.sources[lead];
@@ -2470,6 +2687,17 @@ impl VideoMode {
                 osd_pill(painter, p, view.right_bottom() - Vec2::splat(12.0), Align2::RIGHT_BOTTOM, g);
             }
         }
+        // Videos still opening, then a slow seek, below the captions.
+        let mut top = view.min.y + 44.0;
+        if let Some(o) = self.opening.front() {
+            let name = shorten(&o.name(), 40);
+            let txt = match self.opening.len() {
+                1 => format!("Opening {name}..."),
+                k => format!("Opening {name} and {} more...", k - 1),
+            };
+            let g = painter.layout_no_wrap(txt, theme::text::body(), p.text);
+            top = osd_pill(painter, p, Pos2::new(view.center().x, top), Align2::CENTER_TOP, g).max.y + 8.0;
+        }
         // A slow seek (long GOP) keeps the last frame on screen with a badge,
         // so stepping never looks frozen.
         let t0 = self.members().iter().filter_map(|&i| self.sources[i].seek_started).min();
@@ -2481,7 +2709,7 @@ impl VideoMode {
                     None => "Seeking...".to_string(),
                 };
                 let g = painter.layout_no_wrap(txt, theme::text::body(), p.text);
-                osd_pill(painter, p, Pos2::new(view.center().x, view.min.y + 44.0), Align2::CENTER_TOP, g);
+                osd_pill(painter, p, Pos2::new(view.center().x, top), Align2::CENTER_TOP, g);
             } else {
                 ui.ctx().request_repaint_after(delay.saturating_sub(t0.elapsed()));
             }
@@ -2625,7 +2853,7 @@ impl VideoMode {
             }
         }
         let (Some(a), Some(b)) = (self.sources[0].current.as_ref(), self.sources[1].current.as_ref()) else { return };
-        let key = (a.pts.to_bits(), b.pts.to_bits(), self.gain.to_bits(), b.rgba.dimensions());
+        let key: DiffKey = ((self.sources[0].id, self.sources[1].id), a.pts.to_bits(), b.pts.to_bits(), self.gain.to_bits(), b.rgba.dimensions());
         let (ia, ib, gain) = (a.rgba.clone(), b.rgba.clone(), self.gain);
         // While playing at most about 15 a second; paused at once.
         let gap = if self.playing { Duration::from_millis(60) } else { Duration::ZERO };
@@ -2637,7 +2865,7 @@ impl VideoMode {
             return;
         }
         let (Some(a), Some(b)) = (self.sources[0].current.as_ref(), self.sources[1].current.as_ref()) else { return };
-        let key = (a.pts.to_bits(), b.pts.to_bits());
+        let key: MetricsKey = (self.sources[0].id, self.sources[1].id, a.pts.to_bits(), b.pts.to_bits());
         if self.metrics_now.as_ref().map(|(k, _)| *k == key).unwrap_or(false) {
             return;
         }
@@ -3002,19 +3230,20 @@ impl VideoMode {
         if let Some(idx) = idx_guard.as_ref() {
             let cols = track.width().max(1.0) as usize;
             // Aggregating 100k+ index entries is too costly per frame: cache it
-            // per (entry count, width) and refresh periodically as frame types are learned.
+            // per (video, entry count, width) and refresh periodically as frame
+            // types are learned.
             let stale = match &self.timeline_cache {
-                Some((n, c, _, at)) => *n != idx.len() || *c != cols || at.elapsed() > Duration::from_secs(2),
+                Some((id, n, c, _, at)) => *id != a.id || *n != idx.len() || *c != cols || at.elapsed() > Duration::from_secs(2),
                 None => true,
             };
             if stale {
-                self.timeline_cache = Some((idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
+                self.timeline_cache = Some((a.id, idx.len(), cols, timeline_columns(idx, dur, cols), Instant::now()));
             }
             let tints = timeline_tints(p);
             let mut mesh = egui::Mesh::default();
             let mut last_tick = f32::NEG_INFINITY;
             let tick = p.muted.gamma_multiply(0.8);
-            if let Some((_, _, columns, _)) = self.timeline_cache.as_ref() {
+            if let Some((_, _, _, columns, _)) = self.timeline_cache.as_ref() {
                 for (c, col) in columns.iter().enumerate() {
                     let x = track.min.x + c as f32;
                     // An I tick per column with a keyframe, at least 3 points apart.
@@ -3057,11 +3286,12 @@ impl VideoMode {
         drop(idx_guard);
         // Metric graph (PSNR-Y) from analysis (in A's frames).
         if let (Some(an), 0) = (&self.analysis, lead) {
-            let rows = an.rows.lock();
-            if rows.len() > 1 {
-                let pts: Vec<Pos2> = rows
+            if an.metrics.len() > 1 {
+                let pts: Vec<Pos2> = an
+                    .frames
                     .iter()
-                    .step_by((rows.len() / track.width().max(1.0) as usize).max(1))
+                    .zip(&an.metrics)
+                    .step_by((an.metrics.len() / track.width().max(1.0) as usize).max(1))
                     .map(|(i, m)| {
                         let t = a.pts_of(*i);
                         let v = ((m.psnr_y.min(60.0) - 20.0) / 40.0).clamp(0.0, 1.0) as f32;
@@ -3091,10 +3321,8 @@ impl VideoMode {
             if let Some(e) = e {
                 tip += &format!("  ·  {}  ·  {}", kind_name(e.kind as char), crate::catalog::human_size(e.size as u64));
             }
-            if let (Some(an), 0) = (&self.analysis, lead) {
-                if let Some((_, m)) = an.rows.lock().iter().find(|(i, _)| *i == f) {
-                    tip += &format!("  ·  PSNR {:.2} dB  SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y);
-                }
+            if let Some(m) = self.analysis.as_ref().filter(|_| lead == 0).and_then(|an| an.row(f)) {
+                tip += &format!("  ·  PSNR {:.2} dB  SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y);
             }
             if self.sources.len() > 1 {
                 tip = format!("{}: {tip}", letter(lead));
@@ -3233,9 +3461,8 @@ impl VideoMode {
                             }
                             ui.ctx().request_repaint_after(Duration::from_millis(200));
                         }
-                        let rows = an.rows.lock().clone();
-                        let ms: Vec<FrameMetrics> = rows.iter().map(|(_, m)| *m).collect();
-                        let sum = metrics::summarize(&ms, an.bit_max);
+                        // Summary and worst frames as of the last `Analysis::sync`.
+                        let sum = an.summary;
                         if sum.frames > 0 {
                             widgets::kv_row(ui, &p, "Frames", &sum.frames.to_string());
                             widgets::kv_row(ui, &p, "Mean PSNR Y", &fmt_db(sum.mean_psnr_y));
@@ -3244,10 +3471,8 @@ impl VideoMode {
                             widgets::kv_row(ui, &p, "Worst PSNR Y", &fmt_db(sum.min_psnr_y));
                             ui.add_space(4.0);
                             ui.label(RichText::new("Worst frames (click to jump)").size(11.5).color(p.faint));
-                            let mut worst = rows.clone();
-                            worst.sort_by(|a, b| a.1.psnr_y.partial_cmp(&b.1.psnr_y).unwrap_or(std::cmp::Ordering::Equal));
                             let mut jump = None;
-                            for (i, m) in worst.iter().take(8) {
+                            for (i, m) in &an.worst {
                                 if ui
                                     .add(egui::Button::new(RichText::new(format!("#{i:<7} PSNR {:>6.2} dB   SSIM {:.4}", metrics::cap_db(m.psnr_y), m.ssim_y)).monospace().size(11.5)).frame(false))
                                     .on_hover_text(format!("Show A's frame {i} (and the matching frame of B)"))
@@ -3779,10 +4004,8 @@ impl VideoMode {
 
 impl Drop for VideoMode {
     fn drop(&mut self) {
-        // Stop a running whole-file analysis so it doesn't keep files open.
-        if let Some(a) = &self.analysis {
-            a.cancel.store(true, Ordering::Relaxed);
-        }
+        // A running analysis and auto-align stop when they are dropped with
+        // the other fields.
         if let Some(a) = self.audio_shared() {
             a.playing.store(false, Ordering::Relaxed);
         }
@@ -3847,7 +4070,8 @@ fn save_frames_job(items: &[(PathBuf, f64, String)], target: &SaveTarget) -> Res
     let n = frames.len();
     match target {
         SaveTarget::Folder { dir, composite } => {
-            let saved = save_all(dir)?;
+            // A read-only folder (a media library, a share) fails here.
+            let saved = save_all(dir).map_err(|e| format!("{e}. Choose another folder in Save frames"))?;
             let mut msg = if n == 1 { format!("Saved {}", saved[0].display()) } else { format!("Saved {n} frames ({}) to {}", (0..n).map(letter).collect::<Vec<_>>().join(", "), dir.display()) };
             if *composite && n > 1 {
                 if let Some(c) = sync::composite(&frames) {
@@ -3870,19 +4094,6 @@ fn save_frames_job(items: &[(PathBuf, f64, String)], target: &SaveTarget) -> Res
             let saved = save_all(dir)?;
             Ok(SaveDone { message: format!("Opened {n} frames in Compare (saved in {})", dir.display()), open: Some(saved) })
         }
-    }
-}
-
-/// Whether files can be created in `dir` (a media library or a read-only
-/// share cannot take snapshots).
-fn dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(".lumen-write-test-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
     }
 }
 
@@ -4275,6 +4486,58 @@ mod tests {
         assert_eq!(fmt_db(f64::NAN), " - ");
         assert_eq!(fmt_ssim(1.0), "1.0000 (identical)");
         assert_eq!(fmt_ssim(0.99), "0.9900 (20.00 dB)");
+    }
+
+    fn psnr(v: f64) -> FrameMetrics {
+        FrameMetrics { psnr_y: v, ..Default::default() }
+    }
+
+    #[test]
+    fn worst_frames_lowest_psnr_first() {
+        let frames: Vec<usize> = (10..20).collect();
+        let ms = [40.0, 30.0, 35.0, 30.0, 50.0, f64::INFINITY, 20.0, 45.0, 30.0, 60.0].map(psnr).to_vec();
+        let w = worst_frames(&frames, &ms, 4);
+        // Ties in frame order.
+        assert_eq!(w.iter().map(|r| r.0).collect::<Vec<_>>(), vec![16, 11, 13, 18]);
+        // Fewer rows than asked for: all of them.
+        let w = worst_frames(&frames[..3], &ms[..3], 8);
+        assert_eq!(w.iter().map(|r| r.0).collect::<Vec<_>>(), vec![11, 12, 10]);
+        assert!(worst_frames(&[], &[], 8).is_empty());
+    }
+
+    #[test]
+    fn analysis_copies_its_rows_and_stops_when_dropped() {
+        let rows = Arc::new(Mutex::new(vec![(0, psnr(40.0)), (1, psnr(30.0))]));
+        let done = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut an = Analysis {
+            rows: rows.clone(),
+            progress: Arc::new(AtomicU32::new(0)),
+            cancel: cancel.clone(),
+            done: done.clone(),
+            error: Arc::new(Mutex::new(None)),
+            bit_max: 255.0,
+            frames: Vec::new(),
+            metrics: Vec::new(),
+            summary: metrics::Summary::default(),
+            worst: Vec::new(),
+            synced: None,
+            complete: false,
+        };
+        an.sync();
+        assert_eq!((an.summary.frames, an.worst[0].0), (2, 1));
+        assert!(!an.complete);
+        // Once done: every row, then no more copies.
+        rows.lock().push((2, psnr(20.0)));
+        done.store(true, Ordering::Release);
+        an.sync();
+        assert!(an.complete);
+        assert_eq!(an.summary.frames, 3);
+        assert_eq!(an.worst.iter().map(|r| r.0).collect::<Vec<_>>(), vec![2, 1, 0]);
+        assert_eq!(an.row(1).map(|m| m.psnr_y), Some(30.0));
+        assert!(an.row(7).is_none());
+        drop(an);
+        assert!(cancel.load(Ordering::Relaxed));
     }
 
     #[test]

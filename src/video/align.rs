@@ -78,6 +78,14 @@ impl AlignJob {
     }
 }
 
+impl Drop for AlignJob {
+    fn drop(&mut self) {
+        // A discarded job stops decoding (and holding open) the videos; each
+        // decoder checks after every frame.
+        self.cancel();
+    }
+}
+
 /// True for the error of a job that was cancelled.
 pub fn is_cancelled(e: &str) -> bool {
     e == CANCELLED

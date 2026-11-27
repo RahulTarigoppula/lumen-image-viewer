@@ -97,6 +97,9 @@ pub fn run_spec(a: &Path, b: &Path, spec: &Spec, cancel: &AtomicBool, mut on_row
             let want = (ia as i64 + offset) as usize;
             // B frames before the partner have no A frame (missing in A).
             while pending_b.as_ref().is_none_or(|(ib, _)| *ib < want) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(anyhow!("Analysis cancelled"));
+                }
                 match rx.recv() {
                     Ok(Ok(f)) => pending_b = Some(f),
                     Ok(Err(e)) => return Err(anyhow!(e)),

@@ -120,9 +120,15 @@ fn q2f(r: ff::Rational) -> f64 {
     }
 }
 
+#[allow(dead_code)] // Video mode gets the info from `Player::open_async`; kept for other callers.
 pub fn probe(path: &Path) -> Result<MediaInfo> {
     init();
     let input = ff::format::input(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    probe_input(&input, path)
+}
+
+/// [`probe`] of a file already opened as `input`.
+fn probe_input(input: &ff::format::context::Input, path: &Path) -> Result<MediaInfo> {
     let mut info = MediaInfo { path: path.to_path_buf(), ..Default::default() };
     info.container = input.format().description().to_string();
     info.duration = if input.duration() > 0 { input.duration() as f64 / ff::ffi::AV_TIME_BASE as f64 } else { 0.0 };
@@ -296,38 +302,56 @@ pub struct Player {
 pub type SharedIndex = Arc<parking_lot::Mutex<Option<Vec<IndexEntry>>>>;
 
 impl Player {
+    /// Open `path` and wait until its decoder is ready (blocks while the
+    /// file is opened; [`Player::open_async`] does not).
+    #[allow(dead_code)] // Video mode opens with `open_async`; kept for the tests and other callers.
     pub fn open(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> Result<Player> {
+        let (player, info) = Player::open_async(path, audio, index, ctx);
+        match info.recv() {
+            Ok(Ok(_)) => Ok(player),
+            Ok(Err(e)) => Err(anyhow!("{e:#}")),
+            Err(_) => Err(anyhow!("The video decoder failed to start")),
+        }
+    }
+
+    /// Start a decoder for `path` without waiting: its thread opens the file
+    /// once, reads its [`MediaInfo`] from it and sends that (or why the file
+    /// cannot be played) on the returned channel, then shows the first frame.
+    pub fn open_async(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> (Player, Receiver<Result<MediaInfo>>) {
         init();
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
         let (ev_tx, ev_rx) = bounded::<Event>(6);
-        // FFmpeg contexts are not Send: build the worker on its own thread and
-        // report whether opening succeeded.
-        let (init_tx, init_rx) = bounded::<Result<(), String>>(1);
+        let (info_tx, info_rx) = bounded::<Result<MediaInfo>>(1);
         let path = path.to_path_buf();
-        std::thread::Builder::new()
-            .name("lumen-video".into())
-            .spawn(move || {
-                let mut worker = match Worker::new(&path, audio, index, cmd_rx, ev_tx.clone(), ctx.clone()) {
-                    Ok(w) => {
-                        let _ = init_tx.send(Ok(()));
-                        w
-                    }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(format!("{e:#}")));
-                        return;
-                    }
-                };
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()));
-                if r.is_err() {
-                    let _ = ev_tx.send(Event::Error("The video decoder crashed".into()));
+        // FFmpeg contexts are not Send: the worker is built on its own thread.
+        let thread_info = info_tx.clone();
+        let spawned = std::thread::Builder::new().name("lumen-video".into()).spawn(move || {
+            let opened = ff::format::input(&path).with_context(|| format!("Cannot open {}", path.display())).and_then(|input| {
+                let info = probe_input(&input, &path)?;
+                Ok((Worker::new(input, audio, index, cmd_rx, ev_tx.clone(), ctx.clone())?, info))
+            });
+            let mut worker = match opened {
+                Ok((w, info)) => {
+                    let _ = thread_info.send(Ok(info));
                     ctx.request_repaint();
+                    w
                 }
-            })?;
-        match init_rx.recv() {
-            Ok(Ok(())) => Ok(Player { tx: cmd_tx, rx: ev_rx }),
-            Ok(Err(e)) => Err(anyhow!(e)),
-            Err(_) => Err(anyhow!("The video decoder failed to start")),
+                Err(e) => {
+                    let _ = thread_info.send(Err(e));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()));
+            if r.is_err() {
+                let _ = ev_tx.send(Event::Error("The video decoder crashed".into()));
+                ctx.request_repaint();
+            }
+        });
+        if let Err(e) = spawned {
+            let _ = info_tx.send(Err(anyhow!("The video decoder failed to start: {e}")));
         }
+        (Player { tx: cmd_tx, rx: ev_rx }, info_rx)
     }
 
     pub fn send(&self, c: Cmd) {
@@ -431,8 +455,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) -> Result<Worker> {
-        let input = ff::format::input(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    fn new(input: ff::format::context::Input, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) -> Result<Worker> {
         let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
         let vidx = vs.index();
         let vtb = q2f(vs.time_base());
@@ -2164,6 +2187,23 @@ mod tests {
             assert!((t - f as f64 / 25.0).abs() < 1e-6, "frame {f} at {t}");
             assert!((g[0] - (40 + f) as f32 / 255.0).abs() < 1e-4 && (g[1] - (200 - f) as f32 / 255.0).abs() < 1e-4, "frame {f}: {g:?}");
         }
+    }
+
+    #[test]
+    fn open_async_reports_the_media_info_then_the_first_frame() {
+        let dir = TestDir::new("engine-open");
+        let p = clip(&dir);
+        let wait = std::time::Duration::from_secs(20);
+        let (player, info) = Player::open_async(&p, None, Arc::new(parking_lot::Mutex::new(None)), egui::Context::default());
+        let info = info.recv_timeout(wait).expect("open result").unwrap();
+        assert_eq!((info.width, info.height), (33, 25));
+        match player.rx.recv_timeout(wait).expect("first frame") {
+            Event::Frame(f) => assert_eq!((f.gen, f.rgba.dimensions()), (0, (33, 25))),
+            Event::Eof { .. } => panic!("no frame"),
+            Event::Error(e) => panic!("{e}"),
+        }
+        let (_player, info) = Player::open_async(&dir.path("missing.mp4"), None, Arc::new(parking_lot::Mutex::new(None)), egui::Context::default());
+        assert!(info.recv_timeout(wait).expect("open result").is_err());
     }
 
     #[test]
