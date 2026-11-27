@@ -10,7 +10,8 @@ run SelectAll
 run Rate(3)
 wait 700
 shot rated_three.png
-run Undo
+# The notice's Undo button puts the three ratings back.
+click 716 736
 wait 1200
 shot rating_undone.png
 # The preview pane's tag row for the first picture: stars, flag and labels.
@@ -31,6 +32,8 @@ shot preview_tags_light.png
 run ToggleTheme
 wait 800
 # The browser's right-click menu and its Rate & tag submenu.
+hover 370 150
+wait 400
 click 370 150 right
 wait 700
 shot browser_menu.png
@@ -55,6 +58,13 @@ wait 1200
 shot viewer_info_light.png
 run ToggleTheme
 wait 800
+# A click on the fifth star rates like the 5 key (notice, undo).
+click 1063 84
+wait 800
+shot viewer_rated.png
+run Undo
+wait 900
+shot viewer_undone.png
 run ToggleInfo
 wait 500
 # The viewer's right-click menu now has Rate & tag too.
@@ -73,13 +83,6 @@ wait 500
 hover 2 400
 wait 1200
 shot window_edge.png
-# Rating in the viewer, then Ctrl+Z puts it back.
-run Rate(5)
-wait 600
-shot viewer_rated.png
-key Ctrl+Z
-wait 900
-shot viewer_undone.png
 # Full screen: the caption shows the tags and the camera line.
 run ToggleFullscreen
 wait 3000
@@ -132,6 +135,8 @@ wait 1200
 shot browser_keep_undone.png
 # The next folder opens at the start of its own order: Compare3 arranged by
 # hand with DeviceZ first, entered from the end of Compare2.
+run SelectNone
+wait 300
 click 770 150
 wait 500
 run MoveEarlier
@@ -144,4 +149,15 @@ run NextImage
 run NextImage
 wait 3000
 shot next_folder_first.png
+# Settings > Viewer: caption, camera line, info panel on start, edge panels.
+run Settings
+wait 1500
+click 276 154
+wait 1000
+hover 740 500
+scroll -500
+wait 1000
+shot settings_viewer.png
+key Escape
+wait 500
 state

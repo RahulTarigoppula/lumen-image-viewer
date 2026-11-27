@@ -1417,6 +1417,11 @@ impl Toasts {
         }
     }
 
+    /// Take away the notice whose button has `id` (what it offers was done another way).
+    pub fn dismiss(&mut self, id: u64) {
+        self.items.retain(|t| t.action.as_ref().is_none_or(|a| a.2 != id));
+    }
+
     fn push(&mut self, text: String, kind: ToastKind, secs: f32) {
         self.items.retain(|t| t.text != text);
         let now = Instant::now();
@@ -1609,5 +1614,21 @@ mod tests {
         }
         let r = Rail { x0: 0.0, x1: 100.0, min: -5.0, max: 5.0, log: false };
         assert_eq!(r.x_of(0.0), 50.0);
+    }
+
+    #[test]
+    fn toast_buttons_and_dismiss() {
+        let mut t = Toasts::default();
+        t.info("Plain");
+        t.with_action("Rated 3 stars", "Undo", "Undo  (Ctrl+Z)", 7);
+        t.with_action("Flagged", "Undo", "Undo  (Ctrl+Z)", 8);
+        assert_eq!(t.items.iter().filter_map(|x| x.action.as_ref().map(|a| a.2)).collect::<Vec<_>>(), vec![7, 8]);
+        // Undone another way: only that notice goes.
+        t.dismiss(7);
+        assert_eq!(t.items.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), vec!["Plain", "Flagged"]);
+        // The same text again replaces the old notice (and its button).
+        t.with_action("Flagged", "Undo", "", 9);
+        assert_eq!(t.items.len(), 2);
+        assert_eq!(t.items[1].action.as_ref().map(|a| a.2), Some(9));
     }
 }

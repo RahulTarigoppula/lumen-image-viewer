@@ -1994,10 +1994,12 @@ impl App {
                 self.browser.mark_resort();
                 ok += 1;
             }
-            FileChange::Tags { before, .. } => {
+            FileChange::Tags { id, before } => {
                 for (p, t) in before {
                     self.core.tags.update(p, |x| *x = *t);
                 }
+                // Its notice's Undo button has nothing left to do.
+                self.core.toasts.dismiss(*id);
                 // The sort or a flag / rating / label filter may depend on them.
                 self.browser.mark_resort();
                 ok += before.len();
