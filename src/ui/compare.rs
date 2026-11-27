@@ -2253,7 +2253,7 @@ impl Compare {
                     self.inspect_cache.gain_info(ui.ctx(), &path)
                 };
                 let at = Pos2::new(caption.min.x, caption.max.y + 8.0);
-                let id = ui.id().with(("cmp-gain-legend", i));
+                let id = ui.scope_id().with(("cmp-gain-legend", i));
                 super::inspect_view::gain_legend(ui, id, at, rect.width() - 20.0, &info, self.inspect, &mut self.hdr_headroom);
             }
             if self.show_hist {
