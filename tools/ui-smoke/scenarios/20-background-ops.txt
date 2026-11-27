@@ -1,0 +1,56 @@
+# File work off the UI thread: a card shows while it runs, a message when it
+# is done. Undo of a rotation and of a move, Copy image from the browser, and
+# Save in the viewer (an action that waits for the save goes on without asking).
+open {media}\BgOps\Pictures
+wait 3000
+# Rotate the JPEG right in the browser, then Ctrl+Z turns it back.
+click 570 150
+wait 300
+run RotateRight
+wait 2000
+shot rotated.png
+run Undo
+wait 2000
+shot rotate_undone.png
+state
+# Cut two pictures, paste them in Moved, come back and undo: both come back, selected.
+click 370 150
+key Shift+Right
+wait 300
+key Ctrl+X
+wait 800
+open {media}\BgOps\Moved
+wait 2000
+key Ctrl+V
+wait 2000
+shot moved.png
+open {media}\BgOps\Pictures
+wait 2000
+run Undo
+wait 2500
+shot move_undone.png
+state
+# Copy image from the browser: decoded on the worker, then put on the clipboard.
+click 770 150
+wait 300
+run CopyImage
+wait 2500
+shot image_copied.png
+# Save an edited PNG in the viewer: "Saving ..." while it is written, then saved.
+open {media}\BgOps\Pictures\gradient_16x9.png
+wait 2500
+run FlipHorizontal
+wait 1000
+run Save
+shot saving.png
+wait 3000
+shot saved.png
+state
+# Edit again, save and at once open another picture: it opens when the save is done.
+run FlipVertical
+wait 1000
+run Save
+open {media}\BgOps\Pictures\portrait_tall.jpg
+wait 4000
+shot opened_after_save.png
+state

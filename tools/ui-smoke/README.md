@@ -39,7 +39,9 @@ The job summary on the run page has a table of scenarios and problems.
    three versions of scene 01, for "select all, compare"), `Undo/` (three
    photos that a scenario deletes and restores), `Explorer/` (a
    `Source/` folder with three pictures, an empty `Target/` and `Outside/` with
-   one file, for cut / paste and drops from another program), `HDR/` (a
+   one file, for cut / paste and drops from another program), `BgOps/` (three
+   pictures in `Pictures/` and an empty `Moved/`, for file work off the UI
+   thread: rotate, move, copy image and save, with their undos), `HDR/` (a
    Samsung-style Ultra HDR photo with a Type2 maker note and SEF trailer, and a
    Pixel-style one with an ISO 21496-1 gain map and an encrypted HDR+ maker
    note; the metadata is written byte by byte), `Brand/acme_logo.png`

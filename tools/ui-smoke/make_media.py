@@ -12,6 +12,7 @@ Layout (like a camera test project):
     Compare3/                                      scene_01 from X, Y and Z
     Undo/scene_01.jpg ... scene_03.jpg             copies of DeviceX (delete and undo)
     Explorer/Source/, Target/, Outside/            cut / paste and drops (three Flat pictures, an empty folder, one file)
+    BgOps/Pictures/, Moved/                        rotate, move, copy and save with their undos (three Flat pictures, an empty folder)
     HDR/samsung_ultrahdr.jpg                       Ultra HDR gain map (XMP), Samsung maker note and trailer
     HDR/pixel_hdrplus.jpg                          ISO 21496-1 gain map, Google HDR+ maker note and XMP
     Brand/acme_logo.png                            a wide logo with transparency (report branding)
@@ -260,6 +261,16 @@ def make_explorer(out):
     for name in ("gradient_16x9.png", "noise_iso6400.jpg", "portrait_tall.jpg"):
         shutil.copyfile(os.path.join(flat, name), os.path.join(base, "Source", name))
     shutil.copyfile(os.path.join(flat, "text_card.png"), os.path.join(base, "Outside", "dropped.png"))
+
+
+def make_bg_ops(out):
+    """Pictures that a scenario rotates, moves, copies and saves, with the undos."""
+    base = os.path.join(out, "BgOps")
+    for d in ("Pictures", "Moved"):
+        os.makedirs(os.path.join(base, d), exist_ok=True)
+    flat = os.path.join(out, "Flat")
+    for name in ("gradient_16x9.png", "noise_iso6400.jpg", "portrait_tall.jpg"):
+        shutil.copyfile(os.path.join(flat, name), os.path.join(base, "Pictures", name))
 
 
 # ---- HDR gain map photos (byte-built metadata, like the Rust unit tests) ----
@@ -566,6 +577,7 @@ def main():
     make_photos(out)
     make_flat(out)
     make_explorer(out)
+    make_bg_ops(out)
     make_hdr(out)
     make_brand(out)
     make_long_names(out)

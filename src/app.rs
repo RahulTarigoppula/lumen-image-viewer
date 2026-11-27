@@ -79,7 +79,9 @@ enum Confirm {
 /// An action that would discard unsaved edits; held while the user decides.
 enum PendingAction {
     OpenFile(PathBuf),
-    OpenViewerAt(usize),
+    /// The browser item with this path (found again when it runs: the list
+    /// may change while a save it waits for runs).
+    OpenViewerAt(PathBuf),
     Exit,
     Transfer(Vec<PathBuf>, PathBuf, bool),
     Delete(Vec<PathBuf>),
@@ -248,6 +250,23 @@ struct TransferDialog {
     typed_dir: Option<(String, bool)>,
 }
 
+/// A save running on the file job thread. The edit session stays unsaved
+/// until it is done, so leaving the image meanwhile still asks first.
+struct Saving {
+    /// The job's label (a job that panics reports it).
+    label: String,
+    path: PathBuf,
+    /// The image being written: once saved, the edit session is clean while
+    /// it shows this one (edits made meanwhile stay unsaved).
+    img: Arc<image::RgbaImage>,
+    /// The open file when the save started.
+    source: Option<PathBuf>,
+    /// The action that waited for the save (the unsaved-edits question).
+    then: Option<PendingAction>,
+    /// Save as: its dialog, closed while saving and back if the save fails.
+    dialog: Option<SaveDialog>,
+}
+
 pub struct App {
     pub core: Core,
     pub mode: Mode,
@@ -335,6 +354,11 @@ pub struct App {
     window_focused: bool,
     /// Copy / move / paste / rotate jobs running off the UI thread.
     file_jobs: FileJobs,
+    /// The save running as a file job (one at a time).
+    saving: Option<Saving>,
+    /// The label of the undo running as a file job: the next undo waits for
+    /// it (an older change expects the files as this one leaves them).
+    undoing: Option<String>,
     /// Ctrl+Alt+M asked to open this map link: waiting for the privacy
     /// confirmation (url, "don't ask again" checkbox).
     gps_confirm: Option<(String, bool)>,
@@ -487,6 +511,8 @@ impl App {
             was_editing: false,
             window_focused: true,
             file_jobs: FileJobs::new(ctx.clone()),
+            saving: None,
+            undoing: None,
             gps_confirm: None,
             window_stack: Vec::new(),
             fullscreen_from_viewer: false,
@@ -608,7 +634,7 @@ impl App {
                     if self.viewer.current() == Some(&entry.path) {
                         self.mode = Mode::Viewer;
                     } else {
-                        self.pending_guard = Some(PendingAction::OpenViewerAt(item));
+                        self.pending_guard = Some(PendingAction::OpenViewerAt(entry.path));
                     }
                     return;
                 }
@@ -1348,27 +1374,21 @@ impl App {
             Save => self.save(false),
             SaveAs => self.save(true),
             CopyImage => {
+                // The viewer's image as shown (edits too), else the file's first frame.
                 let img = if self.mode == Mode::Viewer {
                     let Some(img) = self.viewer.current_image(&self.core) else {
                         self.image_unavailable();
                         return;
                     };
-                    img
+                    Some(img)
                 } else {
-                    let Some(p) = self.targets().first().cloned() else { return };
-                    let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
-                    match crate::decode::decode_file(&p, first_frame) {
-                        Ok(d) => d.image,
-                        Err(e) => {
-                            self.core.toasts.error(format!("Could not open {}: {e}", crate::ui::viewer::file_name(&p)));
-                            return;
-                        }
-                    }
+                    None
                 };
-                match fileops::copy_image_to_clipboard(&img) {
-                    Ok(()) => self.core.toasts.success("Image copied to clipboard"),
-                    Err(e) => self.core.toasts.error(format!("Copy failed: {e}")),
-                }
+                let Some(p) = self.targets().first().cloned() else { return };
+                // Decoding and the clipboard's PNG copy take seconds for a big
+                // photo: off the UI thread (the clipboard has no owner window,
+                // so any thread may fill it).
+                self.file_jobs.submit("Copying the image", copy_image_job(img, p));
             }
             PasteImage => match fileops::paste_image_from_clipboard() {
                 Ok(img) => {
@@ -1709,6 +1729,10 @@ impl App {
             self.core.toasts.info("Open an image in the viewer to save it");
             return;
         };
+        if let Some(s) = &self.saving {
+            self.core.toasts.info(format!("Still saving {}", crate::ui::viewer::file_name(&s.path)));
+            return;
+        }
         let Some(img) = self.viewer.current_image(&self.core) else { return };
         let loaded = self.viewer.loaded(&self.core);
         let mut opts = SaveOptions { jpeg_quality: self.core.settings.jpeg_quality, keep_metadata: self.core.settings.keep_exif_on_save, ..Default::default() };
@@ -1737,10 +1761,12 @@ impl App {
             return;
         }
         opts.format = fmt.unwrap();
-        self.do_save(&path, &img, &opts);
+        self.do_save(&path, img, &opts, None, None);
     }
 
-    fn do_save(&mut self, path: &Path, img: &image::RgbaImage, opts: &SaveOptions) -> bool {
+    /// Save `img` to `path` (see `write_save`), first asking when that
+    /// replaces a change made on disk to the open file.
+    fn do_save(&mut self, path: &Path, img: Arc<image::RgbaImage>, opts: &SaveOptions, then: Option<PendingAction>, dialog: Option<SaveDialog>) {
         // Saving over the open file: when it changed on disk after it was loaded
         // (edited in another program), ask before replacing that change.
         if self.viewer.current().is_some_and(|c| fileops::same_path(c, path)) {
@@ -1750,79 +1776,118 @@ impl App {
             if changed {
                 // From Save as: the question replaces the dialog. From the
                 // unsaved-edits question: its action waits for the answer.
-                self.save_dialog = None;
-                self.confirm = Some(Confirm::SaveChanged { path: path.to_path_buf(), opts: opts.clone(), then: self.pending_guard.take() });
-                return false;
+                drop(dialog);
+                self.confirm = Some(Confirm::SaveChanged { path: path.to_path_buf(), opts: opts.clone(), then });
+                return;
             }
         }
-        self.write_save(path, img, opts)
+        self.write_save(path, img, opts, then, dialog);
     }
 
-    /// Save `img` to `path` (no questions asked) and refresh what shows it.
-    fn write_save(&mut self, path: &Path, img: &image::RgbaImage, opts: &SaveOptions) -> bool {
+    /// Save `img` to `path` (no questions asked) on the file job thread:
+    /// encoding a big PNG or AVIF takes seconds. `finish_save` refreshes what
+    /// shows the file and then runs `then`; Save as's `dialog` comes back if
+    /// the save fails.
+    fn write_save(&mut self, path: &Path, img: Arc<image::RgbaImage>, opts: &SaveOptions, then: Option<PendingAction>, dialog: Option<SaveDialog>) {
+        if let Some(s) = &self.saving {
+            self.core.toasts.info(format!("Still saving {} - save again when it is done", crate::ui::viewer::file_name(&s.path)));
+            // Nothing is lost: the question or the dialog stays.
+            if self.pending_guard.is_none() {
+                self.pending_guard = then;
+            }
+            if self.save_dialog.is_none() {
+                self.save_dialog = dialog;
+            }
+            return;
+        }
         // The open file is the source of the comment / XMP / IPTC carried into a JPEG.
         let source = self.viewer.current().cloned();
-        match crate::encode::save_from(img, path, opts, source.as_deref()) {
-            Ok(()) => {
-                let same = self.viewer.current().map(|c| c == path).unwrap_or(false);
-                if same {
-                    if let Some(e) = &mut self.viewer.edit {
-                        e.saved_version = e.version;
-                    }
-                }
-                self.core.thumbs.forget(path);
-                self.viewer.forget_stat(path);
-                self.core.meta.forget(path);
-                // Always drop the cached pre-edit decode: otherwise returning to this
-                // file later shows (and re-edits) the old pixels. The edit session keeps
-                // showing the saved image meanwhile.
-                self.core.loader.invalidate(path);
-                self.core.toasts.success(format!("Saved {}", crate::ui::viewer::file_name(path)));
-                if path.parent() == Some(self.browser.folder.as_path()) {
-                    self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
-                }
-                true
+        let label = format!("Saving {}", crate::ui::viewer::file_name(path));
+        if self.file_jobs.submit(label.clone(), save_job(img.clone(), path.to_path_buf(), opts.clone(), source.clone())) {
+            self.saving = Some(Saving { label, path: path.to_path_buf(), img, source, then, dialog });
+        } else {
+            self.core.toasts.error("Save failed: the background worker is not running");
+        }
+    }
+
+    /// The save started by `write_save` is done (`res`): the edit session is
+    /// saved as far as it was then, the views show the new file, and what
+    /// waited for it goes on (or, after a failure, asks again).
+    fn finish_save(&mut self, res: Result<(), String>) {
+        let Some(s) = self.saving.take() else { return };
+        let path = s.path.as_path();
+        let shows_source = self.viewer.current().is_some_and(|c| s.source.as_ref() == Some(c));
+        if let Err(e) = res {
+            self.core.toasts.error(format!("Save failed: {e}"));
+            // Save as: the dialog comes back as it was, while the viewer still shows that image.
+            if let Some(mut d) = s.dialog.filter(|_| shows_source && !self.modal_open()) {
+                d.error = Some("Could not save - see the message below.".into());
+                self.save_dialog = Some(d);
             }
-            Err(e) => {
-                self.core.toasts.error(format!("Save failed: {e}"));
-                false
+            // The edits are not saved: what waited asks again.
+            if self.pending_guard.is_none() {
+                self.pending_guard = s.then;
+            }
+            return;
+        }
+        // The image written, not edits made while it was written.
+        if let Some(e) = self.viewer.edit.as_mut().filter(|e| fileops::same_path(&e.path, path)) {
+            e.mark_saved_image(&s.img);
+        }
+        self.core.thumbs.forget(path);
+        self.viewer.forget_stat(path);
+        self.core.meta.forget(path);
+        // Always drop the cached pre-edit decode: otherwise returning to this
+        // file later shows (and re-edits) the old pixels. The edit session keeps
+        // showing the saved image meanwhile.
+        self.core.loader.invalidate(path);
+        self.core.toasts.success(format!("Saved {}", crate::ui::viewer::file_name(path)));
+        if path.parent() == Some(self.browser.folder.as_path()) {
+            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        }
+        if let Some(d) = &s.dialog {
+            self.core.settings.jpeg_quality = d.opts.jpeg_quality;
+            // Saved to a new file: the viewer goes on with the saved copy (as
+            // saved, no edits); the original stays as it is on disk. Not when
+            // the image was changed or left while saving (nothing is dropped).
+            let unchanged = shows_source && !self.viewer.has_tool() && self.viewer.current_image(&self.core).is_some_and(|i| Arc::ptr_eq(&i, &s.img));
+            if self.mode == Mode::Viewer && unchanged && !self.viewer.current().is_some_and(|c| fileops::same_path(c, path)) {
+                self.viewer.show_saved_copy(path);
             }
         }
+        if let Some(a) = s.then {
+            // Edits made while saving are not saved: asked about first.
+            if self.viewer.has_unsaved_work() {
+                self.pending_guard = Some(a);
+            } else {
+                self.perform_pending(a);
+            }
+        }
+    }
+
+    /// A running save writes the open file as it is shown now, with no tool
+    /// work on top: once it is done, nothing would be lost by leaving it.
+    fn save_covers_current(&self) -> bool {
+        let Some(s) = &self.saving else { return false };
+        self.viewer.current().is_some_and(|c| fileops::same_path(c, &s.path)) && !self.viewer.tool_has_work() && self.viewer.current_image(&self.core).is_some_and(|i| Arc::ptr_eq(&i, &s.img))
+    }
+
+    /// "Wait until photo.jpg is saved" when a running save writes one of
+    /// `files` (or a file inside one of them).
+    fn wait_for_save(&self, files: &[PathBuf]) -> Option<String> {
+        let s = self.saving.as_ref()?;
+        files.iter().any(|f| fileops::is_within(&s.path, f)).then(|| format!("Wait until {} is saved", crate::ui::viewer::file_name(&s.path)))
     }
 
     fn set_wallpaper(&mut self) {
         let img = if self.mode == Mode::Viewer { self.viewer.current_image(&self.core) } else { None };
-        let path = self.targets().first().cloned();
-        let target = if let (Some(p), false) = (&path, self.viewer.is_dirty()) {
-            let ext = crate::formats::ext_of(p);
-            if matches!(ext.as_str(), "jpg" | "jpeg" | "bmp" | "png") {
-                Some(p.clone())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let target = match target {
-            Some(t) => t,
-            None => {
-                let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
-                let img = img.or_else(|| path.as_ref().and_then(|p| crate::decode::decode_file(p, first_frame).ok()).map(|d| d.image));
-                let Some(img) = img else { return };
-                let out = crate::settings::data_dir().join("wallpaper.jpg");
-                let _ = std::fs::create_dir_all(crate::settings::data_dir());
-                let opts = SaveOptions { jpeg_quality: 95, ..Default::default() };
-                if let Err(e) = crate::encode::save(&img, &out, &opts) {
-                    self.core.toasts.error(e.to_string());
-                    return;
-                }
-                out
-            }
-        };
-        match fileops::set_wallpaper(&target, 0) {
-            Ok(()) => self.core.toasts.success("Desktop wallpaper set"),
-            Err(e) => self.core.toasts.error(e.to_string()),
-        }
+        let Some(path) = self.targets().first().cloned() else { return };
+        // A JPEG, BMP or PNG file as saved is used as it is; anything else
+        // (or the viewer's edited image) is written as a JPEG first.
+        let edited = self.mode == Mode::Viewer && self.viewer.is_dirty();
+        let as_is = !edited && matches!(crate::formats::ext_of(&path).as_str(), "jpg" | "jpeg" | "bmp" | "png");
+        // Decoding, encoding and Windows taking the picture take a while: off the UI thread.
+        self.file_jobs.submit("Setting the wallpaper", wallpaper_job(path, as_is, img));
     }
 
     /// Delete, asking first when the setting says so, and always when the files
@@ -1837,6 +1902,11 @@ impl App {
     }
 
     fn delete_files(&mut self, files: Vec<PathBuf>) {
+        // The save would bring the file back.
+        if let Some(msg) = self.wait_for_save(&files) {
+            self.core.toasts.info(msg);
+            return;
+        }
         // For undo: when they went, their tags and their places in the viewer.
         let at = std::time::SystemTime::now();
         let kept: Vec<DeletedItem> = files.iter().map(|f| DeletedItem { path: f.clone(), tag: self.core.tags.get(f), viewer_at: self.viewer.list.iter().position(|p| p == f) }).collect();
@@ -1943,8 +2013,29 @@ impl App {
                     }
                 }
             }
-            JobResult::Restore { files, res } => self.finish_restore(files, res),
-            JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
+            JobResult::Restore { files, res } => {
+                self.undoing = None;
+                self.finish_restore(files, res);
+            }
+            JobResult::UndoMoves { label, total, done, errs } => {
+                self.undoing = None;
+                self.finish_undo_moves(label, total, done, errs);
+            }
+            JobResult::UndoTransform { label, files, ok, restored, errs } => {
+                self.undoing = None;
+                self.finish_undo_transform(label, files, ok, restored, errs);
+            }
+            JobResult::Saved(res) => self.finish_save(res),
+            JobResult::Panicked(label) => {
+                if self.saving.as_ref().is_some_and(|s| s.label == label) {
+                    self.finish_save(Err("it stopped unexpectedly".into()));
+                    return;
+                }
+                if self.undoing.as_ref() == Some(&label) {
+                    self.undoing = None;
+                }
+                self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder"));
+            }
             JobResult::Message { ok: true, text } => self.core.toasts.success(text),
             JobResult::Message { ok: false, text } => self.core.toasts.error(text),
             JobResult::CopyText(text) => {
@@ -2117,6 +2208,79 @@ impl App {
                 let more = if all.len() > 3 { ", ..." } else { "" };
                 self.core.toasts.error(format!("Could not restore {} of {}: {}{more} ({})", all.len(), count(all.len() + n, "item"), names.join(", "), all[0].1));
             }
+        }
+    }
+
+    /// Moved or renamed items are back where they were (undo of `label`;
+    /// `done`: each as (where it was, where it is again)): tags, arranged
+    /// orders and the views follow, and the ones back in the folder shown
+    /// are selected.
+    fn finish_undo_moves(&mut self, label: String, total: usize, done: Vec<(PathBuf, PathBuf)>, errs: Vec<(String, String)>) {
+        self.core.tags.moved_many(&done);
+        self.core.orders.rename_many(&done);
+        // What `forget_file` does for each item, with one pass over the
+        // thumbnail cache for all of them (an undo can be thousands of files).
+        let touched: std::collections::HashSet<&Path> = done.iter().flat_map(|(from, to)| [from.as_path(), to.as_path()]).collect();
+        for p in &touched {
+            self.core.loader.invalidate(p);
+            self.viewer.forget_stat(p);
+            self.core.meta.forget(p);
+        }
+        self.core.thumbs.forget_many(&touched);
+        self.viewer.replace_paths(&done);
+        let mut folders: Vec<&Path> = Vec::new();
+        for d in done.iter().flat_map(|(from, to)| [to.parent(), from.parent()]).flatten() {
+            if !folders.contains(&d) {
+                folders.push(d);
+            }
+        }
+        for f in folders {
+            self.browser.tree.invalidate(f);
+        }
+        let here: Vec<PathBuf> = done.iter().map(|(_, to)| to).filter(|to| to.parent().is_some_and(|d| fileops::same_path(d, &self.browser.folder))).cloned().collect();
+        if !here.is_empty() {
+            self.browser.pending_select = here.first().cloned();
+            self.browser.pending_selection = Some(here.into_iter().collect());
+        }
+        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        if let Some(msg) = undo_failures(&errs, total) {
+            self.core.toasts.error(msg);
+        }
+        if !done.is_empty() {
+            self.core.toasts.success(format!("Undone: {label}"));
+        }
+    }
+
+    /// Rotated / flipped files are turned back (undo of `label`; `ok` of
+    /// `files` restored, `restored`: those with their stamp before the
+    /// change and their stamp now).
+    fn finish_undo_transform(&mut self, label: String, files: Vec<PathBuf>, ok: usize, restored: Vec<(PathBuf, fileops::FileStamp, Option<fileops::FileStamp>)>, errs: Vec<(String, String)>) {
+        for p in &files {
+            self.forget_file(p);
+        }
+        // An older rotation of the same file expects it as this change
+        // found it: it is that again, with a new time.
+        for older in self.file_undo.iter_mut() {
+            if let FileChange::Transform { files: older_files, .. } = &mut older.change {
+                for f in older_files.iter_mut() {
+                    if let Some((_, _, now)) = restored.iter().find(|(p, was, _)| *p == f.path && f.after == Some(*was)) {
+                        f.after = *now;
+                    }
+                }
+            }
+        }
+        // The viewer shows the restored file (unless it holds edits of its own).
+        let shown = self.viewer.current().is_some_and(|c| files.contains(c));
+        if shown && !self.viewer.is_dirty() {
+            self.viewer.edit = None;
+            self.viewer.reset_view(self.core.settings.fit_mode);
+        }
+        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        if let Some(msg) = undo_failures(&errs, files.len()) {
+            self.core.toasts.error(msg);
+        }
+        if ok > 0 {
+            self.core.toasts.success(format!("Undone: {label}"));
         }
     }
 
@@ -2332,125 +2496,69 @@ impl App {
         Some(Box::new(move || folder_end_sorted(shown, key, desc, positions, dims, taken, last)))
     }
 
-    /// Ctrl+Z with no edit to undo: put the last moved / renamed files back, or
-    /// turn the last rotated / flipped files back.
+    /// Ctrl+Z with no edit to undo: put the last moved / renamed files back,
+    /// turn the last rotated / flipped files back, take deleted files out of
+    /// the Recycle Bin (those as file jobs, off the UI thread: moving back
+    /// to another drive copies every file), or put tags or an arranged order
+    /// back (in memory, at once).
     fn undo_file_op(&mut self) {
+        // One at a time: an older change expects the files as the newer
+        // undo leaves them.
+        if self.undoing.is_some() {
+            self.core.toasts.info("Still undoing the last change");
+            return;
+        }
         let Some(op) = self.file_undo.pop() else {
             self.core.toasts.info("Nothing to undo. Deleted files can be restored from the Recycle Bin.");
             return;
         };
-        let mut ok = 0;
-        let mut errs = Vec::new();
-        match &op.change {
+        match op.change {
             FileChange::Moves(moves) => {
-                let mut folders: Vec<PathBuf> = Vec::new();
-                for (orig, cur) in moves.iter().rev() {
-                    match fileops::move_path(cur, orig) {
-                        Ok(()) => {
-                            ok += 1;
-                            self.core.tags.moved(cur, orig);
-                            self.core.orders.rename(cur, orig);
-                            self.forget_file(cur);
-                            self.forget_file(orig);
-                            self.viewer.replace_path(cur, orig);
-                            for d in [orig.parent(), cur.parent()].into_iter().flatten() {
-                                if !folders.iter().any(|f| f == d) {
-                                    folders.push(d.to_path_buf());
-                                }
-                            }
-                        }
-                        Err(e) => errs.push(e.to_string()),
-                    }
-                }
-                for f in &folders {
-                    self.browser.tree.invalidate(f);
-                }
-                if let Some((orig, _)) = moves.first() {
-                    if orig.parent() == Some(self.browser.folder.as_path()) {
-                        self.browser.pending_select = Some(orig.clone());
-                    }
-                }
+                let job = format!("Moving back {}", count(moves.len(), "item"));
+                self.submit_undo(job, undo_moves_job(op.label, moves));
             }
             FileChange::Order { folder, previous, active } => {
                 match previous {
                     Some(v) => {
-                        self.core.orders.set(folder, v.clone());
-                        self.core.orders.set_active(folder, *active);
+                        self.core.orders.set(&folder, v);
+                        self.core.orders.set_active(&folder, active);
                     }
-                    None => self.core.orders.clear(folder),
+                    None => self.core.orders.clear(&folder),
                 }
                 self.browser.mark_resort();
-                ok += 1;
+                self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+                self.core.toasts.success(format!("Undone: {}", op.label));
             }
             FileChange::Delete { files, at } => {
-                // Off the UI thread: the Recycle Bin can be large. The job
-                // refreshes the views and reports when it is done.
-                self.file_jobs.submit(format!("Restoring {}", count(files.len(), "item")), restore_job(files.clone(), *at));
-                return;
+                // The Recycle Bin can be large. The job refreshes the views
+                // and reports when it is done.
+                self.submit_undo(format!("Restoring {}", count(files.len(), "item")), restore_job(files, at));
             }
             FileChange::Tags { id, before } => {
-                for (p, t) in before {
+                for (p, t) in &before {
                     self.core.tags.update(p, |x| *x = *t);
                 }
                 // Its notice's Undo button has nothing left to do.
-                self.core.toasts.dismiss(*id);
+                self.core.toasts.dismiss(id);
                 // The sort or a flag / rating / label filter may depend on them.
+                // (Tags live in Lumen's own store: the folder on disk did not change.)
                 self.browser.mark_resort();
-                ok += before.len();
+                if !before.is_empty() {
+                    self.core.toasts.success(format!("Undone: {}", op.label));
+                }
             }
             FileChange::Transform { t, files } => {
-                // (path, its stamp before this change, its stamp once restored)
-                let mut restored: Vec<(&Path, fileops::FileStamp, Option<fileops::FileStamp>)> = Vec::new();
-                for f in files {
-                    let p = &f.path;
-                    // Changed again since (saved from another program, edited
-                    // here): writing the old contents back would lose that.
-                    let changed = f.after.is_some() && fileops::FileStamp::of(p) != f.after;
-                    let res = match &f.before {
-                        _ if !p.is_file() => Err(anyhow::anyhow!("the file no longer exists")),
-                        _ if changed => Err(anyhow::anyhow!("the file was modified since, so it was left as it is")),
-                        Some(b) => crate::encode::write_atomic(p, b),
-                        None => crate::encode::lossless_jpeg_transform(p, inverse(*t)).map(|_| ()),
-                    };
-                    match res {
-                        Ok(()) => {
-                            ok += 1;
-                            if let Some(was) = f.was {
-                                restored.push((p.as_path(), was, fileops::FileStamp::of(p)));
-                            }
-                        }
-                        Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
-                    }
-                    self.forget_file(p);
-                }
-                // An older rotation of the same file expects it as this change
-                // found it: it is that again, with a new time.
-                for older in self.file_undo.iter_mut() {
-                    if let FileChange::Transform { files: older_files, .. } = &mut older.change {
-                        for f in older_files.iter_mut() {
-                            if let Some((_, _, now)) = restored.iter().find(|(p, was, _)| *p == f.path && f.after == Some(*was)) {
-                                f.after = *now;
-                            }
-                        }
-                    }
-                }
-                // The viewer shows the restored file (unless it holds edits of its own).
-                let shown = self.viewer.current().is_some_and(|c| files.iter().any(|f| &f.path == c));
-                if shown && !self.viewer.is_dirty() {
-                    self.viewer.edit = None;
-                    self.viewer.reset_view(self.core.settings.fit_mode);
-                }
+                let job = format!("Restoring {}", count(files.len(), "file"));
+                self.submit_undo(job, undo_transform_job(op.label, t, files));
             }
         }
-        // Tags live in Lumen's own store: the folder on disk did not change.
-        if !matches!(op.change, FileChange::Tags { .. }) {
-            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
-        }
-        if !errs.is_empty() {
-            self.core.toasts.error(format!("Undo: {} could not be restored - {}", count(errs.len(), "item"), errs[0]));
-        }
-        if ok > 0 {
-            self.core.toasts.success(format!("Undone: {}", op.label));
+    }
+
+    /// Run an undo as a file job (with the progress card); the next undo
+    /// waits for it.
+    fn submit_undo(&mut self, label: String, job: FileJob) {
+        if self.file_jobs.submit(label.clone(), job) {
+            self.undoing = Some(label);
         }
     }
 
@@ -2458,7 +2566,11 @@ impl App {
     fn perform_pending(&mut self, a: PendingAction) {
         match a {
             PendingAction::OpenFile(p) => self.open_file_now(&p),
-            PendingAction::OpenViewerAt(i) => self.open_viewer_at(i),
+            PendingAction::OpenViewerAt(p) => {
+                if let Some(i) = self.browser.index_of(&p) {
+                    self.open_viewer_at(i);
+                }
+            }
             PendingAction::Exit => {
                 self.allow_close = true;
                 self.core.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2474,6 +2586,14 @@ impl App {
     fn guard_dialog(&mut self, ctx: &egui::Context) {
         if self.pending_guard.is_none() {
             return;
+        }
+        // The image is being saved as it is shown: the action waits for that
+        // save instead of asking (and asks if the save fails).
+        if self.save_covers_current() {
+            if let Some(s) = &mut self.saving {
+                s.then = self.pending_guard.take();
+                return;
+            }
         }
         let p = self.core.pal;
         let name = self.viewer.current().map(|c| crate::ui::viewer::file_name(c)).unwrap_or_default();
@@ -2528,33 +2648,22 @@ impl App {
         match choice {
             Some(0) => self.pending_guard = None,
             Some(1) => {
-                let saved = match (self.viewer.current().cloned(), self.viewer.current_image(&self.core)) {
-                    (Some(path), Some(img)) => {
-                        let fmt = crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(&path));
-                        let loaded = self.viewer.loaded(&self.core);
-                        let mut opts = SaveOptions { jpeg_quality: self.core.settings.jpeg_quality, keep_metadata: self.core.settings.keep_exif_on_save, ..Default::default() };
-                        if let Some(l) = &loaded {
-                            opts.exif = l.decoded.exif.clone();
-                            if !self.core.settings.color_manage {
-                                opts.icc = l.decoded.icc_profile.clone();
-                            }
-                        }
-                        match fmt {
-                            Some(f) => {
-                                opts.format = f;
-                                self.do_save(&path, &img, &opts)
-                            }
-                            None => false,
+                // The action runs once the save is done (on the file job thread).
+                let then = self.pending_guard.take();
+                if let (Some(path), Some(img)) = (self.viewer.current().cloned(), self.viewer.current_image(&self.core)) {
+                    let fmt = crate::formats::SaveFormat::from_ext(&crate::formats::ext_of(&path));
+                    let loaded = self.viewer.loaded(&self.core);
+                    let mut opts = SaveOptions { jpeg_quality: self.core.settings.jpeg_quality, keep_metadata: self.core.settings.keep_exif_on_save, ..Default::default() };
+                    if let Some(l) = &loaded {
+                        opts.exif = l.decoded.exif.clone();
+                        if !self.core.settings.color_manage {
+                            opts.icc = l.decoded.icc_profile.clone();
                         }
                     }
-                    _ => false,
-                };
-                if saved {
-                    if let Some(a) = self.pending_guard.take() {
-                        self.perform_pending(a);
+                    if let Some(f) = fmt {
+                        opts.format = f;
+                        self.do_save(&path, img, &opts, then, None);
                     }
-                } else {
-                    self.pending_guard = None;
                 }
             }
             Some(3) => {
@@ -3056,7 +3165,12 @@ impl App {
                     match kind {
                         PendingPrompt::Rename(path) => {
                             let path = path.clone();
-                            match fileops::rename(&path, &value) {
+                            let renamed = match self.wait_for_save(std::slice::from_ref(&path)) {
+                                // A running save writes the old name.
+                                Some(msg) => Err(anyhow::anyhow!(msg)),
+                                None => fileops::rename(&path, &value),
+                            };
+                            match renamed {
                                 Ok(new) => {
                                     self.push_file_undo(format!("Rename to {}", crate::ui::viewer::file_name(&new)), vec![(path.clone(), new.clone())]);
                                     self.core.tags.moved(&path, &new);
@@ -3161,13 +3275,7 @@ impl App {
             if let Some(c) = choice {
                 if let Some(Confirm::SaveChanged { path, opts, then }) = self.confirm.take() {
                     match (c, self.viewer.current_image(&self.core)) {
-                        (1, Some(img)) => {
-                            if self.write_save(&path, &img, &opts) {
-                                if let Some(a) = then {
-                                    self.perform_pending(a);
-                                }
-                            }
-                        }
+                        (1, Some(img)) => self.write_save(&path, img, &opts, then, None),
                         (2, Some(img)) => self.save_dialog = Some(SaveDialog::new(edited_copy_name(&path), img, opts)),
                         _ => {}
                     }
@@ -3175,27 +3283,18 @@ impl App {
             }
         }
         self.transfer_dialog(ctx);
-        if let Some(dlg) = &mut self.save_dialog {
-            match dlg.show(ctx, &p) {
-                SaveOutcome::Open => {}
-                SaveOutcome::Cancel => self.save_dialog = None,
-                SaveOutcome::Save(path, opts) => {
-                    if let Some(img) = self.viewer.current_image(&self.core) {
-                        if self.do_save(&path, &img, &opts) {
-                            self.save_dialog = None;
-                            self.core.settings.jpeg_quality = opts.jpeg_quality;
-                            // Saved to a new file: the viewer goes on with the
-                            // saved copy (as saved, no edits); the original stays
-                            // as it is on disk.
-                            if self.mode == Mode::Viewer && self.viewer.current() != Some(&path) {
-                                self.viewer.show_saved_copy(&path);
-                            }
-                        } else if let Some(d) = &mut self.save_dialog {
-                            d.error = Some("Could not save - see the message below.".into());
-                        }
-                    }
+        match self.save_dialog.as_mut().map(|d| d.show(ctx, &p)) {
+            Some(SaveOutcome::Cancel) => self.save_dialog = None,
+            Some(SaveOutcome::Save(path, opts)) => {
+                if let Some(img) = self.viewer.current_image(&self.core) {
+                    // The dialog closes while saving (the viewer stays usable)
+                    // and comes back if the save fails; once saved, the viewer
+                    // goes on with the copy (see `finish_save`).
+                    let dlg = self.save_dialog.take();
+                    self.do_save(&path, img, &opts, None, dlg);
                 }
             }
+            Some(SaveOutcome::Open) | None => {}
         }
         if !self.show_settings {
             crate::ui::keymap::set_capturing(false);
@@ -4549,6 +4648,15 @@ enum JobResult {
     Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String> },
     /// Deleted files taken out of the Recycle Bin again (undo of a delete).
     Restore { files: Vec<DeletedItem>, res: crate::recycle::Restored },
+    /// Moved or renamed items put back (undo of `label`, `total` items):
+    /// `done` as (where each was, where it is again), `errs` as (name, why).
+    UndoMoves { label: String, total: usize, done: Vec<(PathBuf, PathBuf)>, errs: Vec<(String, String)> },
+    /// Rotated / flipped `files` turned back (undo of `label`): how many,
+    /// those restored with their stamp before the change and now, and the
+    /// ones left as they were (name, why).
+    UndoTransform { label: String, files: Vec<PathBuf>, ok: usize, restored: Vec<(PathBuf, fileops::FileStamp, Option<fileops::FileStamp>)>, errs: Vec<(String, String)> },
+    /// The save `App::saving` describes is done.
+    Saved(Result<(), String>),
     Panicked(String),
     /// A job that only reports a line to the user.
     Message { ok: bool, text: String },
@@ -4607,10 +4715,13 @@ impl FileJobs {
         FileJobs { tx, rx, status, queued: 0 }
     }
 
-    fn submit(&mut self, label: impl Into<String>, job: FileJob) {
-        if self.tx.send((label.into(), job)).is_ok() {
+    /// Queue `job`; false when the worker is not running.
+    fn submit(&mut self, label: impl Into<String>, job: FileJob) -> bool {
+        let sent = self.tx.send((label.into(), job)).is_ok();
+        if sent {
             self.queued += 1;
         }
+        sent
     }
 }
 
@@ -4730,6 +4841,131 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
     })
 }
 
+/// Undo of moves and renames (`label`): each item goes back where it was,
+/// the last moved first. Across drives that copies it back.
+fn undo_moves_job(label: String, moves: Vec<(PathBuf, PathBuf)>) -> FileJob {
+    Box::new(move |pr| {
+        let total = moves.len();
+        let (mut done, mut errs) = (Vec::new(), Vec::new());
+        for (i, (orig, cur)) in moves.iter().rev().enumerate() {
+            // Lumen is closing: stop between items (the one being copied is dropped).
+            if fileops::copies_cancelled() {
+                break;
+            }
+            pr.set(i, total);
+            match fileops::move_path(cur, orig) {
+                Ok(()) => done.push((cur.clone(), orig.clone())),
+                Err(e) => errs.push((crate::ui::viewer::file_name(cur), e.root_cause().to_string())),
+            }
+        }
+        // In the order they were moved (the first one gets the focus).
+        done.reverse();
+        JobResult::UndoMoves { label, total, done, errs }
+    })
+}
+
+/// Undo of a rotation / flip `t` written to `files` (`label`).
+fn undo_transform_job(label: String, t: Transform, files: Vec<Transformed>) -> FileJob {
+    Box::new(move |pr| {
+        let total = files.len();
+        let (mut ok, mut restored, mut errs) = (0, Vec::new(), Vec::new());
+        for (i, f) in files.iter().enumerate() {
+            pr.set(i, total);
+            match restore_transformed(f, t) {
+                Ok(()) => {
+                    ok += 1;
+                    if let Some(was) = f.was {
+                        restored.push((f.path.clone(), was, fileops::FileStamp::of(&f.path)));
+                    }
+                }
+                Err(e) => errs.push((crate::ui::viewer::file_name(&f.path), e.to_string())),
+            }
+        }
+        // (The kept contents, up to the undo budget, are freed here.)
+        let files = files.into_iter().map(|f| f.path).collect();
+        JobResult::UndoTransform { label, files, ok, restored, errs }
+    })
+}
+
+/// Put one file rotated / flipped by `t` back: its previous bytes when they
+/// were kept, else (a JPEG whose EXIF orientation alone changed) the inverse turn.
+fn restore_transformed(f: &Transformed, t: Transform) -> anyhow::Result<()> {
+    let p = &f.path;
+    // Changed again since (saved from another program, edited here):
+    // writing the old contents back would lose that.
+    let changed = f.after.is_some() && fileops::FileStamp::of(p) != f.after;
+    match &f.before {
+        _ if !p.is_file() => Err(anyhow::anyhow!("the file no longer exists")),
+        _ if changed => Err(anyhow::anyhow!("the file was modified since, so it was left as it is")),
+        Some(b) => crate::encode::write_atomic(p, b),
+        None => crate::encode::lossless_jpeg_transform(p, inverse(t)).map(|_| ()),
+    }
+}
+
+/// The message for the items an undo left as they were (`errs`: name and
+/// why) out of `total`: by name, the first few when there are several.
+fn undo_failures(errs: &[(String, String)], total: usize) -> Option<String> {
+    match errs {
+        [] => None,
+        [(name, why)] => Some(format!("Could not undo \"{name}\": {why}")),
+        all => {
+            let names: Vec<&str> = all.iter().take(3).map(|(n, _)| n.as_str()).collect();
+            let more = if all.len() > 3 { ", ..." } else { "" };
+            Some(format!("Could not undo {} of {}: {}{more} ({})", all.len(), count(total, "item"), names.join(", "), all[0].1))
+        }
+    }
+}
+
+/// Encode `img` and write it to `path` (atomically, see `write_atomic`);
+/// `source`, the open file, gives a JPEG its comment, XMP and IPTC.
+fn save_job(img: Arc<image::RgbaImage>, path: PathBuf, opts: SaveOptions, source: Option<PathBuf>) -> FileJob {
+    Box::new(move |_| JobResult::Saved(crate::encode::save_from(&img, &path, &opts, source.as_deref()).map_err(|e| e.to_string())))
+}
+
+/// The picture a job works on: `img` (the viewer's, as shown), else the
+/// first frame of the file at `path`, decoded here.
+fn job_image(img: Option<Arc<image::RgbaImage>>, path: &Path) -> Result<Arc<image::RgbaImage>, String> {
+    if let Some(img) = img {
+        return Ok(img);
+    }
+    let first_frame = crate::decode::DecodeOptions { animations: false, ..Default::default() };
+    crate::decode::decode_file(path, first_frame).map(|d| d.image).map_err(|e| format!("Could not open {}: {e}", crate::ui::viewer::file_name(path)))
+}
+
+/// Copy image: `img`, or the file at `path`, onto the clipboard.
+fn copy_image_job(img: Option<Arc<image::RgbaImage>>, path: PathBuf) -> FileJob {
+    Box::new(move |_| {
+        let res = job_image(img, &path).and_then(|img| fileops::copy_image_to_clipboard(&img).map_err(|e| format!("Copy failed: {e}")));
+        match res {
+            Ok(()) => JobResult::Message { ok: true, text: "Image copied to clipboard".into() },
+            Err(text) => JobResult::Message { ok: false, text },
+        }
+    })
+}
+
+/// Set as wallpaper: the file at `path` as it is (`as_is`: a JPEG, PNG or
+/// BMP), else `img` or the decoded file, written as a JPEG in Lumen's data
+/// folder first.
+fn wallpaper_job(path: PathBuf, as_is: bool, img: Option<Arc<image::RgbaImage>>) -> FileJob {
+    Box::new(move |_| {
+        let target = if as_is {
+            Ok(path)
+        } else {
+            job_image(img, &path).and_then(|img| {
+                let dir = crate::settings::data_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let out = dir.join("wallpaper.jpg");
+                let opts = SaveOptions { jpeg_quality: 95, ..Default::default() };
+                crate::encode::save(&img, &out, &opts).map(|()| out).map_err(|e| e.to_string())
+            })
+        };
+        match target.and_then(|t| fileops::set_wallpaper(&t, 0).map_err(|e| e.to_string())) {
+            Ok(()) => JobResult::Message { ok: true, text: "Desktop wallpaper set".into() },
+            Err(text) => JobResult::Message { ok: false, text },
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4741,6 +4977,43 @@ mod tests {
         assert_eq!(edited_copy_name(&d.join("a.gif")), d.join("a edited.gif"));
         assert_eq!(lossy_resave_reason(None, Path::new("x.png")), None);
         assert!(lossy_resave_reason(None, Path::new("x.GIF")).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_failures_name_the_files() {
+        let e = |n: &str| (n.to_string(), "Access is denied".to_string());
+        assert_eq!(undo_failures(&[], 5), None);
+        assert_eq!(undo_failures(&[e("a.jpg")], 5).as_deref(), Some("Could not undo \"a.jpg\": Access is denied"));
+        assert_eq!(undo_failures(&[e("a.jpg"), e("b.jpg")], 2000).as_deref(), Some("Could not undo 2 of 2000 items: a.jpg, b.jpg (Access is denied)"));
+        let many = [e("a.jpg"), e("b.jpg"), e("c.jpg"), e("d.jpg")];
+        assert_eq!(undo_failures(&many, 4).as_deref(), Some("Could not undo 4 of 4 items: a.jpg, b.jpg, c.jpg, ... (Access is denied)"));
+    }
+
+    /// Undo of moves runs on a worker: every item goes back, the last moved
+    /// first (so a chain of renames comes undone), and one that cannot is
+    /// named.
+    #[test]
+    fn undoing_moves_puts_items_back_and_names_failures() {
+        let d = std::env::temp_dir().join(format!("lumen-undo-moves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("to")).unwrap();
+        // a.jpg was renamed to b.jpg, then b.jpg moved into to/; c.jpg was
+        // moved too but is gone now.
+        std::fs::write(d.join("to").join("b.jpg"), b"a").unwrap();
+        let moves = vec![(d.join("a.jpg"), d.join("b.jpg")), (d.join("b.jpg"), d.join("to").join("b.jpg")), (d.join("c.jpg"), d.join("to").join("c.jpg"))];
+        let progress = JobProgress { status: Arc::new(Mutex::new(JobStatus::default())), ctx: egui::Context::default() };
+        match undo_moves_job("Move".into(), moves)(&progress) {
+            JobResult::UndoMoves { label, total, done, errs } => {
+                assert_eq!((label.as_str(), total), ("Move", 3));
+                assert_eq!(done, vec![(d.join("b.jpg"), d.join("a.jpg")), (d.join("to").join("b.jpg"), d.join("b.jpg"))]);
+                assert_eq!(errs.len(), 1);
+                assert_eq!(errs[0].0, "c.jpg");
+            }
+            _ => panic!("not an undo of moves"),
+        }
+        assert_eq!(std::fs::read(d.join("a.jpg")).unwrap(), b"a");
+        assert!(!d.join("b.jpg").exists() && !d.join("to").join("b.jpg").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

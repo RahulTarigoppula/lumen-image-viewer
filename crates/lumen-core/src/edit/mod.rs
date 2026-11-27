@@ -86,6 +86,17 @@ impl EditSession {
         self.saved_version = self.version;
     }
 
+    /// Record that `img` has been written to disk: the image a save started
+    /// from, which edits made while it was written may have replaced (they
+    /// stay unsaved).
+    pub fn mark_saved_image(&mut self, img: &Arc<RgbaImage>) {
+        self.saved = Arc::downgrade(img);
+        // An equal version alone means clean (see `is_dirty`): only when the
+        // saved image is the one shown. Versions only grow, so one below
+        // never matches again.
+        self.saved_version = if Arc::ptr_eq(img, &self.current) { self.version } else { self.version.wrapping_sub(1) };
+    }
+
     /// Pick up a legacy `saved_version = version` assignment before mutating.
     fn sync_saved(&mut self) {
         if self.saved_version == self.version {
@@ -225,6 +236,36 @@ mod session_tests {
         s.redo();
         assert!(s.is_dirty());
         s.undo();
+        assert!(!s.is_dirty());
+    }
+
+    /// A save runs in the background: edits made meanwhile stay unsaved, and
+    /// undoing back to the saved image makes the session clean.
+    #[test]
+    fn saving_an_older_image() {
+        let mut s = EditSession::new(PathBuf::from("a.png"), Arc::new(img(1)));
+        s.push(img(2), "x");
+        let saving = s.current.clone();
+        s.mark_saved_image(&saving);
+        assert!(!s.is_dirty());
+        s.push(img(3), "y");
+        let saving = s.current.clone();
+        s.push(img(4), "z");
+        s.mark_saved_image(&saving);
+        assert!(s.is_dirty(), "the edit made while saving is not saved");
+        s.undo();
+        assert!(!s.is_dirty());
+        s.redo();
+        assert!(s.is_dirty());
+        // Back to the image opened, then saved while unchanged.
+        let mut s = EditSession::new(PathBuf::from("a.png"), Arc::new(img(1)));
+        s.push(img(2), "x");
+        s.undo();
+        assert!(!s.is_dirty());
+        let older = s.redo.last().map(|(i, _)| i.clone()).unwrap();
+        s.mark_saved_image(&older);
+        assert!(s.is_dirty(), "the file now holds the other image");
+        s.redo();
         assert!(!s.is_dirty());
     }
 }
