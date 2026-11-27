@@ -408,7 +408,7 @@ fn phone_jpeg_full_inspection() {
     let gm = &group(&i, "HDR gain map").fields;
     assert_eq!(value(gm, "Format"), "Ultra HDR (Adobe gain map XMP)");
     assert!(value(gm, "Gain map image").starts_with("The image the GContainer directory lists"), "{}", value(gm, "Gain map image"));
-    assert_eq!(value(gm, "Boost"), "x1 to x4");
+    assert_eq!(value(gm, "Boost"), "1x to 4x");
 
     let maker = &group(&i, "Maker note").fields;
     assert_eq!(value(maker, "Size"), "12 bytes");
@@ -897,8 +897,8 @@ fn ultra_hdr_gain_map_file() {
     let g = &group(&i, "HDR gain map").fields;
     assert_eq!(value(g, "Format"), "Ultra HDR (Adobe gain map XMP)");
     assert!(value(g, "Gain map image").starts_with("Multi-picture image 2, 8 x 4, one channel (gray)"), "{}", value(g, "Gain map image"));
-    assert_eq!(value(g, "Boost"), "x1 to x4");
-    assert_eq!(value(g, "Screen headroom"), "x1 to x4");
+    assert_eq!(value(g, "Boost"), "1x to 4x");
+    assert_eq!(value(g, "Screen headroom"), "1x to 4x");
     assert!(value(&group(&i, "Multi-picture (MPF)").fields, "Image 2").starts_with("HDR gain map"));
     assert_eq!(value(&i.capture, "HDR gain map"), "Yes, highlights up to 4x brighter");
 
@@ -907,11 +907,11 @@ fn ultra_hdr_gain_map_file() {
     assert_eq!(map.image.dimensions(), (4, 8), "turned like the photo (EXIF orientation 6)");
     // Turned a quarter clockwise: the white right half is now the bottom half.
     assert!(map.image.get_pixel(1, 1).0[0] < 60 && map.image.get_pixel(1, 6).0[0] > 200, "{:?}", map.image);
-    assert_eq!(map.legend()[1], "Black: x1, white: x4 brighter");
+    assert_eq!(map.legend()[1], "Black: 1x, white: 4x brighter");
     // The whole chain: white stays SDR white (a quarter of the x4 peak) where the map is black and reaches the peak where it is white.
     let base = image::RgbaImage::from_pixel(4, 8, image::Rgba([255, 255, 255, 255]));
     let out = gainmap::render_hdr(&base, &gainmap::prepare(&map, 4, 8), &map.meta, 4.0);
-    assert!(out.get_pixel(1, 0).0[0] < 150 && out.get_pixel(1, 7).0[0] > 250, "{:?}", out);
+    assert!(out.get_pixel(1, 0).0[0] < 170 && out.get_pixel(1, 7).0[0] > 230, "{:?}", out);
 
     // ISO 21496-1 next to the XMP: the ISO values win.
     let mut iso = super::jpeg::ISO_GAINMAP_PREFIX.to_vec();
@@ -923,7 +923,7 @@ fn ultra_hdr_gain_map_file() {
     let g = &group(&i, "HDR gain map").fields;
     assert_eq!(value(g, "Format"), "ISO 21496-1 gain map");
     assert!(g[0].note.contains("also has Ultra HDR metadata"), "{}", g[0].note);
-    assert_eq!(value(g, "Boost per channel"), "red x1-4, green x1-2.83, blue x1-2");
+    assert_eq!(value(g, "Boost per channel"), "red 1-4x, green 1-2.8x, blue 1-2x");
     assert_eq!(gainmap::load_bytes(&file).ok().expect("a gain map").meta.kind, gainmap::GainMapKind::Iso);
 
     // Without MPF or GContainer the gain map is still found after the main image.

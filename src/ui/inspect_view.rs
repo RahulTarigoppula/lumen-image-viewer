@@ -495,8 +495,8 @@ pub fn gain_legend(ui: &mut egui::Ui, id: egui::Id, at: Pos2, max_w: f32, info: 
                     if max > 1.01 {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.label(small("Screen headroom", p.text)).on_hover_text("How much brighter than SDR white the screen can show: x1 is a normal (SDR) screen, x4 an HDR screen whose highlights reach four times SDR white. Phones and HDR monitors reach about x2 to x16.");
-                            let slider = super::widgets::Slider::new(&mut h, 1.0..=max).logarithmic(true).fixed_decimals(1).prefix("x").default_value(max).width(100.0).value_width(52.0);
+                            ui.label(small("Screen headroom", p.text)).on_hover_text("How much brighter than SDR white the screen can show: 1x is a normal (SDR) screen, 4x an HDR screen whose highlights reach four times SDR white. Phones and HDR monitors reach about 2x to 16x.");
+                            let slider = super::widgets::Slider::new(&mut h, 1.0..=max).logarithmic(true).fixed_decimals(1).suffix("x").default_value(max).width(100.0).value_width(52.0);
                             if ui.add(slider).on_hover_text("Double-click for the map's full headroom").changed() {
                                 *headroom = h;
                             }
@@ -504,7 +504,7 @@ pub fn gain_legend(ui: &mut egui::Ui, id: egui::Id, at: Pos2, max_w: f32, info: 
                     }
                     let used = gainmap::weight(&map.meta, h);
                     ui.label(small(&format!("Map applied: {:.0}%", used * 100.0), p.muted)).on_hover_text("How much of the gain map a screen with this headroom uses, from the headroom range stored in the file.");
-                    ui.label(small(&format!("Straight curve: x{} peak = white, SDR white = 1/{}", trim_x(h), trim_x(h)), p.muted))
+                    ui.label(small(&format!("Straight curve: {}x peak = white, SDR white = 1/{}", trim_x(h), trim_x(h)), p.muted))
                         .on_hover_text("The HDR version is scaled down so the brightest a screen with this headroom shows is white. The areas the HDR version lifts stay bright; the rest looks darker than in the normal view.");
                 }
             }

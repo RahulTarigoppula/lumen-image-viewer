@@ -379,7 +379,7 @@ pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote, samsung: Option<&Sa
         if let (Some(a), Some(b)) = (apple.hdr_headroom, apple.hdr_gain) {
             f.push(Field::new(
                 "HDR headroom",
-                format!("x{:.2}", super::gainmap::apple_headroom(a, b)),
+                format!("{:.1}x", super::gainmap::apple_headroom(a, b)),
                 "How much brighter than SDR white the HDR version may go: Apple's formula on maker note tags 0x0021 and 0x0030.",
             ));
         }

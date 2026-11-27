@@ -381,7 +381,11 @@ fn describe(t: u16, v: &Val) -> (String, String, &'static str) {
         }
         0xA011 => named("Color space", pick(v, &[(0, "sRGB"), (1, "Adobe RGB")]), "Color space chosen in the camera."),
         0xA012 => named("Smart Range", pick(v, &OFF_ON), "Samsung's dynamic range boost: keeps more highlight and shadow detail."),
-        0xA013 => named("Exposure compensation", v.real().map_or_else(|| plain(v), |b| format!("{b:+.1} EV")), "Exposure compensation as Samsung stored it."),
+        0xA013 => named(
+            "Exposure compensation",
+            v.real().map_or_else(|| plain(v), |b| if b.abs() < 0.05 { "0 EV".to_string() } else { format!("{b:+.1} EV") }),
+            "Exposure compensation as Samsung stored it.",
+        ),
         0xA014 => named("ISO", v.int().map_or_else(|| plain(v), |i| format!("ISO {i}")), "ISO sensitivity as Samsung stored it."),
         0xA018 => named("Exposure time", v.real().filter(|&x| x > 0.0).map_or_else(|| plain(v), fmt_exposure), "Shutter time as Samsung stored it."),
         0xA019 => named("F-number", v.real().filter(|&x| x > 0.0).map_or_else(|| plain(v), |n| format!("f/{}", fmt_num(n))), "Aperture as Samsung stored it."),

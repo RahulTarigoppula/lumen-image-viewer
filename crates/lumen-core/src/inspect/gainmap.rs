@@ -626,10 +626,10 @@ pub fn load_bytes(b: &[u8]) -> Result<GainMap, NoGainMap> {
     Ok(GainMap { meta: f.meta, image, channels, source: f.source })
 }
 
-/// A boost factor for people: "4", "3.48".
+/// A factor for people, with one decimal at most: "4", "3.5".
 fn times(v: f32) -> String {
-    let s = format!("{v:.2}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
 }
 
 impl GainMap {
@@ -639,11 +639,11 @@ impl GainMap {
         let (w, h) = self.image.dimensions();
         let mut out = vec![format!("{}, {w} x {h}, {}", m.kind.label(), if self.channels == 1 { "one channel" } else { "three channels" })];
         if m.kind == GainMapKind::Apple {
-            out.push(format!("Black: no change, white: x{} brighter{}", times(m.max_boost()), if m.assumed { " (assumed)" } else { "" }));
+            out.push(format!("Black: no change, white: {}x brighter{}", times(m.max_boost()), if m.assumed { " (assumed)" } else { "" }));
         } else {
             let per = if m.per_channel { " (brightest channel)" } else { "" };
-            out.push(format!("Black: x{}, white: x{} brighter{per}", times(m.min_boost()), times(m.max_boost())));
-            out.push(format!("Applies from x{} to x{} screen headroom", times(m.capacity_min.exp2()), times(m.capacity_max.exp2())));
+            out.push(format!("Black: {}x, white: {}x brighter{per}", times(m.min_boost()), times(m.max_boost())));
+            out.push(format!("Applies from {}x to {}x screen headroom", times(m.capacity_min.exp2()), times(m.capacity_max.exp2())));
         }
         if m.base_is_hdr {
             out.push("The main image is the HDR version".into());
@@ -752,12 +752,12 @@ pub(crate) fn group(f: &Found) -> Group {
     v.push(Field::new("Gain map image", stored, "A small extra JPEG stored after the main image. Brighter pixels mark the areas an HDR screen shows brighter."));
     let boost_note = "How much brighter the HDR version is than the normal photo, from the gain map's black (smallest boost) to its white (largest).";
     if m.kind == GainMapKind::Apple {
-        let h = if m.assumed { format!("up to x{} (assumed: the Apple maker note has no headroom)", times(m.max_boost())) } else { format!("up to x{}", times(m.max_boost())) };
+        let h = if m.assumed { format!("up to {}x (assumed: the Apple maker note has no headroom)", times(m.max_boost())) } else { format!("up to {}x", times(m.max_boost())) };
         v.push(Field::new("Boost", h, boost_note));
     } else {
-        v.push(Field::new("Boost", format!("x{} to x{}", times(m.min_boost()), times(m.max_boost())), boost_note));
+        v.push(Field::new("Boost", format!("{}x to {}x", times(m.min_boost()), times(m.max_boost())), boost_note));
         if m.per_channel {
-            let per = ["red", "green", "blue"].iter().enumerate().map(|(c, n)| format!("{n} x{}-{}", times(m.min_log2[c].exp2()), times(m.max_log2[c].exp2()))).collect::<Vec<_>>().join(", ");
+            let per = ["red", "green", "blue"].iter().enumerate().map(|(c, n)| format!("{n} {}-{}x", times(m.min_log2[c].exp2()), times(m.max_log2[c].exp2()))).collect::<Vec<_>>().join(", ");
             v.push(Field::new("Boost per channel", per, "Separate boost range for each color channel."));
         }
         let gamma = if m.gamma.iter().all(|&g| g == m.gamma[0]) { times(m.gamma[0]) } else { m.gamma.iter().map(|&g| times(g)).collect::<Vec<_>>().join(", ") };
@@ -769,7 +769,7 @@ pub(crate) fn group(f: &Found) -> Group {
         ));
         v.push(Field::new(
             "Screen headroom",
-            format!("x{} to x{}", times(m.capacity_min.exp2()), times(m.capacity_max.exp2())),
+            format!("{}x to {}x", times(m.capacity_min.exp2()), times(m.capacity_max.exp2())),
             "Headroom: how much brighter than SDR white a screen can show. Below the first value the photo shows as stored; from the second on the full HDR version shows.",
         ));
     }
@@ -971,8 +971,9 @@ pub(crate) mod tests {
         let map = gray_map(8, 6, |_, _| 0, meta(0.0, 2.0, 1.0));
         let l = map.legend();
         assert_eq!(l[0], "Ultra HDR, 8 x 6, one channel");
-        assert_eq!(l[1], "Black: x1, white: x4 brighter");
-        assert_eq!(l[2], "Applies from x1 to x4 screen headroom");
-        assert_eq!(times(3.4816), "3.48");
+        assert_eq!(l[1], "Black: 1x, white: 4x brighter");
+        assert_eq!(l[2], "Applies from 1x to 4x screen headroom");
+        assert_eq!(times(3.4816), "3.5");
+        assert_eq!(times(10.0), "10");
     }
 }

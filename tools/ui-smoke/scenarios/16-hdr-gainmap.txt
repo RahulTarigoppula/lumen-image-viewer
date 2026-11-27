@@ -45,6 +45,10 @@ shot viewer_gain_map.png
 run CycleInspect
 wait 6000
 shot viewer_hdr_rendition.png
+# Screen headroom 2x: the knob to the middle of its (logarithmic) rail.
+drag 213 157 170 157
+wait 5000
+shot viewer_hdr_headroom_2x.png
 open {media}\HDR\pixel_hdrplus.jpg
 wait 6000
 shot pixel_hdr_rendition.png
@@ -88,3 +92,7 @@ shot compare_gain_map.png
 key O
 wait 8000
 shot compare_hdr_rendition.png
+# Pane B's slider to 2x: the headroom is shared, so pane A follows.
+drag 852 166 809 166
+wait 8000
+shot compare_hdr_headroom_2x.png
