@@ -27,14 +27,15 @@ shot moved.png
 open {media}\BgOps\Pictures
 wait 2000
 run Undo
-wait 2500
+wait 1200
 shot move_undone.png
 state
-# Copy image from the browser: decoded on the worker, then put on the clipboard.
+# Copy image from the browser: decoded on the worker, then put on the clipboard
+# (the message shows for 2.5 s).
 click 770 150
 wait 300
 run CopyImage
-wait 2500
+wait 800
 shot image_copied.png
 # Save an edited PNG in the viewer: "Saving ..." while it is written, then saved.
 open {media}\BgOps\Pictures\gradient_16x9.png
