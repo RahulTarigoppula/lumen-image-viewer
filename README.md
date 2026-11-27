@@ -2,9 +2,9 @@
 
 <h1 align="center">Lumen</h1>
 <p align="center"><b>A fast, private, modern image and video viewer for Windows: a FastStone Image Viewer replacement with a built-in video analysis mode.</b><br>
-One portable <code>Lumen.exe</code>. No installer, no account, no telemetry.</p>
+One portable <code>Lumen.exe</code> or a small installer. No admin rights, no account, no telemetry.</p>
 
-<p align="center"><a href="https://github.com/RahulTarigoppula/lumen-image-viewer/releases/latest"><b>Download Lumen.exe</b></a></p>
+<p align="center"><a href="https://github.com/RahulTarigoppula/lumen-image-viewer/releases/latest"><b>Download Lumen</b></a></p>
 
 ---
 
@@ -59,9 +59,22 @@ Press **F1** in the app for the full list, or **Ctrl+K** to search every command
 
 ## Install
 
-1. Download **Lumen.exe** from [Releases](https://github.com/RahulTarigoppula/lumen-image-viewer/releases/latest).
-2. Run it. It is fully portable. Settings live in `%APPDATA%\Lumen`; create an empty `portable.txt` next to the exe to keep everything beside it instead.
-3. Optional: Settings, Windows integration, *Register file types* adds "Open with Lumen" and an Explorer "Browse with Lumen" folder menu (per user, no admin rights).
+Download one of these from [Releases](https://github.com/RahulTarigoppula/lumen-image-viewer/releases/latest):
+
+- **Lumen-Setup.exe** (installer): installs Lumen for your account, no admin rights needed (or for all users, if you choose so on the first page). Adds a Start menu shortcut, an optional desktop icon and, with *Use Lumen to open pictures and videos*, "Open with Lumen" for every supported type. A newer setup updates the installed copy in place. Uninstall from Windows Settings > Apps > Installed apps; your settings in `%APPDATA%\Lumen` are kept.
+- **Lumen.exe** or **Lumen-portable.zip** (portable): nothing is installed, just run it. Settings live in `%APPDATA%\Lumen`; put an empty `portable.txt` beside the exe to keep them next to it instead (in `LumenData`, for example on a USB stick).
+
+Either way, Settings, Windows integration adds "Open with Lumen" and an Explorer "Browse with Lumen" folder menu (per user, no admin rights), and removes them again.
+
+The downloads are not code-signed, so Windows SmartScreen may show "Windows protected your PC" the first time: choose **More info**, then **Run anyway**. To check a download, compare its SHA-256 with the line in `SHA256SUMS.txt` from the same release (this prints `True` when they match):
+
+```powershell
+(Get-FileHash .\Lumen-Setup.exe).Hash -eq ((Select-String -SimpleMatch 'Lumen-Setup.exe' .\SHA256SUMS.txt).Line -split ' ')[0]
+```
+
+With Git Bash or WSL, `sha256sum -c --ignore-missing SHA256SUMS.txt` in the download folder checks every file at once.
+
+Silent install (for scripts): `Lumen-Setup.exe /VERYSILENT /TASKS=fileassoc` (add `/ALLUSERS` for all users, `desktopicon` to the tasks for a desktop icon); uninstall with `unins000.exe /VERYSILENT` in the install folder.
 
 For HEIC, AVIF and RAW files, install the free Microsoft Store extensions (*HEIF Image Extensions*, *AV1 Video Extension*, *Raw Image Extension*); Lumen picks them up automatically.
 
