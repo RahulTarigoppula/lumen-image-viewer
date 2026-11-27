@@ -2256,7 +2256,7 @@ impl Compare {
         let on = pane.intersect(dest);
         let shown = Rect::from_min_max(((on.min - dest.min) / dest.size()).to_pos2(), ((on.max - dest.min) / dest.size()).to_pos2());
         let Some(r) = widgets::navigator_rect(pane, d.0 as f32 / d.1.max(1) as f32, avoid) else { return };
-        let id = ui.id().with("cmp-navigator");
+        let id = ui.scope_id().with("cmp-navigator");
         let out = widgets::navigator(ui, id, r, tex, shown);
         if out.visible {
             crate::analysis_ui::canvas::occlude(ui.ctx(), r.expand(4.0));
@@ -2848,7 +2848,7 @@ impl Compare {
                 } else {
                     "Show: histograms, camera info, pixel values, inspect views, how the panes are laid out, and the Metadata window"
                 };
-                let open_id = ui.id().with("cmp-show-open");
+                let open_id = ui.scope_id().with("cmp-show-open");
                 let was_open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
                 let r = widgets::labeled_menu_button(ui, I::STACK, SHOW_LABEL, tip, was_open);
                 let open = egui::Popup::menu(&r).show(|ui| self.show_menu(ui)).is_some();

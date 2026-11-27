@@ -1599,7 +1599,7 @@ const NAVIGATOR_MAX: Vec2 = Vec2::new(176.0, 132.0);
 /// Gap between the navigator and the edge of its area (and what it avoids).
 const NAVIGATOR_MARGIN: f32 = 12.0;
 /// Seconds the navigator stays after the view last moved; then it fades out.
-const NAVIGATOR_LINGER: f64 = 1.6;
+const NAVIGATOR_LINGER: f64 = 2.5;
 
 /// Where the zoom navigator of an image `aspect` (width / height) goes in
 /// `area`: at most [`NAVIGATOR_MAX`] and 30% of the area, in the
@@ -1727,7 +1727,7 @@ pub fn navigator(ui: &mut Ui, id: Id, rect: Rect, tex: egui::TextureId, shown: R
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-        resp.on_hover_text("Navigator: the framed part is on screen. Drag the frame to pan, or click to jump there");
+        resp.on_hover_text("Drag the frame to pan, or click to jump there");
     }
     ui.data_mut(|d| d.insert_temp(id, st));
     out

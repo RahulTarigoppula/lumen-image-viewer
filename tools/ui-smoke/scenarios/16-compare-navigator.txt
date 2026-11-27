@@ -33,3 +33,9 @@ shot three_show_menu.png
 click 526 288
 wait 1500
 shot three_rows.png
+# Pixel values and a line profile in the rows layout (drawn across B).
+key V
+key P
+drag 500 380 780 400
+wait 1500
+shot three_rows_profile.png

@@ -1480,7 +1480,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         let shown = Rect::from_min_max(((on.min - dest.min) / size).to_pos2(), ((on.max - dest.min) / size).to_pos2());
         let avoid = crate::analysis_ui::canvas::occluders(ui.ctx());
         let Some(rect) = widgets::navigator_rect(view, w / h, &avoid) else { return };
-        let id = ui.id().with("viewer-navigator");
+        let id = ui.scope_id().with("viewer-navigator");
         let out = widgets::navigator(ui, id, rect, tex, shown);
         if out.visible {
             crate::analysis_ui::canvas::occlude(ui.ctx(), rect.expand(4.0));
