@@ -106,6 +106,20 @@ impl Review {
         self.images.iter().map(|i| i.marks.len()).sum()
     }
 
+    /// Repair what a damaged or hand-edited file can hold: detail boxes
+    /// inside the image (0..1) with their corners in order, and no marks or
+    /// boxes with values that are not numbers.
+    pub fn sanitize(&mut self) {
+        self.details.retain(|d| d.rect.iter().all(|v| v.is_finite()));
+        for d in &mut self.details {
+            let r = d.rect.map(|v| v.clamp(0.0, 1.0));
+            d.rect = ordered([r[0], r[1]], [r[2], r[3]]);
+        }
+        for im in &mut self.images {
+            im.marks.retain(|m| m.width.is_finite() && m.pts.iter().all(|p| p[0].is_finite() && p[1].is_finite()));
+        }
+    }
+
     /// Reorder (and fill in) the images to match `paths`; images not in
     /// `paths` are dropped, new ones start empty.
     pub fn align(&mut self, paths: &[PathBuf]) {
@@ -192,10 +206,57 @@ pub fn load(dir: &Path, paths: &[PathBuf]) -> Review {
     load_in(dir, None, paths)
 }
 
+/// Read-only (reports): an unreadable file gives an empty review.
 pub fn load_in(dir: &Path, root: Option<&Path>, paths: &[PathBuf]) -> Review {
     let mut r = std::fs::read_to_string(review_file_in(dir, root, paths)).ok().and_then(|t| serde_json::from_str::<Review>(&t).ok()).unwrap_or_default();
+    r.sanitize();
     r.align(paths);
     r
+}
+
+/// A review loaded for editing, and what was wrong with its file.
+#[derive(Default)]
+pub struct Loaded {
+    pub review: Review,
+    /// The file could not be read as a review: it was renamed to this, so
+    /// the next save does not replace it.
+    pub set_aside: Option<PathBuf>,
+    /// The file is there but could not be read (and not set aside): saving
+    /// over it is not safe.
+    pub unreadable: Option<String>,
+}
+
+/// Load the review of `paths` for editing. A damaged file is never replaced
+/// by an empty review: it is kept beside it as `<name>.broken`.
+pub fn load_checked_in(dir: &Path, root: Option<&Path>, paths: &[PathBuf]) -> Loaded {
+    let file = review_file_in(dir, root, paths);
+    let mut out = Loaded::default();
+    match std::fs::read(&file) {
+        Ok(bytes) => match serde_json::from_slice::<Review>(&bytes) {
+            Ok(r) => out.review = r,
+            Err(e) => {
+                let aside = broken_name(&file);
+                match std::fs::rename(&file, &aside) {
+                    Ok(()) => {
+                        log::warn!("review {} is damaged ({e}); kept as {}", file.display(), aside.display());
+                        out.set_aside = Some(aside);
+                    }
+                    Err(e2) => out.unreadable = Some(format!("{e} ({e2})")),
+                }
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => out.unreadable = Some(e.to_string()),
+    }
+    out.review.sanitize();
+    out.review.align(paths);
+    out
+}
+
+/// `<name>.broken` beside `file`, numbered when that is taken.
+fn broken_name(file: &Path) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    (1..1000).map(|i| if i == 1 { file.with_file_name(format!("{name}.broken")) } else { file.with_file_name(format!("{name}.broken-{i}")) }).find(|p| !p.exists()).unwrap_or_else(|| file.with_file_name(format!("{name}.broken")))
 }
 
 /// Write `r` for its images. An empty review is written only to replace an
@@ -204,17 +265,25 @@ pub fn save(dir: &Path, r: &Review) -> Result<()> {
     save_in(dir, None, r)
 }
 
+/// Write `r` now on this thread, after any queued background write.
 pub fn save_in(dir: &Path, root: Option<&Path>, r: &Review) -> Result<()> {
+    if let Some((file, bytes)) = save_bytes_in(dir, root, r)? {
+        lumen_core::persist::write_now(&file, &bytes)?;
+    }
+    Ok(())
+}
+
+/// The file and content to write for `r`; `None` when there is nothing to
+/// save (an empty review and no earlier file). Written with
+/// `lumen_core::persist`: one writer, a unique temp file flushed to disk and
+/// swapped in, so overlapping saves never leave a half-written file.
+pub fn save_bytes_in(dir: &Path, root: Option<&Path>, r: &Review) -> Result<Option<(PathBuf, Vec<u8>)>> {
     let paths: Vec<PathBuf> = r.images.iter().map(|i| i.path.clone()).collect();
     let file = review_file_in(dir, root, &paths);
     if r.is_empty() && !file.exists() {
-        return Ok(());
+        return Ok(None);
     }
-    std::fs::create_dir_all(dir)?;
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(r)?)?;
-    std::fs::rename(&tmp, &file)?;
-    Ok(())
+    Ok(Some((file, serde_json::to_vec_pretty(r)?)))
 }
 
 /// Remembered export choices.
@@ -328,6 +397,16 @@ pub fn clamp_px(p: [f32; 2], dims: (u32, u32)) -> [f32; 2] {
 /// (x0, y0, x1, y1) with x0 <= x1, y0 <= y1.
 pub fn ordered(a: [f32; 2], b: [f32; 2]) -> [f32; 4] {
     [a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]
+}
+
+/// A detail box (fractions 0..1) moved by `d`, kept inside the image. Never
+/// panics, also for a box wider than the image or with values that are not
+/// numbers (a damaged file).
+pub fn moved_box(r: [f32; 4], d: [f32; 2]) -> [f32; 4] {
+    let (w, h) = (r[2] - r[0], r[3] - r[1]);
+    let x = (r[0] + d[0]).min(1.0 - w).max(0.0);
+    let y = (r[1] + d[1]).min(1.0 - h).max(0.0);
+    [x, y, x + w, y + h]
 }
 
 /// The drag end for a box from `a` to `b`; `square` makes it a square (or a
@@ -772,6 +851,55 @@ mod tests {
         save(&dir, &Review::new(&paths)).unwrap();
         assert!(load(&dir, &paths).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_review_is_set_aside_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("lumen-review-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = vec![PathBuf::from("C:/x/a.jpg"), PathBuf::from("C:/x/b.jpg")];
+        let file = review_file(&dir, &paths);
+        // Half a file, as a crash during a write could leave it.
+        std::fs::write(&file, b"{\"summary\":\"lots of work\",\"images\":[{\"pa").unwrap();
+        let l = load_checked_in(&dir, None, &paths);
+        assert!(l.review.is_empty());
+        assert!(l.unreadable.is_none());
+        let aside = l.set_aside.expect("set aside");
+        assert_eq!(aside.file_name().unwrap().to_string_lossy(), format!("{}.broken", file.file_name().unwrap().to_string_lossy()));
+        // Saving the new review leaves the damaged one alone.
+        let mut r = l.review;
+        r.summary = "new".into();
+        save(&dir, &r).unwrap();
+        assert!(std::fs::read_to_string(&aside).unwrap().contains("lots of work"));
+        assert_eq!(load(&dir, &paths).summary, "new");
+        // A second damaged file gets its own name.
+        std::fs::write(&file, b"not json").unwrap();
+        let again = load_checked_in(&dir, None, &paths).set_aside.unwrap();
+        assert_ne!(again, aside);
+        assert!(aside.exists() && again.exists());
+        // No temp files are left behind.
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert!(names.iter().all(|n| !n.contains("tmp")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_detail_boxes_are_repaired_and_moving_them_never_panics() {
+        let mut r = Review::new(&[PathBuf::from("C:/x/a.jpg")]);
+        r.details.push(Detail { rect: [0.9, -0.5, 0.1, 3.0], title: String::new(), comment: String::new() });
+        r.details.push(Detail { rect: [f32::NAN, 0.0, 0.5, 0.5], title: String::new(), comment: String::new() });
+        r.images[0].marks.push(mark(Shape::Rect, vec![[f32::INFINITY, 0.0], [10.0, 10.0]]));
+        r.images[0].marks.push(mark(Shape::Rect, vec![[0.0, 0.0], [10.0, 10.0]]));
+        r.sanitize();
+        assert_eq!(r.details.len(), 1);
+        assert_eq!(r.details[0].rect, [0.1, 0.0, 0.9, 1.0]);
+        assert_eq!(r.images[0].marks.len(), 1);
+        // Moving keeps a box inside the image.
+        assert_eq!(moved_box([0.25, 0.25, 0.5, 0.5], [0.75, -0.5]), [0.75, 0.0, 1.0, 0.25]);
+        // A box wider than the image (a damaged file) or not a number: no panic.
+        assert_eq!(moved_box([-0.5, 0.0, 1.5, 0.5], [0.1, 0.0])[0], 0.0);
+        let _ = moved_box([f32::NAN, 0.0, 0.5, f32::NAN], [0.1, 0.1]);
     }
 
     fn gray(w: u32, h: u32) -> Arc<RgbaImage> {

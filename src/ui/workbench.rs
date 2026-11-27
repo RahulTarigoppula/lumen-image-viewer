@@ -18,13 +18,123 @@ use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use lumen_core::report;
-use lumen_core::workbench::{measure, rank, Choice, DeviceMeasure, Scale, Verdict, Vote, Workspace, ARTIFACT_TAGS};
+use lumen_core::workbench::{measure, merge, rank, Choice, DeviceMeasure, Project, RoundDiff, Scale, Verdict, Vote, Workspace, ARTIFACT_TAGS};
 use std::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+/// Time and size of the project file: how a save by someone else is noticed.
+type Stamp = (SystemTime, u64);
+
+fn stamp_of(file: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(file).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// File size and time per capture (thumbnail keys).
+type ShotMeta = HashMap<PathBuf, (u64, Option<SystemTime>)>;
+
+fn shot_paths(ws: &Workspace) -> Vec<PathBuf> {
+    ws.project.scenes.iter().flat_map(|s| s.shots.iter().map(|sh| ws.abs(&sh.path))).collect()
+}
+
+fn stat_shots(paths: Vec<PathBuf>) -> ShotMeta {
+    paths.into_iter().filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, (m.len(), m.modified().ok())))).collect()
+}
+
+/// What a background read or write of the project file found.
+enum IoDone {
+    /// The file's stamp now (the poll for saves by someone else).
+    Stamp(Option<Stamp>),
+    /// The file, read after it changed on disk.
+    Read(Option<Stamp>, Result<Project, String>),
+    Saved(Synced),
+    /// "Save mine as a copy" wrote this file.
+    Copied(Result<PathBuf, String>),
+}
+
+/// How a save ended.
+enum Synced {
+    /// Written, with someone else's changes merged in when `merged`: what
+    /// is on disk now.
+    Wrote { project: Arc<Project>, stamp: Option<Stamp>, merged: bool },
+    /// Someone else saved changes to the same values (`theirs` is `None`
+    /// when their file cannot be read; `why` says why).
+    Conflict { theirs: Option<Project>, stamp: Option<Stamp>, why: String },
+    Failed(String),
+}
+
+/// A background read or write of the project file.
+struct Io {
+    rx: Receiver<IoDone>,
+    /// What a running save writes.
+    sent: Option<Arc<Project>>,
+}
+
+/// Someone else saved the project with changes to some of the same values.
+struct Conflict {
+    theirs: Option<Project>,
+    stamp: Option<Stamp>,
+    why: String,
+    /// "Save mine as a copy" is running.
+    copying: bool,
+}
+
+fn write_project(file: &Path, p: &Project) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(p).map_err(|e| e.to_string())?;
+    lumen_core::encode::write_atomic(file, &bytes).map_err(|e| format!("{e:#}"))
+}
+
+/// Save `mine` as the project in `root`. When the file changed since `known`
+/// (someone else saved), their version is read and merged with `mine` first;
+/// `base` is the version both started from.
+fn sync(root: &Path, base: &Project, mine: Arc<Project>, known: Option<Stamp>) -> Synced {
+    let file = root.join(lumen_core::workbench::PROJECT_FILE);
+    let now = stamp_of(&file);
+    let mut out = mine;
+    let mut merged = false;
+    if now.is_some() && now != known {
+        let theirs = match Workspace::load(root) {
+            Ok(w) => w.project,
+            Err(e) => return Synced::Conflict { theirs: None, stamp: now, why: format!("{e:#}") },
+        };
+        match merge::merge(base, &out, &theirs) {
+            Some(m) if m == theirs => return Synced::Wrote { project: Arc::new(theirs), stamp: now, merged: true },
+            Some(m) => {
+                out = Arc::new(m);
+                merged = true;
+            }
+            None => return Synced::Conflict { theirs: Some(theirs), stamp: now, why: String::new() },
+        }
+    }
+    match write_project(&file, &out) {
+        Ok(()) => Synced::Wrote { project: out, stamp: stamp_of(&file), merged },
+        Err(e) => Synced::Failed(e),
+    }
+}
+
+/// Keep `p` in a file of its own: beside the project, or (`local`, or when
+/// that fails) in Lumen's data folder.
+fn keep_copy(root: &Path, p: &Project, local: bool) -> Result<PathBuf, String> {
+    let time = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let beside = root.join(format!("lumen-project.yours-{time}.json"));
+    if !local && write_project(&beside, p).is_ok() {
+        return Ok(beside);
+    }
+    let name = super::review::file_stem(if p.name.trim().is_empty() { "project" } else { &p.name });
+    let file = crate::settings::data_dir().join("unsaved-projects").join(format!("{name}-{time}.json"));
+    let bytes = serde_json::to_vec_pretty(p).map_err(|e| e.to_string())?;
+    lumen_core::persist::write_file(&file, &bytes).map_err(|e| format!("{e:#}"))?;
+    Ok(file)
+}
+
+/// The same scenes with the same captures (measurements still fit).
+fn same_scenes(a: &Project, b: &Project) -> bool {
+    a.scenes.len() == b.scenes.len() && a.scenes.iter().zip(&b.scenes).all(|(x, y)| x.name == y.name && x.shots == y.shots)
+}
 
 /// What the workbench asks the app to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,15 +150,21 @@ pub enum WbRequest {
 /// A running blind test.
 pub struct Blind {
     pub trial: Option<rank::Trial>,
+    /// The name of the trial's scene: the vote names it, and the scene is
+    /// found by it (the scene list can change while the trial is shown).
+    scene: String,
     /// Votes given in this session.
     pub count: usize,
     rng: rank::Rng,
     pub rater: String,
 }
 
+/// One measured capture: scene name, device, the capture's stored path, values.
+type Measured = (String, String, String, std::collections::BTreeMap<String, f64>);
+
 /// A running measurement of the project's captures.
 struct MeasureJob {
-    rx: Receiver<(usize, String, std::collections::BTreeMap<String, f64>)>,
+    rx: Receiver<Measured>,
     done: Arc<AtomicUsize>,
     total: usize,
     cancel: Arc<AtomicBool>,
@@ -67,11 +183,33 @@ pub struct WorkbenchUi {
     pub ws: Workspace,
     /// The selected scene in the overview.
     pub selected: usize,
+    ctx: egui::Context,
     dirty: Option<Instant>,
-    disk_stamp: Option<SystemTime>,
+    /// Save at the next tick (a blind vote, leaving a view), not after `SAVE_DELAY`.
+    save_asap: bool,
+    /// The last save failed: said once, retried every `SAVE_RETRY`.
+    save_failed: bool,
+    /// The project as last read from or written to the file: where a merge
+    /// with someone else's save starts from.
+    base: Arc<Project>,
+    disk_stamp: Option<Stamp>,
+    /// A change on disk that could not be read: not read again.
+    bad_stamp: Option<Stamp>,
     disk_check: Instant,
+    /// The background read or write of the project file (one at a time).
+    io: Option<Io>,
+    conflict: Option<Conflict>,
+    /// Messages from background work for the next tick: (error, text).
+    notes: Vec<(bool, String)>,
+    /// Counts changes to the project: cached side panel values follow it.
+    rev: u64,
+    ranking: Option<(u64, Vec<rank::Ranked>)>,
+    rounds: Option<(u64, RoundDiff)>,
     /// File size and time per capture (thumbnail keys).
-    meta: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    meta: ShotMeta,
+    meta_rx: Option<Receiver<ShotMeta>>,
+    /// "Find devices and scenes again" running.
+    detecting: Option<Receiver<Project>>,
     filter: String,
     pub requests: Vec<WbRequest>,
     setup: bool,
@@ -87,6 +225,8 @@ pub struct WorkbenchUi {
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
+/// A failed save (an offline share) is tried again after this.
+const SAVE_RETRY: Duration = Duration::from_secs(10);
 const NAME_W: f32 = 210.0;
 
 /// Left edge of a device column's content (name, thumbnails, measure lines)
@@ -106,8 +246,9 @@ fn rgb(c: [u8; 3]) -> Color32 {
 
 impl WorkbenchUi {
     /// Open the project in `root`, or detect devices and scenes and create it.
-    /// The second value says whether a new project was made.
-    pub fn open(root: &Path) -> anyhow::Result<(WorkbenchUi, bool)> {
+    /// The second value says whether a new project was made. Reads files
+    /// (and EXIF when detecting): run it off the UI thread.
+    pub fn open(root: &Path, ctx: &egui::Context) -> anyhow::Result<(WorkbenchUi, bool)> {
         let (ws, created) = if root.join(lumen_core::workbench::PROJECT_FILE).is_file() {
             (Workspace::load(root)?, false)
         } else {
@@ -116,14 +257,29 @@ impl WorkbenchUi {
             ws.save()?;
             (ws, true)
         };
-        let disk_stamp = ws.disk_stamp();
+        let disk_stamp = stamp_of(&ws.file());
+        let base = Arc::new(ws.project.clone());
+        let meta = stat_shots(shot_paths(&ws));
         let mut ui = WorkbenchUi {
             ws,
             selected: 0,
+            ctx: ctx.clone(),
             dirty: None,
+            save_asap: false,
+            save_failed: false,
+            base,
             disk_stamp,
+            bad_stamp: None,
             disk_check: Instant::now(),
-            meta: HashMap::new(),
+            io: None,
+            conflict: None,
+            notes: Vec::new(),
+            rev: 0,
+            ranking: None,
+            rounds: None,
+            meta,
+            meta_rx: None,
+            detecting: None,
             filter: String::new(),
             requests: Vec::new(),
             setup: false,
@@ -136,7 +292,6 @@ impl WorkbenchUi {
             prev: None,
         };
         ui.load_previous();
-        ui.refresh_meta();
         Ok((ui, created))
     }
 
@@ -145,51 +300,294 @@ impl WorkbenchUi {
         self.prev = self.ws.project.previous.as_ref().and_then(|p| Workspace::load(&self.ws.abs(p)).ok());
     }
 
+    /// Read the captures' sizes and times again, in the background.
     fn refresh_meta(&mut self) {
-        self.meta.clear();
-        for s in &self.ws.project.scenes {
-            for sh in &s.shots {
-                let path = self.ws.abs(&sh.path);
-                if let Ok(m) = std::fs::metadata(&path) {
-                    self.meta.insert(path, (m.len(), m.modified().ok()));
-                }
-            }
+        let paths = shot_paths(&self.ws);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new().name("lumen-wb-stat".into()).spawn(move || {
+            let _ = tx.send(stat_shots(paths));
+            ctx.request_repaint();
+        });
+        if spawned.is_ok() {
+            self.meta_rx = Some(rx);
         }
     }
 
     pub fn touch(&mut self) {
         self.dirty.get_or_insert_with(Instant::now);
+        self.rev += 1;
     }
 
-    pub fn save_now(&mut self, toasts: &mut widgets::Toasts) {
-        if self.dirty.take().is_some() {
-            match self.ws.save() {
-                Ok(()) => self.disk_stamp = self.ws.disk_stamp(),
-                Err(e) => toasts.error(format!("Could not save the project: {e:#}")),
-            }
+    /// Save at the next tick instead of after the usual delay.
+    pub fn save_soon(&mut self) {
+        if self.dirty.is_some() {
+            self.save_asap = true;
         }
     }
 
-    /// Autosave, reload when someone else saved the project, export progress.
-    pub fn tick(&mut self, core: &mut Core) {
-        if let Some(t) = self.dirty {
-            if t.elapsed() >= SAVE_DELAY {
-                self.save_now(&mut core.toasts);
-            } else {
-                core.ctx.request_repaint_after(SAVE_DELAY);
+    /// Run `job` (a read or write of the project file) on a worker thread;
+    /// `tick` takes its result. The job says whether the UI must wake up.
+    fn spawn_io(&mut self, sent: Option<Arc<Project>>, job: impl FnOnce() -> (IoDone, bool) + Send + 'static) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new().name("lumen-wb-io".into()).spawn(move || {
+            let (done, wake) = job();
+            if tx.send(done).is_ok() && wake {
+                ctx.request_repaint();
             }
-        }
-        if self.dirty.is_none() && self.disk_check.elapsed() > Duration::from_secs(3) {
-            self.disk_check = Instant::now();
-            let now = self.ws.disk_stamp();
-            if now.is_some() && now != self.disk_stamp {
-                if let Ok(ws) = Workspace::load(&self.ws.root) {
-                    self.ws = ws;
-                    self.selected = self.selected.min(self.ws.project.scenes.len().saturating_sub(1));
-                    self.refresh_meta();
-                    core.toasts.info("The project was changed by someone else and has been reloaded");
+        });
+        match spawned {
+            Ok(_) => self.io = Some(Io { rx, sent }),
+            Err(e) => {
+                log::warn!("workbench: no thread for the project file: {e}");
+                if sent.is_some() {
+                    self.dirty = Some(Instant::now() + SAVE_RETRY);
                 }
-                self.disk_stamp = now;
+            }
+        }
+    }
+
+    fn start_save(&mut self) {
+        self.dirty = None;
+        self.save_asap = false;
+        let mine = Arc::new(self.ws.project.clone());
+        let (root, base, known) = (self.ws.root.clone(), self.base.clone(), self.disk_stamp);
+        self.spawn_io(Some(mine.clone()), move || (IoDone::Saved(sync(&root, &base, mine, known)), true));
+    }
+
+    /// Has someone else saved the project? A stat off the UI thread: the
+    /// project can be on a share that went offline.
+    fn start_poll(&mut self) {
+        let file = self.ws.file();
+        let (known, bad) = (self.disk_stamp, self.bad_stamp);
+        self.spawn_io(None, move || {
+            let now = stamp_of(&file);
+            let changed = now.is_some() && now != known && now != bad;
+            (IoDone::Stamp(now), changed)
+        });
+    }
+
+    fn start_read(&mut self) {
+        let (root, file) = (self.ws.root.clone(), self.ws.file());
+        self.spawn_io(None, move || {
+            let stamp = stamp_of(&file);
+            (IoDone::Read(stamp, Workspace::load(&root).map(|w| w.project).map_err(|e| format!("{e:#}"))), true)
+        });
+    }
+
+    /// Show `next` (a merge, a reload, scenes found again).
+    fn apply(&mut self, next: Project) {
+        if next == self.ws.project {
+            return;
+        }
+        let scenes_changed = !same_scenes(&self.ws.project, &next);
+        self.ws.project = next;
+        self.rev += 1;
+        self.selected = self.selected.min(self.ws.project.scenes.len().saturating_sub(1));
+        if scenes_changed {
+            // Its results belong to scenes that may be gone or renumbered.
+            if let Some(j) = self.measuring.take() {
+                j.cancel.store(true, Ordering::Relaxed);
+                self.notes.push((false, "Measuring stopped: the scenes changed".into()));
+            }
+            self.refresh_meta();
+        }
+    }
+
+    /// Someone else saved `theirs`: add their changes to the open project.
+    fn take_theirs(&mut self, theirs: Project, stamp: Option<Stamp>) {
+        match merge::merge(&self.base, &self.ws.project, &theirs) {
+            Some(next) => {
+                let msg = if self.dirty.is_some() { "The project was changed by someone else: their changes were added to yours" } else { "The project was changed by someone else and has been reloaded" };
+                self.apply(next);
+                self.base = Arc::new(theirs);
+                self.disk_stamp = stamp;
+                // Not during a blind test: other raters' votes come in all the time.
+                if self.blind.is_none() {
+                    self.notes.push((false, msg.into()));
+                }
+            }
+            None => self.conflict = Some(Conflict { theirs: Some(theirs), stamp, why: String::new(), copying: false }),
+        }
+    }
+
+    fn on_io(&mut self, done: IoDone, sent: Option<Arc<Project>>) {
+        match done {
+            IoDone::Stamp(now) => {
+                if now.is_some() && now != self.disk_stamp && now != self.bad_stamp {
+                    self.start_read();
+                }
+            }
+            IoDone::Read(stamp, Ok(theirs)) => self.take_theirs(theirs, stamp),
+            IoDone::Read(stamp, Err(e)) => {
+                log::warn!("workbench: the project file changed but cannot be read: {e}");
+                self.bad_stamp = stamp;
+            }
+            IoDone::Saved(Synced::Wrote { project, stamp, merged }) => {
+                if self.save_failed {
+                    self.notes.push((false, "The project is saved again".into()));
+                }
+                self.save_failed = false;
+                self.bad_stamp = None;
+                if merged {
+                    // Their changes, plus what changed here while the save ran.
+                    let sent = sent.unwrap_or_else(|| project.clone());
+                    match merge::merge(&sent, &self.ws.project, &project) {
+                        Some(next) => self.apply(next),
+                        None => self.conflict = Some(Conflict { theirs: Some((*project).clone()), stamp, why: String::new(), copying: false }),
+                    }
+                    if self.blind.is_none() {
+                        self.notes.push((false, "The project was also changed by someone else: both sets of changes are kept".into()));
+                    }
+                }
+                self.base = project;
+                self.disk_stamp = stamp;
+            }
+            IoDone::Saved(Synced::Conflict { theirs, stamp, why }) => self.conflict = Some(Conflict { theirs, stamp, why, copying: false }),
+            IoDone::Saved(Synced::Failed(e)) => {
+                if !self.save_failed {
+                    self.notes.push((true, format!("Could not save the project (trying again): {e}")));
+                }
+                self.save_failed = true;
+                self.dirty = Some(Instant::now() + SAVE_RETRY);
+            }
+            IoDone::Copied(Ok(path)) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                self.notes.push((false, format!("Your version was saved as {name}")));
+                if let Some(c) = self.conflict.take() {
+                    match c.theirs {
+                        Some(t) => {
+                            self.apply(t.clone());
+                            self.base = Arc::new(t);
+                            self.disk_stamp = c.stamp;
+                        }
+                        None => self.bad_stamp = c.stamp,
+                    }
+                    self.dirty = None;
+                }
+            }
+            IoDone::Copied(Err(e)) => {
+                self.notes.push((true, format!("Could not save your version: {e}")));
+                if let Some(c) = &mut self.conflict {
+                    c.copying = false;
+                }
+            }
+        }
+    }
+
+    fn poll_io(&mut self) {
+        let Some(io) = &self.io else { return };
+        let done = match io.rx.try_recv() {
+            Ok(d) => d,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // The worker ended without an answer: save again later.
+                if self.io.take().is_some_and(|io| io.sent.is_some()) {
+                    self.dirty = Some(Instant::now() + SAVE_RETRY);
+                }
+                return;
+            }
+        };
+        let sent = self.io.take().and_then(|io| io.sent);
+        self.on_io(done, sent);
+    }
+
+    /// Save now on this thread (the window closes, another project opens):
+    /// waits for a running save, and keeps a copy when it cannot ask.
+    pub fn save_blocking(&mut self) {
+        let mut stuck = false;
+        if let Some(io) = self.io.take() {
+            match io.rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(done @ (IoDone::Saved(_) | IoDone::Copied(_))) => self.on_io(done, io.sent),
+                // A poll or read: the save below looks at the file itself.
+                Ok(_) => {}
+                Err(e) => {
+                    // A share that does not answer: keep a local copy instead.
+                    stuck = e.is_timeout();
+                    if io.sent.is_some() {
+                        self.dirty.get_or_insert_with(Instant::now);
+                    }
+                }
+            }
+        }
+        let kept = |res: Result<PathBuf, String>| match res {
+            Ok(p) => log::warn!("workbench: your version of the project was saved as {}", p.display()),
+            Err(e) => log::error!("workbench: could not keep your version of the project: {e}"),
+        };
+        if self.conflict.take().is_some() {
+            // Nobody to ask: their version stays, mine is kept beside it.
+            kept(keep_copy(&self.ws.root, &self.ws.project, stuck));
+            return;
+        }
+        if self.dirty.take().is_none() {
+            return;
+        }
+        if stuck {
+            kept(keep_copy(&self.ws.root, &self.ws.project, true));
+            return;
+        }
+        match sync(&self.ws.root, &self.base, Arc::new(self.ws.project.clone()), self.disk_stamp) {
+            Synced::Wrote { project, stamp, .. } => {
+                self.base = project;
+                self.disk_stamp = stamp;
+            }
+            Synced::Conflict { .. } => kept(keep_copy(&self.ws.root, &self.ws.project, false)),
+            Synced::Failed(e) => {
+                log::error!("workbench: could not save the project: {e}");
+                kept(keep_copy(&self.ws.root, &self.ws.project, true));
+            }
+        }
+    }
+
+    /// Autosave, reload when someone else saved the project, background
+    /// results, export progress. Runs every frame in every mode.
+    pub fn tick(&mut self, core: &mut Core) {
+        self.poll_io();
+        if self.io.is_some() && self.dirty.is_some() {
+            // A poll that found nothing does not wake the UI: look again soon.
+            core.ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.io.is_none() && self.conflict.is_none() {
+            if let Some(t) = self.dirty {
+                let wait = if self.save_asap { Duration::ZERO } else { SAVE_DELAY.saturating_sub(t.elapsed()) };
+                if wait.is_zero() {
+                    self.start_save();
+                } else {
+                    core.ctx.request_repaint_after(wait);
+                }
+            } else if self.disk_check.elapsed() > Duration::from_secs(3) {
+                self.disk_check = Instant::now();
+                self.start_poll();
+            }
+        }
+        for (error, msg) in std::mem::take(&mut self.notes) {
+            if error {
+                core.toasts.error(msg);
+            } else {
+                core.toasts.info(msg);
+            }
+        }
+        if let Some(rx) = &self.meta_rx {
+            match rx.try_recv() {
+                Ok(m) => {
+                    self.meta = m;
+                    self.meta_rx = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.meta_rx = None,
+                Err(_) => {}
+            }
+        }
+        if let Some(rx) = &self.detecting {
+            match rx.try_recv() {
+                Ok(fresh) => {
+                    self.detecting = None;
+                    self.finish_redetect(fresh, core);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.detecting = None;
+                    core.toasts.error("Could not find the devices and scenes");
+                }
+                Err(_) => {}
             }
         }
         self.poll_measure(core);
@@ -240,7 +638,17 @@ impl WorkbenchUi {
             core.toasts.info("Every capture is measured already");
             return;
         }
-        let jobs: Vec<(usize, String, PathBuf)> = todo.into_iter().filter_map(|(i, d)| Some((i, d.clone(), self.ws.abs(&self.ws.project.scenes.get(i)?.shot(&d)?.path)))).collect();
+        // Results name their scene and capture (not an index): the scenes can
+        // be found again or reloaded while this runs.
+        let jobs: Vec<(String, String, String, PathBuf)> = todo
+            .into_iter()
+            .filter_map(|(i, d)| {
+                let s = self.ws.project.scenes.get(i)?;
+                let stored = s.shot(&d)?.path.clone();
+                let path = self.ws.abs(&stored);
+                Some((s.name.clone(), d, stored, path))
+            })
+            .collect();
         let total = jobs.len();
         let done = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -249,7 +657,7 @@ impl WorkbenchUi {
         std::thread::spawn(move || {
             crate::bg::background_priority();
             let pool = lumen_analysis::job::AnalysisPool::new(None);
-            for (i, dev, path) in jobs {
+            for (scene, dev, stored, path) in jobs {
                 if c2.load(Ordering::Relaxed) {
                     break;
                 }
@@ -258,7 +666,7 @@ impl WorkbenchUi {
                     Some(measure::measure(&img.image, &pool))
                 }));
                 if let Ok(Some(values)) = res {
-                    let _ = tx.send((i, dev, values));
+                    let _ = tx.send((scene, dev, stored, values));
                 } else {
                     log::warn!("workbench: could not measure {}", path.display());
                 }
@@ -278,8 +686,9 @@ impl WorkbenchUi {
         let total = job.total;
         let finished = job.done.load(Ordering::Relaxed) >= total || (job.cancel.load(Ordering::Relaxed) && job.rx.is_empty() && got.is_empty());
         if !got.is_empty() {
-            for (i, dev, values) in got {
-                if let Some(s) = self.ws.project.scenes.get_mut(i) {
+            for (scene, dev, stored, values) in got {
+                // Only into the scene and capture that was measured.
+                if let Some(s) = self.ws.project.scenes.iter_mut().find(|s| s.name == scene && s.shot(&dev).is_some_and(|sh| sh.path == stored)) {
                     s.measures.retain(|m| m.device != dev);
                     s.measures.push(DeviceMeasure { device: dev, values });
                 }
@@ -342,7 +751,7 @@ impl WorkbenchUi {
 
     pub fn start_blind(&mut self, rater: String) {
         let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
-        self.blind = Some(Blind { trial: None, count: 0, rng: rank::Rng::new(seed), rater });
+        self.blind = Some(Blind { trial: None, scene: String::new(), count: 0, rng: rank::Rng::new(seed), rater });
         self.next_trial();
     }
 
@@ -366,6 +775,7 @@ impl WorkbenchUi {
         let votes = p.votes.clone();
         let b = self.blind.as_mut()?;
         let t = rank::next_trial(&available, &names, &votes, &mut b.rng);
+        b.scene = t.as_ref().and_then(|t| names.get(t.scene)).cloned().unwrap_or_default();
         b.trial = t.clone();
         t
     }
@@ -374,11 +784,12 @@ impl WorkbenchUi {
     pub fn blind_link(&self) -> Option<(Vec<PathBuf>, SceneLink)> {
         let b = self.blind.as_ref()?;
         let t = b.trial.as_ref()?;
-        let s = self.ws.project.scenes.get(t.scene)?;
+        let k = self.ws.project.scene_index(&b.scene)?;
+        let s = &self.ws.project.scenes[k];
         let left = s.shot(&t.left)?;
         let right = s.shot(&t.right)?;
         let link = SceneLink {
-            scene: t.scene,
+            scene: k,
             count: self.ws.project.scenes.len(),
             name: String::new(),
             labels: Vec::new(),
@@ -399,10 +810,16 @@ impl WorkbenchUi {
             1 => Choice::B,
             _ => Choice::Tie,
         };
-        let scene = self.ws.project.scenes.get(t.scene).map(|s| s.name.clone()).unwrap_or_default();
+        // The scene shown (by name: the scene list may have changed since).
+        let scene = b.scene.clone();
+        if self.ws.project.scene_index(&scene).is_none() {
+            return;
+        }
         self.ws.project.votes.push(Vote { scene, a: t.left, b: t.right, choice, rater: b.rater.clone() });
         b.count += 1;
+        // Every vote is written right away: closing the window loses none.
         self.touch();
+        self.save_asap = true;
         self.next_trial();
     }
 
@@ -413,8 +830,10 @@ impl WorkbenchUi {
     fn thumb(&self, core: &mut Core, ui: &Ui, path: &Path, rect: Rect) -> Rect {
         let p = core.pal;
         let Some((size, mtime)) = self.meta.get(path).copied() else {
+            // Still being looked up (scenes found again), or missing.
+            let icon = if self.meta_rx.is_some() { I::HOURGLASS } else { I::IMAGE_BROKEN };
             ui.painter().rect_filled(rect, CornerRadius::same(6), p.faint_bg);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(20.0), p.faint);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(20.0), p.faint);
             return rect;
         };
         let key = ThumbKey::new(path, size, mtime);
@@ -439,15 +858,34 @@ impl WorkbenchUi {
         }
     }
 
+    /// The blind test ranking (a fit and 200 bootstrap fits): computed
+    /// again only after a change, not on every repaint.
+    fn ranking(&mut self) -> Vec<rank::Ranked> {
+        if self.ranking.as_ref().is_none_or(|(rev, _)| *rev != self.rev) {
+            let names: Vec<String> = self.ws.project.devices.iter().map(|d| d.name.clone()).collect();
+            self.ranking = Some((self.rev, rank::rank(&names, &self.ws.project.votes)));
+        }
+        self.ranking.as_ref().map(|(_, r)| r.clone()).unwrap_or_default()
+    }
+
+    /// What changed since the previous round, computed again only after a change.
+    fn rounds(&mut self) -> Option<RoundDiff> {
+        let prev = self.prev.as_ref()?;
+        if self.rounds.as_ref().is_none_or(|(rev, _)| *rev != self.rev) {
+            self.rounds = Some((self.rev, lumen_core::workbench::compare_rounds(&self.ws.project, &prev.project, 1)));
+        }
+        self.rounds.as_ref().map(|(_, d)| d.clone())
+    }
+
     /// Scenes shown with the current filter, as indices.
     fn visible(&self) -> Vec<usize> {
         let f = self.filter.trim().to_lowercase();
         self.ws.project.scenes.iter().enumerate().filter(|(_, s)| f.is_empty() || s.name.to_lowercase().contains(&f) || s.comment.to_lowercase().contains(&f)).map(|(i, _)| i).collect()
     }
 
+    /// The overview (the app calls `tick` every frame, in every mode).
     pub fn ui(&mut self, ui: &mut Ui, core: &mut Core) {
         let p = core.pal;
-        self.tick(core);
         egui::Panel::top("wb-toolbar")
             .resizable(false)
             .exact_size(super::theme::size::TOOLBAR)
@@ -606,8 +1044,8 @@ impl WorkbenchUi {
                 self.ws.project.reference = r;
                 self.touch();
             }
-            if let Some(prev) = &self.prev {
-                let d = lumen_core::workbench::compare_rounds(&self.ws.project, &prev.project, 1);
+            let rounds = self.rounds();
+            if let (Some(prev), Some(d)) = (&self.prev, rounds) {
                 ui.add_space(6.0);
                 let pname = if prev.project.name.is_empty() { "previous round".to_string() } else { prev.project.name.clone() };
                 widgets::section_title(ui, &p, &format!("SINCE {}", pname.to_uppercase()));
@@ -662,8 +1100,7 @@ impl WorkbenchUi {
             if !self.ws.project.votes.is_empty() {
                 ui.add_space(6.0);
                 widgets::section_title(ui, &p, "BLIND TEST RANKING");
-                let names: Vec<String> = self.ws.project.devices.iter().map(|d| d.name.clone()).collect();
-                for r in rank::rank(&names, &self.ws.project.votes).into_iter().filter(|r| r.votes > 0) {
+                for r in self.ranking().into_iter().filter(|r| r.votes > 0) {
                     let color = rgb(self.ws.project.device_color(&r.device));
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(self.ws.project.display(&r.device)).color(p.text));
@@ -1039,7 +1476,9 @@ impl WorkbenchUi {
                 }
                 widgets::section_title(ui, &p, "CAPTURES");
                 ui.label(RichText::new("Added or renamed files? Find devices and scenes again; scores and comments are kept for scenes with the same name.").size(text::SMALL).color(p.muted));
-                if widgets::secondary_button(ui, &format!("{}  Find devices and scenes again", I::ARROW_CLOCKWISE)).clicked() {
+                let finding = self.detecting.is_some();
+                let label = if finding { format!("{}  Finding devices and scenes...", I::SPINNER) } else { format!("{}  Find devices and scenes again", I::ARROW_CLOCKWISE) };
+                if ui.add_enabled_ui(!finding, |ui| widgets::secondary_button(ui, &label)).inner.clicked() {
                     redetect = true;
                 }
                 widgets::section_title(ui, &p, "PREVIOUS ROUND");
@@ -1076,7 +1515,7 @@ impl WorkbenchUi {
             changed = true;
         }
         if redetect {
-            self.redetect(core);
+            self.redetect();
         }
         if clear_prev {
             self.ws.project.previous = None;
@@ -1102,17 +1541,35 @@ impl WorkbenchUi {
         }
     }
 
-    /// Find devices and scenes again, keeping scores, comments and votes of
-    /// scenes and devices that still exist.
-    fn redetect(&mut self, core: &mut Core) {
-        let fresh = Workspace::detect(&self.ws.root, &exif_of);
-        let old = std::mem::replace(&mut self.ws.project, fresh.project);
-        let p = &mut self.ws.project;
-        p.name = old.name;
-        p.reference = old.reference.filter(|r| p.devices.iter().any(|d| &d.name == r));
+    /// Find devices and scenes again (a folder scan and EXIF reads, so on a
+    /// worker thread); `finish_redetect` takes the result.
+    fn redetect(&mut self) {
+        if self.detecting.is_some() {
+            return;
+        }
+        let (root, ctx) = (self.ws.root.clone(), self.ctx.clone());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let spawned = std::thread::Builder::new().name("lumen-wb-detect".into()).spawn(move || {
+            crate::bg::background_priority();
+            let _ = tx.send(Workspace::detect(&root, &exif_of).project);
+            ctx.request_repaint();
+        });
+        if spawned.is_ok() {
+            self.detecting = Some(rx);
+        }
+    }
+
+    /// The scenes found again: keep scores, comments and votes of scenes and
+    /// devices that still exist (also those made while the scan ran).
+    fn finish_redetect(&mut self, fresh: Project, core: &mut Core) {
+        let old = &self.ws.project;
+        let mut p = fresh;
+        p.name = old.name.clone();
+        p.reference = old.reference.clone().filter(|r| p.devices.iter().any(|d| &d.name == r));
         p.scale = old.scale;
-        p.attributes = old.attributes;
-        p.votes = old.votes;
+        p.attributes = old.attributes.clone();
+        p.votes = old.votes.clone();
+        p.previous = old.previous.clone();
         for d in &mut p.devices {
             if let Some(o) = old.devices.iter().find(|o| o.name == d.name) {
                 d.alias = o.alias.clone();
@@ -1130,8 +1587,9 @@ impl WorkbenchUi {
         }
         p.normalize();
         let n = p.scenes.len();
-        self.selected = self.selected.min(n.saturating_sub(1));
-        self.refresh_meta();
+        // Stops a measurement when the scenes changed (its results would
+        // land in the wrong scene) and reads the captures' times again.
+        self.apply(p);
         self.touch();
         core.toasts.info(format!("Found {} devices and {n} scenes", self.ws.project.devices.len()));
     }
@@ -1185,7 +1643,7 @@ impl WorkbenchUi {
     }
 
     fn start_export(&mut self, form: ExportForm, core: &mut Core) {
-        self.save_now(&mut core.toasts);
+        self.save_soon();
         let ext = form.format.ext();
         let stem = super::review::file_stem(if form.title.trim().is_empty() { "Round report" } else { &form.title });
         let Some(mut out) = rfd::FileDialog::new().add_filter(form.format.label(), &[ext]).set_directory(&self.ws.root).set_file_name(format!("{stem}.{ext}")).save_file() else { return };
@@ -1221,6 +1679,79 @@ impl WorkbenchUi {
             Ok(()) => core.toasts.success(format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
             Err(e) => core.toasts.error(format!("Could not save the CSV: {e:#}")),
         }
+    }
+
+    // ------------------------------------------------------------ conflicts
+
+    /// Someone else saved changes to the same values: ask which to keep.
+    /// Shown over every mode; saving waits for the answer.
+    pub fn conflict_dialog(&mut self, ctx: &egui::Context, core: &mut Core) {
+        let Some(c) = &self.conflict else { return };
+        let p = core.pal;
+        let (readable, copying) = (c.theirs.is_some(), c.copying);
+        let body = if readable {
+            "Someone else saved this project while you were working on it, and some of the same scores, notes or settings were changed by both of you.".to_string()
+        } else {
+            format!("Someone else changed the project file and it cannot be read now: {}", c.why)
+        };
+        let mut choice = None;
+        widgets::modal(ctx, egui::Id::new("wb-conflict"), 460.0, |ui| {
+            widgets::modal_title(ui, "The project was changed by someone else");
+            widgets::modal_body(ui, &body);
+            ui.add_space(super::theme::space::BUTTONS_GAP);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(!copying, |ui| {
+                    if widgets::primary_button(ui, &p, "Keep mine").on_hover_text("Save your version over theirs").clicked() {
+                        choice = Some(0);
+                    }
+                    if readable && widgets::secondary_button(ui, "Load theirs").on_hover_text("Drop your changes and show their version").clicked() {
+                        choice = Some(1);
+                    }
+                    let label = if copying { "Saving..." } else { "Save mine as a copy" };
+                    if widgets::secondary_button(ui, label).on_hover_text("Keep your version in a file of its own beside the project, then show theirs").clicked() {
+                        choice = Some(2);
+                    }
+                });
+            });
+        });
+        match choice {
+            Some(0) => {
+                let c = self.conflict.take().expect("conflict");
+                if let Some(t) = c.theirs {
+                    self.base = Arc::new(t);
+                }
+                self.disk_stamp = c.stamp;
+                self.touch();
+                self.save_asap = true;
+            }
+            Some(1) => {
+                let c = self.conflict.take().expect("conflict");
+                if let Some(t) = c.theirs {
+                    self.apply(t.clone());
+                    self.base = Arc::new(t);
+                    self.disk_stamp = c.stamp;
+                    self.dirty = None;
+                }
+            }
+            Some(2) if self.io.is_none() => {
+                if let Some(c) = &mut self.conflict {
+                    c.copying = true;
+                }
+                let (root, mine) = (self.ws.root.clone(), self.ws.project.clone());
+                self.spawn_io(None, move || (IoDone::Copied(keep_copy(&root, &mine, false)), true));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for WorkbenchUi {
+    /// Nothing is lost when the window closes or another project opens.
+    fn drop(&mut self) {
+        if let Some(j) = self.measuring.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        self.save_blocking();
     }
 }
 
@@ -1278,5 +1809,47 @@ fn short(a: &str) -> String {
         "Clipping" => "Clip".into(),
         "Banding" => "Band".into(),
         _ => a.chars().take(5).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumen_core::workbench::detect::{self, FileInfo};
+
+    #[test]
+    fn a_save_merges_with_someone_elses_and_never_overwrites_a_conflict() {
+        let root = std::env::temp_dir().join(format!("lumen-wb-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(lumen_core::workbench::PROJECT_FILE);
+        let base = Project::from_detection("Round", &detect::detect(&[FileInfo::new("A56/day.jpg"), FileInfo::new("X/day.jpg")]));
+        let Synced::Wrote { stamp, merged: false, .. } = sync(&root, &base, Arc::new(base.clone()), None) else { panic!("first save") };
+        assert_eq!(stamp, stamp_of(&file));
+        // Someone else votes and saves while I write a comment.
+        let mut theirs = base.clone();
+        theirs.votes.push(Vote { scene: base.scenes[0].name.clone(), a: "A56".into(), b: "X".into(), choice: Choice::A, rater: "b".into() });
+        write_project(&file, &theirs).unwrap();
+        let mut mine = base.clone();
+        mine.scenes[0].comment = "flare".into();
+        let Synced::Wrote { project, merged: true, stamp } = sync(&root, &base, Arc::new(mine.clone()), stamp) else { panic!("not merged") };
+        let on_disk = Workspace::load(&root).unwrap().project;
+        assert_eq!(on_disk, *project);
+        assert_eq!((on_disk.votes.len(), on_disk.scenes[0].comment.as_str()), (1, "flare"));
+        assert_eq!(stamp, stamp_of(&file));
+        // Both change the same comment: nothing is written, theirs stays.
+        let mut theirs = on_disk.clone();
+        theirs.scenes[0].comment = "halo".into();
+        write_project(&file, &theirs).unwrap();
+        let mut mine = on_disk.clone();
+        mine.scenes[0].comment = "soft".into();
+        assert!(matches!(sync(&root, &on_disk, Arc::new(mine.clone()), stamp), Synced::Conflict { theirs: Some(_), .. }));
+        assert_eq!(Workspace::load(&root).unwrap().project.scenes[0].comment, "halo");
+        // "Save mine as a copy" keeps it beside the project.
+        let copy = keep_copy(&root, &mine, false).unwrap();
+        assert_eq!(copy.parent(), Some(root.as_path()));
+        let kept: Project = serde_json::from_slice(&std::fs::read(&copy).unwrap()).unwrap();
+        assert_eq!(kept.scenes[0].comment, "soft");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

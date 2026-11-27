@@ -826,7 +826,8 @@ impl Slideshow {
             let tx = self.caption_tx.clone();
             let path = path.to_path_buf();
             rayon::spawn(move || {
-                let date = crate::meta::read_exif(&path).and_then(|e| e.taken);
+                // A reader panic gives no caption (rayon would abort the app).
+                let date = crate::bg::catch(|| crate::meta::read_exif(&path).and_then(|e| e.taken)).flatten();
                 let _ = tx.send((path, date));
             });
         }

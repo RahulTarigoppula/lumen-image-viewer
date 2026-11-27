@@ -10,6 +10,7 @@ use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use lumen_core::report;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,13 @@ pub struct ReviewUi {
     focus: Option<Sel>,
     /// Restored from an earlier session (for one toast).
     pub restored: bool,
+    /// The saved file was damaged or unreadable (told once, by `tick`).
+    load_note: Option<String>,
+    /// The saved file could not be read: never written over.
+    no_save: bool,
+    /// Set by the background writer when a save failed.
+    save_failed: Arc<AtomicBool>,
+    save_warned: bool,
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(800);
@@ -151,7 +159,14 @@ impl ReviewUi {
 
     /// A review stored in `dir`, keyed on paths relative to `root` (projects).
     pub fn new_in(paths: &[PathBuf], dir: PathBuf, root: Option<PathBuf>) -> ReviewUi {
-        let review = review::load_in(&dir, root.as_deref(), paths);
+        let loaded = review::load_checked_in(&dir, root.as_deref(), paths);
+        let load_note = match (&loaded.set_aside, &loaded.unreadable) {
+            (Some(p), _) => Some(format!("The saved review of these images was damaged; it was kept as {} and a new one is started", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())),
+            (None, Some(e)) => Some(format!("The saved review of these images could not be read, so changes here are not saved: {e}")),
+            (None, None) => None,
+        };
+        let no_save = loaded.unreadable.is_some();
+        let review = loaded.review;
         let restored = !review.is_empty();
         ReviewUi {
             review,
@@ -174,6 +189,10 @@ impl ReviewUi {
             metrics: None,
             focus: None,
             restored,
+            load_note,
+            no_save,
+            save_failed: Arc::new(AtomicBool::new(false)),
+            save_warned: false,
         }
     }
 
@@ -281,15 +300,21 @@ impl ReviewUi {
 
     /// Save soon after the last change; poll the export.
     pub fn tick(&mut self, ctx: &egui::Context, toasts: &mut widgets::Toasts) {
+        if let Some(note) = self.load_note.take() {
+            toasts.error(note);
+        }
+        if self.save_failed.swap(false, Ordering::Relaxed) {
+            if !self.save_warned {
+                toasts.error("Could not save the review (trying again)");
+                self.save_warned = true;
+            }
+            // Retried a while later.
+            self.dirty.get_or_insert_with(|| Instant::now() + Duration::from_secs(5));
+        }
         if let Some(t) = self.dirty {
             if t.elapsed() >= SAVE_DELAY && self.drag.is_none() {
                 self.dirty = None;
-                let (dir, root, r) = (self.dir.clone(), self.root.clone(), self.review.clone());
-                std::thread::spawn(move || {
-                    if let Err(e) = review::save_in(&dir, root.as_deref(), &r) {
-                        log::warn!("saving the review failed: {e}");
-                    }
-                });
+                self.write(false);
             } else {
                 ctx.request_repaint_after(SAVE_DELAY);
             }
@@ -321,9 +346,25 @@ impl ReviewUi {
     /// Write now (leaving compare).
     pub fn save_now(&mut self) {
         if self.dirty.take().is_some() {
-            if let Err(e) = review::save_in(&self.dir, self.root.as_deref(), &self.review) {
-                log::warn!("saving the review failed: {e}");
+            self.write(true);
+        }
+    }
+
+    /// Write the review: `now` on this thread, otherwise queued on Lumen's
+    /// one background writer (a newer save replaces a queued older one).
+    fn write(&self, now: bool) {
+        if self.no_save {
+            return;
+        }
+        match review::save_bytes_in(&self.dir, self.root.as_deref(), &self.review) {
+            Ok(Some((file, bytes))) if now => {
+                if let Err(e) = lumen_core::persist::write_now(&file, &bytes) {
+                    log::warn!("saving the review failed: {e:#}");
+                }
             }
+            Ok(Some((file, bytes))) => lumen_core::persist::write_later(file, bytes, Some(&self.save_failed)),
+            Ok(None) => {}
+            Err(e) => log::warn!("saving the review failed: {e:#}"),
         }
     }
 
@@ -467,10 +508,7 @@ impl ReviewUi {
                                     self.redo.clear();
                                 }
                                 if let Some(dt) = self.review.details.get_mut(*idx) {
-                                    let (w, h) = (dt.rect[2] - dt.rect[0], dt.rect[3] - dt.rect[1]);
-                                    let x = (dt.rect[0] + d[0]).clamp(0.0, 1.0 - w);
-                                    let y = (dt.rect[1] + d[1]).clamp(0.0, 1.0 - h);
-                                    dt.rect = [x, y, x + w, y + h];
+                                    dt.rect = review::moved_box(dt.rect, d);
                                 }
                                 *last = p;
                                 self.dirty.get_or_insert_with(Instant::now);

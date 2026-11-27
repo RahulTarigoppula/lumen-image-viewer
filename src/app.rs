@@ -166,6 +166,8 @@ pub struct App {
     compare: Option<crate::ui::compare::Compare>,
     /// The open camera comparison project.
     workbench: Option<crate::ui::workbench::WorkbenchUi>,
+    /// A project being opened (read, or found in its folder) on a worker.
+    opening_project: Option<Receiver<anyhow::Result<(crate::ui::workbench::WorkbenchUi, bool)>>>,
     /// The EXIF / Metadata window (viewer, compare and browser).
     meta_window: crate::ui::metadata_view::MetadataWindow,
     video: Option<crate::video::VideoMode>,
@@ -325,6 +327,7 @@ impl App {
             slideshow: None,
             compare: None,
             workbench: None,
+            opening_project: None,
             meta_window: Default::default(),
             video: None,
             analysis: Default::default(),
@@ -3042,18 +3045,38 @@ impl App {
         self.viewer.open(images, 0, self.core.settings.fit_mode);
     }
 
-    /// Open (or create) the project in `root` and show the workbench.
+    /// Open (or create) the project in `root` and show the workbench. The
+    /// files are read (and, for a new project, scanned) on a worker thread:
+    /// the folder can be large or on a slow share.
     fn open_project(&mut self, root: &Path) {
         if let Some(w) = &mut self.workbench {
-            w.save_now(&mut self.core.toasts);
+            w.save_soon();
         }
-        match crate::ui::workbench::WorkbenchUi::open(root) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (root, ctx) = (root.to_path_buf(), self.core.ctx.clone());
+        let spawned = std::thread::Builder::new().name("lumen-open-project".into()).spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::ui::workbench::WorkbenchUi::open(&root, &ctx)));
+            let _ = tx.send(res.unwrap_or_else(|_| Err(anyhow::anyhow!("the project could not be read"))));
+            ctx.request_repaint();
+        });
+        match spawned {
+            Ok(_) => self.opening_project = Some(rx),
+            Err(e) => self.core.toasts.error(format!("Could not open the project: {e}")),
+        }
+    }
+
+    /// The project `open_project` started is read.
+    fn project_opened(&mut self, res: anyhow::Result<(crate::ui::workbench::WorkbenchUi, bool)>) {
+        match res {
             Ok((w, created)) => {
                 if created {
                     let p = &w.ws.project;
                     self.core.toasts.success(format!("Found {} devices and {} scenes ({}). Saved as {}.", p.devices.len(), p.scenes.len(), p.detected_by, lumen_core::workbench::PROJECT_FILE));
                 }
-                self.workbench = Some(w);
+                // The old project saves what is left on a worker (dropping it saves).
+                if let Some(old) = self.workbench.replace(w) {
+                    let _ = std::thread::Builder::new().name("lumen-wb-close".into()).spawn(move || drop(old));
+                }
                 self.compare = None;
                 self.mode = Mode::Workbench;
             }
@@ -3118,7 +3141,7 @@ impl App {
         if let Some(w) = &mut self.workbench {
             let n = w.blind.as_ref().map(|b| b.count).unwrap_or(0);
             w.blind = None;
-            w.save_now(&mut self.core.toasts);
+            w.save_soon();
             if n > 0 {
                 self.core.toasts.success(format!("Blind test: {n} vote{} recorded. The ranking is in the project's side panel.", if n == 1 { "" } else { "s" }));
             }
@@ -3140,7 +3163,7 @@ impl App {
                     match next {
                         Some(k) => {
                             if let Some(w) = &mut self.workbench {
-                                w.save_now(&mut self.core.toasts);
+                                w.save_soon();
                             }
                             self.open_scene(k);
                         }
@@ -3154,8 +3177,11 @@ impl App {
                     }
                 }
                 L::SetDone(done) => {
+                    // By name: the scene list may have been reloaded since.
                     if let Some(w) = &mut self.workbench {
-                        w.set_done(link.scene, done);
+                        if let Some(k) = w.ws.project.scene_index(&link.name) {
+                            w.set_done(k, done);
+                        }
                     }
                 }
                 L::Vote(v) => {
@@ -3227,6 +3253,21 @@ impl eframe::App for App {
         }
         crate::analysis_ui::tick(&mut self.core);
         self.poll_sibling_folder();
+        if let Some(rx) = &self.opening_project {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.opening_project = None;
+                    self.project_opened(res);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.opening_project = None,
+                Err(_) => {}
+            }
+        }
+        // The project saves (blind votes too) and notices saves by others in
+        // every mode, not only while its overview or scorecard is shown.
+        if let Some(w) = &mut self.workbench {
+            w.tick(&mut self.core);
+        }
         if let Some(t) = self.advance_at {
             if Instant::now() >= t {
                 self.advance_at = None;
@@ -3465,20 +3506,22 @@ impl eframe::App for App {
                 let mut keep = true;
                 // A project scene: the scorecard panel beside the images.
                 let card = match (&self.compare, &self.workbench) {
-                    (Some(c), Some(w)) if c.scorecard => c.link.as_ref().filter(|l| !l.blind).map(|l| {
-                        let files = w.ws.scene_files(l.scene);
+                    (Some(c), Some(w)) if c.scorecard => c.link.as_ref().filter(|l| !l.blind).and_then(|l| {
+                        // By name: scores must land in the scene shown, also
+                        // after the project was reloaded (scenes renumbered).
+                        let k = w.ws.project.scene_index(&l.name)?;
+                        let files = w.ws.scene_files(k);
                         let mut devs: Vec<String> = Vec::new();
                         for (d, _) in files.into_iter().take(4) {
                             if !devs.contains(&d) {
                                 devs.push(d);
                             }
                         }
-                        (l.scene, devs)
+                        Some((k, devs))
                     }),
                     _ => None,
                 };
                 if let (Some((scene, devs)), Some(w)) = (card, self.workbench.as_mut()) {
-                    w.tick(&mut self.core);
                     let max = (ctx.content_rect().width() * 0.4).clamp(280.0, 520.0);
                     let close = egui::Panel::right("wb-scorecard")
                         .resizable(true)
@@ -3528,7 +3571,7 @@ impl eframe::App for App {
                         Some(_) if self.workbench.is_some() => {
                             self.compare = None;
                             if let Some(w) = &mut self.workbench {
-                                w.save_now(&mut self.core.toasts);
+                                w.save_soon();
                             }
                             self.mode = Mode::Workbench;
                         }
@@ -3557,7 +3600,7 @@ impl eframe::App for App {
                         R::BlindTrial => self.open_blind_trial(),
                         R::Back => {
                             if let Some(w) = &mut self.workbench {
-                                w.save_now(&mut self.core.toasts);
+                                w.save_soon();
                             }
                             self.mode = Mode::Browser;
                         }
@@ -3607,6 +3650,9 @@ impl eframe::App for App {
         self.meta_window.ui(&ctx, &p);
         self.dialogs(&ctx);
         self.guard_dialog(&ctx);
+        if let Some(w) = &mut self.workbench {
+            w.conflict_dialog(&ctx, &mut self.core);
+        }
         // Leaving video mode by any route stops playback.
         if self.mode != Mode::Video && self.video.is_some() {
             self.video = None;
@@ -3784,6 +3830,10 @@ impl App {
         self.core.settings.save_now();
         self.core.tags.save_if_dirty();
         self.core.orders.save_if_dirty();
+        // The project too (blind votes, scorecard edits not saved yet).
+        if let Some(w) = &mut self.workbench {
+            w.save_blocking();
+        }
     }
 }
 

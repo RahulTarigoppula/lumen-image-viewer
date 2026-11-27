@@ -400,8 +400,31 @@ pub fn set_exif_dates(path: &Path, value: NaiveDateTime, tags: DateTags, keep_ti
 
 // ---------------------------------------------------------------- XMP sidecar
 
+/// The XMP sidecar of `path`: `IMG_1.xmp`, as Lightroom names it. A RAW file
+/// keeps that name; a JPEG (or other non-RAW file) beside a RAW file of the
+/// same name gets `IMG_1.jpg.xmp` instead, so the two never share one sidecar
+/// (exporting the JPEG's tags would overwrite the RAW's rating).
 pub fn sidecar_path(path: &Path) -> PathBuf {
-    path.with_extension("xmp")
+    let plain = path.with_extension("xmp");
+    if crate::formats::is_raw_ext(&crate::formats::ext_of(path)) {
+        return plain;
+    }
+    let mut full = path.as_os_str().to_owned();
+    full.push(".xmp");
+    let full = PathBuf::from(full);
+    if full.exists() || has_raw_sibling(path) {
+        full
+    } else {
+        plain
+    }
+}
+
+/// The extensions `formats::is_raw_ext` accepts.
+const RAW_EXTS: [&str; 23] = ["dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef", "srw", "x3f", "3fr", "erf", "kdc", "dcr", "mrw", "mos", "iiq", "rwl"];
+
+/// A RAW file with the same name as `path` in the same folder.
+fn has_raw_sibling(path: &Path) -> bool {
+    path.extension().is_some() && RAW_EXTS.iter().any(|e| path.with_extension(e).is_file())
 }
 
 const LABELS: [&str; 6] = ["", "Red", "Yellow", "Green", "Blue", "Purple"];
@@ -721,6 +744,31 @@ mod tests {
         assert!(s.contains("crs:Exposure2012=\"+0.50\""));
         assert!(s.contains("<xmp:Rating>5</xmp:Rating>"));
         assert_eq!(read_xmp_sidecar(&p), Some(crate::tags::Tag { rating: 5, flagged: false, label: 1 }));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn raw_and_jpeg_pairs_get_their_own_sidecars() {
+        let d = tmpdir("xmppair");
+        let (jpg, raw) = (d.join("IMG_1.jpg"), d.join("IMG_1.CR2"));
+        std::fs::write(&jpg, b"x").unwrap();
+        // Alone, the JPEG uses the usual name.
+        assert_eq!(sidecar_path(&jpg), d.join("IMG_1.xmp"));
+        std::fs::write(&raw, b"x").unwrap();
+        // Beside its RAW file: the RAW keeps IMG_1.xmp (Lightroom), the JPEG gets its own.
+        assert_eq!(sidecar_path(&raw), d.join("IMG_1.xmp"));
+        assert_eq!(sidecar_path(&jpg), d.join("IMG_1.jpg.xmp"));
+        let lr = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"r\"><rdf:Description rdf:about=\"\" xmp:Rating=\"5\"/></rdf:RDF></x:xmpmeta>";
+        std::fs::write(d.join("IMG_1.xmp"), lr).unwrap();
+        let side = export_xmp_sidecar(&jpg, crate::tags::Tag { rating: 1, flagged: false, label: 0 }).unwrap();
+        assert_eq!(side, d.join("IMG_1.jpg.xmp"));
+        assert_eq!(std::fs::read_to_string(d.join("IMG_1.xmp")).unwrap(), lr, "the RAW's rating is untouched");
+        assert_eq!(read_xmp_sidecar(&jpg).map(|t| t.rating), Some(1));
+        assert_eq!(read_xmp_sidecar(&raw).map(|t| t.rating), Some(5));
+        // A JPEG sidecar written earlier is still found once the RAW is gone.
+        std::fs::remove_file(&raw).unwrap();
+        assert_eq!(sidecar_path(&jpg), d.join("IMG_1.jpg.xmp"));
+        assert!(RAW_EXTS.iter().all(|e| crate::formats::is_raw_ext(e)));
         let _ = std::fs::remove_dir_all(&d);
     }
 
