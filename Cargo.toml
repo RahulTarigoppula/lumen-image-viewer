@@ -78,6 +78,9 @@ bytemuck = "1.25.2"
 libwebp-sys = "0.9"
 flate2 = "1"
 zip.workspace = true
+# The main window's handle (Windows share sheet) and WinRT lists of files.
+raw-window-handle = "0.6"
+windows-collections = "0.3"
 
 [dependencies.windows]
 workspace = true
@@ -112,6 +115,8 @@ features = [
     "Storage",
     "Storage_Streams",
     "Foundation",
+    # Share... (the Windows share sheet).
+    "ApplicationModel_DataTransfer",
 ]
 
 [features]

@@ -2247,6 +2247,7 @@ dependencies = [
  "lumen-analysis",
  "lumen-core",
  "parking_lot",
+ "raw-window-handle",
  "rayon",
  "rfd",
  "serde",
@@ -2255,6 +2256,7 @@ dependencies = [
  "trash",
  "webp",
  "windows",
+ "windows-collections",
  "winresource",
  "zip",
 ]
