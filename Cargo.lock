@@ -2257,6 +2257,7 @@ dependencies = [
  "webp",
  "windows",
  "windows-collections",
+ "windows-core",
  "winresource",
  "zip",
 ]

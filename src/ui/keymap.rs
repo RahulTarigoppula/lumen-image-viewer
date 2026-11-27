@@ -132,6 +132,7 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+F2", BatchRename),
             ("Ctrl+Shift+N", NewFolder),
             ("Ctrl+Shift+C", CopyPath),
+            ("Ctrl+X", CutFiles),
             ("Ctrl+C", CopyFiles),
             ("Ctrl+V", PasteFiles),
             ("Ctrl+Z", Undo),

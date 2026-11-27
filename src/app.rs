@@ -266,6 +266,13 @@ pub struct App {
     maximized_before_fullscreen: bool,
     /// The main window's handle (HWND), for the Windows share window.
     hwnd: Option<isize>,
+    /// Files dragged over the window from another program (see `droptarget`).
+    os_drag: Option<crate::droptarget::OsDrag>,
+    /// Files from another program dropped this frame, with where and how.
+    os_drop: Option<crate::droptarget::OsDrag>,
+    /// Where such files would go if dropped now: the folder, and whether it
+    /// is the empty area of the folder shown (for the browser's highlight).
+    os_target: Option<(PathBuf, bool)>,
 }
 
 /// Floating windows that Esc can close, most recently opened first.
@@ -400,6 +407,9 @@ impl App {
             fullscreen_from_viewer: false,
             maximized_before_fullscreen: false,
             hwnd: main_window(cc),
+            os_drag: None,
+            os_drop: None,
+            os_target: None,
         };
         crate::devhook::mark("app_struct");
         crate::ui::keymap::install(&app.core.settings);
@@ -410,6 +420,18 @@ impl App {
             o.quit_shortcuts.clear();
         });
         crate::devhook::mark("keymap");
+        // The main window owns the files Lumen puts on the clipboard, and gets
+        // Lumen's own drop target (move or copy into folders, see droptarget.rs).
+        {
+            use raw_window_handle::HasWindowHandle as _;
+            if let Ok(h) = cc.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
+                    let hwnd = w.hwnd.get();
+                    fileops::set_main_window(hwnd);
+                    crate::droptarget::install(hwnd, &ctx);
+                }
+            }
+        }
         for msg in crate::ui::batch::recover_pending_renames() {
             app.core.toasts.info(msg);
         }
@@ -846,6 +868,20 @@ impl App {
                     self.core.toasts.success(if t.len() == 1 { "Path copied".to_string() } else { format!("{} paths copied", t.len()) });
                 }
             }
+            CutFiles => {
+                let files = self.targets();
+                if files.is_empty() {
+                    return;
+                }
+                match fileops::cut_files_to_clipboard(&files) {
+                    Ok(seq) => {
+                        self.core.toasts.success(format!("{} cut - paste in another folder to move", count(files.len(), "file")));
+                        // Faded in the browser until pasted (or the clipboard changes).
+                        self.browser.set_cut(files, seq);
+                    }
+                    Err(e) => self.core.toasts.error(e.to_string()),
+                }
+            }
             CopyFiles => {
                 if self.mode == Mode::Viewer {
                     self.run(CopyImage);
@@ -865,9 +901,20 @@ impl App {
                     return;
                 }
                 match fileops::paste_files_from_clipboard() {
-                    Ok(files) if !files.is_empty() => {
+                    Ok(clip) if !clip.files.is_empty() => {
                         let dest = self.browser.folder.clone();
-                        self.file_jobs.submit(format!("Pasting {}", count(files.len(), "item")), transfer_job(files, dest, false));
+                        if clip.cut {
+                            // Cut in Explorer or here: move them (those already here stay).
+                            let files = crate::droptarget::movable(&clip.files, &dest);
+                            if files.is_empty() {
+                                self.core.toasts.info("The cut files are already in this folder");
+                            } else {
+                                self.transfer_files(files, dest, true);
+                            }
+                        } else {
+                            // A copy into the files' own folder is named "photo - Copy.jpg".
+                            self.file_jobs.submit(format!("Pasting {}", count(clip.files.len(), "item")), transfer_job(clip.files, dest, false));
+                        }
                     }
                     _ => {
                         // Maybe an image bitmap: save it as a new PNG.
@@ -1641,12 +1688,24 @@ impl App {
         }
     }
 
-    fn report_transfer(&mut self, n: usize, errs: Vec<String>, moved: bool) {
+    /// "Moved 3 files to Holiday (Ctrl+Z to undo)", and the first error.
+    fn report_transfer(&mut self, n: usize, folders: usize, errs: Vec<String>, dest: &Path, moved: bool) {
         if !errs.is_empty() {
             self.core.toasts.error(format!("{} failed: {}", errs.len(), errs.first().cloned().unwrap_or_default()));
         }
         if n > 0 {
-            self.core.toasts.success(format!("{} {}", if moved { "Moved" } else { "Copied" }, count(n, "item")));
+            let what = match (n.saturating_sub(folders), folders) {
+                (files, 0) => count(files, "file"),
+                (0, dirs) => count(dirs, "folder"),
+                _ => count(n, "item"),
+            };
+            let to = dest.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string());
+            let undo = Command::Undo.shortcut();
+            self.core.toasts.success(match (moved, undo.is_empty()) {
+                (true, false) => format!("Moved {what} to {to} ({undo} to undo)"),
+                (true, true) => format!("Moved {what} to {to}"),
+                (false, _) => format!("Copied {what} to {to}"),
+            });
         }
     }
 
@@ -1674,7 +1733,7 @@ impl App {
     /// A background file job finished: update caches, tags, undo and the views.
     fn finish_file_job(&mut self, res: JobResult) {
         match res {
-            JobResult::Transfer { done, errs, dest, do_move } => self.finish_transfer(done, errs, dest, do_move),
+            JobResult::Transfer { done, errs, dest, do_move, folders } => self.finish_transfer(done, errs, dest, do_move, folders),
             JobResult::Rotate { t, lossless, reencoded, skipped, errs } => {
                 for f in lossless.iter().chain(&reencoded) {
                     self.forget_file(&f.path);
@@ -1745,10 +1804,21 @@ impl App {
             });
     }
 
-    fn finish_transfer(&mut self, done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool) {
+    fn finish_transfer(&mut self, done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool, folders: usize) {
         if do_move && !done.is_empty() {
             let label = format!("Move {} to {}", count(done.len(), "item"), dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string()));
             self.push_file_undo(label, done.clone());
+            // Cut files that were pasted (or moved some other way) leave the
+            // clipboard, as in Explorer.
+            if errs.is_empty() {
+                let moved: Vec<PathBuf> = done.iter().map(|(from, _)| from.clone()).collect();
+                fileops::clear_cut_after_move(&moved);
+            }
+        }
+        // Pasted or dropped into the folder shown: select what arrived, as Explorer does.
+        if !done.is_empty() && fileops::same_path(&dest, &self.browser.folder) {
+            self.browser.pending_select = done.first().map(|(_, to)| to.clone());
+            self.browser.pending_selection = Some(done.iter().map(|(_, to)| to.clone()).collect());
         }
         if do_move {
             self.core.tags.moved_many(&done);
@@ -1782,7 +1852,7 @@ impl App {
                 self.viewer.remove_path(&last);
             }
         }
-        self.report_transfer(done.len(), errs, do_move);
+        self.report_transfer(done.len(), folders, errs, &dest, do_move);
         self.browser.tree.invalidate(&dest);
         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
         if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
@@ -3060,7 +3130,7 @@ impl App {
             });
             ui.separator();
             submenu(ui, I::PENCIL_SIMPLE, "Edit", |ui| {
-                for c in [Command::SelectAll, Command::SelectNone, Command::InvertSelection, Command::CopyFiles, Command::PasteFiles, Command::CopyTo, Command::MoveTo, Command::Rename, Command::Delete, Command::NewFolder] {
+                for c in [Command::SelectAll, Command::SelectNone, Command::InvertSelection, Command::CutFiles, Command::CopyFiles, Command::PasteFiles, Command::CopyTo, Command::MoveTo, Command::Rename, Command::Delete, Command::NewFolder] {
                     item(ui, c, &mut fire);
                 }
             });
@@ -3134,13 +3204,55 @@ impl App {
 
     fn handle_dropped(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        // Where and how they were dropped (Lumen's drop target, see droptarget.rs).
+        let how = self.os_drop.take();
         if dropped.is_empty() {
             return;
         }
         if self.mode == Mode::Video {
             return; // video mode handles its own drops
         }
+        // Onto a folder in the browser: copy or move them there, as Explorer
+        // does. The zones are where the folders were in the last frame.
+        if let Some(how) = how.filter(|_| self.mode == Mode::Browser && !self.modal_open()) {
+            let drag = crate::droptarget::OsDrag { files: dropped.clone(), ..how };
+            match crate::droptarget::plan(&self.browser.drop_zones, drag.pos(ctx.pixels_per_point()), &drag) {
+                crate::droptarget::DropPlan::Transfer { files, dest, op, .. } => {
+                    self.transfer_files(files, dest, op == crate::droptarget::DropOp::Move);
+                    return;
+                }
+                crate::droptarget::DropPlan::Nothing => return,
+                crate::droptarget::DropPlan::Open => {}
+            }
+        }
         self.open_paths(dropped);
+    }
+
+    /// While files from another program are dragged over the window: what a
+    /// drop at the pointer would do (the cursor, a "Move to Holiday" badge,
+    /// and the folder the browser highlights in the next frame).
+    fn os_drag_feedback(&mut self, ctx: &egui::Context) {
+        use crate::droptarget::{DropOp, DropPlan};
+        let Some(drag) = self.os_drag.clone() else {
+            self.os_target = None;
+            return;
+        };
+        let pos = drag.pos(ctx.pixels_per_point());
+        let plan = if self.mode == Mode::Browser && !self.modal_open() { crate::droptarget::plan(&self.browser.drop_zones, pos, &drag) } else { DropPlan::Open };
+        crate::droptarget::show_effect(&plan);
+        let target = match &plan {
+            DropPlan::Transfer { dest, background, .. } => Some((dest.clone(), *background)),
+            _ => None,
+        };
+        if target != self.os_target {
+            self.os_target = target;
+            ctx.request_repaint();
+        }
+        if let (Some(pos), DropPlan::Transfer { dest, op, .. }) = (pos, &plan) {
+            let name = dest.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| dest.display().to_string());
+            let verb = if *op == DropOp::Move { "Move" } else { "Copy" };
+            crate::ui::browser::pointer_badge(ctx, pos, &format!("{verb} to {name}"), &self.core.pal);
+        }
     }
 
     /// Open paths handed over by Explorer (a second launch) or dropped on the window:
@@ -3356,6 +3468,17 @@ impl App {
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         raw.events.append(&mut self.dev_input);
+        // Files dragged in from another program arrive through Lumen's own drop
+        // target (droptarget.rs): hand them to egui as winit would.
+        let hover = crate::droptarget::hovering();
+        if hover.is_some() || crate::droptarget::installed() {
+            raw.hovered_files = hover.iter().flat_map(|d| d.files.iter()).map(|p| egui::HoveredFile { path: Some(p.clone()), ..Default::default() }).collect();
+        }
+        if let Some(d) = crate::droptarget::take_dropped() {
+            raw.dropped_files.extend(d.files.iter().map(|p| std::sync::Arc::new(crate::droptarget::DroppedPath(p.clone())) as egui::DroppedFileHandle));
+            self.os_drop = Some(d);
+        }
+        self.os_drag = hover;
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -3472,6 +3595,10 @@ impl eframe::App for App {
         self.dev_actions(&ctx);
         crate::ui::gate_background_tooltips(&ctx);
         self.handle_dropped(&ctx);
+        // Files from another program over the window: the browser notes where
+        // its folders are this frame and highlights the one a drop would go to.
+        self.browser.drop_zones.clear();
+        self.browser.os_drop = self.os_drag.as_ref().and_then(|d| d.pos(ctx.pixels_per_point())).map(|pos| crate::droptarget::Hover { pos, target: self.os_target.clone() });
         self.clipboard_keys(&ctx);
         self.shortcuts(&ctx);
         self.browser.suppress_keys = self.modal_open() || self.tool_window_active;
@@ -3565,7 +3692,8 @@ impl eframe::App for App {
                         BrowserEvent::Open(i) => self.open_viewer_at(i),
                         BrowserEvent::Command(c) => self.run(c),
                         BrowserEvent::DropFiles { target, files, copy } => {
-                            let files: Vec<PathBuf> = files.into_iter().filter(|f| f != &target && !target.starts_with(f)).collect();
+                            // Files already in the folder stay where they are.
+                            let files = crate::droptarget::movable(&files, &target);
                             if !files.is_empty() {
                                 self.transfer_files(files, target, !copy);
                             }
@@ -3761,6 +3889,7 @@ impl eframe::App for App {
                 }
             }
         }
+        self.os_drag_feedback(&ctx);
 
         let t_overlay = Instant::now();
         analysis_actions.extend(self.analysis.overlay(ui, &mut self.core, subject.as_ref()));
@@ -3895,6 +4024,16 @@ impl App {
                 crate::devhook::DevAction::Ppp(s) => {
                     // Same effect on layout and textures as a display with another scale.
                     ctx.set_zoom_factor(s * self.core.settings.ui_scale.clamp(0.6, 2.5));
+                    ctx.request_repaint();
+                }
+                crate::devhook::DevAction::OsDrag { pos, ctrl, shift, files } => {
+                    let ppp = ctx.pixels_per_point();
+                    let allowed = fileops::EFFECT_COPY | fileops::EFFECT_MOVE | fileops::EFFECT_LINK;
+                    crate::droptarget::simulate(Some(crate::droptarget::OsDrag { files, px: Some((pos.x * ppp, pos.y * ppp)), ctrl, shift, allowed }), false);
+                    ctx.request_repaint();
+                }
+                crate::devhook::DevAction::OsDrop(drop) => {
+                    crate::droptarget::simulate(None, drop);
                     ctx.request_repaint();
                 }
                 crate::devhook::DevAction::Open(p) => {
@@ -4036,7 +4175,8 @@ struct JobStatus {
 
 /// What a finished background file job hands back to the UI thread.
 enum JobResult {
-    Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool },
+    /// `folders`: how many of `done` are folders (for the message).
+    Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool, folders: usize },
     /// Changed files with their previous bytes for undo (`None` once the
     /// budget for keeping them is used up).
     Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String> },
@@ -4143,7 +4283,8 @@ fn transfer_job(files: Vec<PathBuf>, dest: PathBuf, do_move: bool) -> FileJob {
             done.extend(d);
             errs.extend(e);
         }
-        JobResult::Transfer { done, errs, dest, do_move }
+        let folders = done.iter().filter(|(_, to)| to.is_dir()).count();
+        JobResult::Transfer { done, errs, dest, do_move, folders }
     })
 }
 

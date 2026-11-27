@@ -1,0 +1,69 @@
+# Explorer-style cut / paste between folders, and files dropped from another program.
+# Cut the first two pictures with Ctrl+X: they look faded until pasted.
+open {media}\Explorer\Source
+wait 3000
+click 370 150
+key Shift+Right
+wait 300
+key Ctrl+X
+wait 1000
+shot cut.png
+run ToggleDetails
+wait 1500
+shot cut_details.png
+run ToggleDetails
+wait 800
+# Ctrl+V in another folder moves them there (and selects them).
+open {media}\Explorer\Target
+wait 2000
+key Ctrl+V
+wait 1500
+shot pasted.png
+# Ctrl+Z puts them back.
+run Undo
+wait 2500
+open {media}\Explorer\Source
+wait 2500
+shot undone.png
+# Copy and paste in the same folder: the copy is named "gradient_16x9 - Copy.png".
+click 370 150
+key Ctrl+C
+wait 500
+key Ctrl+V
+wait 3000
+shot copy_named.png
+# A file dragged in from another program and held over the Target folder tile:
+# the tile lights up and a badge says "Move to Target"; the drop moves it there.
+open {media}\Explorer
+wait 3000
+osdrag 770 150 none {media}\Explorer\Outside\dropped.png
+wait 1000
+shot drop_hover.png
+osdrop
+wait 1500
+shot dropped.png
+# With Ctrl over the empty area: a copy into the folder shown.
+osdrag 900 500 ctrl {media}\Explorer\Target\dropped.png
+wait 1000
+shot drop_ctrl_hover.png
+osdrop
+wait 1500
+shot drop_ctrl.png
+# Held over a row of the folder tree with Shift: "Move to Source"; then taken away.
+osdrag 150 365 shift {media}\Explorer\Target\dropped.png
+wait 1000
+shot drop_tree_hover.png
+osleave
+wait 500
+# Over a folder row of the details list with Ctrl: "Copy to Source".
+run ToggleDetails
+wait 1500
+osdrag 400 119 ctrl {media}\Explorer\Target\dropped.png
+wait 1000
+shot drop_details_hover.png
+osleave
+run ToggleDetails
+wait 800
+open {media}\Explorer\Target
+wait 2500
+shot target_after.png

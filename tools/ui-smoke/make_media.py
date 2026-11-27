@@ -11,6 +11,7 @@ Layout (like a camera test project):
     Compare2/                                      scene_01 from X and Y (select all, compare)
     Compare3/                                      scene_01 from X, Y and Z
     Undo/scene_01.jpg ... scene_03.jpg             copies of DeviceX (delete and undo)
+    Explorer/Source/, Target/, Outside/            cut / paste and drops (three Flat pictures, an empty folder, one file)
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
@@ -242,6 +243,17 @@ def make_flat(out):
     ic.save(os.path.join(flat, "icon_alpha.png"))
 
 
+def make_explorer(out):
+    """Folders for cut / paste between folders and drops from another program."""
+    base = os.path.join(out, "Explorer")
+    for d in ("Source", "Target", "Outside"):
+        os.makedirs(os.path.join(base, d), exist_ok=True)
+    flat = os.path.join(out, "Flat")
+    for name in ("gradient_16x9.png", "noise_iso6400.jpg", "portrait_tall.jpg"):
+        shutil.copyfile(os.path.join(flat, name), os.path.join(base, "Source", name))
+    shutil.copyfile(os.path.join(flat, "text_card.png"), os.path.join(base, "Outside", "dropped.png"))
+
+
 def find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -290,6 +302,7 @@ def main():
     os.makedirs(out)
     make_photos(out)
     make_flat(out)
+    make_explorer(out)
     videos = False if "--no-video" in sys.argv else make_videos(out)
     count = sum(len(f) for _, _, f in os.walk(out))
     print(f"make_media: {count} files in {out} (videos: {'yes' if videos else 'no'})")
