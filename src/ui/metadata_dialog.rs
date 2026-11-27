@@ -359,7 +359,7 @@ impl MetadataDialog {
     }
 
     fn sidecar_ui(&mut self, ui: &mut Ui, p: &Palette, core: &mut Core) {
-        ui.label("Writes the Lumen rating, color label and flag to an XMP sidecar (name.xmp) next to each file, so Lightroom, Bridge and darktable can read them. Existing sidecars are updated in place; files without a rating, label or flag are skipped so existing ratings are not cleared.");
+        ui.label("Writes the Lumen rating, color label and flag to an XMP sidecar (name.xmp, or name.jpg.xmp for a JPEG beside a RAW file of the same name) next to each file, so Lightroom, Bridge and darktable can read them. Existing sidecars are updated in place; files without a rating, label or flag are skipped so existing ratings are not cleared.");
         ui.add_space(4.0);
         let tagged = self.paths.iter().filter(|path| !core.tags.get(path).is_empty()).count();
         ui.label(RichText::new(format!("{tagged} of {} file(s) have a rating, label or flag.", self.paths.len())).color(p.muted));

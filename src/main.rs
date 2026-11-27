@@ -26,8 +26,9 @@ fn main() -> eframe::Result {
     #[cfg(feature = "video")]
     lumen_core::video::set_thumbnailer(video::engine::thumbnail);
     logging::init();
-    // Rayon runs decoders, resizing and histograms: below the UI thread.
-    let _ = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("lumen-rayon-{i}")).start_handler(|_| bg::background_priority()).build_global();
+    // Rayon runs decoders, resizing and histograms: below the UI thread. A
+    // panic in a spawned job is logged; without a handler rayon aborts the app.
+    let _ = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("lumen-rayon-{i}")).start_handler(|_| bg::background_priority()).panic_handler(bg::rayon_panic).build_global();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial: Option<PathBuf> = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);

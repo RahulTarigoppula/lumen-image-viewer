@@ -555,27 +555,35 @@ pub fn recover_all_journals(dir: &Path) -> Vec<String> {
     journals.into_iter().filter(|(_, j)| !active.contains(j)).flat_map(|(_, j)| recover_journal(&j)).collect()
 }
 
+/// Write the journal durably (flushed to disk before it replaces anything):
+/// after a power cut it is complete, never empty, while files already carry
+/// their temporary names.
 pub fn write_journal(path: &Path, plan: &[RenameStep]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let json = serde_json::to_vec_pretty(plan).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    lumen_core::encode::write_atomic(path, &json).map_err(|e| std::io::Error::other(format!("{e:#}")))
 }
 
 /// Repair an interrupted rename from its journal: every file still carrying
 /// a temporary name gets its final name (when free) or its original name back.
 /// Returns human-readable messages (empty when there was nothing to do); the
-/// journal is deleted once no temporary file is left.
+/// journal is deleted once no temporary file is left. An unreadable journal
+/// is kept (renamed so it is not tried again), never deleted: it may be the
+/// only record of which file had which name.
 pub fn recover_journal(path: &Path) -> Vec<String> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let plan: Vec<RenameStep> = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
         Err(e) => {
-            let _ = std::fs::remove_file(path);
-            return vec![format!("The rename journal was unreadable and was removed: {e}")];
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let aside = path.with_file_name(format!("{name}.broken"));
+            let kept = match std::fs::rename(path, &aside) {
+                Ok(()) => format!("it was kept as {}", aside.display()),
+                Err(_) => format!("it is still at {}", path.display()),
+            };
+            return vec![format!("An interrupted batch rename could not be finished: its journal is unreadable ({e}); {kept}. Files named lumen-rename-... may need their names back by hand.")];
         }
     };
     let mut msgs = Vec::new();
@@ -756,6 +764,20 @@ mod journal_tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"A");
         assert!(!journal.exists());
         assert!(recover_journal(&journal).is_empty());
+        // An unreadable journal (empty after a power cut) is kept, not deleted,
+        // and not tried again.
+        std::fs::write(&journal, b"").unwrap();
+        let msgs = recover_journal(&journal);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(!journal.exists());
+        assert!(dir.join("journal.json.broken").exists());
+        assert!(!is_journal_name("rename-journal-x.json.broken"));
+        // The journal is written durably, with no temp file left.
+        write_journal(&journal, &plan).unwrap();
+        let back: Vec<RenameStep> = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(back.len(), plan.len());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("tmp")));
+        std::fs::remove_file(&journal).unwrap();
         // A complete journaled run leaves no journal behind.
         let plan = plan_two_phase(&[(a.clone(), dir.join("c.jpg"))], "u");
         let out = execute_plan_journaled(&plan, Some(&journal), |_| {});

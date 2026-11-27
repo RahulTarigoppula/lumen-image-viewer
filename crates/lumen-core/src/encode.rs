@@ -318,7 +318,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(".{name}.{}-{n}.lumen-tmp", std::process::id()));
+    let tmp = path.with_file_name(format!(".{}.{}-{n}.lumen-tmp", temp_stem(&name), std::process::id()));
     let written = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
@@ -351,11 +351,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// The file name part of a temp file for `name`: the name itself when short,
+/// else its start and a hash, so the temp name stays well inside the 255
+/// characters a name can have.
+fn temp_stem(name: &str) -> String {
+    if name.chars().count() <= 64 {
+        return name.to_string();
+    }
+    // FNV-1a: stable, no dependencies.
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    format!("{}~{h:016x}", name.chars().take(40).collect::<String>())
+}
+
 #[cfg(windows)]
 fn replace_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
-    let (src, dst) = (HSTRING::from(tmp.as_os_str()), HSTRING::from(path.as_os_str()));
+    // Paths of 248+ characters need the \\?\ form for these calls (std's
+    // own file functions add it themselves).
+    let long = crate::decode::wic::long_path;
+    let (src, dst) = (HSTRING::from(long(tmp).as_os_str()), HSTRING::from(long(path).as_os_str()));
     if path.exists() {
         // SAFETY: both strings are valid NUL-terminated wide paths for the call's duration.
         let r = unsafe { ReplaceFileW(&dst, &src, PCWSTR::null(), REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, None, None) };
@@ -592,6 +607,31 @@ mod tests {
         assert!(names.iter().all(|n| !n.ends_with(".lumen-tmp")), "{names:?}");
         // A failed write (target folder missing) leaves nothing behind.
         assert!(write_atomic(&d.join("missing").join("b.bin"), b"x").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_atomic_handles_long_names_and_paths() {
+        let d = temp_dir("long");
+        // A 240-character name: the temp name must not pass 255.
+        let long_name = format!("{}.jpg", "n".repeat(236));
+        let p = d.join(&long_name);
+        write_atomic(&p, b"one").unwrap();
+        write_atomic(&p, b"two").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert!(temp_stem(&long_name).len() < 64);
+        assert_eq!(temp_stem("a.jpg"), "a.jpg");
+        // A full path over 260 characters (new file, then a replace).
+        let mut deep = d.clone();
+        while deep.as_os_str().len() < 300 {
+            deep.push("a-folder-with-a-rather-long-name");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let q = deep.join("image.png");
+        write_atomic(&q, b"one").unwrap();
+        write_atomic(&q, b"second").unwrap();
+        assert_eq!(std::fs::read(&q).unwrap(), b"second");
+        assert_eq!(std::fs::read_dir(&deep).unwrap().count(), 1, "no temp file left");
         let _ = std::fs::remove_dir_all(&d);
     }
 

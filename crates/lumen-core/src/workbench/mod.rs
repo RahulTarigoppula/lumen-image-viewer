@@ -8,6 +8,7 @@
 
 pub mod detect;
 pub mod measure;
+pub mod merge;
 pub mod rank;
 
 use anyhow::{Context, Result};
