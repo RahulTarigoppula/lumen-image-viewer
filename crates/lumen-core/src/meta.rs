@@ -201,7 +201,6 @@ struct RangeReader<'a, R> {
 
 impl<R: std::io::Read + std::io::Seek> RangeReader<'_, R> {
     fn read(&mut self, at: u64, len: usize) -> Option<Vec<u8>> {
-        use std::io::{Read, Seek};
         let end = at.checked_add(len as u64)?;
         if end <= self.head.len() as u64 {
             return Some(self.head[at as usize..end as usize].to_vec());

@@ -37,6 +37,7 @@ pub fn merge(base: &Project, mine: &Project, theirs: &Project) -> Option<Project
         votes: merge_votes(&base.votes, &mine.votes, &theirs.votes)?,
         detected_by: pick(&base.detected_by, &mine.detected_by, &theirs.detected_by)?,
         previous: pick(&base.previous, &mine.previous, &theirs.previous)?,
+        branding: pick(&base.branding, &mine.branding, &theirs.branding)?,
     };
     // A scale or attribute change on one side and new scores on the other.
     p.normalize();
