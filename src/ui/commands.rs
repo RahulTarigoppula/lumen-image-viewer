@@ -154,6 +154,8 @@ pub enum Command {
     MoveLater,
     /// The round report of the open project (title, branding, format).
     RoundReport,
+    /// Company name, logo, accent color and footer of every report (the defaults).
+    ReportBranding,
     // Compare (keys in the Compare and Blind test modes of the keymap)
     PanLeft,
     PanRight,
@@ -320,6 +322,7 @@ impl Command {
             MoveEarlier => "Move earlier (custom order)".into(),
             MoveLater => "Move later (custom order)".into(),
             RoundReport => "Round report (project)...".into(),
+            ReportBranding => "Report branding...".into(),
             PanLeft => "Pan left".into(),
             PanRight => "Pan right".into(),
             PanUp => "Pan up".into(),
@@ -479,6 +482,7 @@ impl Command {
             MoveEarlier => I::ARROW_LEFT,
             MoveLater => I::ARROW_RIGHT,
             RoundReport => I::PRESENTATION_CHART,
+            ReportBranding => I::PAINT_BRUSH,
             PanLeft => I::ARROW_LEFT,
             PanRight => I::ARROW_RIGHT,
             PanUp => I::ARROW_UP,
@@ -533,7 +537,7 @@ impl Command {
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
             CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater,
-            RoundReport,
+            RoundReport, ReportBranding,
         ]);
         // Compare's own commands (the palette offers them only in Compare).
         v.extend(Self::COMPARE);
@@ -577,7 +581,7 @@ impl Command {
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
         v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater]);
-        v.push(RoundReport);
+        v.extend([RoundReport, ReportBranding]);
         v.extend(Self::COMPARE);
         #[cfg(feature = "ai")]
         v.push(RunAi);

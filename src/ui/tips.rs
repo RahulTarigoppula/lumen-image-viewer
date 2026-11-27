@@ -106,6 +106,7 @@ pub fn describe(c: Command) -> &'static str {
         MoveLater => "Arrange the folder by hand: the selected files move one place later",
         CycleInspect => "Cycle clipping warnings, false color, focus peaking and single channels",
         RoundReport => "One report for the whole project, with your company's branding: PowerPoint, PDF or web page",
+        ReportBranding => "Company or team name, logo, accent color and footer line of every report",
         AlignToA => "Warp B-D onto A so phones with different lenses and crops line up pixel for pixel",
         LineProfile => "Drag a line across an edge: brightness along it in every pane, and the edge width",
         JumpDivider => "In Split view, move the divider all the way to one side and back",

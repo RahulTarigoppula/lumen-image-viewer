@@ -5,17 +5,18 @@ open {media}\Compare2
 wait 2500
 run Settings
 wait 1500
+# Keyboard page, Compare tab.
 click 284 256
 wait 1000
-shot keyboard.png
-click 680 364
+click 709 382
 wait 800
 shot compare_tab.png
-click 560 398
+# Search "swap", click its key (X) and press Y.
+click 566 412
 type swap
 wait 800
 shot search_swap.png
-click 740 461
+click 725 474
 wait 500
 key Y
 wait 800

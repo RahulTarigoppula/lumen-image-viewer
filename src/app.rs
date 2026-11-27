@@ -188,6 +188,8 @@ pub struct App {
     show_settings: bool,
     show_help: bool,
     show_about: bool,
+    /// The default report branding, opened from the command palette.
+    report_branding: Option<crate::ui::branding::BrandingDialog>,
     fullscreen: bool,
     viewer_from_browser: bool,
     last_save: Instant,
@@ -342,6 +344,7 @@ impl App {
             show_settings: false,
             show_help: false,
             show_about: false,
+            report_branding: None,
             fullscreen: false,
             viewer_from_browser: false,
             last_save: Instant::now(),
@@ -687,6 +690,7 @@ impl App {
                     self.mode = Mode::Workbench;
                 }
             }
+            ReportBranding => self.report_branding = Some(Default::default()),
             // Compare's own commands land here only outside Compare.
             PanLeft | PanRight | PanUp | PanDown | ViewSideBySide | ViewSplit | ViewDifference | JumpDivider | ToggleLink | SwapAB | AlignToA | ToggleCameraInfo | LineProfile | ToggleMarkup | ToggleReview | ExportReport | KeepOnly | NextScene
             | PrevScene | ToggleScorecard | CompareHelp | VoteLeft | VoteRight | VoteSame => self.core.toasts.info("This works in Compare: select two to four images, then Compare"),
@@ -2139,6 +2143,7 @@ impl App {
             || self.viewer.confirm_discard
             || self.pending_guard.is_some()
             || self.gps_confirm.is_some()
+            || self.report_branding.is_some()
             || self.analysis.modal_open(&self.core)
     }
 
@@ -3626,6 +3631,15 @@ impl eframe::App for App {
         self.meta_window.ui(&ctx, &p);
         self.dialogs(&ctx);
         self.guard_dialog(&ctx);
+        if let Some(d) = &mut self.report_branding {
+            let out = d.show(&ctx, &p, crate::ui::branding::Target::Defaults(&mut self.core.settings.report_branding));
+            if let Some(e) = out.error {
+                self.core.toasts.error(e);
+            }
+            if !out.open {
+                self.report_branding = None;
+            }
+        }
         // Leaving video mode by any route stops playback.
         if self.mode != Mode::Video && self.video.is_some() {
             self.video = None;

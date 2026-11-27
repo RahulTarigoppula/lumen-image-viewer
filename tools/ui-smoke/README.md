@@ -36,7 +36,8 @@ The job summary on the run page has a table of scenarios and problems.
    framed, colored, blurred and noised differently per device, with EXIF make,
    model, ISO and exposure), a `Flat/` folder (gradient PNG, noise JPEG, text
    card, tall portrait, icon with alpha), `Compare2/` and `Compare3/` (two and
-   three versions of scene 01, for "select all, compare") and `Video/` with two
+   three versions of scene 01, for "select all, compare"), `Brand/acme_logo.png`
+   (a wide logo with transparency, for report branding) and `Video/` with two
    4 s clips when an ffmpeg binary is found (PATH, or the `imageio-ffmpeg` pip
    package that CI installs).
 3. `run.ps1` copies `lumen.exe` and the Mesa DLLs into a temporary folder with
@@ -66,6 +67,7 @@ key Ctrl+Q            # any shortcut the keymap parser accepts
 click 640 400         # window point in points; `click x y right` for the right button
 drag 300 300 420 400
 type compare
+dialog {media}\Brand\acme_logo.png  # the next file dialog (logo, round report) returns this path
 ppp 1.5               # pretend the window moved to a 150% display
 size 800 600
 shot info.png         # saved as shots/NN-name__info.png

@@ -31,28 +31,32 @@ shot blind_next.png
 key Escape
 wait 2000
 shot after_blind.png
+# The round report dialog; Branding, Edit... opens the branding dialog with
+# the company field focused.
 run RoundReport
 wait 1000
 shot report_dialog.png
-click 803 565
+click 831 592
 wait 1000
 shot branding_open.png
 type Acme Camera Lab
-click 640 400
+click 640 393
 type Confidential
 dialog {media}\Brand\acme_logo.png
-click 610 468
+click 593 472
 wait 1500
-click 572 540
+# The red accent swatch.
+click 552 548
 wait 800
 shot branding.png
-click 820 602
+# Done, then PDF, then Export...
+click 826 613
 wait 1000
-shot report_branded.png
-click 470 420
+click 408 447
 wait 500
+shot report_branded.png
 dialog {media}\round-report.pdf
-click 820 640
+click 835 643
 wait 25000
 shot exported.png
 open {media}\round-report.pdf

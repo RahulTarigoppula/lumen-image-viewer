@@ -101,7 +101,10 @@ pub fn summary_row(ui: &mut Ui, p: &Palette, b: &Branding, whose: &str, editable
         ui.painter().rect_filled(dot, CornerRadius::same(3), Color32::from_rgb(c[0], c[1], c[2]));
         let button_w = if editable { 96.0 } else { 0.0 };
         let w = (ui.available_width() - button_w).max(60.0);
-        ui.add_sized([w, 20.0], egui::Label::new(RichText::new(format!("{}  ({whose})", b.summary())).color(p.text)).truncate());
+        ui.allocate_ui_with_layout(Vec2::new(w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_width(w);
+            ui.add(egui::Label::new(RichText::new(format!("{}  ({whose})", b.summary())).color(p.text)).truncate());
+        });
         if editable {
             clicked = widgets::secondary_button(ui, &format!("{}  Edit...", I::PAINT_BRUSH)).on_hover_text("Company or team name, logo, accent color and footer line of the report").clicked();
         }
