@@ -216,6 +216,8 @@ pub struct App {
     file_undo: Vec<FileUndo>,
     /// The running slideshow was started from the viewer (return there when it ends).
     slideshow_from_viewer: bool,
+    /// Video mode was opened from the viewer's video (return there when it closes).
+    video_from_viewer: bool,
     /// Frames started so far, up to 2 (startup milestones).
     startup_frames: u8,
     /// When the previous frame started (dev hook `bench`: frame intervals).
@@ -359,6 +361,7 @@ impl App {
             tool_window_active: false,
             file_undo: Vec::new(),
             slideshow_from_viewer: false,
+            video_from_viewer: false,
             startup_frames: 0,
             last_frame_start: None,
             dev_input: Vec::new(),
@@ -419,8 +422,9 @@ impl App {
     /// Open a single file: show its folder in the browser and the file in the viewer.
     /// Asks first when the viewer holds unsaved edits of another image.
     pub fn open_file(&mut self, path: &Path) {
-        let is_video = crate::video::is_video_ext(&crate::formats::ext_of(path));
-        if !is_video && self.viewer.has_unsaved_work() {
+        // A video that opens in video mode leaves the viewer (and its edits) as they are.
+        let to_video_mode = crate::video::is_video_path(path) && self.core.settings.video.open_in_video_mode;
+        if !to_video_mode && self.viewer.has_unsaved_work() {
             if self.viewer.current().map(|c| c == path).unwrap_or(false) {
                 self.mode = Mode::Viewer;
             } else {
@@ -432,10 +436,8 @@ impl App {
     }
 
     fn open_file_now(&mut self, path: &Path) {
-        let ext = crate::formats::ext_of(path);
-        if crate::video::is_video_ext(&ext) {
-            self.video = Some(crate::video::VideoMode::new(vec![path.to_path_buf()], &self.core));
-            self.mode = Mode::Video;
+        if crate::video::is_video_path(path) && self.core.settings.video.open_in_video_mode {
+            self.open_video_mode(vec![path.to_path_buf()]);
             if let Some(parent) = path.parent() {
                 self.browser.pending_select = Some(path.to_path_buf());
                 self.browser.load(parent.to_path_buf(), &self.core.ctx, self.core.settings.show_hidden_files);
@@ -459,13 +461,14 @@ impl App {
         let Some(entry) = self.browser.item(item).cloned() else { return };
         match entry.kind {
             EntryKind::Folder => self.navigate(entry.path),
-            EntryKind::Video => {
-                let vids: Vec<PathBuf> = self.browser.selected_paths().into_iter().filter(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))).collect();
-                let list = if vids.len() >= 2 && vids.contains(&entry.path) { vids } else { vec![entry.path.clone()] };
-                self.video = Some(crate::video::VideoMode::new(list, &self.core));
-                self.mode = Mode::Video;
+            // Several videos selected: they open together in video mode to compare.
+            EntryKind::Video if self.core.settings.video.open_in_video_mode || self.selected_videos_with(&entry.path).len() >= 2 => {
+                let vids = self.selected_videos_with(&entry.path);
+                let list = if vids.len() >= 2 { vids } else { vec![entry.path.clone()] };
+                self.open_video_mode(list);
             }
-            EntryKind::Image => {
+            // One video plays in the viewer, between the folder's images.
+            EntryKind::Image | EntryKind::Video => {
                 if self.viewer.has_unsaved_work() {
                     if self.viewer.current() == Some(&entry.path) {
                         self.mode = Mode::Viewer;
@@ -474,7 +477,7 @@ impl App {
                     }
                     return;
                 }
-                let list = self.browser.image_paths();
+                let list = self.browser.media_paths();
                 let idx = list.iter().position(|p| p == &entry.path).unwrap_or(0);
                 self.viewer.open(list, idx, self.core.settings.fit_mode);
                 self.viewer_from_browser = true;
@@ -484,6 +487,26 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The selected videos, when `path` is one of them (else none).
+    fn selected_videos_with(&self, path: &Path) -> Vec<PathBuf> {
+        let vids: Vec<PathBuf> = self.browser.selected_paths().into_iter().filter(|p| crate::video::is_video_path(p)).collect();
+        if vids.iter().any(|p| p == path) {
+            vids
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Show `paths` in video mode (frame by frame, analysis, comparison).
+    /// Opened from the viewer, leaving video mode goes back there.
+    fn open_video_mode(&mut self, paths: Vec<PathBuf>) {
+        self.video_from_viewer = self.mode == Mode::Viewer;
+        // The viewer's video stops first: one decoder and one sound at a time.
+        self.viewer.stop_video();
+        self.video = Some(crate::video::VideoMode::new(paths, &self.core));
+        self.mode = Mode::Video;
     }
 
     fn close_viewer(&mut self) {
@@ -532,7 +555,8 @@ impl App {
         if cur.parent() != Some(self.browser.folder.as_path()) {
             return;
         }
-        let list = self.browser.image_paths();
+        // Videos play in the viewer too, in the folder's order.
+        let list = self.browser.media_paths();
         if list != self.viewer.list && !list.is_empty() {
             if let Some(i) = list.iter().position(|p| p == &cur) {
                 self.viewer.list = list;
@@ -566,6 +590,10 @@ impl App {
                     return;
                 }
             }
+        }
+        // ... and to the viewer's video when one plays there.
+        if self.mode == Mode::Viewer && self.viewer.video_command(cmd, &mut self.core.settings.video) {
+            return;
         }
         let fit = self.core.settings.fit_mode;
         let wrap = self.core.settings.loop_navigation;
@@ -888,18 +916,19 @@ impl App {
                 let (list, start) = if self.mode == Mode::Viewer {
                     (self.viewer.list.clone(), self.viewer.index)
                 } else {
+                    // Images and videos (videos play, then the show moves on).
                     let sel = self.browser.selected_paths();
-                    let images: Vec<PathBuf> = sel.into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
-                    if images.len() >= 2 {
-                        (images, 0)
+                    let media: Vec<PathBuf> = sel.into_iter().filter(|p| crate::formats::is_image_path(p) || crate::video::is_video_path(p)).collect();
+                    if media.len() >= 2 {
+                        (media, 0)
                     } else {
-                        let all = self.browser.image_paths();
+                        let all = self.browser.media_paths();
                         let start = self.browser.focused_path().and_then(|f| all.iter().position(|p| p == &f)).unwrap_or(0);
                         (all, start)
                     }
                 };
                 if list.is_empty() {
-                    self.core.toasts.info("No images to show");
+                    self.core.toasts.info("No images or videos to show");
                     return;
                 }
                 self.slideshow_from_viewer = self.mode == Mode::Viewer;
@@ -909,19 +938,32 @@ impl App {
             }
             Compare => {
                 let sel: Vec<PathBuf> = self.browser.selected_paths().into_iter().filter(|p| !p.is_dir()).collect();
-                let vids = sel.iter().filter(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))).count();
+                let vids = sel.iter().filter(|p| crate::video::is_video_path(p)).count();
                 if vids >= 2 {
-                    self.video = Some(crate::video::VideoMode::new(sel, &self.core));
-                    self.mode = Mode::Video;
+                    self.open_video_mode(sel);
                     return;
                 }
                 let imgs: Vec<PathBuf> = sel.into_iter().filter(|p| crate::formats::is_image_path(p)).collect();
+                // In the viewer: the image on screen and the next one (videos are passed over).
+                let next_image = |from: usize, step: isize| {
+                    let list = &self.viewer.list;
+                    let mut i = from as isize + step;
+                    while i >= 0 && (i as usize) < list.len() {
+                        if crate::formats::is_image_path(&list[i as usize]) {
+                            return Some(i as usize);
+                        }
+                        i += step;
+                    }
+                    None
+                };
+                let cur = self.viewer.index;
+                let pair = (self.viewer.current().is_some_and(|p| crate::formats::is_image_path(p)))
+                    .then(|| next_image(cur, 1).or_else(|| next_image(cur, -1)))
+                    .flatten();
                 let imgs = if imgs.len() >= 2 {
                     imgs
-                } else if self.mode == Mode::Viewer && self.viewer.list.len() >= 2 {
-                    let i = self.viewer.index;
-                    let j = if i + 1 < self.viewer.list.len() { i + 1 } else { i - 1 };
-                    vec![self.viewer.list[i].clone(), self.viewer.list[j].clone()]
+                } else if let (Mode::Viewer, Some(j)) = (self.mode, pair) {
+                    vec![self.viewer.list[cur].clone(), self.viewer.list[j].clone()]
                 } else {
                     self.core.toasts.info("Select 2-4 images (or 2 videos) to compare");
                     return;
@@ -974,9 +1016,12 @@ impl App {
                 self.browser.mark_resort();
             }
             OpenVideoMode => {
-                let vids: Vec<PathBuf> = self.browser.selected_paths().into_iter().filter(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))).collect();
-                self.video = Some(crate::video::VideoMode::new(vids, &self.core));
-                self.mode = Mode::Video;
+                // The viewer's video goes on in video mode; else the selected videos.
+                let vids: Vec<PathBuf> = match self.viewer.current() {
+                    Some(p) if self.mode == Mode::Viewer && crate::video::is_video_path(p) => vec![p.clone()],
+                    _ => self.browser.selected_paths().into_iter().filter(|p| crate::video::is_video_path(p)).collect(),
+                };
+                self.open_video_mode(vids);
             }
             OpenViewer => {
                 if let Some(f) = self.browser.focus {
@@ -1212,6 +1257,13 @@ impl App {
             PlayPause => self.viewer.toggle_animation(),
             NextFrame => self.viewer.step_frame(&self.core, 1),
             PrevFrame => self.viewer.step_frame(&self.core, -1),
+            // Without a video on screen (a video takes these above).
+            SeekBack | SeekForward => {}
+            ToggleMute => {
+                let v = &mut self.core.settings.video;
+                v.muted = !v.muted;
+                self.core.toasts.info(if v.muted { "Video sound off" } else { "Video sound on" });
+            }
             OpenWithEditor | OpenWithEditorN(_) => {
                 let n = if let OpenWithEditorN(n) = cmd { n.max(1) as usize } else { 1 };
                 if let Some(p) = self.targets().first() {
@@ -1254,14 +1306,26 @@ impl App {
                 // In the browser: open the focused image or video, with the panel.
                 let from_browser = self.mode == Mode::Browser;
                 if let Some(i) = self.browser.focus.filter(|&i| from_browser && self.browser.item(i).is_some_and(|e| e.kind != EntryKind::Folder)) {
-                    self.open_viewer_at(i);
+                    match self.browser.item(i).filter(|e| e.kind == EntryKind::Video).map(|e| e.path.clone()) {
+                        // A video is analyzed in video mode (frame metrics, timing).
+                        Some(p) => {
+                            let vids = self.selected_videos_with(&p);
+                            self.open_video_mode(if vids.len() >= 2 { vids } else { vec![p] });
+                        }
+                        None => self.open_viewer_at(i),
+                    }
+                }
+                // The viewer's video is analyzed in video mode too.
+                let viewer_video = self.mode == Mode::Viewer && self.viewer.showing_video();
+                if let Some(p) = self.viewer.current().cloned().filter(|_| viewer_video) {
+                    self.open_video_mode(vec![p]);
                 }
                 if !matches!(self.mode, Mode::Viewer | Mode::Compare | Mode::Video) {
                     self.core.toasts.info(if from_browser { "Select an image or a video to analyze" } else { "The analysis panel works on an open image, a comparison or a video" });
                     return;
                 }
                 match cmd {
-                    ToggleAnalysis if from_browser => self.analysis.open = true,
+                    ToggleAnalysis if from_browser || viewer_video => self.analysis.open = true,
                     ToggleAnalysis => self.analysis.toggle(),
                     RunMetrics => self.analysis.request_metrics_run(),
                     _ => self.analysis.request_ai_run(),
@@ -1350,6 +1414,10 @@ impl App {
     /// Tell the user why the viewer has no image to work on: it is still
     /// loading, or the file could not be opened (and why).
     fn image_unavailable(&mut self) {
+        if self.mode == Mode::Viewer && self.viewer.showing_video() {
+            self.core.toasts.info("This works on images, not on videos");
+            return;
+        }
         let failed = self.viewer.current().and_then(|p| match self.core.loader.state(p) {
             Some(crate::loader::LoadState::Failed(e)) => Some(format!("Could not open {}: {e}", crate::ui::viewer::file_name(p))),
             _ => None,
@@ -2872,6 +2940,7 @@ impl App {
                         ("Drag", "Pan a zoomed image"),
                         ("Press & hold", "Magnifier loupe (when the image fits the window)"),
                         ("Middle click", "Toggle fit / 100%"),
+                        ("Click a video", "Play / pause it (drag on its bar to seek)"),
                         ("Double click", "Back to the browser"),
                         ("Back / forward buttons", "Previous / next image"),
                     ] {
@@ -3007,26 +3076,28 @@ impl App {
             }
             return;
         }
-        let vids: Vec<PathBuf> = paths.iter().filter(|p| crate::video::is_video_ext(&crate::formats::ext_of(p))).cloned().collect();
+        let vids: Vec<PathBuf> = paths.iter().filter(|p| crate::video::is_video_path(p)).cloned().collect();
         if vids.len() == paths.len() {
-            self.video = Some(crate::video::VideoMode::new(vids, &self.core));
-            self.mode = Mode::Video;
+            self.open_video_mode(vids);
             return;
         }
-        let images: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file() && crate::formats::is_image_path(p)).collect();
-        if images.len() < 2 {
-            if let Some(p) = images.first() {
+        // Images and videos together: the viewer, where videos play in place.
+        let media: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file() && (crate::formats::is_image_path(p) || crate::video::is_video_path(p))).collect();
+        if media.len() < 2 {
+            if let Some(p) = media.first() {
                 self.open_file(p);
             }
             return;
         }
         if self.viewer.has_unsaved_work() {
-            self.pending_guard = Some(PendingAction::OpenFile(images[0].clone()));
+            self.pending_guard = Some(PendingAction::OpenFile(media[0].clone()));
             return;
         }
-        self.open_file_now(&images[0]);
-        // Show exactly the handed-over files, in the given order.
-        self.viewer.open(images, 0, self.core.settings.fit_mode);
+        self.open_file_now(&media[0]);
+        if self.mode == Mode::Viewer {
+            // Show exactly the handed-over files, in the given order.
+            self.viewer.open(media, 0, self.core.settings.fit_mode);
+        }
     }
 
     /// Open (or create) the project in `root` and show the workbench.
@@ -3059,8 +3130,7 @@ impl App {
         // Video captures open in video compare (up to four, from their start).
         let videos = files.iter().filter(|f| crate::video::is_video_ext(&crate::formats::ext_of(f))).count();
         if videos == files.len() {
-            self.video = Some(crate::video::VideoMode::new(files, &self.core));
-            self.mode = Mode::Video;
+            self.open_video_mode(files);
             return;
         }
         if videos > 0 {
@@ -3564,8 +3634,11 @@ impl eframe::App for App {
                     self.mode = Mode::Compare;
                 } else if !keep {
                     self.video = None;
-                    self.mode = Mode::Browser;
-                    if self.fullscreen {
+                    // Opened from the viewer's video: back to it.
+                    let back = self.video_from_viewer && self.viewer.current().is_some();
+                    self.video_from_viewer = false;
+                    self.mode = if back { Mode::Viewer } else { Mode::Browser };
+                    if self.fullscreen && !back {
                         self.set_fullscreen(false);
                     }
                 }
@@ -3596,6 +3669,13 @@ impl eframe::App for App {
         // Leaving video mode by any route stops playback.
         if self.mode != Mode::Video && self.video.is_some() {
             self.video = None;
+        }
+        if self.mode != Mode::Video {
+            self.video_from_viewer = false;
+        }
+        // So does leaving (or covering) the viewer: its video decoder is freed.
+        if self.mode != Mode::Viewer {
+            self.viewer.stop_video();
         }
         let available = |c: Command| -> bool { !matches!(c, Command::Exit) || true };
         if let Some(c) = self.palette.show(&ctx, &p, &available) {
@@ -3738,6 +3818,12 @@ impl App {
                         self.file_undo.len()
                     );
                     self.dev.write_state(&s);
+                    if self.viewer.showing_video() {
+                        self.dev.write_state(&format!("viewer video: {}", self.viewer.video_state()));
+                    }
+                    if let Some(s) = &self.slideshow {
+                        self.dev.write_state(&format!("slideshow: {}", s.state_text()));
+                    }
                 }
             }
         }

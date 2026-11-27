@@ -297,6 +297,13 @@ pub type SharedIndex = Arc<parking_lot::Mutex<Option<Vec<IndexEntry>>>>;
 
 impl Player {
     pub fn open(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> Result<Player> {
+        Player::open_with_cache(path, audio, index, ctx, FRAME_CACHE_BYTES)
+    }
+
+    /// [`Player::open`] that keeps at most `cache_bytes` of decoded frames
+    /// for instant steps back (the viewer's inline player keeps less than
+    /// video mode).
+    pub fn open_with_cache(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context, cache_bytes: usize) -> Result<Player> {
         init();
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
         let (ev_tx, ev_rx) = bounded::<Event>(6);
@@ -307,7 +314,7 @@ impl Player {
         std::thread::Builder::new()
             .name("lumen-video".into())
             .spawn(move || {
-                let mut worker = match Worker::new(&path, audio, index, cmd_rx, ev_tx.clone(), ctx.clone()) {
+                let mut worker = match Worker::new(&path, audio, index, cmd_rx, ev_tx.clone(), ctx.clone(), cache_bytes) {
                     Ok(w) => {
                         let _ = init_tx.send(Ok(()));
                         w
@@ -351,6 +358,8 @@ const FRAME_CACHE_BYTES: usize = 512 << 20;
 struct FrameCache {
     frames: VecDeque<(f64, ff::frame::Video)>,
     bytes: usize,
+    /// Most bytes kept (the oldest frames go first).
+    cap: usize,
 }
 
 impl FrameCache {
@@ -362,7 +371,7 @@ impl FrameCache {
     fn push(&mut self, pts: f64, f: ff::frame::Video) {
         self.bytes += frame_bytes(&f);
         self.frames.push_back((pts, f));
-        while self.bytes > FRAME_CACHE_BYTES && self.frames.len() > 1 {
+        while self.bytes > self.cap && self.frames.len() > 1 {
             if let Some((_, old)) = self.frames.pop_front() {
                 self.bytes = self.bytes.saturating_sub(frame_bytes(&old));
             }
@@ -431,7 +440,8 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) -> Result<Worker> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context, cache_bytes: usize) -> Result<Worker> {
         let input = ff::format::input(path).with_context(|| format!("Cannot open {}", path.display()))?;
         let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
         let vidx = vs.index();
@@ -483,7 +493,7 @@ impl Worker {
             demux_eof: false,
             vdec_eof: false,
             pending_vpkts: Default::default(),
-            cache: FrameCache::default(),
+            cache: FrameCache { cap: cache_bytes.max(1), ..Default::default() },
             shown: None,
             audio_min_pts: f64::NEG_INFINITY,
             skip_before: f64::NEG_INFINITY,
@@ -819,7 +829,7 @@ impl Worker {
                 // Frames older than what the cache holds are only decoded
                 // when other frames need them.
                 if exact && self.frame_bytes_hint > 0 {
-                    let fit = (FRAME_CACHE_BYTES / self.frame_bytes_hint).saturating_sub(2);
+                    let fit = (self.cache.cap / self.frame_bytes_hint).saturating_sub(2);
                     self.skip_before = t - fit as f64 * self.frame_dur;
                 }
             }

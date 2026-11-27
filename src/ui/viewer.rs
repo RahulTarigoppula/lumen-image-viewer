@@ -337,6 +337,8 @@ pub struct Viewer {
     wheel_nav: WheelNav,
     /// The app window is full screen (the bar auto-hides, the menu shows the check).
     is_fullscreen: bool,
+    /// The video on screen, played in place of an image.
+    video: crate::video::inline::InlineVideo,
 }
 
 impl Viewer {
@@ -383,7 +385,32 @@ impl Viewer {
             edge: EdgeState::default(),
             wheel_nav: WheelNav::default(),
             is_fullscreen: false,
+            video: Default::default(),
         }
+    }
+
+    /// The file on screen is a video.
+    pub fn showing_video(&self) -> bool {
+        self.current().is_some_and(|p| crate::video::is_video_path(p))
+    }
+
+    /// Stop the video on screen and free its decoder and sound output (the
+    /// viewer is left or covered).
+    pub fn stop_video(&mut self) {
+        self.video.close();
+    }
+
+    /// Playback commands (play / pause, frame steps, seeking, mute) for a
+    /// video on screen. False when no video is shown, so they go on to the
+    /// animation player.
+    pub fn video_command(&mut self, cmd: Command, s: &mut crate::settings::VideoSettings) -> bool {
+        let Some(path) = self.current().filter(|p| crate::video::is_video_path(p)).cloned() else { return false };
+        self.video.command(&path, cmd, s)
+    }
+
+    /// The video player's state for the dev hook.
+    pub fn video_state(&self) -> String {
+        self.video.state_text()
     }
 
     /// Toggle "lock zoom ratio" (keep zoom and position while browsing).
@@ -750,7 +777,10 @@ impl Viewer {
     pub fn request_loads(&mut self, core: &mut Core) {
         let Some(cur) = self.current().cloned() else { return };
         let screen = core.ctx.content_rect().size() * core.ctx.pixels_per_point();
-        core.loader.request(&cur, 0, Some(screen.x.max(screen.y) as u32));
+        // A video plays through its own decoder; the images next to it still preload.
+        if !crate::video::is_video_path(&cur) {
+            core.loader.request(&cur, 0, Some(screen.x.max(screen.y) as u32));
+        }
         let mut keep = self.preload_set(&core.loader, core.settings.preload_neighbors);
         // A preloaded neighbour that turned out huge is dropped again and not
         // preloaded any more (it is decoded when the user moves to it).
@@ -868,6 +898,15 @@ impl Viewer {
             self.last_activity = Instant::now();
         }
 
+        // A video plays here; moving to another file stops it and frees its decoder.
+        let video_path = self.current().filter(|p| crate::video::is_video_path(p)).cloned();
+        let is_video = video_path.is_some();
+        self.video.show(video_path.as_deref(), ui.ctx(), &core.settings.video);
+        if is_video {
+            let minimized = ui.input(|i| i.viewport().minimized == Some(true));
+            self.video.tick(ui.ctx(), minimized, &core.settings.video);
+        }
+
         let Some(path) = self.current().cloned() else {
             ui.painter().text(view.center(), Align2::CENTER_CENTER, "No images", FontId::proportional(16.0), p.muted);
             let hint = format!("Open a file ({}) or a folder ({}), or drop images here", Command::OpenFile.shortcut(), Command::OpenFolder.shortcut());
@@ -878,8 +917,8 @@ impl Viewer {
         // ---- Pick what to show
         let mut size: Option<(u32, u32)> = None;
         let mut has_alpha = false;
-        let edit_img = self.edit.as_ref().filter(|e| e.path == path).map(|e| (e.version, e.current.clone()));
-        let state_ready = core.loader.get_ready(&path);
+        let edit_img = self.edit.as_ref().filter(|e| e.path == path && !is_video).map(|e| (e.version, e.current.clone()));
+        let state_ready = if is_video { None } else { core.loader.get_ready(&path) };
         // Receive an edited image's pyramid built in the background.
         if let Some((bp, key, rx)) = &self.gpu_build {
             match rx.try_recv() {
@@ -932,6 +971,9 @@ impl Viewer {
                     size = Some((g.width, g.height));
                 }
             }
+        } else if is_video {
+            // Known as soon as the file is open; the poster shows until the first frame.
+            size = self.video.size();
         }
         // Locked zoom ratio: apply the previous image's zoom and position once
         // the new image's size is known.
@@ -982,6 +1024,29 @@ impl Viewer {
             }
             let nearest = !core.settings.smooth_zoom_in && self.zoom >= 2.0;
             let mut drawn = false;
+            if is_video {
+                if let Some((title, why)) = self.video.unavailable() {
+                    // The decoder failed while playing.
+                    self.video_card(ui, &p, view, &path, title, &why);
+                } else if !self.video.paint(ui.ctx(), &painter, dest, self.zoom, nearest) {
+                    // The poster (the thumbnail) until the first frame is decoded.
+                    let key = self.thumb_key(&path);
+                    if let Thumb::Ready(t) = core.thumbs.get(&key) {
+                        let mut mesh = egui::Mesh::with_texture(t.tex.id());
+                        mesh.add_rect_with_uv(dest, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                    let r = Rect::from_center_size(dest.intersect(view).center(), Vec2::splat(28.0));
+                    egui::Spinner::new().size(28.0).paint_at(ui, r);
+                }
+                // A click on the picture plays or pauses it (not one between
+                // the toolbar's buttons).
+                let on_picture = resp.interact_pointer_pos().is_some_and(|q| dest.contains(q) && q.y < view.max.y - 60.0);
+                if resp.clicked() && on_picture && !self.has_tool() {
+                    self.video.toggle_play();
+                }
+                drawn = true;
+            }
             if let Some(t) = &mut self.tool {
                 let ts = t.scale();
                 if !t.show_original {
@@ -1034,12 +1099,15 @@ impl Viewer {
             if self.crop.is_some() {
                 self.crop_overlay(ui, &painter, dest, sz, &resp);
             }
-            if (self.magnifier_active || self.magnifier_locked) && self.crop.is_none() {
+            if (self.magnifier_active || self.magnifier_locked) && self.crop.is_none() && !is_video {
                 self.paint_magnifier(ui, core, dest, sz, view);
             }
-            if self.show_pixel && self.crop.is_none() {
+            if self.show_pixel && self.crop.is_none() && !is_video {
                 self.paint_pixel_values(ui, core, dest, view);
             }
+        } else if let Some((title, why)) = is_video.then(|| self.video.unavailable()).flatten() {
+            self.video_card(ui, &p, view, &path, title, &why);
+            self.nav_input(ui, &resp, core, &mut ev, false);
         } else {
             // Not decoded yet (or failed): show the cached thumbnail / quick preview.
             match core.loader.state(&path) {
@@ -1105,13 +1173,27 @@ impl Viewer {
         }
         let edge_open = self.edge_panels_ui(ui, core, view, &mut ev);
         let idle = self.last_activity.elapsed() > Duration::from_millis(2200);
-        let near_bottom = ui.input(|i| i.pointer.hover_pos()).map(|pos| pos.y > view.max.y - 90.0 && view.contains(pos)).unwrap_or(false);
+        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|pos| view.contains(*pos));
+        let near_bottom = hover.is_some_and(|pos| pos.y > view.max.y - 90.0);
+        let popup = egui::Popup::is_any_open(ui.ctx());
         // Windowed, the bar always shows (FastStone users work from it); full
         // screen it hides after a moment, but never while one of its menus is open.
-        if !idle || near_bottom || !fullscreen || egui::Popup::is_any_open(ui.ctx()) {
+        let bar_shown = !idle || near_bottom || !fullscreen || popup;
+        if bar_shown {
             self.bottom_bar(ui, core, view, size.is_some(), &mut ev);
         } else if fullscreen && self.crop.is_none() && self.tool.is_none() && !edge_open {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        }
+        // A video's transport bar sits above the toolbar and hides with the
+        // mouse while it plays (paused, it stays).
+        if is_video && size.is_some() {
+            let near = hover.is_some_and(|pos| pos.y > view.max.y - 64.0 - crate::video::inline::BAR_H - 40.0);
+            if !idle || near || popup || !self.video.playing() || self.video.scrubbing() {
+                let bottom = if bar_shown { view.max.y - 64.0 } else { view.max.y - 12.0 };
+                if let Some(c) = self.video.transport(ui, &p, &mut core.settings.video, view, bottom) {
+                    ev.push(ViewerEvent::Command(c));
+                }
+            }
         }
         if !idle {
             ui.ctx().request_repaint_after(Duration::from_millis(2300));
@@ -1621,6 +1703,26 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             });
         });
         scroll_fades(ui, &out, theme::palette(ui.ctx()).panel);
+    }
+
+    /// The card shown in place of a video that cannot play: why, and a
+    /// button that opens it in the program Windows uses for it.
+    #[allow(clippy::too_many_arguments)]
+    fn video_card(&self, ui: &mut Ui, p: &Palette, view: Rect, path: &Path, title: &str, why: &str) {
+        let c = view.center();
+        let painter = ui.painter().clone();
+        painter.text(c - Vec2::new(0.0, 70.0), Align2::CENTER_CENTER, I::FILM_STRIP, FontId::proportional(42.0), p.faint);
+        painter.text(c - Vec2::new(0.0, 28.0), Align2::CENTER_CENTER, title, theme::semibold(15.0), p.text);
+        painter.text(c - Vec2::new(0.0, 6.0), Align2::CENTER_CENTER, file_name(path), FontId::proportional(12.5), p.muted);
+        let galley = painter.layout(why.to_string(), FontId::proportional(12.5), p.muted, (view.width() - 80.0).clamp(120.0, 520.0));
+        let top = c + Vec2::new(-galley.size().x / 2.0, 12.0);
+        let below = top.y + galley.size().y + 14.0;
+        painter.galley(top, galley, p.muted);
+        let r = Rect::from_center_size(Pos2::new(c.x, below + 15.0), Vec2::new(230.0, 30.0));
+        let open = ui.put(r, egui::Button::new(format!("{}  Open with the default app", I::ARROW_SQUARE_OUT)));
+        if open.on_hover_text("Play it in the program Windows uses for this kind of file").clicked() {
+            crate::fileops::open_with_default(path);
+        }
     }
 
     fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path) {

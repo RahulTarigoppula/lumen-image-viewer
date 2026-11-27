@@ -725,6 +725,42 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= toggle_row(ui, p, "Show panels when the mouse touches a screen edge", "Edit tools on the left, file info on the right, thumbnails at the bottom.", &mut s.edge_panels);
     });
 
+    section_title(ui, p, "Videos");
+    card(ui, p, |ui| {
+        changed |= row(ui, p, "Open videos in", "A video you open on its own. Two or more selected videos open in video mode to compare.", |ui| {
+            segmented_tips(
+                ui,
+                &mut s.video.open_in_video_mode,
+                &[
+                    (false, "Viewer", "The video plays in the viewer, and Left / Right go on to the folder's other files"),
+                    (true, "Video mode", "The video opens in video mode: frame by frame, scopes and comparison"),
+                ],
+            )
+        });
+        changed |= toggle_row(ui, p, "Repeat videos", "A video in the viewer starts again when it ends.", &mut s.video.repeat);
+        changed |= toggle_row(ui, p, "Sound in slideshows", "Videos in a slideshow play their sound. Off: they play muted.", &mut s.slideshow.video_sound);
+        changed |= row(ui, p, "Longest video in a slideshow", "The slideshow moves on when a video ends, or after this time.", |ui| {
+            let mut c = false;
+            let label = |v: f32| {
+                if v <= 0.0 {
+                    "Whole video".to_string()
+                } else if v < 60.0 {
+                    format!("{v:.0} seconds")
+                } else {
+                    format!("{:.0} min", v / 60.0)
+                }
+            };
+            crate::ui::widgets::combo("settings-video-max").width(150.0).selected_text(label(s.slideshow.video_max_secs)).show_ui(ui, |ui| {
+                for v in [0.0, 10.0, 30.0, 60.0, 300.0] {
+                    c |= ui.selectable_value(&mut s.slideshow.video_max_secs, v, label(v)).changed();
+                }
+            })
+            .response
+            .on_hover_text("How long one video plays before the next slide");
+            c
+        });
+    });
+
     section_title(ui, p, "Zoom");
     card(ui, p, |ui| {
         changed |= toggle_row(ui, p, "Smooth zoom-in filtering", "Off shows crisp pixels when enlarging (good for pixel art).", &mut s.smooth_zoom_in);
