@@ -1,6 +1,6 @@
 # Lumen handoff
 
-State on 27 November 2026: version 2.2.0, `main` and `dev/v1.4` at the same commit, every CI job green, releases
+State on 28 November 2026: version 2.2.0, `main` and `dev/v1.4` at the same commit, every CI job green, releases
 built by `.github/workflows/build.yml` (Lumen.exe, Lumen-portable.zip, Lumen-Setup.exe, SHA256SUMS.txt).
 
 ## 2.2.0 in short

@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.2.0 (27 November 2026)
+## 2.2.0 (28 November 2026)
 
 Everything left over from the 2.1 handoff (Explorer cut / paste and drop, undo of deletes, sharing, videos in the
 viewer, lossless JPEG crop, an installer), Samsung and Pixel camera data with HDR gain maps, report branding, and a
