@@ -589,8 +589,10 @@ impl FolderTree {
                 let id = ui.make_persistent_id(egui::IdSalt::new("folder-tree"));
                 let offset = egui::scroll_area::State::load(&ctx, id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
                 let y = i as f32 * row_h;
-                if y < offset {
-                    scroll = scroll.vertical_scroll_offset(y);
+                // Going up, a section caption right above the row comes into view too.
+                let top = if i > 0 && matches!(self.rows.get(i - 1), Some(Row::Header(_))) { y - row_h } else { y };
+                if top < offset {
+                    scroll = scroll.vertical_scroll_offset(top);
                 } else if y + row_h > offset + view_h {
                     scroll = scroll.vertical_scroll_offset(y + row_h - view_h);
                 }
