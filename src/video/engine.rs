@@ -306,7 +306,14 @@ impl Player {
     /// file is opened; [`Player::open_async`] does not).
     #[allow(dead_code)] // Video mode opens with `open_async`; kept for the tests and other callers.
     pub fn open(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> Result<Player> {
-        let (player, info) = Player::open_async(path, audio, index, ctx);
+        Player::open_with_cache(path, audio, index, ctx, FRAME_CACHE_BYTES)
+    }
+
+    /// [`Player::open`] that keeps at most `cache_bytes` of decoded frames
+    /// for instant steps back (the viewer's inline player keeps less than
+    /// video mode). Blocks while the file is opened.
+    pub fn open_with_cache(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context, cache_bytes: usize) -> Result<Player> {
+        let (player, info) = Player::open_async_with_cache(path, audio, index, ctx, cache_bytes);
         match info.recv() {
             Ok(Ok(_)) => Ok(player),
             Ok(Err(e)) => Err(anyhow!("{e:#}")),
@@ -318,6 +325,11 @@ impl Player {
     /// once, reads its [`MediaInfo`] from it and sends that (or why the file
     /// cannot be played) on the returned channel, then shows the first frame.
     pub fn open_async(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context) -> (Player, Receiver<Result<MediaInfo>>) {
+        Player::open_async_with_cache(path, audio, index, ctx, FRAME_CACHE_BYTES)
+    }
+
+    /// [`Player::open_async`] with its own frame cache size.
+    pub fn open_async_with_cache(path: &Path, audio: Option<Arc<AudioShared>>, index: SharedIndex, ctx: egui::Context, cache_bytes: usize) -> (Player, Receiver<Result<MediaInfo>>) {
         init();
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
         let (ev_tx, ev_rx) = bounded::<Event>(6);
@@ -328,7 +340,7 @@ impl Player {
         let spawned = std::thread::Builder::new().name("lumen-video".into()).spawn(move || {
             let opened = ff::format::input(&path).with_context(|| format!("Cannot open {}", path.display())).and_then(|input| {
                 let info = probe_input(&input, &path)?;
-                Ok((Worker::new(input, audio, index, cmd_rx, ev_tx.clone(), ctx.clone())?, info))
+                Ok((Worker::new(input, audio, index, cmd_rx, ev_tx.clone(), ctx.clone(), cache_bytes)?, info))
             });
             let mut worker = match opened {
                 Ok((w, info)) => {
@@ -375,6 +387,8 @@ const FRAME_CACHE_BYTES: usize = 512 << 20;
 struct FrameCache {
     frames: VecDeque<(f64, ff::frame::Video)>,
     bytes: usize,
+    /// Most bytes kept (the oldest frames go first).
+    cap: usize,
 }
 
 impl FrameCache {
@@ -386,7 +400,7 @@ impl FrameCache {
     fn push(&mut self, pts: f64, f: ff::frame::Video) {
         self.bytes += frame_bytes(&f);
         self.frames.push_back((pts, f));
-        while self.bytes > FRAME_CACHE_BYTES && self.frames.len() > 1 {
+        while self.bytes > self.cap && self.frames.len() > 1 {
             if let Some((_, old)) = self.frames.pop_front() {
                 self.bytes = self.bytes.saturating_sub(frame_bytes(&old));
             }
@@ -455,7 +469,8 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(input: ff::format::context::Input, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context) -> Result<Worker> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(input: ff::format::context::Input, audio: Option<Arc<AudioShared>>, index: SharedIndex, rx: Receiver<Cmd>, tx: Sender<Event>, ctx: egui::Context, cache_bytes: usize) -> Result<Worker> {
         let vs = input.streams().best(ff::media::Type::Video).ok_or_else(|| anyhow!("No video stream"))?;
         let vidx = vs.index();
         let vtb = q2f(vs.time_base());
@@ -506,7 +521,7 @@ impl Worker {
             demux_eof: false,
             vdec_eof: false,
             pending_vpkts: Default::default(),
-            cache: FrameCache::default(),
+            cache: FrameCache { cap: cache_bytes.max(1), ..Default::default() },
             shown: None,
             audio_min_pts: f64::NEG_INFINITY,
             skip_before: f64::NEG_INFINITY,
@@ -842,7 +857,7 @@ impl Worker {
                 // Frames older than what the cache holds are only decoded
                 // when other frames need them.
                 if exact && self.frame_bytes_hint > 0 {
-                    let fit = (FRAME_CACHE_BYTES / self.frame_bytes_hint).saturating_sub(2);
+                    let fit = (self.cache.cap / self.frame_bytes_hint).saturating_sub(2);
                     self.skip_before = t - fit as f64 * self.frame_dur;
                 }
             }

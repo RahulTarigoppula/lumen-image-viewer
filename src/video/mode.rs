@@ -498,7 +498,7 @@ impl Drop for Source {
     }
 }
 
-fn rgba_to_color_image(img: &RgbaImage) -> egui::ColorImage {
+pub(super) fn rgba_to_color_image(img: &RgbaImage) -> egui::ColorImage {
     let (w, h) = img.dimensions();
     // Video frames are opaque, so straight RGBA bytes are already premultiplied.
     let pixels: Vec<Color32> = bytemuck::cast_slice::<u8, [u8; 4]>(img.as_raw()).iter().map(|p| Color32::from_rgba_premultiplied(p[0], p[1], p[2], 255)).collect();
@@ -818,7 +818,7 @@ fn cap_button(ui: &mut Ui, rect: Rect, id: egui::Id, icon: &str, tip: &str, on: 
 
 /// Why a video did not open, in a few words for the error card: the
 /// innermost cause (FFmpeg's or the system's message), in sentence case.
-fn open_reason(e: &anyhow::Error) -> String {
+pub(super) fn open_reason(e: &anyhow::Error) -> String {
     let root = e.root_cause().to_string();
     let low = root.to_lowercase();
     let text = if low.contains("no such file") || low.contains("cannot find") {
@@ -4136,7 +4136,7 @@ pub(super) fn dev_log(line: &str) {
     }
 }
 
-fn rotate_mesh(mesh: &mut egui::Mesh, dest: Rect, rotation: i32) {
+pub(super) fn rotate_mesh(mesh: &mut egui::Mesh, dest: Rect, rotation: i32) {
     // Rotate UVs so a rotated video (phone footage) displays upright in `dest`.
     let r = rotation.rem_euclid(360);
     if r == 0 {

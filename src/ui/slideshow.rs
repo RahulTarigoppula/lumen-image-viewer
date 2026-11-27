@@ -6,7 +6,12 @@
 //!   → / PgDn / wheel ↓ next      ← / PgUp / wheel ↑ previous
 //!   Home / End         first / last
 //!   + / -              longer / shorter interval
-//!   C caption, K Ken Burns, S shuffle, L loop, H help, Esc exit.
+//!   C caption, K Ken Burns, S shuffle, L loop, M sound of videos, H help, Esc exit.
+//!
+//! Videos play (muted unless "play sound" is on) and the show moves on when
+//! one ends, or after the longest time set for videos. The next video's
+//! decoder opens while the slide before it shows, and its slide only comes
+//! once its first frame is there, so a change never waits on a decoder.
 //!
 //! Rendering never builds new textures during a transition: the next slide is
 //! decoded in the background and its GPU tiles are uploaded ("pre-warmed")
@@ -21,6 +26,8 @@ use crate::app::Core;
 use crate::loader::LoadState;
 use crate::render::GpuImage;
 use crate::settings::FitMode;
+use crate::video::inline::{InlinePlayer, SoundOut};
+use crate::video::playback;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -499,7 +506,7 @@ const WALK_MAX_IMAGES: usize = 50_000;
 const WALK_MAX_FOLDERS: usize = 20_000;
 const WALK_MAX_TIME: Duration = Duration::from_secs(20);
 
-/// Image files under `dir`, its subfolders included. Stops (the bool is
+/// Image and video files under `dir`, its subfolders included. Stops (the bool is
 /// true) after `max_images` images or `max_folders` folders, at `deadline`
 /// or when `cancel` is set.
 fn walk_images(dir: &Path, max_images: usize, max_folders: usize, deadline: Instant, cancel: &AtomicBool) -> (Vec<PathBuf>, bool) {
@@ -517,7 +524,7 @@ fn walk_images(dir: &Path, max_images: usize, max_folders: usize, deadline: Inst
             let path = item.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if crate::formats::is_image_path(&path) {
+            } else if crate::formats::is_image_path(&path) || crate::video::is_video_path(&path) {
                 out.push(path);
                 if out.len() >= max_images {
                     return (out, true);
@@ -576,14 +583,63 @@ impl Drop for SubfolderScan {
 
 // ---------------------------------------------------------------- slideshow
 
+/// What a slide shows: a decoded picture on the GPU, or a video that plays.
+enum Pic {
+    Image(GpuImage),
+    Video(InlinePlayer),
+}
+
 struct Slide {
     path: PathBuf,
-    gpu: GpuImage,
+    pic: Pic,
     /// Seconds since this slide started appearing (drives Ken Burns).
     clock: f32,
     kb: KenBurns,
     /// All tiles for its display zoom are on the GPU.
     warm: bool,
+}
+
+impl Slide {
+    /// The picture's size in pixels.
+    fn dims(&self) -> (u32, u32) {
+        match &self.pic {
+            Pic::Image(g) => (g.width, g.height),
+            Pic::Video(v) => v.display_size().unwrap_or((16, 9)),
+        }
+    }
+
+    fn video(&self) -> Option<&InlinePlayer> {
+        match &self.pic {
+            Pic::Video(v) => Some(v),
+            Pic::Image(_) => None,
+        }
+    }
+
+    fn video_mut(&mut self) -> Option<&mut InlinePlayer> {
+        match &mut self.pic {
+            Pic::Video(v) => Some(v),
+            Pic::Image(_) => None,
+        }
+    }
+
+    /// A picture is there to show (a video has decoded its first frame).
+    fn showable(&self) -> bool {
+        self.video().is_none_or(|v| v.has_frame())
+    }
+
+    /// Paint into `dest` with `painter` (clipped to `clip`); `zoom` in
+    /// physical pixels per picture pixel. True while image tiles are still
+    /// on their way to the GPU.
+    fn paint(&mut self, ctx: &egui::Context, painter: &egui::Painter, dest: Rect, clip: Rect, zoom: f32, tint: Color32) -> bool {
+        match &mut self.pic {
+            Pic::Image(g) => g.paint(ctx, painter, dest, clip, zoom, false, tint),
+            Pic::Video(v) => {
+                v.fit_decode(zoom, ctx);
+                v.paint(ctx, painter, dest, false, tint);
+                false
+            }
+        }
+    }
 }
 
 struct Active {
@@ -625,6 +681,8 @@ pub struct Slideshow {
     exit_requested: bool,
     /// Searching the subfolders in the background ("include subfolders").
     scan: Option<SubfolderScan>,
+    /// The sound output for videos (only while "play sound" is on).
+    sound: Option<SoundOut>,
 }
 
 impl Slideshow {
@@ -662,6 +720,7 @@ impl Slideshow {
             pending_since: Instant::now(),
             exit_requested: false,
             scan: None,
+            sound: None,
         };
         if core.settings.slideshow.include_subfolders {
             // The folder's own pictures play while the subfolders are searched.
@@ -782,6 +841,15 @@ impl Slideshow {
                 self.go(self.step(self.pos, 1, true).unwrap_or(0), 1);
             }
         }
+        // A video on screen pauses and plays on with the show.
+        let paused = self.paused;
+        if let Some(v) = self.current.as_mut().and_then(|c| c.video_mut()) {
+            if paused {
+                v.pause();
+            } else if !v.ended() {
+                v.play();
+            }
+        }
         self.flash = Some((if self.paused { I::PAUSE } else { I::PLAY }, Instant::now()));
     }
 
@@ -810,7 +878,9 @@ impl Slideshow {
             self.active = None;
             return self.outgoing.take();
         }
-        if let Some(i) = self.ready.iter().position(|s| s.path == path) {
+        // A video waits until its first frame is decoded, so the change to it
+        // never shows black.
+        if let Some(i) = self.ready.iter().position(|s| s.path == path && s.showable()) {
             return Some(self.ready.remove(i));
         }
         None
@@ -833,6 +903,39 @@ impl Slideshow {
         }
     }
 
+    /// Only the video on screen plays sound, and only with "play sound" on.
+    fn sync_video_sound(&mut self, core: &Core) {
+        // The others first: taking their sound away clears what is queued.
+        for s in self.ready.iter_mut().chain(self.outgoing.iter_mut()) {
+            if let Some(v) = s.video_mut() {
+                v.set_audio(None);
+            }
+        }
+        let want = core.settings.slideshow.video_sound && self.current.as_ref().is_some_and(|c| c.video().is_some());
+        if !want {
+            if let Some(v) = self.current.as_mut().and_then(|c| c.video_mut()) {
+                v.set_audio(None);
+            }
+            return;
+        }
+        let out = self.sound.get_or_insert_with(|| SoundOut::open(&core.ctx));
+        out.set_level(core.settings.video.volume, false);
+        let shared = out.shared();
+        if let (Some(v), Some(a)) = (self.current.as_mut().and_then(|c| c.video_mut()), shared) {
+            v.set_audio(Some(a));
+        }
+    }
+
+    /// One line for the dev hook's `state`.
+    pub fn state_text(&self) -> String {
+        let name = self.current.as_ref().and_then(|c| c.path.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let video = match self.current.as_ref().and_then(|c| c.video()) {
+            Some(v) => format!(" video t={:.2}/{:.2} playing={} ended={} frame={}", v.position(), v.duration(), v.playing(), v.ended(), v.has_frame()),
+            None => String::new(),
+        };
+        format!("[{}/{}] {name} paused={} changing={} waiting={}{video}", self.pos + 1, self.order.len(), self.paused, self.active.is_some(), self.pending.is_some())
+    }
+
     /// Load/prepare slides and resolve the pending navigation target.
     fn update_loading(&mut self, core: &mut Core) {
         let looping = core.settings.slideshow.loop_show;
@@ -843,13 +946,22 @@ impl Slideshow {
             if self.failed.contains(&path) {
                 continue;
             }
+            if !self.holds(&path) && crate::video::is_video_path(&path) {
+                // A video opens its decoder (first frame, paused) when it is
+                // on screen or next; it starts playing when its slide comes.
+                if prio <= 1 {
+                    let v = InlinePlayer::open(&path, &core.ctx, None, false);
+                    self.ready.push(Slide { kb: KenBurns::from_seed(seed_of(&path)), path: path.clone(), pic: Pic::Video(v), clock: 0.0, warm: true });
+                }
+                continue;
+            }
             if !self.holds(&path) {
                 match core.loader.state(&path) {
                     Some(LoadState::Ready(_)) => {
                         if let Some(img) = core.loader.get_ready(&path) {
                             let gpu = GpuImage::new(&core.ctx, &format!("slide:{}", path.display()), img.pyramid.clone());
                             self.caption_for(&path);
-                            self.ready.push(Slide { kb: KenBurns::from_seed(seed_of(&path)), path: path.clone(), gpu, clock: 0.0, warm: false });
+                            self.ready.push(Slide { kb: KenBurns::from_seed(seed_of(&path)), path: path.clone(), pic: Pic::Image(gpu), clock: 0.0, warm: false });
                         }
                     }
                     Some(LoadState::Failed(_)) => {
@@ -866,6 +978,17 @@ impl Slideshow {
         // Drop prepared slides no longer near the play position.
         let near: Vec<PathBuf> = wanted.iter().filter_map(|&p| self.path_at(p).cloned()).collect();
         self.ready.retain(|s| near.contains(&s.path));
+        // A video that cannot play (or never shows a picture) is passed over.
+        let broken: Vec<PathBuf> = self
+            .ready
+            .iter()
+            .filter(|s| s.video().is_some_and(|v| v.error().is_some() || (!v.has_frame() && v.age().as_secs_f32() > playback::VIDEO_SLIDE_STALL_SECS)))
+            .map(|s| s.path.clone())
+            .collect();
+        for p in broken {
+            self.ready.retain(|s| s.path != p);
+            self.failed.insert(p);
+        }
 
         // Resolve pending target (skipping failures).
         if let Some((mut pos, dir)) = self.pending {
@@ -937,6 +1060,20 @@ impl Slideshow {
         if kind == Transition::None {
             duration = 0.0;
         }
+        // The video going away stops; the one coming plays from its start
+        // (while the change runs, so the change never waits for it).
+        let mut old = old;
+        if let Some(v) = old.as_mut().and_then(|o| o.video_mut()) {
+            v.pause();
+        }
+        if let Some(v) = slide.video_mut() {
+            if v.position() > 0.0 || v.ended() {
+                v.seek(0.0, true);
+            }
+            if !self.paused {
+                v.play();
+            }
+        }
         self.outgoing = old;
         self.current = Some(slide);
         self.display = 0.0;
@@ -997,6 +1134,10 @@ impl Slideshow {
         if take(Key::L) {
             cfg.loop_show = !cfg.loop_show;
         }
+        if take(Key::M) {
+            cfg.video_sound = !cfg.video_sound;
+            self.flash = Some((if cfg.video_sound { I::SPEAKER_HIGH } else { I::SPEAKER_SLASH }, Instant::now()));
+        }
         let mut reshuffle = false;
         if take(Key::S) {
             cfg.random_order = !cfg.random_order;
@@ -1044,12 +1185,13 @@ impl Slideshow {
     // ------------------------------------------------------------ drawing
 
     fn base_dest(slide: &Slide, view: Rect, ppp: f32, fit: FitMode, kb: bool, kb_total: f32) -> (Rect, f32) {
-        let dims = (slide.gpu.width, slide.gpu.height);
+        let dims = slide.dims();
         let zoom = fit_zoom(fit, dims, view.size() * ppp);
         let size = Vec2::new(dims.0 as f32, dims.1 as f32) * zoom / ppp;
         let mut dest = Rect::from_center_size(view.center(), size);
         let mut z = zoom;
-        if kb {
+        // Videos keep still (their own motion is enough).
+        if kb && slide.video().is_none() {
             let (s, pan) = slide.kb.at(progress(slide.clock, kb_total));
             dest = KenBurns::apply(dest, s, pan);
             z *= s.max(1.0);
@@ -1086,16 +1228,16 @@ impl Slideshow {
                 Some(h) => {
                     let inside = clip.intersect(h);
                     if inside.width() > 0.0 && inside.height() > 0.0 {
-                        slide.gpu.paint(ctx, &painter.with_clip_rect(inside), dest, inside, zoom, false, Color32::WHITE);
+                        slide.paint(ctx, &painter.with_clip_rect(inside), dest, inside, zoom, Color32::WHITE);
                     }
                     if layer.alpha > 0.002 {
                         for r in rect_minus(clip, h) {
-                            slide.gpu.paint(ctx, &painter.with_clip_rect(r), dest, r, zoom, false, tint);
+                            slide.paint(ctx, &painter.with_clip_rect(r), dest, r, zoom, tint);
                         }
                     }
                 }
                 None => {
-                    slide.gpu.paint(ctx, &painter.with_clip_rect(clip), dest, clip, zoom, false, tint);
+                    slide.paint(ctx, &painter.with_clip_rect(clip), dest, clip, zoom, tint);
                 }
             }
         }
@@ -1128,6 +1270,15 @@ impl Slideshow {
         let interval = cfg.interval_secs.clamp(0.5, 3600.0);
         let kb_total = interval + 2.0 * cfg.transition_secs.max(0.0);
 
+        // ---- Videos: frames from their decoders, sound for the one on screen
+        self.sync_video_sound(core);
+        let ctx = ui.ctx().clone();
+        for s in self.ready.iter_mut().chain(self.outgoing.iter_mut()).chain(self.current.iter_mut()) {
+            if let Some(v) = s.video_mut() {
+                v.tick(&ctx);
+            }
+        }
+
         // ---- Clocks
         if let Some(a) = &mut self.active {
             a.elapsed += dt.min(0.1);
@@ -1151,8 +1302,20 @@ impl Slideshow {
             }
         }
 
-        // ---- Auto advance
-        if !self.paused && self.active.is_none() && self.pending.is_none() && self.current.is_some() && self.display >= interval {
+        // ---- Auto advance: a picture after the interval, a video when it
+        // ends (or after its time limit).
+        let due = match self.current.as_ref().and_then(|c| c.video()) {
+            Some(v) => v.error().is_some() || playback::video_slide_due(v.ended(), self.display, cfg.video_max_secs) || (!v.has_frame() && self.display > playback::VIDEO_SLIDE_STALL_SECS),
+            None => self.display >= interval,
+        };
+        if due && self.order.len() == 1 && cfg.loop_show && !self.paused && self.active.is_none() {
+            // A lone video with Loop on plays again.
+            if let Some(v) = self.current.as_mut().and_then(|c| c.video_mut()) {
+                v.play();
+                self.display = 0.0;
+            }
+        }
+        if !self.paused && self.active.is_none() && self.pending.is_none() && self.current.is_some() && due {
             match self.step(self.pos, 1, cfg.loop_show) {
                 Some(p) if self.order.len() > 1 => self.go(p, 1),
                 _ => {
@@ -1169,7 +1332,6 @@ impl Slideshow {
 
         // ---- Draw slides
         let painter = ui.painter().with_clip_rect(view);
-        let ctx = ui.ctx().clone();
         let t = self.active.as_ref().map(|a| ease_in_out_cubic(progress(a.elapsed, a.duration)));
         match (t, self.active.as_ref().map(|a| a.kind)) {
             (Some(t), Some(kind)) => {
@@ -1188,7 +1350,7 @@ impl Slideshow {
             _ => {
                 if let Some(c) = &mut self.current {
                     let d = Self::base_dest(c, view, ppp, cfg.fit, cfg.ken_burns, kb_total);
-                    c.gpu.paint(&ctx, &painter, d.0, view, d.1, false, Color32::WHITE);
+                    c.paint(&ctx, &painter, d.0, view, d.1, Color32::WHITE);
                     c.warm = true;
                 }
             }
@@ -1198,7 +1360,7 @@ impl Slideshow {
             let hidden = ui.painter().with_clip_rect(Rect::NOTHING);
             if let Some(s) = self.ready.iter_mut().find(|s| !s.warm) {
                 let d = Self::base_dest(s, view, ppp, cfg.fit, false, kb_total);
-                let pending = s.gpu.paint(&ctx, &hidden, d.0, view, d.1, false, Color32::TRANSPARENT);
+                let pending = s.paint(&ctx, &hidden, d.0, view, d.1, Color32::TRANSPARENT);
                 s.warm = !pending;
             }
         }
@@ -1208,7 +1370,7 @@ impl Slideshow {
             // (While the subfolders are searched, more pictures may still come.)
             if (self.all_failed || self.order.is_empty()) && self.scan.is_none() {
                 painter.text(view.center() - Vec2::new(0.0, 16.0), Align2::CENTER_CENTER, I::IMAGE_BROKEN, FontId::proportional(44.0), p.faint);
-                painter.text(view.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, "None of these images could be shown", FontId::proportional(15.0), Color32::from_gray(200));
+                painter.text(view.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, "None of these files could be shown", FontId::proportional(15.0), Color32::from_gray(200));
                 painter.text(view.center() + Vec2::new(0.0, 48.0), Align2::CENTER_CENTER, "Press Esc to leave the slideshow", FontId::proportional(12.5), Color32::from_gray(140));
             } else if self.pending_since.elapsed() > Duration::from_millis(250) {
                 let r = Rect::from_center_size(view.center(), Vec2::splat(30.0));
@@ -1229,7 +1391,7 @@ impl Slideshow {
 
         // ---- Overlays
         let idle = self.last_activity.elapsed() > Duration::from_secs(2);
-        let bar_rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 40.0), Vec2::new(744.0_f32.min(view.width() - 24.0), 56.0));
+        let bar_rect = Rect::from_center_size(Pos2::new(view.center().x, view.max.y - 40.0), Vec2::new(780.0_f32.min(view.width() - 24.0), 56.0));
         let hover_bar = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| bar_rect.expand(12.0).contains(pos));
         let show_bar = !idle || hover_bar || self.popup_was_open || self.help;
         if cfg.show_caption {
@@ -1291,7 +1453,11 @@ impl Slideshow {
         let Some(c) = &self.current else { return };
         let name = c.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut parts = vec![format!("{} / {}", self.pos + 1, self.order.len()), name];
-        parts.push(format!("{} × {}", c.gpu.width, c.gpu.height));
+        let (w, h) = c.dims();
+        parts.push(format!("{w} × {h}"));
+        if let Some(v) = c.video() {
+            parts.push(playback::position_text(v.position(), v.duration()));
+        }
         if let Some(Some(d)) = self.captions.get(&c.path) {
             parts.push(d.clone());
         }
@@ -1310,8 +1476,14 @@ impl Slideshow {
         let bg = Color32::from_rgba_unmultiplied(18, 19, 22, 225);
         ui.painter().rect_filled(rect, CornerRadius::same(12), bg);
         ui.painter().rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, Color32::from_white_alpha(22)), egui::StrokeKind::Inside);
-        // Progress of the current slide.
-        let frac = if self.current.is_some() { progress(self.display, interval) } else { 0.0 };
+        // Progress of the current slide (a video's: how far it played).
+        let frac = match &self.current {
+            Some(c) => match c.video() {
+                Some(v) => playback::video_slide_progress(v.position(), v.duration(), self.display, core.settings.slideshow.video_max_secs),
+                None => progress(self.display, interval),
+            },
+            None => 0.0,
+        };
         let track = Rect::from_min_size(rect.min + Vec2::new(14.0, 5.0), Vec2::new(rect.width() - 28.0, 3.0));
         ui.painter().rect_filled(track, CornerRadius::same(2), Color32::from_white_alpha(28));
         let mut fill = track;
@@ -1392,6 +1564,10 @@ impl Slideshow {
             cfg.include_subfolders = !cfg.include_subfolders;
             subfolders = Some(cfg.include_subfolders);
         }
+        let (icon, tip) = if cfg.video_sound { (I::SPEAKER_HIGH, "Videos play with sound. Click to mute them  (M)") } else { (I::SPEAKER_SLASH, "Videos play without sound. Click to hear them  (M)") };
+        if widgets::icon_button(&mut child, icon, tip, cfg.video_sound).clicked() {
+            cfg.video_sound = !cfg.video_sound;
+        }
         widgets::separator_v(&mut child);
         if widgets::icon_button(&mut child, I::QUESTION, "Keyboard shortcuts  (H)", self.help).clicked() {
             self.help = !self.help;
@@ -1414,7 +1590,7 @@ impl Slideshow {
     }
 
     fn help_overlay(&self, ui: &Ui, view: Rect) {
-        let rows: [(&str, &str); 13] = [
+        let rows: [(&str, &str); 14] = [
             ("Space / P / click", "Pause or resume"),
             ("→  PgDn  wheel ↓", "Next image"),
             ("←  PgUp  wheel ↑", "Previous image"),
@@ -1425,6 +1601,7 @@ impl Slideshow {
             ("K", "Ken Burns pan & zoom"),
             ("S", "Shuffle"),
             ("L", "Loop"),
+            ("M", "Sound of videos on / off"),
             ("H  ?", "This help"),
             ("F11", "Toggle full screen"),
             ("Esc", "Exit slideshow"),

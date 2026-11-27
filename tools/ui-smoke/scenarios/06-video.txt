@@ -1,6 +1,9 @@
-# Video mode on one clip: first frame, then playing.
+# Video mode on one clip: a single clip opens in the viewer, "Open in video
+# mode" hands it over; first frame, then playing.
 @needs video
 open {media}\Video\clip_DeviceX.mp4
+wait 3000
+run OpenVideoMode
 wait 4000
 shot paused.png
 run PlayPause

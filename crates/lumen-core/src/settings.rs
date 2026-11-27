@@ -146,6 +146,11 @@ pub struct SlideshowSettings {
     pub show_caption: bool,
     pub ken_burns: bool,
     pub fit: FitMode,
+    /// Videos in the slideshow play their sound (off: they play muted).
+    pub video_sound: bool,
+    /// Longest time one video plays before the next slide, in seconds
+    /// (0: until it ends).
+    pub video_max_secs: f32,
 }
 
 impl Default for SlideshowSettings {
@@ -160,7 +165,29 @@ impl Default for SlideshowSettings {
             show_caption: true,
             ken_burns: false,
             fit: FitMode::FitAlways,
+            video_sound: false,
+            video_max_secs: 0.0,
         }
+    }
+}
+
+/// Videos played in the viewer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoSettings {
+    /// A video opened on its own (Enter, double-click, Explorer) opens in
+    /// video mode instead of playing in the viewer.
+    pub open_in_video_mode: bool,
+    /// Sound volume, 1.0 as recorded.
+    pub volume: f32,
+    pub muted: bool,
+    /// Start again from the beginning at the end.
+    pub repeat: bool,
+}
+
+impl Default for VideoSettings {
+    fn default() -> Self {
+        Self { open_in_video_mode: false, volume: 1.0, muted: false, repeat: false }
     }
 }
 
@@ -206,6 +233,8 @@ pub struct Settings {
     pub show_preview_pane: bool,
     pub show_info_overlay: bool,
     pub slideshow: SlideshowSettings,
+    /// Videos in the viewer: where they open, volume and repeat.
+    pub video: VideoSettings,
     pub window_maximized: bool,
     /// Size of the window when it was last closed un-maximized (points). The
     /// position is left to Windows, so a window never opens on a monitor that
@@ -314,6 +343,7 @@ impl Default for Settings {
             show_preview_pane: true,
             show_info_overlay: false,
             slideshow: SlideshowSettings::default(),
+            video: VideoSettings::default(),
             window_maximized: true,
             window_size: None,
             first_run_done: false,

@@ -224,6 +224,9 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+PgDn", NextFrame),
             (",", PrevFrame),
             ("Ctrl+PgUp", PrevFrame),
+            // A video in the viewer (Left / Right stay next / previous file).
+            ("Shift+Left", SeekBack),
+            ("Shift+Right", SeekForward),
             ("E", OpenWithEditor),
             ("Del", Delete),
             ("F2", Rename),
@@ -675,6 +678,10 @@ mod tests {
             assert!(has(KeyMode::Viewer, "Ctrl+PgDn", Command::NextFrame));
             assert!(has(KeyMode::Viewer, "Ctrl+PgUp", Command::PrevFrame));
             assert!(has(KeyMode::Viewer, "K", Command::PlayPause));
+            // Videos in the viewer: arrows keep stepping files, Shift+arrows seek.
+            assert!(has(KeyMode::Viewer, "Right", Command::NextImage));
+            assert!(has(KeyMode::Viewer, "Shift+Left", Command::SeekBack));
+            assert!(has(KeyMode::Viewer, "Shift+Right", Command::SeekForward));
         }
     }
 

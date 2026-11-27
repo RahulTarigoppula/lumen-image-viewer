@@ -95,6 +95,11 @@ pub enum Command {
     PlayPause,
     NextFrame,
     PrevFrame,
+    /// Video in the viewer: a few seconds back / on.
+    SeekBack,
+    SeekForward,
+    /// Video in the viewer: sound off / on.
+    ToggleMute,
     OpenWithEditor,
     /// External editor number 2..=9 from Settings > External editors.
     OpenWithEditorN(u8),
@@ -249,9 +254,12 @@ impl Command {
             ToggleHistogram => "Toggle histogram".into(),
             ToggleMagnifier => "Toggle magnifier".into(),
             ToggleFilmstrip => "Toggle filmstrip".into(),
-            PlayPause => "Play / pause animation".into(),
+            PlayPause => "Play / pause video or animation".into(),
             NextFrame => "Next frame".into(),
             PrevFrame => "Previous frame".into(),
+            SeekBack => "Video: back 5 seconds".into(),
+            SeekForward => "Video: forward 5 seconds".into(),
+            ToggleMute => "Video: mute / unmute".into(),
             OpenWithEditor => "Open in external editor".into(),
             OpenWithEditorN(n) => format!("Open in external editor {n}"),
             Properties => "File properties".into(),
@@ -389,6 +397,9 @@ impl Command {
             PlayPause => I::PLAY_PAUSE,
             NextFrame => I::SKIP_FORWARD,
             PrevFrame => I::SKIP_BACK,
+            SeekBack => I::REWIND,
+            SeekForward => I::FAST_FORWARD,
+            ToggleMute => I::SPEAKER_SLASH,
             OpenWithEditor | OpenWithEditorN(_) => I::ARROW_SQUARE_OUT,
             Properties => I::FILE_TEXT,
             FitWidth => I::ARROWS_OUT_LINE_HORIZONTAL,
@@ -452,7 +463,7 @@ impl Command {
         v.extend(Self::EDIT_GROUPS.iter().flat_map(|g| g.iter().copied()));
         v.extend([
             Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper, Print, ToggleInfo,
-            ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
+            ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, SeekBack, SeekForward, ToggleMute, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
             CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater,
         ]);
@@ -485,7 +496,7 @@ impl Command {
             FlipVertical, Crop, Resize, CanvasSize, AdjustColors, Levels, Curves, Sharpen, Blur, Effects, AutoEnhance,
             AddText, AddBorder, Watermark, FreeRotate, DrawBoard, CloneStamp, HealingBrush, RedEye, BlurRegion, Selection, Undo, Redo, Save, SaveAs, CopyImage, PasteImage, SetWallpaper,
             Print, ToggleInfo, ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, NextFrame, PrevFrame,
-            OpenWithEditor,
+            SeekBack, SeekForward, ToggleMute, OpenWithEditor,
         ]);
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);

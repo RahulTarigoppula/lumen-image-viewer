@@ -1,0 +1,43 @@
+# Videos play in the viewer: the first clip of the folder plays with the
+# transport bar, then paused, seeked on the bar and stepped by frames, the
+# next clip, and a short slideshow over the folder. The clips are 4 s long.
+@needs video
+@timeout 90
+open {media}\Video
+wait 2500
+run OpenViewer
+wait 1500
+hover 640 600
+wait 300
+shot playing.png
+state
+run PlayPause
+wait 500
+# The seek bar of the 760 pt transport bar (1280 pt window): about the middle.
+click 611 716
+wait 1200
+run NextFrame
+run NextFrame
+wait 1000
+shot paused_seek.png
+state
+run SeekBack
+wait 800
+state
+run NextImage
+wait 2000
+hover 640 610
+wait 300
+shot next_clip.png
+state
+run Slideshow
+wait 2500
+shot slideshow.png
+state
+# The first clip ends about a second later; the other one plays then.
+wait 2200
+shot slideshow_next.png
+state
+key Escape
+wait 1500
+shot back_in_viewer.png
