@@ -115,6 +115,10 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+Shift+T", ToggleTheme),
             ("Ctrl+Shift+V", OpenVideoMode),
             ("Alt+F4", Exit),
+            // Browser panes (address bar, folder tree, files). Global, so F6
+            // also leaves the address bar or the filter box while typing.
+            ("F6", NextPane),
+            ("Shift+F6", PrevPane),
             // Analysis panel (viewer, compare and video). Plain Q is the
             // FastStone flag key, so the panel uses the Q family with modifiers.
             ("Ctrl+Q", ToggleAnalysis),
@@ -166,6 +170,7 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Alt+Enter", Properties),
             ("Alt+I", Properties),
             ("Ctrl+W", SetWallpaper),
+            ("Ctrl+P", Print),
             ("W", ShowInExplorer),
             ("Ctrl+Alt+M", OpenGpsMap),
             ("D", EditComment),
@@ -824,6 +829,22 @@ mod tests {
             assert!(has(KeyMode::Viewer, "Right", Command::NextImage));
             assert!(has(KeyMode::Viewer, "Shift+Left", Command::SeekBack));
             assert!(has(KeyMode::Viewer, "Shift+Right", Command::SeekForward));
+        }
+    }
+
+    #[test]
+    fn browser_print_and_pane_keys() {
+        for p in Preset::ALL {
+            let km = Keymap::preset(p);
+            let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+            assert_eq!(km.lookup(KeyMode::Browser, Key::P, ctrl), Some(Command::Print), "{p:?}");
+            assert_eq!(km.lookup(KeyMode::Browser, Key::P, ctrl | Modifiers::SHIFT), Some(Command::TogglePreviewPane), "{p:?}");
+            assert_eq!(km.lookup(KeyMode::Browser, Key::L, Modifiers::NONE), Some(Command::RotateLeft), "{p:?}");
+            assert_eq!(km.lookup(KeyMode::Browser, Key::R, Modifiers::NONE), Some(Command::RotateRight), "{p:?}");
+            assert_eq!(km.lookup(KeyMode::Global, Key::F6, Modifiers::NONE), Some(Command::NextPane), "{p:?}");
+            assert_eq!(km.lookup(KeyMode::Global, Key::F6, Modifiers::SHIFT), Some(Command::PrevPane), "{p:?}");
+            // F6 must work while typing (it leaves the address bar).
+            assert!(works_while_typing(&km.keys_for(KeyMode::Global, Command::NextPane)[0]));
         }
     }
 

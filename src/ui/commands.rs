@@ -197,6 +197,10 @@ pub enum Command {
     VoteLeft,
     VoteRight,
     VoteSame,
+    /// Browser: move the keyboard to the next part (address bar, folder tree, files).
+    NextPane,
+    /// Browser: move the keyboard to the previous part.
+    PrevPane,
 }
 
 use Command::*;
@@ -360,6 +364,8 @@ impl Command {
             VoteLeft => "Blind test: left is better".into(),
             VoteRight => "Blind test: right is better".into(),
             VoteSame => "Blind test: about the same".into(),
+            NextPane => "Next pane: address bar, folders, files".into(),
+            PrevPane => "Previous pane".into(),
         }
     }
 
@@ -525,6 +531,8 @@ impl Command {
             VoteLeft => I::ARROW_FAT_LEFT,
             VoteRight => I::ARROW_FAT_RIGHT,
             VoteSame => I::EQUALS,
+            NextPane => I::ARROW_SQUARE_RIGHT,
+            PrevPane => I::ARROW_SQUARE_LEFT,
         }
     }
 
@@ -601,6 +609,7 @@ impl Command {
         v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater]);
         v.extend([RoundReport, ReportBranding]);
         v.extend(Self::COMPARE);
+        v.extend([NextPane, PrevPane]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

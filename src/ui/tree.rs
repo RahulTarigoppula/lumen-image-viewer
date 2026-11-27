@@ -5,7 +5,7 @@ use super::theme::{self, Palette};
 use super::widgets;
 use crate::droptarget::{DropOp, Hover, Zone};
 use crate::fileops;
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -60,6 +60,89 @@ pub struct FolderTree {
     pub os_drop: Option<Hover>,
     /// Where folder rows were drawn this frame while such a drag is on.
     pub drop_zones: Vec<(Rect, Zone)>,
+    /// The tree has the keyboard (F6, or a click in it): the arrows move the
+    /// cursor row, Enter opens its folder.
+    pub focused: bool,
+    /// The keyboard cursor: its row and that row's path (the row is found
+    /// again by path when the rows are rebuilt).
+    cursor: Option<(usize, PathBuf)>,
+    /// Scroll the cursor row into view on the next frame.
+    scroll_cursor: bool,
+    /// Type-ahead: the letters typed so far and when the last one came (egui time).
+    typed: (String, f64),
+}
+
+/// What a key does in the tree (see [`tree_key`]).
+#[derive(Debug, PartialEq)]
+enum TreeMove {
+    None,
+    /// Put the cursor on this row.
+    To(usize),
+    /// Expand or collapse this row's folder.
+    Toggle(usize),
+    /// Open this row's folder.
+    Open(usize),
+    /// Give the keyboard back to the files.
+    Leave,
+}
+
+/// Seconds between letters for type-ahead to go on with the same word.
+const TYPEAHEAD_SECS: f64 = 0.9;
+
+/// The move for `key` with the cursor on row `cur`: Up / Down, Page Up / Down
+/// (`page` rows), Home / End over the folder rows; Right expands a closed
+/// folder or steps into an open one; Left collapses an open folder or goes to
+/// its parent (Backspace too); Enter / Space open; Esc leaves the tree.
+fn tree_key(rows: &[Row], expanded: &HashSet<PathBuf>, cur: usize, key: Key, page: usize) -> TreeMove {
+    let items: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| matches!(r, Row::Item { .. })).map(|(i, _)| i).collect();
+    let (Some(pos), Some(Row::Item { path, depth, expandable, .. })) = (items.iter().position(|&i| i == cur), rows.get(cur)) else {
+        return items.first().map_or(TreeMove::None, |&i| TreeMove::To(i));
+    };
+    let last = items.len() - 1;
+    let open = *expandable && expanded.contains(path);
+    match key {
+        Key::ArrowUp => TreeMove::To(items[pos.saturating_sub(1)]),
+        Key::ArrowDown => TreeMove::To(items[(pos + 1).min(last)]),
+        Key::PageUp => TreeMove::To(items[pos.saturating_sub(page)]),
+        Key::PageDown => TreeMove::To(items[(pos + page).min(last)]),
+        Key::Home => TreeMove::To(items[0]),
+        Key::End => TreeMove::To(items[last]),
+        Key::ArrowRight if *expandable && !open => TreeMove::Toggle(cur),
+        Key::ArrowRight if open => match rows.get(cur + 1) {
+            Some(Row::Item { depth: d, .. }) if *d == depth + 1 => TreeMove::To(cur + 1),
+            _ => TreeMove::None,
+        },
+        Key::ArrowLeft if open => TreeMove::Toggle(cur),
+        Key::ArrowLeft | Key::Backspace if *depth > 0 => {
+            (0..cur).rev().find(|&i| matches!(&rows[i], Row::Item { depth: d, .. } if d + 1 == *depth)).map_or(TreeMove::None, TreeMove::To)
+        }
+        Key::Enter | Key::Space => TreeMove::Open(cur),
+        Key::Escape => TreeMove::Leave,
+        _ => TreeMove::None,
+    }
+}
+
+/// Type-ahead in the tree: the row of the next folder name (lowercase in
+/// `names`, `None` for rows that are not folders) that starts with `query`,
+/// from the cursor on and wrapping around. A new search (`fresh`) starts
+/// after the cursor, so typing the same letter again steps to the next
+/// folder with it; so does a run of one letter ("ddd") that no name starts with.
+fn typeahead_row(names: &[Option<String>], cur: Option<usize>, query: &str, fresh: bool) -> Option<usize> {
+    let n = names.len();
+    if n == 0 || query.is_empty() {
+        return None;
+    }
+    let find = |q: &str, start: usize| (0..n).map(|k| (start + k) % n).find(|&i| names[i].as_deref().is_some_and(|s| s.starts_with(q)));
+    let after = cur.map_or(0, |c| c + 1) % n;
+    let start = if fresh { after } else { cur.unwrap_or(0) % n };
+    find(query, start).or_else(|| {
+        let first = query.chars().next()?;
+        if query.chars().all(|c| c == first) {
+            find(&first.to_string(), after)
+        } else {
+            None
+        }
+    })
 }
 
 const ROW_H: f32 = 26.0;
@@ -231,6 +314,141 @@ impl FolderTree {
         }
     }
 
+    /// Give the tree the keyboard (F6) with the cursor on `current`, the open
+    /// folder's row in the drive tree, scrolled into view.
+    pub fn focus(&mut self, current: &Path) {
+        self.focused = true;
+        self.cursor = Some((usize::MAX, current.to_path_buf()));
+        self.scroll_cursor = true;
+    }
+
+    /// The cursor's row, found again by path after the rows changed: the
+    /// nearest row with that path (a row of `usize::MAX` prefers the drive
+    /// tree, which comes last). A folder no longer shown falls back to its
+    /// nearest shown parent, then to the first folder.
+    fn resolve_cursor(&mut self) -> Option<usize> {
+        let (i, path) = self.cursor.clone()?;
+        if matches!(self.rows.get(i), Some(Row::Item { path: p, .. }) if *p == path) {
+            return Some(i);
+        }
+        let rows = &self.rows;
+        let nearest = |want: &Path| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| matches!(r, Row::Item { path: p, .. } if p == want))
+                .min_by_key(|(k, _)| k.abs_diff(i))
+                .map(|(k, _)| k)
+        };
+        let found = nearest(path.as_path()).or_else(|| path.ancestors().skip(1).find_map(nearest)).or_else(|| rows.iter().position(|r| matches!(r, Row::Item { .. })));
+        self.cursor = found.and_then(|k| match &self.rows[k] {
+            Row::Item { path, .. } => Some((k, path.clone())),
+            _ => None,
+        });
+        found
+    }
+
+    fn set_cursor(&mut self, i: usize) {
+        if let Some(Row::Item { path, .. }) = self.rows.get(i) {
+            self.cursor = Some((i, path.clone()));
+            self.scroll_cursor = true;
+        }
+    }
+
+    fn typeahead_on(&self, now: f64) -> bool {
+        !self.typed.0.is_empty() && now - self.typed.1 < TYPEAHEAD_SECS
+    }
+
+    /// The tree's keys this frame (see [`tree_key`]; letters jump by name).
+    /// Enter on the folder that is already open hands the keyboard to its files.
+    fn keys(&mut self, ui: &Ui, current: &Path, favorites: &[PathBuf]) -> Option<TreeAction> {
+        let (events, now) = ui.input(|i| (i.events.clone(), i.time));
+        let ctx = ui.ctx().clone();
+        let mut action = None;
+        for e in &events {
+            if !self.focused {
+                break;
+            }
+            match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if !(modifiers.ctrl || modifiers.command || modifiers.alt) => {
+                    // A space inside a type-ahead word belongs to the name (the Text event).
+                    if *key == Key::Space && self.typeahead_on(now) {
+                        continue;
+                    }
+                    if self.cursor.is_none() {
+                        self.cursor = Some((usize::MAX, current.to_path_buf()));
+                    }
+                    let Some(cur) = self.resolve_cursor() else { continue };
+                    let page = ((self.last_view_h / ROW_H) as usize).saturating_sub(1).max(1);
+                    match tree_key(&self.rows, &self.expanded, cur, *key, page) {
+                        TreeMove::None => {}
+                        TreeMove::To(i) => self.set_cursor(i),
+                        TreeMove::Toggle(i) => {
+                            if let Some(Row::Item { path, .. }) = self.rows.get(i) {
+                                let path = path.clone();
+                                self.toggle(&path);
+                                // Rows now, so the next key in this frame sees them.
+                                self.rebuild_rows(favorites, &ctx);
+                                self.scroll_cursor = true;
+                            }
+                        }
+                        TreeMove::Open(i) => {
+                            if let Some(Row::Item { path, expandable, .. }) = self.rows.get(i) {
+                                let (path, expandable) = (path.clone(), *expandable);
+                                if path == current && *key == Key::Enter {
+                                    self.focused = false;
+                                } else {
+                                    if expandable && !self.expanded.contains(&path) {
+                                        self.toggle(&path);
+                                        self.rebuild_rows(favorites, &ctx);
+                                    }
+                                    action = Some(TreeAction::Navigate(path));
+                                }
+                            }
+                        }
+                        TreeMove::Leave => self.focused = false,
+                    }
+                }
+                egui::Event::Text(t) => {
+                    let fresh = !self.typeahead_on(now);
+                    // A lone space opens (the Space key above); it starts no search.
+                    if fresh && t.trim().is_empty() {
+                        continue;
+                    }
+                    if fresh {
+                        self.typed.0.clear();
+                    }
+                    self.typed.0.push_str(&t.to_lowercase());
+                    self.typed.1 = now;
+                    if self.cursor.is_none() {
+                        self.cursor = Some((usize::MAX, current.to_path_buf()));
+                    }
+                    let cur = self.resolve_cursor();
+                    let names: Vec<Option<String>> = self
+                        .rows
+                        .iter()
+                        .map(|r| match r {
+                            Row::Item { name, .. } => Some(name.to_lowercase()),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(i) = typeahead_row(&names, cur, &self.typed.0, fresh) {
+                        self.set_cursor(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The tree owns the plain keys: the files must not see them too (the
+        // Enter that hands the keyboard over would also open the focused file).
+        let plain = |e: &egui::Event| match e {
+            egui::Event::Text(_) => true,
+            egui::Event::Key { pressed: true, modifiers, .. } => !(modifiers.ctrl || modifiers.command || modifiers.alt),
+            _ => false,
+        };
+        ctx.input_mut(|i| i.events.retain(|e| !plain(e)));
+        action
+    }
+
     /// Re-read the listing of `dir` the next time it is shown (the old one stays
     /// on screen until the new one arrives, so nothing flickers).
     pub fn invalidate(&mut self, dir: &Path) {
@@ -320,7 +538,9 @@ impl FolderTree {
 
     /// Rows are virtualized: the tree is flattened once per change and only the
     /// rows on screen are laid out, so folders with thousands of sub-folders stay cheap.
-    pub fn ui(&mut self, ui: &mut Ui, current: &Path, favorites: &[PathBuf], p: &Palette) -> Option<TreeAction> {
+    /// `show_focus`: the tree has the keyboard (its cursor row gets a focus ring);
+    /// `keys`: it may read this frame's keys.
+    pub fn ui(&mut self, ui: &mut Ui, current: &Path, favorites: &[PathBuf], p: &Palette, show_focus: bool, keys: bool) -> Option<TreeAction> {
         let ctx = ui.ctx().clone();
         self.drop_zones.clear();
         if self.poll() {
@@ -334,6 +554,8 @@ impl FolderTree {
         if self.rows_dirty || self.rows_favs.as_slice() != favorites {
             self.rebuild_rows(favorites, &ctx);
         }
+        let mut action = if keys && self.focused { self.keys(ui, current, favorites) } else { None };
+        let cursor_row = if show_focus && self.focused { self.resolve_cursor() } else { None };
         let row_h = ROW_H;
         self.indent = indent_step(ui.available_width(), self.max_depth);
         self.tips = !super::overlay_open(&ctx);
@@ -365,7 +587,23 @@ impl FolderTree {
                 None => {}
             }
         }
-        let mut action = None;
+        // The keyboard cursor moved: scroll just enough to show its row.
+        if self.scroll_cursor {
+            if let Some(i) = cursor_row {
+                self.scroll_cursor = false;
+                // The scroll area hashes its `IdSalt` once more: build the same id.
+                let id = ui.make_persistent_id(egui::IdSalt::new("folder-tree"));
+                let offset = egui::scroll_area::State::load(&ctx, id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
+                let y = i as f32 * row_h;
+                // Going up, a section caption right above the row comes into view too.
+                let top = if i > 0 && matches!(self.rows.get(i - 1), Some(Row::Header(_))) { y - row_h } else { y };
+                if top < offset {
+                    scroll = scroll.vertical_scroll_offset(top);
+                } else if y + row_h > offset + view_h {
+                    scroll = scroll.vertical_scroll_offset(y + row_h - view_h);
+                }
+            }
+        }
         let rows = std::mem::take(&mut self.rows);
         // show_rows measures rows with the outer item spacing: make it zero there too.
         let prev_spacing = ui.spacing().item_spacing.y;
@@ -383,7 +621,7 @@ impl FolderTree {
                         ui.painter().text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, "Loading...", FontId::proportional(12.0), p.faint);
                     }
                     Row::Item { path, name, icon, depth, expandable, favorite } => {
-                        if let Some(a) = self.row(ui, path, name, icon, *depth, current, *expandable, p, *favorite) {
+                        if let Some(a) = self.row(ui, i, cursor_row == Some(i), path, name, icon, *depth, current, *expandable, p, *favorite) {
                             action = Some(a);
                         }
                     }
@@ -401,6 +639,8 @@ impl FolderTree {
     fn row(
         &mut self,
         ui: &mut Ui,
+        index: usize,
+        cursor_here: bool,
         path: &Path,
         name: &str,
         icon: &str,
@@ -445,6 +685,10 @@ impl FolderTree {
                     p.accent,
                 );
             }
+            // The keyboard cursor (the tree has the keyboard).
+            if cursor_here {
+                ui.painter().rect_stroke(r, CornerRadius::same(6), Stroke::new(1.5, p.accent), egui::StrokeKind::Inside);
+            }
             let x0 = rect.min.x + 12.0 + depth as f32 * self.indent;
             let cy = rect.center().y;
             if expandable {
@@ -481,6 +725,10 @@ impl FolderTree {
             let m = ui.input(|i| i.modifiers);
             let copy = crate::droptarget::drop_op(&files.0, path, m.ctrl, m.shift) == DropOp::Copy;
             action = Some(TreeAction::DropFiles { target: path.to_path_buf(), files: files.0.clone(), copy });
+        }
+        if resp.clicked() || resp.secondary_clicked() {
+            // The keyboard follows the click (Up / Down go on from this row).
+            self.cursor = Some((index, path.to_path_buf()));
         }
         if resp.clicked() {
             // Click on the caret toggles, elsewhere navigates (and expands).
@@ -544,4 +792,86 @@ impl FolderTree {
 fn header(ui: &mut Ui, p: &Palette, text: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
     ui.painter().text(Pos2::new(rect.min.x + 14.0, rect.max.y - 8.0), Align2::LEFT_CENTER, text, theme::text::caption(), p.muted);
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    fn item(path: &str, depth: usize) -> Row {
+        Row::Item { path: PathBuf::from(path), name: display_name(Path::new(path)), icon: I::FOLDER, depth, expandable: true, favorite: false }
+    }
+
+    /// Quick access, then C:\ with Photos (open: 2024, 2025) and Work (open, listing), then D:\.
+    fn rows() -> (Vec<Row>, HashSet<PathBuf>) {
+        let rows = vec![
+            Row::Header("Quick access"),
+            Row::Item { path: PathBuf::from(r"C:\Users\me\Pictures"), name: "Pictures".into(), icon: I::FOLDER, depth: 0, expandable: false, favorite: false },
+            Row::Header(THIS_PC),
+            item(r"C:\", 0),
+            item(r"C:\Photos", 1),
+            item(r"C:\Photos\2024", 2),
+            item(r"C:\Photos\2025", 2),
+            item(r"C:\Work", 1),
+            Row::Loading { depth: 2 },
+            item(r"D:\", 0),
+        ];
+        let open: HashSet<PathBuf> = [r"C:\", r"C:\Photos", r"C:\Work"].into_iter().map(PathBuf::from).collect();
+        (rows, open)
+    }
+
+    #[test]
+    fn arrows_move_over_folder_rows_only() {
+        let (r, open) = rows();
+        let k = |cur, key| tree_key(&r, &open, cur, key, 3);
+        assert_eq!(k(1, Key::ArrowDown), TreeMove::To(3), "headers are skipped");
+        assert_eq!(k(3, Key::ArrowUp), TreeMove::To(1));
+        assert_eq!(k(1, Key::ArrowUp), TreeMove::To(1), "stays on the first row");
+        assert_eq!(k(7, Key::ArrowDown), TreeMove::To(9), "the loading row is skipped");
+        assert_eq!(k(9, Key::ArrowDown), TreeMove::To(9));
+        assert_eq!(k(4, Key::Home), TreeMove::To(1));
+        assert_eq!(k(4, Key::End), TreeMove::To(9));
+        assert_eq!(k(1, Key::PageDown), TreeMove::To(5));
+        assert_eq!(k(9, Key::PageUp), TreeMove::To(5));
+        // A cursor that is not on a folder row starts over at the first one.
+        assert_eq!(k(8, Key::ArrowDown), TreeMove::To(1));
+    }
+
+    #[test]
+    fn left_and_right_fold_and_walk_the_tree() {
+        let (r, open) = rows();
+        let k = |cur, key| tree_key(&r, &open, cur, key, 3);
+        assert_eq!(k(5, Key::ArrowRight), TreeMove::Toggle(5), "a closed folder opens");
+        assert_eq!(k(4, Key::ArrowRight), TreeMove::To(5), "an open folder: to its first sub-folder");
+        assert_eq!(k(7, Key::ArrowRight), TreeMove::None, "sub-folders still being listed");
+        assert_eq!(k(1, Key::ArrowRight), TreeMove::None, "quick access rows do not expand");
+        assert_eq!(k(4, Key::ArrowLeft), TreeMove::Toggle(4), "an open folder closes");
+        assert_eq!(k(6, Key::ArrowLeft), TreeMove::To(4), "a closed folder: to its parent");
+        assert_eq!(k(4, Key::Backspace), TreeMove::To(3), "Backspace goes to the parent even when open");
+        assert_eq!(k(9, Key::ArrowLeft), TreeMove::None, "a closed drive has no parent row");
+        assert_eq!(k(6, Key::Enter), TreeMove::Open(6));
+        assert_eq!(k(6, Key::Space), TreeMove::Open(6));
+        assert_eq!(k(6, Key::Escape), TreeMove::Leave);
+    }
+
+    #[test]
+    fn typeahead_finds_folders_by_their_first_letters() {
+        let (r, _) = rows();
+        let names: Vec<Option<String>> = r
+            .iter()
+            .map(|r| match r {
+                Row::Item { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typeahead_row(&names, Some(1), "p", true), Some(4));
+        assert_eq!(typeahead_row(&names, Some(4), "p", true), Some(1), "the same letter again steps on, wrapping around");
+        assert_eq!(typeahead_row(&names, Some(4), "pi", false), Some(1), "more letters narrow the search");
+        assert_eq!(typeahead_row(&names, Some(4), "ph", false), Some(4), "the cursor row still matches");
+        assert_eq!(typeahead_row(&names, Some(4), "pp", false), Some(1), "a repeated letter cycles");
+        assert_eq!(typeahead_row(&names, Some(3), "2025", true), Some(6));
+        assert_eq!(typeahead_row(&names, None, "w", true), Some(7));
+        assert_eq!(typeahead_row(&names, Some(3), "x", true), None);
+        assert_eq!(typeahead_row(&[], None, "a", true), None);
+    }
 }

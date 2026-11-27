@@ -280,6 +280,9 @@ pub struct App {
     save_dialog: Option<SaveDialog>,
     show_settings: bool,
     show_help: bool,
+    /// The keyboard shortcuts window's search text, and "focus its field next frame".
+    help_query: String,
+    help_focus: bool,
     show_about: bool,
     /// The default report branding, opened from the command palette.
     report_branding: Option<crate::ui::branding::BrandingDialog>,
@@ -454,6 +457,8 @@ impl App {
             save_dialog: None,
             show_settings: false,
             show_help: false,
+            help_query: String::new(),
+            help_focus: false,
             show_about: false,
             report_branding: None,
             fullscreen: false,
@@ -852,7 +857,14 @@ impl App {
             | PrevScene | ToggleScorecard | CompareHelp | VoteLeft | VoteRight | VoteSame => self.core.toasts.info("This works in Compare: select two to four images, then Compare"),
             CommandPalette => self.palette.toggle(),
             Settings => self.show_settings = !self.show_settings,
-            ShortcutsHelp => self.show_help = !self.show_help,
+            ShortcutsHelp => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    // A fresh search, ready to type in.
+                    self.help_query.clear();
+                    self.help_focus = true;
+                }
+            }
             About => self.show_about = true,
             ToggleFullscreen => self.set_fullscreen(!self.fullscreen),
             ToggleTheme => {
@@ -1168,6 +1180,9 @@ impl App {
                     self.core.toasts.info("Select 2-4 images (or 2 videos) to compare");
                     return;
                 };
+                if imgs.len() > 4 {
+                    self.core.toasts.info(format!("Comparing the first 4 of {}", imgs.len()));
+                }
                 self.compare = Some(crate::ui::compare::Compare::new(imgs.into_iter().take(4).collect(), &self.core));
                 self.mode = Mode::Compare;
             }
@@ -1432,6 +1447,12 @@ impl App {
                 if self.mode == Mode::Browser {
                     let step = if cmd == MoveEarlier { -1 } else { 1 };
                     self.browser.nudge(&mut self.core, step);
+                }
+            }
+            NextPane | PrevPane => {
+                if self.mode == Mode::Browser {
+                    let ctx = self.core.ctx.clone();
+                    self.browser.cycle_focus(&ctx, cmd == NextPane);
                 }
             }
             CycleInspect => {
@@ -2769,6 +2790,9 @@ impl App {
         // Mode shortcuts are off while typing or while a tool window has the user's attention.
         let mode_map = mode_map.filter(|_| !typing && !self.tool_window_active);
         let typeahead = mode_map == Some(KeyMode::Browser) && self.browser.typeahead_active();
+        // The folder tree (F6) owns the plain keys: arrows, Enter, letters, Del ...
+        // Only shortcuts with Ctrl or Alt and the F-keys still reach the browser.
+        let tree_keys = mode_map == Some(KeyMode::Browser) && self.browser.tree_focused();
         // Esc with a menu or a list open only closes it (egui does), it does
         // not also leave the viewer or the mode.
         let popup = egui::Popup::is_any_open(ctx);
@@ -2782,7 +2806,8 @@ impl App {
                 if typeahead && plain && key.name().len() == 1 {
                     return None;
                 }
-                if let Some(m) = mode_map {
+                let tree_owns = tree_keys && !keymap::works_while_typing(&egui::KeyboardShortcut::new(mods, key));
+                if let Some(m) = mode_map.filter(|_| !tree_owns) {
                     if let Some(c) = km.lookup(m, key, mods) {
                         // Image navigation works like the toolbar arrows: it closes an
                         // untouched tool, or asks first when the tool has changes.
@@ -2811,10 +2836,11 @@ impl App {
                 }
             }
             Some(KeyMode::Browser) => {
-                // Letters not bound to a command start (or continue) a type-ahead search.
+                // Letters not bound to a command start (or continue) a type-ahead search
+                // in the files (the folder tree has its own when it has the keyboard).
                 let texts: Vec<String> = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect());
                 let mods = ctx.input(|i| i.modifiers);
-                if fire.is_empty() && !mods.ctrl && !mods.alt {
+                if fire.is_empty() && !mods.ctrl && !mods.alt && !tree_keys {
                     let bound = km.bound_letters(KeyMode::Browser);
                     for t in texts {
                         let Some(c) = t.chars().next() else { continue };
@@ -3329,10 +3355,13 @@ impl App {
     }
 
     fn help_window(&mut self, ctx: &egui::Context) {
-        use crate::ui::keymap::{self, KeyMode};
+        use crate::ui::keymap;
         let p = self.core.pal;
         let mut open = true;
+        let mut close = false;
         let km = keymap::active();
+        // Generated from the active keymap and the mouse settings, so this list is always correct.
+        let sections = crate::ui::help::filtered(crate::ui::help::sections(&km, self.core.settings.wheel_action), &self.help_query);
         crate::ui::widgets::app_window("shortcuts-help", "Keyboard shortcuts").open(&mut open).default_size(640.0, 560.0).min_size(360.0, 240.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Preset: {}", keymap::Preset::from_id(&self.core.settings.keymap_preset).label())).color(p.muted));
@@ -3341,10 +3370,33 @@ impl App {
                     crate::ui::settings_window::open_page(ctx, "Keyboard");
                 }
             });
+            ui.add_space(6.0);
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.help_query)
+                    .id_salt("help-search")
+                    .hint_text(format!("{}  Search shortcuts and mouse actions", I::MAGNIFYING_GLASS))
+                    .desired_width(f32::INFINITY),
+            );
+            if std::mem::take(&mut self.help_focus) {
+                search.request_focus();
+            }
+            // Esc in the search: clears it, or closes the window when it is empty.
+            if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                if self.help_query.is_empty() {
+                    close = true;
+                } else {
+                    self.help_query.clear();
+                    search.request_focus();
+                }
+            }
             ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if sections.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("No shortcuts or mouse actions match").color(p.muted));
+                    return;
+                }
                 // One grid for every section, so the key column lines up at the same x.
-                // Generated from the active keymap, so this list is always correct.
                 let no_wrap = |t: RichText| egui::Label::new(t).wrap_mode(egui::TextWrapMode::Extend);
                 // One grid cell: the gap above the title lives inside it
                 // (add_space directly in a grid row is not allowed).
@@ -3356,41 +3408,27 @@ impl App {
                     ui.end_row();
                 };
                 egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).striped(false).show(ui, |ui| {
-                    for mode in KeyMode::ALL {
-                        title(ui, mode.label());
-                        for c in keymap::commands_of(mode) {
-                            let keys = keymap::mode_text(&km, mode, c);
-                            if keys.is_empty() {
-                                continue;
+                    for s in &sections {
+                        title(ui, &s.title);
+                        for r in &s.rows {
+                            if s.mouse {
+                                ui.add(no_wrap(RichText::new(&r.label)));
+                                ui.add(no_wrap(RichText::new(&r.keys).color(p.muted)));
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(r.icon.unwrap_or_default()).size(theme::size::ICON).color(p.muted)));
+                                    ui.add(no_wrap(RichText::new(&r.label)));
+                                });
+                                crate::ui::widgets::shortcut_keys(ui, &p, &r.keys);
                             }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                ui.add_sized([18.0, 20.0], egui::Label::new(RichText::new(c.icon()).size(theme::size::ICON).color(p.muted)));
-                                ui.add(no_wrap(RichText::new(c.label())));
-                            });
-                            crate::ui::widgets::shortcut_keys(ui, &p, &keys);
                             ui.end_row();
                         }
-                    }
-                    title(ui, "Mouse");
-                    for (k, v) in [
-                        ("Wheel", "Next / previous image (or zoom - configurable in Settings)"),
-                        ("Ctrl + wheel", "Zoom at cursor (thumbnail size in the browser)"),
-                        ("Drag", "Pan a zoomed image"),
-                        ("Press & hold", "Magnifier loupe (when the image fits the window)"),
-                        ("Middle click", "Toggle fit / 100%"),
-                        ("Click a video", "Play / pause it (drag on its bar to seek)"),
-                        ("Double click", "Back to the browser"),
-                        ("Back / forward buttons", "Previous / next image"),
-                    ] {
-                        ui.add(no_wrap(RichText::new(v)));
-                        ui.add(no_wrap(RichText::new(k).color(p.muted)));
-                        ui.end_row();
                     }
                 });
             });
         });
-        self.show_help = open;
+        self.show_help = open && !close;
     }
 
     // ------------------------------------------------------------ chrome

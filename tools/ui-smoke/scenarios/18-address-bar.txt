@@ -1,0 +1,20 @@
+# Address bar: a path that is not there keeps the field open with "Folder not
+# found"; a path to a file opens its folder with the file selected.
+open {media}\RoundA\DeviceX
+wait 2500
+key Ctrl+L
+wait 500
+type \no_such_folder
+key Enter
+wait 800
+shot not_found.png
+key Ctrl+A
+type {media}\Flat\noise_iso6400.jpg
+key Enter
+wait 2500
+shot file_selected.png
+# Five images selected: Compare shows the first 4 and says so.
+run SelectAll
+run Compare
+wait 1500
+shot compare_first4.png

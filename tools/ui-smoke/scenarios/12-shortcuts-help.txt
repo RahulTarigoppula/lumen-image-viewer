@@ -1,5 +1,6 @@
-# Keyboard shortcuts window (F1 / ShortcutsHelp), then its end: the Compare
-# and Blind test sections come from the keymap like the others.
+# Keyboard shortcuts window (F1 / ShortcutsHelp): its end (the Compare and
+# Blind test sections come from the keymap like the others), then its search
+# (by name, by mouse action, nothing found).
 open {media}\RoundA\DeviceX
 wait 2000
 run ShortcutsHelp
@@ -12,3 +13,14 @@ shot shortcuts_end.png
 scroll 700
 wait 800
 shot shortcuts_compare.png
+type print
+wait 800
+shot search_print.png
+key Ctrl+A
+type wheel
+wait 800
+shot search_wheel.png
+key Ctrl+A
+type zzzqqq
+wait 800
+shot search_none.png

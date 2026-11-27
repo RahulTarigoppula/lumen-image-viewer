@@ -1,0 +1,12 @@
+# Long file and folder names: one caption line with the middle left out, so the
+# start and the extension stay; the tooltip has the whole name.
+open {media}\LongNames
+wait 3500
+shot captions.png
+hover 570 150
+wait 1500
+shot tooltip.png
+# The right-click menu of a file has Rotate left / right.
+click 570 150 right
+wait 800
+shot context_menu.png

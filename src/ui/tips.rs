@@ -119,6 +119,8 @@ pub fn describe(c: Command) -> &'static str {
         JumpDivider => "In Split view, move the divider all the way to one side and back",
         KeepOnly => "Flag the image under the pointer and give the others the red rejected label",
         ExportReport => "Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page",
+        NextPane => "In the browser: move the keyboard to the address bar, the folder tree or the files",
+        PrevPane => "In the browser: move the keyboard back to the files, the folder tree or the address bar",
         _ => "",
     }
 }
