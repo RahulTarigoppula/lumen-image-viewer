@@ -1,5 +1,139 @@
 # Changelog
 
+## 2.2.0 (27 November 2026)
+
+Everything left over from the 2.1 handoff (Explorer cut / paste and drop, undo of deletes, sharing, videos in the
+viewer, lossless JPEG crop, an installer), Samsung and Pixel camera data with HDR gain maps, report branding, and a
+second full pass over looks, ease of use, stability and speed.
+
+### Install
+- New Windows installer, Lumen-Setup.exe: installs for your account without admin rights (or for all users), adds a
+  Start menu shortcut and an optional desktop icon, can make Lumen an "Open with" choice for pictures and videos,
+  updates in place and uninstalls from Settings > Apps (your settings are kept).
+- Lumen.exe and Lumen-portable.zip stay fully portable. SHA256SUMS.txt lists all three downloads in the standard
+  format, so `sha256sum -c` works.
+- Command-line switches `--register-file-types` and `--unregister` add or remove Lumen's Windows integration
+  without opening a window.
+
+### Files, Explorer and sharing
+- Ctrl+X cuts files in the browser, like Explorer: they look faded until pasted; Ctrl+V in another folder (or in
+  Explorer) moves them, and Ctrl+Z puts them back. Files cut in Explorer are moved when pasted in Lumen. A copy
+  pasted into its own folder is named "photo - Copy.jpg".
+- Drag files from Explorer onto a folder tile, list row or folder tree row to move them there (same drive) or copy
+  them (other drive); Shift moves, Ctrl copies. The folder lights up and a badge says "Move to ..." or "Copy to ...".
+  Ctrl or Shift on the empty area copies or moves into the folder shown; other drops still open the files. Lumen's
+  own thumbnail drags onto folders follow the same rule.
+- Copy and move messages say where the files went, e.g. "Moved 3 files to Holiday (Ctrl+Z to undo)".
+- Undo a delete: Ctrl+Z after deleting in the browser or the viewer brings the files back from the Recycle Bin to
+  where they were, selected and with their ratings and labels. A name now taken gets a number added, a missing
+  folder is made again, and files that cannot be restored are listed.
+- Share... (browser right-click menu, viewer menus, command palette) opens the Windows share window for the
+  selected files or the current image.
+
+### Browser
+- When a filter hides every file, the grid says "No files match the filters" and offers Clear filters; the status
+  bar says how many are hidden ("3 of 120 files (filtered)").
+- Long names under thumbnails keep their start and extension ("IMG_2026...final_edit.jpg").
+- A folder that does not exist in the address bar says "Folder not found" and keeps your text; a path to a file
+  opens its folder with the file selected.
+- The right-click menu now opens on files (before, only on empty space); it has Rotate left / right, and Ctrl+P
+  prints. Comparing more than 4 selected images says it shows the first 4.
+- The folder tree works from the keyboard: F6 / Shift+F6 move between the address bar, the folders and the files;
+  arrows, Left / Right, Enter, Home / End and typing a name move around. Clicking a folder gives the tree the
+  keyboard, clicking the files takes it back.
+- Keyboard shortcuts (F1): a search box, and mouse actions listed for the browser, the viewer and Compare,
+  following your mouse wheel setting.
+- Moving through thumbnails with the keyboard no longer jumps the view when it is scrolled.
+
+### Viewer
+- Videos play right in the viewer, between the folder's images: poster first, then a bar for play / pause,
+  seeking, repeat, volume and "Open in video mode". K plays or pauses, comma and period step one frame,
+  Shift+Left / Right jump 5 seconds; Left / Right still change file. A single video opened from the browser or
+  Explorer plays here (Settings > Viewer > Videos can send it to video mode); volume, mute and repeat are remembered.
+- Slideshows include videos: they play muted (M for sound) and the show moves on when one ends or after a time you
+  set. Builds without the video player show a clear card with "Open with the default app".
+- Full screen shows the caption with rating, flag and color label by default; the old "Show info overlay" setting
+  is now "Open the info panel on start".
+- New optional camera line in the caption (exposure, aperture, ISO, focal length, date), in full screen by
+  default; choose when and which fields in Settings > Viewer.
+- Zoom navigator: when zoomed in, a small overview in the corner shows which part you see; drag it to pan (also in
+  Compare; can be turned off in Settings > Viewer).
+- Stars, flag and color labels look and work the same in the browser preview pane and the viewer's Info panel,
+  with tooltips that name your own keys; the viewer's right-click menu has "Rate & tag". Stars are easier to see
+  in the light theme, and hovering a star previews that rating.
+- Ratings, flags, color labels and Compare's Keep can be undone with Ctrl+Z or the Undo button on their notice;
+  notices say how many files changed.
+- Edge panels: Full screen only (new default), Always or Off; resting the pointer at a window edge no longer pops a
+  panel.
+- The Info panel takes at most 40% of the window and hides by itself below 700 points wide.
+- Going past the last picture opens the next folder at its first picture in that folder's own order, including a
+  hand-arranged one.
+- The EXIF and Metadata buttons are one Metadata button; the window opens on the tab you used last.
+
+### Lossless JPEG
+- Crop has a new "Lossless" option for JPEGs: it crops the file without re-saving the picture, so no quality is
+  lost; the left and top edges snap to the JPEG's 8 or 16 px grid. Ctrl+Z undoes it.
+- Lossless rotate and flip now also work for JPEGs whose metadata has no orientation tag: the picture itself is
+  turned without re-saving (a few edge pixels may be trimmed, and the message says so).
+- Lossless crops and turns update the picture size in the metadata and make a new thumbnail; an HDR gain map that
+  no longer matches is removed, and you are told.
+- Rotating in the viewer runs in the background and can still be undone with Ctrl+Z.
+
+### Compare, analysis and reports
+- A Show menu holds histograms, the camera strip, pixel values, inspect views, the pane layout and Metadata, so
+  the view modes keep their names on smaller screens.
+- Pictures are laid out in columns, rows or a grid, whichever shows them largest (or pick one in the Show menu).
+- Compare shortcuts can be changed in Settings > Keyboard (new Compare and Blind test tabs) with conflict warnings
+  and reset; the defaults are the same as before. The ? overlay, the shortcuts window, tooltips and menus show your
+  own keys, and Compare's commands are in the command palette.
+- Deleting a picture on a USB drive, SD card or network folder in Compare says it is permanent and always asks;
+  elsewhere it follows the "Confirm delete" setting.
+- Analysis no longer says "no problem areas" right under a list of things to check; Mark up keeps Clear and Done
+  visible when the Review panel is open.
+- Report branding: company or team name, logo, accent color and a footer line such as "Confidential", with a cover
+  page showing the project, devices, date and author. Works for the round report and the comparison review, as
+  PowerPoint, PDF and web page; set it once as the default ("Report branding..." in the palette) or per project.
+
+### Camera metadata and HDR
+- Samsung Galaxy photos: the maker note is decoded (device, firmware, lens, sensor area, Smart Range, exposure,
+  ISO, face detection), and its clues appear in the capture summary.
+- Google Pixel photos: HDR+, Night Sight, astrophotography and best-of-burst are recognized; Google's encrypted
+  maker note and XMP blocks are labelled as encrypted instead of shown as text.
+- HDR gain maps (Ultra HDR, ISO 21496-1, Apple JPEG): a new "HDR gain map" section shows boost, headroom and map
+  size, and two new inspect views (Shift+O, in Compare O): "Gain map" over the picture, and "HDR rendition" with a
+  screen headroom slider, to see which areas an HDR screen brightens. HEIC gain maps are detected and say so.
+
+### Video mode
+- Discarding an analysis or auto-align (Swap, closing a video, Re-run, leaving video mode) stops it at once.
+- Opening videos no longer freezes the window; each file is read once to get its details.
+- Stepping back no longer keeps a full-resolution copy of every remembered frame (much less memory for 4K pairs).
+- After Swap or closing a video, quality numbers, the difference image and the timeline no longer briefly show
+  the previous video's results; the Info panel stays fast during long analyses.
+- With one video the caption shows just the name and time; Save frames no longer writes a test file.
+
+### Stability and speed
+- Blind test votes are saved after every vote, and the project is saved when Lumen closes.
+- When someone else saves the project while you work, their changes are added to yours; if you both changed the
+  same score or note, Lumen asks which to keep. Opening, saving and finding scenes again no longer freeze Lumen on
+  a slow or offline share, and measurements always land in the scene they were measured from.
+- A damaged review file is kept as .broken instead of being replaced by an empty review; overlapping review saves
+  can no longer break the file; moving a detail box from a damaged review no longer crashes Lumen.
+- The batch rename journal is written safely to disk, and an unreadable journal is kept instead of deleted.
+- A JPEG next to a RAW file of the same name gets its own sidecar (name.jpg.xmp), so exporting its tags no longer
+  overwrites the RAW's Lightroom rating.
+- Saving, rotating and editing metadata work for files with very long paths or names.
+- An error in a background task (EXIF panel, slideshow captions) no longer closes Lumen.
+- Animated GIF, PNG and WebP files keep only as many frames as fit in memory (a small file with a huge canvas could
+  make Lumen use about 4 GB); multi-page TIFFs show their first page right away and load the rest in the background.
+- Reading metadata no longer reads whole files: big TIFF scans and files without EXIF are read only as far as their
+  metadata, and each file's EXIF is read once instead of twice.
+- SVG files can only show images embedded in them or stored in their own folder.
+- The Metadata window no longer rebuilds its table every frame; Save As, the filmstrip, going to the next folder
+  and Settings > Performance no longer freeze while a slow or network drive answers.
+- Undoing a move, a rename or a rotation, saving, Save as, Copy image and Set as wallpaper now run in the
+  background with a progress card, so Lumen stays responsive with big files or a slow drive. Edits made while a save
+  runs stay unsaved until you save again, and an action that waits for the save goes on when it is done.
+
 ## 2.1.0 (27 November 2026)
 
 A full pass over looks, ease of use, stability and speed, and the FastStone-style way to arrange a folder by
