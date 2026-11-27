@@ -95,10 +95,11 @@ struct FileUndo {
 enum FileChange {
     /// Moved or renamed: each pair is (original path, current path).
     Moves(Vec<(PathBuf, PathBuf)>),
-    /// `t` was applied to files on disk. Each file is restored from its
-    /// previous bytes when they were kept; without them (only for JPEGs whose
-    /// EXIF orientation alone changed) the inverse transform turns it back.
-    Transform { t: Transform, files: Vec<Transformed> },
+    /// `t` was applied to files on disk (`None`: a lossless JPEG crop). Each
+    /// file is restored from its previous bytes when they were kept; without
+    /// them (only for JPEGs turned losslessly) the inverse transform turns it
+    /// back.
+    Transform { t: Option<Transform>, files: Vec<Transformed> },
     /// A folder was arranged by hand: its previous custom order (none) and sort key.
     Order { folder: PathBuf, previous: Option<Vec<String>>, active: bool },
     /// Moved to the Recycle Bin at `at` (undo takes them out again).
@@ -1650,13 +1651,12 @@ impl App {
             }
             return;
         }
-        // Viewer, unedited JPEG: rewrite the EXIF orientation only.
+        // Viewer, unedited JPEG: turned losslessly on disk (the EXIF
+        // orientation, or the picture's blocks when it has no orientation
+        // tag), off the UI thread; the viewer shows the file again when done.
         if self.core.settings.lossless_jpeg_rotate && !self.viewer.is_dirty() {
             if let Some(p) = self.viewer.current().cloned().filter(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p))) {
-                if self.lossless_transform(&[p], t) > 0 {
-                    self.viewer.edit = None;
-                    self.viewer.reset_view(fit);
-                }
+                self.file_jobs.submit(t.label(), rotate_job(vec![p], Vec::new(), t, self.core.settings.jpeg_quality));
                 return;
             }
         }
@@ -1677,31 +1677,20 @@ impl App {
         self.core.meta.forget(p);
     }
 
-    /// Lossless JPEG rotate / flip (undoable); returns how many files changed.
-    fn lossless_transform(&mut self, jpegs: &[PathBuf], t: Transform) -> usize {
-        let mut done = Vec::new();
-        let mut errs = Vec::new();
-        for p in jpegs {
-            // The file as it was, for an exact undo.
-            let before = std::fs::read(p).ok().filter(|b| b.len() <= UNDO_BYTES_BUDGET);
-            let was = fileops::FileStamp::of(p);
-            match crate::encode::lossless_jpeg_transform(p, t) {
-                Ok(_) => {
-                    done.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) });
-                    self.forget_file(p);
-                }
-                Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
-            }
+    /// Crop the JPEG `path` on disk without re-encoding it (undoable from
+    /// its previous bytes); `rect` is in its displayed pixels.
+    fn lossless_crop(&mut self, path: PathBuf, rect: (u32, u32, u32, u32)) {
+        self.file_jobs.submit("Cropping losslessly", lossless_crop_job(path, rect));
+    }
+
+    /// The viewer shows one of `files`, changed on disk: drop its edit
+    /// session (it has no unsaved edits) so the new file shows, fitted.
+    fn show_changed(&mut self, files: &[&Path]) {
+        let shown = self.viewer.current().is_some_and(|c| files.contains(&c.as_path()));
+        if shown && !self.viewer.is_dirty() {
+            self.viewer.edit = None;
+            self.viewer.reset_view(self.core.settings.fit_mode);
         }
-        if !errs.is_empty() {
-            self.core.toasts.error(format!("{} not rotated - {}", count(errs.len(), "file"), errs[0]));
-        }
-        let ok = done.len();
-        if ok > 0 {
-            self.core.toasts.info(format!("{} - lossless{}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
-            self.push_undo(FileUndo { label: t.label().to_string(), change: FileChange::Transform { t, files: done } });
-        }
-        ok
     }
 
     fn save(&mut self, save_as: bool) {
@@ -1916,10 +1905,12 @@ impl App {
     fn finish_file_job(&mut self, res: JobResult) {
         match res {
             JobResult::Transfer { done, errs, dest, do_move, folders } => self.finish_transfer(done, errs, dest, do_move, folders),
-            JobResult::Rotate { t, lossless, reencoded, skipped, errs } => {
+            JobResult::Rotate { t, lossless, reencoded, skipped, errs, trimmed, gain_maps } => {
                 for f in lossless.iter().chain(&reencoded) {
                     self.forget_file(&f.path);
                 }
+                let changed: Vec<&Path> = lossless.iter().chain(&reencoded).map(|f| f.path.as_path()).collect();
+                self.show_changed(&changed);
                 if !skipped.is_empty() {
                     self.core.toasts.info(format!("Skipped {}: {}", count(skipped.len(), "file"), skipped.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
                 }
@@ -1933,10 +1924,19 @@ impl App {
                     // those were too large to keep, the change cannot be undone.
                     let undoable = reencoded.iter().all(|f| f.before.is_some());
                     let note = if undoable { "" } else { " (too large to undo)" };
-                    self.core.toasts.info(format!("{}{how}{}{note}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                    // Turning the picture itself keeps whole blocks only.
+                    let cut = match trimmed.as_slice() {
+                        [] => String::new(),
+                        [(w, h)] if ok == 1 => format!(", {} trimmed off the edge to keep it lossless", px_size(*w, *h)),
+                        many => format!(", edges trimmed by a few pixels on {} to keep them lossless", count(many.len(), "file")),
+                    };
+                    self.core.toasts.info(format!("{}{how}{}{note}{cut}", t.label(), if ok > 1 { format!(" ({ok} files)") } else { String::new() }));
+                    if gain_maps > 0 {
+                        self.core.toasts.info(gain_map_note(gain_maps));
+                    }
                     if undoable {
-                        let files = lossless.into_iter().chain(reencoded).collect();
-                        self.push_undo(FileUndo { label: t.label().to_string(), change: FileChange::Transform { t, files } });
+                        let files: Vec<Transformed> = lossless.into_iter().chain(reencoded).collect();
+                        self.push_undo(FileUndo { label: t.label().to_string(), change: FileChange::Transform { t: Some(t), files } });
                     } else {
                         // Ctrl+Z must not skip this change and undo an older one instead.
                         self.file_undo.clear();
@@ -1944,6 +1944,22 @@ impl App {
                 }
             }
             JobResult::Restore { files, res } => self.finish_restore(files, res),
+            JobResult::Cropped { file, size, gain_map_removed } => {
+                self.forget_file(&file.path);
+                self.show_changed(&[file.path.as_path()]);
+                let text = format!("Cropped losslessly to {} × {}", size.0, size.1);
+                if gain_map_removed {
+                    self.core.toasts.info(gain_map_note(1));
+                }
+                if file.before.is_some() {
+                    self.core.toasts.success(text);
+                    self.push_undo(FileUndo { label: "Lossless crop".to_string(), change: FileChange::Transform { t: None, files: vec![file] } });
+                } else {
+                    self.core.toasts.info(format!("{text} (too large to undo)"));
+                    // Ctrl+Z must not skip this change and undo an older one instead.
+                    self.file_undo.clear();
+                }
+            }
             JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
             JobResult::Message { ok: true, text } => self.core.toasts.success(text),
             JobResult::Message { ok: false, text } => self.core.toasts.error(text),
@@ -2410,7 +2426,10 @@ impl App {
                         _ if !p.is_file() => Err(anyhow::anyhow!("the file no longer exists")),
                         _ if changed => Err(anyhow::anyhow!("the file was modified since, so it was left as it is")),
                         Some(b) => crate::encode::write_atomic(p, b),
-                        None => crate::encode::lossless_jpeg_transform(p, inverse(*t)).map(|_| ()),
+                        None => match t {
+                            Some(t) => crate::encode::lossless_jpeg_transform(p, inverse(*t)).map(|_| ()),
+                            None => Err(anyhow::anyhow!("the file before the change was not kept")),
+                        },
                     };
                     match res {
                         Ok(()) => {
@@ -4065,6 +4084,7 @@ impl eframe::App for App {
                     match e {
                         ViewerEvent::Command(c) => self.run(c),
                         ViewerEvent::Close => self.run(Command::CloseViewer),
+                        ViewerEvent::LosslessCrop { path, rect } => self.lossless_crop(path, rect),
                     }
                 }
             }
@@ -4545,8 +4565,12 @@ enum JobResult {
     /// `folders`: how many of `done` are folders (for the message).
     Transfer { done: Vec<(PathBuf, PathBuf)>, errs: Vec<String>, dest: PathBuf, do_move: bool, folders: usize },
     /// Changed files with their previous bytes for undo (`None` once the
-    /// budget for keeping them is used up).
-    Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String> },
+    /// budget for keeping them is used up). `trimmed`: pixels cut off the
+    /// width and height of JPEGs whose picture was turned (per file, only
+    /// when any were); `gain_maps`: HDR gain maps removed that way.
+    Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String>, trimmed: Vec<(u32, u32)>, gain_maps: usize },
+    /// A lossless JPEG crop: the file as it was, its new displayed size.
+    Cropped { file: Transformed, size: (u32, u32), gain_map_removed: bool },
     /// Deleted files taken out of the Recycle Bin again (undo of a delete).
     Restore { files: Vec<DeletedItem>, res: crate::recycle::Restored },
     Panicked(String),
@@ -4678,12 +4702,19 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
             kept += b.len();
             Some(b)
         };
+        let (mut trimmed, mut gain_maps) = (Vec::new(), 0);
         for (i, p) in jpegs.iter().enumerate() {
             pr.set(i, total);
             let before = keep(p);
             let was = fileops::FileStamp::of(p);
             match crate::encode::lossless_jpeg_transform(p, t) {
-                Ok(_) => lossless.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) }),
+                Ok(turn) => {
+                    if turn.trimmed != (0, 0) {
+                        trimmed.push(turn.trimmed);
+                    }
+                    gain_maps += usize::from(turn.gain_map_removed);
+                    lossless.push(Transformed { path: p.clone(), before, was, after: fileops::FileStamp::of(p) });
+                }
                 Err(e) => errs.push(format!("{}: {e}", crate::ui::viewer::file_name(p))),
             }
         }
@@ -4726,8 +4757,47 @@ fn rotate_job(jpegs: Vec<PathBuf>, others: Vec<PathBuf>, t: Transform, jpeg_qual
                 Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
-        JobResult::Rotate { t, lossless, reencoded, skipped, errs }
+        JobResult::Rotate { t, lossless, reencoded, skipped, errs, trimmed, gain_maps }
     })
+}
+
+/// Lossless crop of the JPEG `path` to `rect` (its displayed pixels), in place.
+fn lossless_crop_job(path: PathBuf, rect: (u32, u32, u32, u32)) -> FileJob {
+    Box::new(move |_| {
+        let name = crate::ui::viewer::file_name(&path);
+        let was = fileops::FileStamp::of(&path);
+        let res = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|before| {
+            let e = lumen_core::jpeg_lossless::crop(&before, rect)?;
+            crate::encode::write_atomic(&path, &e.bytes)?;
+            Ok((before, e))
+        });
+        match res {
+            Ok((before, e)) => {
+                // The file as it was, for an exact undo.
+                let before = Some(before).filter(|b| b.len() <= UNDO_BYTES_BUDGET);
+                let file = Transformed { path: path.clone(), before, was, after: fileops::FileStamp::of(&path) };
+                JobResult::Cropped { file, size: (e.kept.2, e.kept.3), gain_map_removed: e.gain_map_removed }
+            }
+            Err(e) => JobResult::Message { ok: false, text: format!("Could not crop {name} losslessly: {e}") },
+        }
+    })
+}
+
+/// "8 px" or "8 x 16 px" (width x height) of a lossless turn's trim.
+fn px_size(w: u32, h: u32) -> String {
+    match (w, h) {
+        (w, 0) => format!("{w} px"),
+        (0, h) => format!("{h} px"),
+        (w, h) => format!("{w} × {h} px"),
+    }
+}
+
+fn gain_map_note(n: usize) -> String {
+    if n == 1 {
+        "The HDR gain map was removed: it no longer matched the picture".to_string()
+    } else {
+        format!("The HDR gain maps of {} were removed: they no longer matched the pictures", count(n, "file"))
+    }
 }
 
 #[cfg(test)]

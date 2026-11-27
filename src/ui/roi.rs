@@ -5,8 +5,9 @@
 //!
 //! Drag outside the rectangle (or anywhere when there is none) to draw a new
 //! one, drag inside to move it, drag edges or corners to resize. Optional:
-//! aspect lock, Shift for a square, Esc to clear, a size label, and a
-//! minimum size below which the rectangle is drawn as a warning.
+//! aspect lock, Shift for a square, Esc to clear, a size label, a
+//! minimum size below which the rectangle is drawn as a warning, and a grid
+//! that two of the edges snap to (lossless JPEG crop).
 
 use egui::{Color32, CursorIcon, FontId, Key, Modifiers, Painter, Pos2, Rect, Response, Stroke, Ui, Vec2};
 
@@ -112,6 +113,57 @@ pub struct RoiResponse {
 
 const WARN: Color32 = Color32::from_rgb(240, 170, 40);
 
+/// One axis of a snapping grid: the step in image pixels, and whether it is
+/// counted from the far side of the image (then the right / bottom edge
+/// snaps, otherwise the left / top edge). The other edge moves freely.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisSnap {
+    pub step: f32,
+    pub from_end: bool,
+}
+
+/// The grid a [`RoiEditor`]'s rectangle snaps to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoiSnap {
+    pub x: AxisSnap,
+    pub y: AxisSnap,
+}
+
+impl RoiSnap {
+    /// "16 px" or "16 x 8 px".
+    pub fn step_text(&self) -> String {
+        let (x, y) = (self.x.step.round(), self.y.step.round());
+        if x == y {
+            format!("{x} px")
+        } else {
+            format!("{x} × {y} px")
+        }
+    }
+}
+
+/// Snap the span `[a0, a1]` of an image `extent` long to `s`: the snapping
+/// edge goes to the nearest grid line (to the one outside when that would
+/// leave less than a pixel); `moving` shifts the other edge along, keeping
+/// the size.
+fn snap_axis(a0: f32, a1: f32, extent: f32, s: AxisSnap, moving: bool) -> (f32, f32) {
+    if !(s.step > 1.0 && a0.is_finite() && a1.is_finite()) {
+        return (a0, a1);
+    }
+    // Count from the snapping side.
+    let (b0, b1) = if s.from_end { (extent - a1, extent - a0) } else { (a0, a1) };
+    let mut t = (b0 / s.step).round() * s.step;
+    if t > b1 - 1.0 || t > extent - 1.0 {
+        t = (b0 / s.step).floor() * s.step;
+    }
+    let t = t.max(0.0);
+    let (n0, n1) = if moving { (t, (b1 + t - b0).min(extent)) } else { (t, b1) };
+    if s.from_end {
+        (extent - n1, extent - n0)
+    } else {
+        (n0, n1)
+    }
+}
+
 /// An editable rectangle in image pixels (`[x0, y0, x1, y1]`, x0 < x1, y0 < y1,
 /// at least 1 px, inside the image).
 pub struct RoiEditor {
@@ -124,12 +176,13 @@ pub struct RoiEditor {
     drag: Option<(Handle, Pos2, [f32; 4])>,
     /// Image size the rectangle refers to.
     size: (f32, f32),
+    snap: Option<RoiSnap>,
 }
 
 impl RoiEditor {
     /// No rectangle yet, on an image of `size` pixels.
     pub fn new(size: (f32, f32), opts: RoiOptions) -> RoiEditor {
-        RoiEditor { rect: None, aspect: None, opts, min_size: None, min_note: String::new(), drag: None, size }
+        RoiEditor { rect: None, aspect: None, opts, min_size: None, min_note: String::new(), drag: None, size, snap: None }
     }
 
     pub fn with_rect(mut self, r: [f32; 4]) -> RoiEditor {
@@ -151,9 +204,26 @@ impl RoiEditor {
                 r.swap(1, 3);
             }
             clamp_rect(&mut r, self.size.0, self.size.1);
-            r
+            self.snapped(r, false)
         });
         self.drag = None;
+    }
+
+    /// Snap two of the edges to `snap` from now on (`None`: no grid).
+    pub fn set_snap(&mut self, snap: Option<RoiSnap>) {
+        self.snap = snap;
+        if let Some(r) = self.rect {
+            self.rect = Some(self.snapped(r, false));
+        }
+    }
+
+    /// `r` with its snapping edges on the grid (`moving`: the whole
+    /// rectangle shifts instead, keeping its size).
+    fn snapped(&self, r: [f32; 4], moving: bool) -> [f32; 4] {
+        let Some(s) = self.snap else { return r };
+        let (x0, x1) = snap_axis(r[0], r[2], self.size.0, s.x, moving);
+        let (y0, y1) = snap_axis(r[1], r[3], self.size.1, s.y, moving);
+        [x0, y0, x1, y1]
     }
 
     #[allow(dead_code)] // Used by the analysis panel.
@@ -213,6 +283,9 @@ impl RoiEditor {
         }
         *r = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
         clamp_rect(r, iw, ih);
+        let fitted = *r;
+        // On a grid the rectangle shifts onto it, keeping the aspect.
+        self.rect = Some(self.snapped(fitted, true));
     }
 
     /// Below `min` (pixels) the rectangle is drawn in a warning color with
@@ -299,6 +372,7 @@ impl RoiEditor {
                 let square = self.opts.shift_square && ui.input(|i| i.modifiers.shift);
                 let aspect = if square { Some(1.0) } else { self.aspect };
                 let r = drag_rect(h, xf.to_image(start), xf.to_image(pos), orig, aspect, (iw, ih));
+                let r = self.snapped(r, h == Handle::Move || aspect.is_some());
                 if self.rect != Some(r) {
                     self.rect = Some(r);
                     out.changed = true;
@@ -338,11 +412,14 @@ impl RoiEditor {
         for pt in [sr.left_top(), sr.right_top(), sr.left_bottom(), sr.right_bottom()] {
             painter.rect_filled(Rect::from_center_size(pt, Vec2::splat(10.0)), 2.0, color);
         }
-        if self.opts.size_label {
+        if self.opts.size_label || self.snap.is_some() {
             let Some((_, _, w, h)) = self.pixel_rect() else { return };
             let mut text = format!("{w} × {h}");
             if warn && !self.min_note.is_empty() {
                 text = format!("{text}  {}", self.min_note);
+            }
+            if let Some(s) = self.snap {
+                text = format!("{text}  ·  {} grid", s.step_text());
             }
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), if warn { WARN } else { Color32::WHITE });
             let pad = Vec2::new(6.0, 3.0);
@@ -536,6 +613,41 @@ mod tests {
         frame(&mut roi, vec![]);
         let out = frame(&mut roi, esc());
         assert!(out.cleared && out.changed && roi.rect().is_none());
+    }
+
+    #[test]
+    fn snapping_to_a_grid() {
+        let left_top = RoiSnap { x: AxisSnap { step: 16.0, from_end: false }, y: AxisSnap { step: 8.0, from_end: false } };
+        let mut e = RoiEditor::new(IMG, RoiOptions::crop()).with_rect([21.0, 13.0, 150.0, 90.0]);
+        e.set_snap(Some(left_top));
+        // Left and top go to the nearest grid line; right and bottom stay.
+        assert_eq!(e.rect(), Some([16.0, 16.0, 150.0, 90.0]));
+        e.set_rect(Some([25.0, 3.0, 150.0, 90.0]));
+        assert_eq!(e.rect(), Some([32.0, 0.0, 150.0, 90.0]));
+        // Never less than a pixel: then the line outside is used.
+        e.set_rect(Some([30.0, 13.0, 31.0, 14.0]));
+        assert_eq!(e.rect(), Some([16.0, 8.0, 31.0, 14.0]));
+        // Counted from the far side: the right and bottom edges snap.
+        let far = RoiSnap { x: AxisSnap { step: 16.0, from_end: true }, y: AxisSnap { step: 8.0, from_end: true } };
+        e.set_snap(Some(far));
+        e.set_rect(Some([21.0, 13.0, 150.0, 90.0]));
+        // 200 - 150 = 50 -> 48 from the right; 100 - 90 = 10 -> 8 from the bottom.
+        assert_eq!(e.rect(), Some([21.0, 13.0, 152.0, 92.0]));
+        // Moving keeps the size.
+        assert_eq!(snap_axis(21.0, 71.0, 200.0, left_top.x, true), (16.0, 66.0));
+        assert_eq!(snap_axis(190.0, 200.0, 200.0, left_top.x, true), (192.0, 200.0));
+        // A fitted aspect shifts onto the grid and keeps its shape.
+        e.set_snap(Some(left_top));
+        e.set_rect(Some([20.0, 20.0, 100.0, 60.0]));
+        e.set_aspect(Some(1.0));
+        let r = e.rect().unwrap();
+        assert_eq!(r[0] % 16.0, 0.0);
+        assert_eq!(r[1] % 8.0, 0.0);
+        assert_eq!(r[2] - r[0], r[3] - r[1]);
+        assert_eq!(left_top.step_text(), "16 × 8 px");
+        e.set_snap(None);
+        e.set_rect(Some([21.0, 13.0, 150.0, 90.0]));
+        assert_eq!(e.rect(), Some([21.0, 13.0, 150.0, 90.0]));
     }
 
     #[test]
