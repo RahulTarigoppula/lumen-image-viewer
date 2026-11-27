@@ -322,7 +322,35 @@ fn color_type_name(ct: image::ColorType) -> String {
 /// Decode the full image at `path`. Never panics: third-party decoder panics
 /// become errors.
 pub fn decode_file(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
+    guard("image", || {
+        let mut d = decode_file_inner(path, opts)?;
+        if let Some(frames) = tiff_pages(path, &d, opts.color_manage) {
+            d.frames = Some(frames);
+        }
+        Ok(d)
+    })
+}
+
+/// [`decode_file`] for showing an image at once: a multi-page TIFF comes back
+/// with its first page only (`frame_count` and `format` say how many pages it
+/// has, see [`has_more_pages`]); [`decode_more_pages`] decodes the others once
+/// the first is on screen.
+pub fn decode_first_page(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
     guard("image", || decode_file_inner(path, opts))
+}
+
+/// True for a multi-page TIFF from [`decode_first_page`] whose other pages
+/// are not decoded yet.
+pub fn has_more_pages(d: &Decoded) -> bool {
+    d.frames.is_none() && d.frame_count > 1 && d.format == format!("TIFF ({} pages)", d.frame_count)
+}
+
+/// All pages (as frames, page 1 first) of `d`, the first page of the
+/// multi-page TIFF at `path` from [`decode_first_page`]. None when it has no
+/// other pages, none could be decoded or the decode was cancelled (see
+/// [`with_cancel`]: the flag is checked before every page).
+pub fn decode_more_pages(path: &Path, d: &Decoded, color_manage: bool) -> Option<Arc<Vec<AnimFrame>>> {
+    guard("TIFF", || Ok(tiff_pages(path, d, color_manage))).ok().flatten()
 }
 
 /// Read a whole file with clear messages for the common failure cases.
@@ -374,28 +402,32 @@ fn decode_file_inner(path: &Path, opts: DecodeOptions) -> Result<Decoded> {
         }
     };
     check_cancel()?;
+    // Multi-page TIFF: the page count now, the other pages in `tiff_pages`.
     if opts.animations && d.frames.is_none() && (matches!(ext.as_str(), "tif" | "tiff") || d.format.starts_with("TIFF")) {
-        add_tiff_pages(path, &mut d, opts.color_manage);
+        if let Some(n) = wic::frame_count(path).ok().filter(|&n| n > 1) {
+            d.frame_count = n;
+            d.format = format!("TIFF ({n} pages)");
+        }
     }
     Ok(d)
 }
 
-/// Multi-page TIFF: expose pages 2..N as frames (delay 0 = pages, no auto-play).
-fn add_tiff_pages(path: &Path, d: &mut Decoded, color_manage: bool) {
-    let Ok(n) = wic::frame_count(path) else { return };
-    if n <= 1 {
-        return;
+/// Multi-page TIFF: pages 1..N as frames (delay 0 = pages, no auto-play),
+/// page 1 being `d`, as far as they fit the memory budget. None when `d` has
+/// no pages left to decode.
+fn tiff_pages(path: &Path, d: &Decoded, color_manage: bool) -> Option<Arc<Vec<AnimFrame>>> {
+    if !has_more_pages(d) {
+        return None;
     }
     let budget = MAX_DECODE_BYTES.saturating_sub(d.image.as_raw().len() as u64);
-    let Ok(rest) = wic::decode_frames(path, 1, n, color_manage, budget) else { return };
+    let rest = wic::decode_frames(path, 1, d.frame_count, color_manage, budget).ok()?;
+    if rest.is_empty() {
+        return None;
+    }
     let mut frames = Vec::with_capacity(rest.len() + 1);
     frames.push(AnimFrame { image: d.image.clone(), delay_ms: 0 });
     frames.extend(rest.into_iter().map(|img| AnimFrame { image: Arc::new(img), delay_ms: 0 }));
-    if frames.len() > 1 {
-        d.frames = Some(Arc::new(frames));
-    }
-    d.frame_count = n;
-    d.format = format!("TIFF ({n} pages)");
+    Some(Arc::new(frames))
 }
 
 fn looks_like_svg(bytes: &[u8]) -> bool {
@@ -463,14 +495,21 @@ fn decode_bytes_native(bytes: &[u8], ext: &str, opts: DecodeOptions) -> Result<D
         .or_else(|| image::ImageFormat::from_extension(ext))
         .ok_or_else(|| anyhow!("Unrecognised image format"))?;
 
+    // Frames of an animation too big to play: only the first is decoded, below.
+    let mut first_of = 0;
     if opts.animations {
-        if let Some(anim) = try_decode_animation(bytes, format)? {
-            return Ok(anim);
+        match try_decode_animation(bytes, format)? {
+            Animation::Done(anim) => return Ok(anim),
+            Animation::TooBig(n) => first_of = n,
+            Animation::Still => {}
         }
     }
 
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.no_limits();
+    if format == image::ImageFormat::Gif {
+        reader.limits(gif_limits());
+    }
     let mut decoder = reader.into_decoder()?;
     let icc = decoder.icc_profile().ok().flatten();
     let exif = decoder.exif_metadata().ok().flatten();
@@ -501,18 +540,23 @@ fn decode_bytes_native(bytes: &[u8], ext: &str, opts: DecodeOptions) -> Result<D
     }
     let rgba = apply_orientation(rgba, orientation);
     let has_alpha = has_alpha_channel && image_has_alpha(&rgba);
+    let (format, frame_count) = if first_of > 1 {
+        (format!("{} (animated, {first_of} frames, too large to play: first frame shown)", format_name(format)), first_of)
+    } else {
+        (format_name(format).to_string(), 1)
+    };
     Ok(Decoded {
         image: Arc::new(rgba),
         frames: None,
         has_alpha,
-        format: format_name(format).to_string(),
+        format,
         decoder: "Native",
         color_info,
         icc_profile: icc,
         exif,
         orientation,
         source_size: (sw, sh),
-        frame_count: 1,
+        frame_count,
         bit_depth: bit_depth.max(8),
     })
 }
@@ -557,39 +601,159 @@ fn expand_to_rgba<const N: usize>(w: u32, h: u32, src: &[u8], f: impl Fn(&[u8; N
     RgbaImage::from_raw(w, h, out).expect("buffer size matches")
 }
 
-fn try_decode_animation(bytes: &[u8], format: image::ImageFormat) -> Result<Option<Decoded>> {
+/// What [`try_decode_animation`] made of a file.
+enum Animation {
+    /// Its frames (or its only one).
+    Done(Decoded),
+    /// Not an animation: decode it as a still image.
+    Still,
+    /// An animation of this many frames whose canvas is too big to hold
+    /// several of them (see [`animation_frame_cap`]): decode the first frame
+    /// as a still image.
+    TooBig(usize),
+}
+
+/// How many frames of a `w` x `h` animation are kept: every frame is a whole
+/// canvas of RGBA, and the decoder works in about two more, all within
+/// [`MAX_DECODE_BYTES`]. None when fewer than two fit.
+fn animation_frame_cap(w: u32, h: u32) -> Option<usize> {
+    // A frame's bookkeeping counts too (many frames of a tiny canvas).
+    let frame = w as u64 * h as u64 * 4 + 256;
+    let cap = (MAX_DECODE_BYTES / frame).saturating_sub(2);
+    (cap >= 2).then_some(cap as usize)
+}
+
+/// Limits for the GIF decoder: a frame may claim up to 65535 x 65535 pixels
+/// whatever the canvas size, so its buffer is checked before it is allocated
+/// (a failed allocation aborts instead of returning an error).
+fn gif_limits() -> image::Limits {
+    let mut limits = image::Limits::no_limits();
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    limits
+}
+
+/// Frames of an animated GIF, APNG or WebP, counted from the file's structure
+/// (nothing is decoded); 0 when it cannot be told.
+fn animation_frame_count(b: &[u8], format: image::ImageFormat) -> usize {
+    // The four bytes at `i`, when the file has them.
+    let quad = |i: usize| i.checked_add(4).and_then(|end| b.get(i..end)).map(|s| [s[0], s[1], s[2], s[3]]);
+    match format {
+        image::ImageFormat::Gif => gif_frame_count(b),
+        // APNG: the frame count of its acTL chunk (before the image data).
+        image::ImageFormat::Png => {
+            let mut i = 8usize;
+            while let (Some(len), Some(kind)) = (quad(i), quad(i.saturating_add(4))) {
+                match &kind {
+                    b"acTL" => return quad(i + 8).map_or(0, |n| u32::from_be_bytes(n) as usize),
+                    b"IDAT" => return 0,
+                    _ => i = i.saturating_add(12).saturating_add(u32::from_be_bytes(len) as usize),
+                }
+            }
+            0
+        }
+        // WebP: one ANMF chunk per frame.
+        image::ImageFormat::WebP => {
+            let (mut i, mut n) = (12usize, 0);
+            while let (Some(kind), Some(size)) = (quad(i), quad(i.saturating_add(4))) {
+                if &kind == b"ANMF" {
+                    n += 1;
+                }
+                let size = u32::from_le_bytes(size) as usize;
+                i = i.saturating_add(8).saturating_add(size + (size & 1));
+            }
+            n
+        }
+        _ => 0,
+    }
+}
+
+/// Images in a GIF, counted from its blocks.
+fn gif_frame_count(b: &[u8]) -> usize {
+    if b.len() < 13 || !b.starts_with(b"GIF") {
+        return 0;
+    }
+    // Size of the color table that follows a block with these flags.
+    let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
+    // Past the data sub-blocks starting at `i` and their terminator.
+    let skip_blocks = |mut i: usize| -> Option<usize> {
+        loop {
+            let n = *b.get(i)? as usize;
+            i += 1 + n;
+            if n == 0 {
+                return Some(i);
+            }
+        }
+    };
+    let mut i = 13 + table(b[10]);
+    let mut frames = 0;
+    loop {
+        let next = match b.get(i) {
+            // Extension: introducer, label, sub-blocks.
+            Some(0x21) => skip_blocks(i + 2),
+            // Image: descriptor, local color table, LZW code size, sub-blocks.
+            Some(0x2C) => {
+                let Some(&flags) = b.get(i + 9) else { return frames };
+                frames += 1;
+                skip_blocks(i + 10 + table(flags) + 1)
+            }
+            // Trailer (or something not understood).
+            _ => None,
+        };
+        match next {
+            Some(j) => i = j,
+            None => return frames,
+        }
+    }
+}
+
+fn try_decode_animation(bytes: &[u8], format: image::ImageFormat) -> Result<Animation> {
+    try_decode_animation_with(bytes, format, animation_frame_cap)
+}
+
+/// [`try_decode_animation`] with `cap` saying how many frames of a canvas size fit.
+fn try_decode_animation_with(bytes: &[u8], format: image::ImageFormat, cap: fn(u32, u32) -> Option<usize>) -> Result<Animation> {
     use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
-    let frames: Vec<image::Frame> = match format {
+    let total = animation_frame_count(bytes, format);
+    // Several frames do not fit: only the first, as a still image (a single
+    // frame is decoded as a still image anyway).
+    let too_big = || if total > 1 { Animation::TooBig(total) } else { Animation::Still };
+    let (frames, max): (Vec<image::Frame>, usize) = match format {
         image::ImageFormat::Gif => {
-            let dec = GifDecoder::new(Cursor::new(bytes))?;
+            let mut dec = GifDecoder::new(Cursor::new(bytes))?;
             let (w, h) = dec.dimensions();
             check_alloc(w, h)?;
-            collect_frames_limited(dec.into_frames())?
+            let Some(max) = cap(w, h) else { return Ok(too_big()) };
+            dec.set_limits(gif_limits())?;
+            (collect_frames_limited(dec.into_frames(), max)?, max)
         }
         image::ImageFormat::Png => {
             let dec = PngDecoder::new(Cursor::new(bytes))?;
             if !dec.is_apng()? {
-                return Ok(None);
+                return Ok(Animation::Still);
             }
             let (w, h) = dec.dimensions();
             check_alloc(w, h)?;
-            collect_frames_limited(dec.apng()?.into_frames())?
+            let Some(max) = cap(w, h) else { return Ok(too_big()) };
+            (collect_frames_limited(dec.apng()?.into_frames(), max)?, max)
         }
         image::ImageFormat::WebP => {
             let dec = WebPDecoder::new(Cursor::new(bytes))?;
             if !dec.has_animation() {
-                return Ok(None);
+                return Ok(Animation::Still);
             }
             let (w, h) = dec.dimensions();
             check_alloc(w, h)?;
-            collect_frames_limited(dec.into_frames())?
+            let Some(max) = cap(w, h) else { return Ok(too_big()) };
+            (collect_frames_limited(dec.into_frames(), max)?, max)
         }
-        _ => return Ok(None),
+        _ => return Ok(Animation::Still),
     };
     if frames.is_empty() {
         return Err(anyhow!("Animation contains no frames"));
     }
     let count = frames.len();
+    // Stopped at the cap with frames left: say how many are shown.
+    let truncated = count == max && total > count;
     let anim: Vec<AnimFrame> = frames
         .into_iter()
         .map(|f| {
@@ -605,33 +769,38 @@ fn try_decode_animation(bytes: &[u8], format: image::ImageFormat) -> Result<Opti
     let first = anim[0].image.clone();
     let size = first.dimensions();
     let has_alpha = anim.iter().take(4).any(|f| image_has_alpha(&f.image));
-    Ok(Some(Decoded {
+    let name = format_name(format);
+    Ok(Animation::Done(Decoded {
         image: first,
         frames: if count > 1 { Some(Arc::new(anim)) } else { None },
         has_alpha,
-        format: if count > 1 { format!("{} (animated)", format_name(format)) } else { format_name(format).into() },
+        format: if truncated {
+            format!("{name} (animated, first {count} of {total} frames)")
+        } else if count > 1 {
+            format!("{name} (animated)")
+        } else {
+            name.into()
+        },
         decoder: "Native",
         color_info: "RGBA 8-bit".into(),
         icc_profile: None,
         exif: None,
         orientation: 1,
         source_size: size,
-        frame_count: count,
+        frame_count: if truncated { total } else { count },
         bit_depth: 8,
     }))
 }
 
-fn collect_frames_limited(frames: image::Frames<'_>) -> Result<Vec<image::Frame>> {
-    // Cap total memory for very long animations (~1.5 GB of RGBA).
-    const BUDGET: usize = 1536 * 1024 * 1024;
-    let mut used = 0usize;
+/// Decode at most `max` frames, giving up between two frames once the decode
+/// is no longer wanted (see [`with_cancel`]).
+fn collect_frames_limited(mut frames: image::Frames<'_>, max: usize) -> Result<Vec<image::Frame>> {
     let mut out = Vec::new();
-    for f in frames {
-        let f = f?;
-        used += f.buffer().as_raw().len();
-        out.push(f);
-        if used > BUDGET {
-            break;
+    while out.len() < max {
+        check_cancel()?;
+        match frames.next() {
+            Some(f) => out.push(f?),
+            None => break,
         }
     }
     Ok(out)
@@ -730,10 +899,17 @@ fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
 
 /// Cheap header-only probe of image dimensions.
 pub fn probe_dimensions(path: &Path) -> Option<(u32, u32)> {
-    guard("probe", || Ok(probe_dimensions_inner(path))).ok().flatten()
+    guard("probe", || Ok(probe_dimensions_inner(path, || exif_orientation_from_file(path)))).ok().flatten()
 }
 
-fn probe_dimensions_inner(path: &Path) -> Option<(u32, u32)> {
+/// [`probe_dimensions`] for a caller that has read the file's EXIF already:
+/// `orientation` is its orientation (1 without EXIF), so it is not read again.
+pub fn probe_dimensions_with_orientation(path: &Path, orientation: u8) -> Option<(u32, u32)> {
+    guard("probe", || Ok(probe_dimensions_inner(path, || orientation))).ok().flatten()
+}
+
+/// `orientation` gives the EXIF orientation when the format needs it.
+fn probe_dimensions_inner(path: &Path, orientation: impl Fn() -> u8) -> Option<(u32, u32)> {
     let ext = formats::ext_of(path);
     match ext.as_str() {
         "psd" | "psb" => return psd::probe(&read_head(path, 26)?),
@@ -748,18 +924,22 @@ fn probe_dimensions_inner(path: &Path) -> Option<(u32, u32)> {
         if let Ok(r) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
             if let Ok(dec) = r.into_decoder() {
                 let (w, h) = dec.dimensions();
-                let swap = matches!(exif_orientation_from_file(path), 5..=8);
+                let swap = matches!(orientation(), 5..=8);
                 return Some(if swap { (h, w) } else { (w, h) });
             }
         }
     }
-    wic::probe_dimensions(path).ok()
+    let size = wic::stored_size(path).ok()?;
+    Some(oriented_size(size, if wic::needs_exif_orientation(path) { orientation() } else { 1 }))
 }
 
 pub fn exif_orientation_from_file(path: &Path) -> u8 {
-    let Some(parsed) = crate::meta::exif_from_file(path) else { return 1 };
-    parsed
-        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+    crate::meta::exif_from_file(path).map_or(1, |e| orientation_of(&e))
+}
+
+/// The EXIF orientation (1..=8) of parsed EXIF; 1 when it has none.
+pub fn orientation_of(exif: &exif::Exif) -> u8 {
+    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| f.value.get_uint(0))
         .map(|v| v.clamp(1, 8) as u8)
         .unwrap_or(1)
@@ -1069,7 +1249,93 @@ mod tests {
         // Thumbnails / no-animation decodes stay single-page.
         let single = decode_file(&p, DecodeOptions { color_manage: true, animations: false }).unwrap();
         assert!(single.frames.is_none());
+        assert!(!has_more_pages(&single));
+        // For the viewer: page 1 first (saying how many there are), the rest after.
+        let first = decode_first_page(&p, DecodeOptions::default()).unwrap();
+        assert!(first.frames.is_none() && has_more_pages(&first));
+        assert_eq!((first.frame_count, first.format.as_str()), (3, "TIFF (3 pages)"));
+        let pages = decode_more_pages(&p, &first, true).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert!(Arc::ptr_eq(&pages[0].image, &first.image));
+        assert_eq!(pages[2].image.dimensions(), (6, 6));
+        assert!(decode_more_pages(&p, &dec, true).is_none(), "all pages are there already");
+        // No longer wanted: the pages are not decoded.
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(with_cancel(&flag, || decode_more_pages(&p, &first, true)).is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn gif_bytes(frames: &[(u32, u32)], canvas: (u32, u32)) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+            for (i, &(w, h)) in frames.iter().enumerate() {
+                let img = RgbaImage::from_pixel(w, h, image::Rgba([i as u8 * 60, 100, 200, 255]));
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(50, 1))).unwrap();
+            }
+        }
+        // The logical screen size.
+        out[6..8].copy_from_slice(&(canvas.0 as u16).to_le_bytes());
+        out[8..10].copy_from_slice(&(canvas.1 as u16).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn animations_fit_the_memory_budget() {
+        // Frames counted from the file's blocks, without decoding.
+        let gif = gif_bytes(&[(8, 6), (8, 6), (8, 6)], (8, 6));
+        assert_eq!(gif_frame_count(&gif), 3);
+        assert_eq!(animation_frame_count(&gif, image::ImageFormat::Gif), 3);
+        for cut in 0..gif.len() {
+            assert!(gif_frame_count(&gif[..cut]) <= 3);
+        }
+        let riff = |k: &[u8], n: usize| [k, &(n as u32).to_le_bytes()[..], &vec![0u8; n + (n & 1)][..]].concat();
+        let body = [riff(b"VP8X", 10), riff(b"ANIM", 6), riff(b"ANMF", 17), riff(b"ANMF", 16)].concat();
+        let webp = [&b"RIFF"[..], &(body.len() as u32 + 4).to_le_bytes()[..], &b"WEBP"[..], &body[..]].concat();
+        assert_eq!(animation_frame_count(&webp, image::ImageFormat::WebP), 2);
+        let chunk = |k: &[u8], d: &[u8]| [&(d.len() as u32).to_be_bytes()[..], k, d, &[0u8; 4][..]].concat();
+        let apng = [&b"\x89PNG\r\n\x1a\n"[..], &chunk(b"IHDR", &[0; 13])[..], &chunk(b"acTL", &[0, 0, 0, 5, 0, 0, 0, 0])[..], &chunk(b"IDAT", &[])[..]].concat();
+        assert_eq!(animation_frame_count(&apng, image::ImageFormat::Png), 5);
+        assert_eq!(animation_frame_count(&apng[..30], image::ImageFormat::Png), 0);
+        let d = decode_bytes(&gif, "gif", DecodeOptions::default()).unwrap();
+        assert_eq!((d.frames.as_ref().map(|f| f.len()), d.frame_count, d.format.as_str()), (Some(3), 3, "GIF (animated)"));
+        // How many canvas-sized frames are kept: none of a 19000 x 19000 canvas
+        // (each is 1.4 GB), a few of a large one, all of an ordinary one.
+        assert_eq!(animation_frame_cap(19000, 19000), None);
+        assert_eq!(animation_frame_cap(12000, 12000), None);
+        assert_eq!(animation_frame_cap(8000, 8000), Some(4));
+        assert!(animation_frame_cap(500, 500).unwrap() > 1000);
+        assert!(animation_frame_cap(1, 1).unwrap() < MAX_DECODE_BYTES as usize / 256);
+        // Over the cap: the frames that fit, and the format says so.
+        let two = try_decode_animation_with(&gif, image::ImageFormat::Gif, |_, _| Some(2)).unwrap();
+        let Animation::Done(d) = two else { panic!("decoded") };
+        assert_eq!((d.frames.as_ref().map(|f| f.len()), d.frame_count, d.format.as_str()), (Some(2), 3, "GIF (animated, first 2 of 3 frames)"));
+        // No room for two frames: the first one as a still image, still known
+        // to be animated (so saving it in place is refused).
+        assert!(matches!(try_decode_animation_with(&gif, image::ImageFormat::Gif, |_, _| None).unwrap(), Animation::TooBig(3)));
+        let one = gif_bytes(&[(8, 6)], (8, 6));
+        assert!(matches!(try_decode_animation_with(&one, image::ImageFormat::Gif, |_, _| None).unwrap(), Animation::Still));
+        // No longer wanted: stops between frames.
+        let flag = Arc::new(AtomicBool::new(true));
+        let e = with_cancel(&flag, || decode_bytes(&gif, "gif", DecodeOptions::default())).err().expect("cancelled");
+        assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+    }
+
+    #[test]
+    fn gif_frames_bigger_than_the_canvas_are_refused_before_allocating() {
+        // A 4 x 4 canvas whose frame claims 30000 x 30000 pixels (3.6 GB of RGBA).
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[4, 0, 4, 0, 0x80, 0, 0]);
+        gif.extend_from_slice(&[0, 0, 0, 255, 255, 255]);
+        gif.push(0x2C);
+        gif.extend_from_slice(&[0, 0, 0, 0]);
+        gif.extend_from_slice(&30000u16.to_le_bytes());
+        gif.extend_from_slice(&30000u16.to_le_bytes());
+        gif.extend_from_slice(&[0, 2, 2, 0x44, 0x01, 0, 0x3B]);
+        assert_eq!(gif_frame_count(&gif), 1);
+        for animations in [true, false] {
+            assert!(decode_bytes(&gif, "gif", DecodeOptions { color_manage: true, animations }).is_err(), "animations: {animations}");
+        }
     }
 
     /// `cargo test --release -p lumen-core -- --ignored --nocapture bench_perf_`

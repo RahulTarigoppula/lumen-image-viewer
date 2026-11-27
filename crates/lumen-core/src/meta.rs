@@ -40,30 +40,157 @@ pub fn read_exif(path: &Path) -> Option<ExifSummary> {
 }
 
 /// Parse the EXIF of the file at `path` (JPEG, TIFF and TIFF-based RAW, PNG,
-/// HEIF, WebP). A TIFF is its own EXIF container, and kamadak-exif reads the
-/// whole file for it (gigabytes for a big scan, over a network share too):
-/// only the directories and the values they point to are read instead.
+/// HEIF, WebP). Only the file's EXIF block is read, never the image data:
+/// kamadak-exif reads a whole TIFF (its own EXIF container: gigabytes for a big
+/// scan, over a network share too) and scans a JPEG, PNG or WebP without EXIF
+/// to its end, so those containers are walked here instead.
 pub fn exif_from_file(path: &Path) -> Option<exif::Exif> {
-    use std::io::{Read, Seek};
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut head = Vec::new();
-    (&mut file).take(4).read_to_end(&mut head).ok()?;
-    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
-        file.seek(std::io::SeekFrom::Start(0)).ok()?;
-        if let Ok(Some(tiff)) = compact_tiff(&mut file, TIFF_EXIF_CAP) {
-            if let Ok(exif) = exif::Reader::new().read_raw(tiff) {
-                return Some(exif);
-            }
-        }
-    }
-    // Other containers are scanned only as far as their EXIF block; unusual
-    // TIFFs (damaged, or with huge tags) are read whole as before.
-    file.seek(std::io::SeekFrom::Start(0)).ok()?;
-    exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)).ok()
+    let file = std::fs::File::open(path).ok()?;
+    exif_from_reader(&mut std::io::BufReader::with_capacity(16 * 1024, file))
 }
 
-/// Most bytes of TIFF directories and tag values [`compact_tiff`] copies.
+/// [`exif_from_file`] for the image read by `r` (at its start).
+fn exif_from_reader<R: std::io::Read + std::io::Seek>(r: &mut std::io::BufReader<R>) -> Option<exif::Exif> {
+    use std::io::BufRead;
+    let head = r.fill_buf().ok()?;
+    let head: Vec<u8> = head[..head.len().min(12)].to_vec();
+    let raw = if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        compact_tiff(r, TIFF_EXIF_CAP).ok().flatten()
+    } else if head.starts_with(&[0xFF, 0xD8]) {
+        jpeg_exif(r)
+    } else if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        png_exif(r)
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        webp_exif(r)
+    } else if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        // HEIF / AVIF: kamadak-exif seeks past the boxes it does not need.
+        return exif::Reader::new().read_from_container(r).ok();
+    } else {
+        None
+    };
+    exif::Reader::new().read_raw(raw?).ok()
+}
+
+/// Most bytes of TIFF directories and tag values [`compact_tiff`] copies, and
+/// the largest EXIF block read from other containers.
 const TIFF_EXIF_CAP: usize = 16 << 20;
+
+/// Read `len` bytes (fewer at the end of the file: an error).
+fn read_len<R: std::io::Read>(r: &mut R, len: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    // Not `vec![0; len]`: a damaged length must not allocate it up front.
+    r.by_ref().take(len as u64).read_to_end(&mut buf).ok()?;
+    (buf.len() == len).then_some(buf)
+}
+
+/// Skip `n` bytes forward.
+fn skip<R: std::io::Read + std::io::Seek>(r: &mut std::io::BufReader<R>, n: u64) -> Option<()> {
+    r.seek_relative(i64::try_from(n).ok()?).ok()
+}
+
+/// A JPEG's APP1 "Exif" segment, looked for up to the start of the image data
+/// (the first SOS): kamadak-exif scans a JPEG without one to its end.
+fn jpeg_exif<R: std::io::Read + std::io::Seek>(r: &mut std::io::BufReader<R>) -> Option<Vec<u8>> {
+    use std::io::{BufRead, Read};
+    let mut b = [0u8; 2];
+    r.read_exact(&mut b).ok()?;
+    // Segments before the image data: a few dozen at most.
+    for _ in 0..1024 {
+        // The next marker. Stray bytes before it are skipped (as kamadak-exif
+        // does), within reason; then fill bytes, then the marker code.
+        let mut stray = Vec::new();
+        r.by_ref().take(64 * 1024).read_until(0xFF, &mut stray).ok()?;
+        if stray.last() != Some(&0xFF) {
+            return None;
+        }
+        let mut code = 0xFF;
+        while code == 0xFF {
+            r.read_exact(&mut b[..1]).ok()?;
+            code = b[0];
+        }
+        match code {
+            // Start of scan, end of image, a second start of image.
+            0xDA | 0xD9 | 0xD8 => return None,
+            // Markers without a length.
+            0x00 | 0x01 | 0xD0..=0xD7 => continue,
+            _ => {}
+        }
+        r.read_exact(&mut b).ok()?;
+        let len = (u16::from_be_bytes(b) as usize).checked_sub(2)?;
+        if code == 0xE1 && len >= 6 {
+            let mut seg = read_len(r, len)?;
+            if seg.starts_with(b"Exif\0\0") {
+                seg.drain(..6);
+                return Some(seg);
+            }
+        } else {
+            skip(r, len as u64)?;
+        }
+    }
+    None
+}
+
+/// The EXIF chunk's TIFF structure, without the "Exif\0\0" some writers put
+/// in front of it (PNG eXIf, WebP EXIF).
+fn strip_exif_id(mut v: Vec<u8>) -> Vec<u8> {
+    if v.starts_with(b"Exif\0\0") {
+        v.drain(..6);
+    }
+    v
+}
+
+/// A PNG's eXIf chunk, looked for up to the image data (the first IDAT; the
+/// PNG specification puts it before).
+fn png_exif<R: std::io::Read + std::io::Seek>(r: &mut std::io::BufReader<R>) -> Option<Vec<u8>> {
+    use std::io::Read;
+    skip(r, 8)?;
+    loop {
+        let mut h = [0u8; 8];
+        r.read_exact(&mut h).ok()?;
+        let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        match &h[4..8] {
+            b"eXIf" if len <= TIFF_EXIF_CAP => return read_len(r, len).map(strip_exif_id),
+            b"IDAT" | b"IEND" | b"eXIf" => return None,
+            _ => skip(r, len as u64 + 4)?,
+        }
+    }
+}
+
+/// A WebP's EXIF chunk, found from the chunk headers (the image data between
+/// them is skipped, the chunk usually comes after it).
+fn webp_exif<R: std::io::Read + std::io::Seek>(r: &mut std::io::BufReader<R>) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut h = [0u8; 12];
+    r.read_exact(&mut h).ok()?;
+    let mut left = u32::from_le_bytes([h[4], h[5], h[6], h[7]]).checked_sub(4)? as u64;
+    let mut first = true;
+    while left >= 8 {
+        let mut c = [0u8; 8];
+        r.read_exact(&mut c).ok()?;
+        let size = u32::from_le_bytes([c[4], c[5], c[6], c[7]]) as u64;
+        let padded = size + (size & 1);
+        left = left.checked_sub(8 + size)?.saturating_sub(size & 1);
+        match &c[..4] {
+            b"EXIF" if size as usize <= TIFF_EXIF_CAP => return read_len(r, size as usize).map(strip_exif_id),
+            b"EXIF" => return None,
+            // The extended header says whether there is an EXIF chunk (the
+            // simple formats have none).
+            b"VP8X" if first && size >= 1 => {
+                let mut flags = [0u8; 1];
+                r.read_exact(&mut flags).ok()?;
+                if flags[0] & 0x08 == 0 {
+                    return None;
+                }
+                skip(r, padded - 1)?;
+            }
+            _ if first => return None,
+            _ => skip(r, padded)?,
+        }
+        first = false;
+    }
+    None
+}
 
 /// Reads ranges of a file, serving the ones inside its first block from memory
 /// (directories and tag values usually sit right after the header).
@@ -89,9 +216,11 @@ impl<R: std::io::Read + std::io::Seek> RangeReader<'_, R> {
 /// A copy of what kamadak-exif parses in a TIFF (the chain of image directories,
 /// the EXIF, GPS and interoperability directories, and the out-of-line values of
 /// their tags) packed into a small TIFF with the offsets rewritten. Image data
-/// is not read. Ok(None) when the file is not a plain TIFF or anything is
-/// unusual (truncated, an odd pointer, more than `cap` bytes): the caller then
-/// lets kamadak-exif read the whole file, so the result is always the same.
+/// is not read, and neither is anything that would take more than `cap` bytes:
+/// what kamadak-exif would refuse or what cannot be read is left out (the
+/// directories after the eighth, values over the cap, odd pointers, entries
+/// pointing past the end of the file), so the file is never read whole.
+/// Ok(None) when the file is not a TIFF or its first directory is unreadable.
 fn compact_tiff<R: std::io::Read + std::io::Seek>(src: &mut R, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
     let mut head = Vec::new();
@@ -105,7 +234,7 @@ fn compact_tiff<R: std::io::Read + std::io::Seek>(src: &mut R, cap: usize) -> st
         _ => return Ok(None),
     };
     let mut r = RangeReader { src, head };
-    let mut c = TiffCompactor { le, out: Vec::with_capacity(64 * 1024), cap };
+    let mut c = TiffCompactor { le, out: Vec::with_capacity(64 * 1024), cap, dirs: 0 };
     c.out.extend_from_slice(&r.head[..4]);
     c.out.extend_from_slice(&[0; 4]);
     let first = c.u32_at(&r.head[4..8]);
@@ -128,10 +257,18 @@ enum IfdKind {
     Interop,
 }
 
+/// kamadak-exif reads at most 8 directories in the main chain.
+const TIFF_MAX_CHAIN: usize = 8;
+/// Directories copied in all: the chain and their EXIF, GPS and
+/// interoperability directories (more are repeated pointers).
+const TIFF_MAX_DIRS: usize = 4 * TIFF_MAX_CHAIN;
+
 struct TiffCompactor {
     le: bool,
     out: Vec<u8>,
     cap: usize,
+    /// Directories copied so far.
+    dirs: usize,
 }
 
 impl TiffCompactor {
@@ -145,9 +282,19 @@ impl TiffCompactor {
         if self.le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
     }
 
+    fn put_u16(&mut self, at: usize, v: u16) {
+        let b = if self.le { v.to_le_bytes() } else { v.to_be_bytes() };
+        self.out[at..at + 2].copy_from_slice(&b);
+    }
+
     fn put_u32(&mut self, at: usize, v: u32) {
         let b = if self.le { v.to_le_bytes() } else { v.to_be_bytes() };
         self.out[at..at + 4].copy_from_slice(&b);
+    }
+
+    /// Whether `len` more bytes (word aligned) still fit the cap.
+    fn fits(&self, len: u64) -> bool {
+        (self.out.len() as u64 + 1).saturating_add(len) <= self.cap as u64
     }
 
     /// Append `bytes` (word aligned, as TIFF wants); its offset in the copy.
@@ -163,62 +310,86 @@ impl TiffCompactor {
         u32::try_from(at).ok()
     }
 
-    /// Copy the main directory chain starting at `ofs`; the copy's first offset.
+    /// Copy the main directory chain starting at `ofs` (cut after the eighth
+    /// directory, or before one that cannot be read); the copy's first offset.
     fn copy_chain<R: std::io::Read + std::io::Seek>(&mut self, r: &mut RangeReader<'_, R>, mut ofs: u64) -> Option<u32> {
         let mut first = None;
         let mut prev_next: Option<usize> = None;
-        let mut n = 0;
-        while ofs != 0 {
-            // kamadak-exif refuses more than 8 directories: let it see that itself.
-            if n >= 8 {
-                return None;
+        for _ in 0..TIFF_MAX_CHAIN {
+            if ofs == 0 {
+                break;
             }
-            let (at, next_at, next) = self.copy_ifd(r, ofs, IfdKind::Tiff)?;
+            let Some((at, next_at, next)) = self.copy_ifd(r, ofs, IfdKind::Tiff) else { break };
             match prev_next {
                 Some(p) => self.put_u32(p, at),
                 None => first = Some(at),
             }
             prev_next = Some(next_at);
             ofs = next as u64;
-            n += 1;
         }
         first
     }
 
-    /// Copy one directory at `ofs` in the source and everything it points to.
-    /// Returns its offset in the copy, where its next-directory offset sits
-    /// (written as 0) and the source's next-directory offset.
+    /// Copy one directory at `ofs` in the source and everything it points to,
+    /// leaving out the entries that cannot be copied. Returns its offset in the
+    /// copy, where its next-directory offset sits (written as 0) and the
+    /// source's next-directory offset.
     fn copy_ifd<R: std::io::Read + std::io::Seek>(&mut self, r: &mut RangeReader<'_, R>, ofs: u64, kind: IfdKind) -> Option<(u32, usize, u32)> {
+        if self.dirs >= TIFF_MAX_DIRS {
+            return None;
+        }
+        self.dirs += 1;
         let count = self.u16_at(&r.read(ofs, 2)?) as usize;
-        let mut table = r.read(ofs, 2 + 12 * count + 4)?;
+        let len = 2 + 12 * count + 4;
+        if !self.fits(len as u64) {
+            return None;
+        }
+        let mut table = r.read(ofs, len)?;
         let next = self.u32_at(&table[2 + 12 * count..]);
-        let len = table.len();
         table[len - 4..].fill(0);
-        let at = self.append(&table)?;
+        let at = self.append(&table)? as usize;
+        // Entries kept are moved up over the ones left out.
+        let mut kept = 0;
         for i in 0..count {
-            let e = at as usize + 2 + 12 * i;
-            let entry = self.out[e..e + 12].to_vec();
-            let tag = self.u16_at(&entry[0..2]);
-            let typ = self.u16_at(&entry[2..4]);
-            let cnt = self.u32_at(&entry[4..8]);
-            let child = match (kind, tag) {
-                (IfdKind::Tiff, 0x8769) => Some(IfdKind::Exif),
-                (IfdKind::Tiff, 0x8825) => Some(IfdKind::Gps),
-                (IfdKind::Exif, 0xA005) => Some(IfdKind::Interop),
-                _ => None,
-            };
-            if let Some(child) = child {
-                // A pointer is one LONG; anything else is left to kamadak-exif.
-                if typ != 4 || cnt != 1 {
-                    return None;
-                }
-                let (child_at, _, child_next) = self.copy_ifd(r, self.u32_at(&entry[8..12]) as u64, child)?;
-                if child_next != 0 {
-                    return None;
-                }
-                self.put_u32(e + 8, child_at);
-                continue;
+            let e = at + 2 + 12 * i;
+            let mut entry = [0u8; 12];
+            entry.copy_from_slice(&self.out[e..e + 12]);
+            if self.copy_entry(r, &mut entry, kind) {
+                let k = at + 2 + 12 * kept;
+                self.out[k..k + 12].copy_from_slice(&entry);
+                kept += 1;
             }
+        }
+        let next_at = at + 2 + 12 * kept;
+        self.put_u16(at, kept as u16);
+        self.out[next_at..next_at + 4].fill(0);
+        Some((at as u32, next_at, next))
+    }
+
+    /// Copy what the directory entry `entry` points to and point it at the
+    /// copy. False when the entry is left out.
+    fn copy_entry<R: std::io::Read + std::io::Seek>(&mut self, r: &mut RangeReader<'_, R>, entry: &mut [u8; 12], kind: IfdKind) -> bool {
+        let tag = self.u16_at(&entry[0..2]);
+        let typ = self.u16_at(&entry[2..4]);
+        let cnt = self.u32_at(&entry[4..8]);
+        let target = self.u32_at(&entry[8..12]);
+        let child = match (kind, tag) {
+            (IfdKind::Tiff, 0x8769) => Some(IfdKind::Exif),
+            (IfdKind::Tiff, 0x8825) => Some(IfdKind::Gps),
+            (IfdKind::Exif, 0xA005) => Some(IfdKind::Interop),
+            _ => None,
+        };
+        let at = if let Some(child) = child {
+            // A pointer is one LONG (kamadak-exif refuses anything else). The
+            // copied directory has no next one (which kamadak-exif refuses too).
+            if typ != 4 || cnt != 1 {
+                return false;
+            }
+            match self.copy_ifd(r, target as u64, child) {
+                Some((at, _, _)) => at,
+                None => return false,
+            }
+        } else {
             let unit: u64 = match typ {
                 1 | 2 | 6 | 7 => 1,
                 3 | 8 => 2,
@@ -227,16 +398,20 @@ impl TiffCompactor {
                 _ => 0,
             };
             let vlen = unit * cnt as u64;
-            if vlen > 4 {
-                if vlen > self.cap as u64 {
-                    return None;
-                }
-                let value = r.read(self.u32_at(&entry[8..12]) as u64, vlen as usize)?;
-                let vat = self.append(&value)?;
-                self.put_u32(e + 8, vat);
+            if vlen <= 4 {
+                return true;
             }
-        }
-        Some((at, at as usize + 2 + 12 * count, next))
+            if !self.fits(vlen) {
+                return false;
+            }
+            match r.read(target as u64, vlen as usize).and_then(|v| self.append(&v)) {
+                Some(at) => at,
+                None => return false,
+            }
+        };
+        let b = if self.le { at.to_le_bytes() } else { at.to_be_bytes() };
+        entry[8..12].copy_from_slice(&b);
+        true
     }
 }
 
@@ -356,6 +531,18 @@ pub struct QuickMeta {
     pub taken: Option<i64>,
 }
 
+/// The dimensions (as shown, after EXIF orientation) and capture date of the
+/// file at `path`, reading its EXIF once for both.
+pub fn quick_meta(path: &Path) -> QuickMeta {
+    let exif = exif_from_file(path);
+    let orientation = exif.as_ref().map_or(1, crate::decode::orientation_of);
+    QuickMeta {
+        dims: crate::decode::probe_dimensions_with_orientation(path, orientation),
+        // Only the date: summarizing every tag as text is several times slower.
+        taken: exif.as_ref().and_then(|e| taken(e)?.1),
+    }
+}
+
 struct MetaJob {
     path: PathBuf,
     /// Request sequence number (higher = asked for more recently), shared with
@@ -408,12 +595,7 @@ fn meta_worker(s: Arc<MetaShared>, tx: Sender<(PathBuf, QuickMeta)>, repaint: im
         let p = job.path;
         // A decoder or EXIF parser panicking on a hostile file must not stop
         // this worker for good (the rest would never be read).
-        let meta = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| QuickMeta {
-            dims: crate::decode::probe_dimensions(&p),
-            // Only the date: summarizing every tag as text is several times slower.
-            taken: read_taken(&p),
-        }))
-        .unwrap_or_default();
+        let meta = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| quick_meta(&p))).unwrap_or_default();
         if tx.send((p, meta)).is_err() {
             return;
         }
@@ -688,22 +870,126 @@ mod tests {
     }
 
     #[test]
-    fn unusual_tiffs_are_left_to_the_full_read() {
+    fn unusual_tiffs_are_cut_instead_of_read_whole() {
+        let compact = |v: &[u8], cap: usize| compact_tiff(&mut std::io::Cursor::new(v.to_vec()), cap).unwrap();
+        let parse = |c: Vec<u8>| fields(&exif::Reader::new().read_raw(c).unwrap());
         let good = tiff_with_ifds_at_end(100);
-        // A value pointing past the end of the file.
+        let all = parse(good.clone());
+        let ifd0 = u32::from_le_bytes(good[4..8].try_into().unwrap()) as usize;
+        // A value pointing past the end of the file: kamadak-exif refuses the
+        // whole file, the copy leaves that entry (Make) out.
         let mut bad = good.clone();
-        let ifd0 = u32::from_le_bytes(bad[4..8].try_into().unwrap()) as usize;
         patch(&mut bad, ifd0 + 2 + 8, u32::MAX - 16);
-        assert!(compact_tiff(&mut std::io::Cursor::new(bad.clone()), TIFF_EXIF_CAP).unwrap().is_none());
-        assert!(exif::Reader::new().read_raw(bad).is_err(), "kamadak-exif refuses it too");
-        // More than the cap.
-        assert!(compact_tiff(&mut std::io::Cursor::new(good.clone()), 64).unwrap().is_none());
-        // Not a TIFF.
-        assert!(compact_tiff(&mut std::io::Cursor::new(b"\xFF\xD8\xFF\xE0 not a tiff".to_vec()), TIFF_EXIF_CAP).unwrap().is_none());
+        assert!(exif::Reader::new().read_raw(bad.clone()).is_err());
+        let f = parse(compact(&bad, TIFF_EXIF_CAP).unwrap());
+        assert_eq!(f.len(), all.len() - 1, "{f:?}");
+        assert!(f.iter().all(|x| all.contains(x) && !x.contains("Make")), "{f:?}");
+        // More than the cap: what fits is kept, the copy stays within the cap.
+        let c = compact(&good, 200).unwrap();
+        assert!(c.len() <= 200, "{}", c.len());
+        let f = parse(c);
+        assert!(!f.is_empty() && f.len() < all.len() && f.iter().all(|x| all.contains(x)), "{f:?}");
+        // An odd EXIF pointer (two LONGs): the EXIF directory is left out.
+        let mut odd = good.clone();
+        patch(&mut odd, ifd0 + 2 + 12 * 5 + 4, 2);
+        let f = parse(compact(&odd, TIFF_EXIF_CAP).unwrap());
+        assert!(f.iter().all(|x| all.contains(x)) && !f.iter().any(|x| x.contains("DateTimeOriginal")), "{f:?}");
+        assert!(f.iter().any(|x| x.contains("GPSLatitude")), "{f:?}");
+        // Nine directories (kamadak-exif refuses more than eight): cut at eight.
+        let mut nine = b"II*\0".to_vec();
+        nine.extend_from_slice(&8u32.to_le_bytes());
+        let mut prev_next = None;
+        for i in 0..9u16 {
+            let (at, _, next_at) = put_ifd(&mut nine, &[(0x0100, 3, 1, (100 + i).to_le_bytes().to_vec())]);
+            if let Some(p) = prev_next {
+                patch(&mut nine, p, at);
+            }
+            prev_next = Some(next_at);
+        }
+        assert!(exif::Reader::new().read_raw(nine.clone()).is_err());
+        let f = parse(compact(&nine, TIFF_EXIF_CAP).unwrap());
+        assert_eq!(f.len(), 8, "{f:?}");
+        assert!(f[7].contains("107"), "{f:?}");
+        // A directory chain pointing back at itself ends too.
+        let mut looped = nine.clone();
+        patch(&mut looped, 8 + 2 + 12, 8);
+        assert_eq!(parse(compact(&looped, TIFF_EXIF_CAP).unwrap()).len(), 8);
+        // Not a TIFF, or its first directory unreadable.
+        assert!(compact(b"\xFF\xD8\xFF\xE0 not a tiff", TIFF_EXIF_CAP).is_none());
+        assert!(compact(b"II*\0\x00\x10\x00\x00", TIFF_EXIF_CAP).is_none());
         // No directories at all.
-        let empty = b"II*\0\0\0\0\0".to_vec();
-        let c = compact_tiff(&mut std::io::Cursor::new(empty), TIFF_EXIF_CAP).unwrap().unwrap();
+        let c = compact(b"II*\0\0\0\0\0", TIFF_EXIF_CAP).unwrap();
         assert_eq!(exif::Reader::new().read_raw(c).unwrap().fields().count(), 0);
+    }
+
+    /// `exif_from_reader` over `data`, and how many bytes it read.
+    fn exif_and_bytes_read(data: Vec<u8>) -> (Option<exif::Exif>, usize) {
+        let mut r = std::io::BufReader::with_capacity(16 * 1024, Counting { inner: std::io::Cursor::new(data), read: 0 });
+        let e = exif_from_reader(&mut r);
+        (e, r.get_ref().read)
+    }
+
+    /// A `kind` chunk of a PNG (the CRC is not checked).
+    fn png_chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
+        [&(data.len() as u32).to_be_bytes()[..], kind, data, &[0u8; 4][..]].concat()
+    }
+
+    /// A RIFF chunk of a WebP.
+    fn riff_chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut v = [kind, &(data.len() as u32).to_le_bytes()[..], data].concat();
+        if data.len() % 2 == 1 {
+            v.push(0);
+        }
+        v
+    }
+
+    fn webp(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let body = chunks.concat();
+        [&b"RIFF"[..], &(body.len() as u32 + 4).to_le_bytes()[..], &b"WEBP"[..], &body[..]].concat()
+    }
+
+    #[test]
+    fn containers_are_read_only_up_to_their_exif() {
+        let blob = exif_blob(3, 3);
+        let date = |e: Option<exif::Exif>| e.and_then(|e| taken(&e)).map(|t| t.0);
+        // JPEG: the APP1 segment; without one, the scan stops at the image data
+        // (4 MB of it here, which kamadak-exif reads through).
+        assert_eq!(date(exif_and_bytes_read(jpeg_with_exif()).0).as_deref(), Some("2021-06-15 10:20:30"));
+        let mut jpg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpg, 90).encode(&vec![120u8; 64 * 48 * 3], 64, 48, jpeg_encoder::ColorType::Rgb).unwrap();
+        let eoi = jpg.split_off(jpg.len() - 2);
+        jpg.extend_from_slice(&vec![0u8; 4 << 20]);
+        jpg.extend_from_slice(&eoi);
+        let (e, read) = exif_and_bytes_read(jpg);
+        assert!(e.is_none());
+        assert!(read <= 64 * 1024, "read {read} bytes");
+        // PNG: the eXIf chunk before the image data (with or without the
+        // "Exif" prefix some writers add); none: stop at the first IDAT.
+        let sig = b"\x89PNG\r\n\x1a\n".to_vec();
+        let ihdr = png_chunk(b"IHDR", &[0; 13]);
+        let idat = png_chunk(b"IDAT", &vec![7; 4 << 20]);
+        for data in [blob.clone(), [&b"Exif\0\0"[..], &blob[..]].concat()] {
+            let png = [sig.clone(), ihdr.clone(), png_chunk(b"eXIf", &data), idat.clone(), png_chunk(b"IEND", &[])].concat();
+            assert_eq!(date(exif_and_bytes_read(png).0).as_deref(), Some("2021-06-15 10:20:30"));
+        }
+        let (e, read) = exif_and_bytes_read([sig.clone(), ihdr.clone(), idat.clone(), png_chunk(b"eXIf", &blob), png_chunk(b"IEND", &[])].concat());
+        assert!(e.is_none());
+        assert!(read <= 64 * 1024, "read {read} bytes");
+        // WebP: the EXIF chunk after the image data, found from the chunk
+        // headers; none when the extended header says so or there is none.
+        let vp8x = |flags: u8| riff_chunk(b"VP8X", &[flags, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let vp8 = riff_chunk(b"VP8 ", &vec![9; (4 << 20) + 1]);
+        let (e, read) = exif_and_bytes_read(webp(&[vp8x(0x08), vp8.clone(), riff_chunk(b"EXIF", &blob)]));
+        assert_eq!(date(e).as_deref(), Some("2021-06-15 10:20:30"));
+        assert!(read <= 64 * 1024, "read {read} bytes");
+        for file in [webp(&[vp8x(0), vp8.clone(), riff_chunk(b"EXIF", &blob)]), webp(&[vp8.clone(), riff_chunk(b"EXIF", &blob)])] {
+            let (e, read) = exif_and_bytes_read(file);
+            assert!(e.is_none());
+            assert!(read <= 64 * 1024, "read {read} bytes");
+        }
+        // Anything else: nothing.
+        assert!(exif_and_bytes_read(b"GIF89a not much".to_vec()).0.is_none());
+        assert!(exif_and_bytes_read(Vec::new()).0.is_none());
     }
 
     fn idle_service() -> MetaService {

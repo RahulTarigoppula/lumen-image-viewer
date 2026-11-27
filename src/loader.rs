@@ -57,7 +57,11 @@ struct Job {
 
 enum Msg {
     Preview(PathBuf, u64, image::RgbaImage),
-    Done(PathBuf, u64, Result<LoadedImage, String>),
+    /// The decoded image; true when more pages follow (`Pages`).
+    Done(PathBuf, u64, Result<LoadedImage, String>, bool),
+    /// All pages of a multi-page TIFF whose first page came with `Done`
+    /// (None: they could not be decoded).
+    Pages(PathBuf, u64, Option<Arc<Vec<decode::AnimFrame>>>),
 }
 
 struct Entry {
@@ -69,11 +73,18 @@ struct Entry {
     /// Shared with the job decoding this entry (see `Job`).
     cancel: Arc<AtomicBool>,
     live: Arc<AtomicU32>,
+    /// Ready with its first page; the other pages are still being decoded.
+    pages_pending: bool,
 }
 
 impl Entry {
     fn loading(&self) -> bool {
         matches!(self.state, LoadState::Loading | LoadState::Preview(_))
+    }
+
+    /// Its job is still running (decoding the image, or its other pages).
+    fn busy(&self) -> bool {
+        self.loading() || self.pages_pending
     }
 }
 
@@ -163,7 +174,7 @@ impl Loader {
         let generation = self.next_generation;
         self.next_generation += 1;
         let (cancel, live) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU32::new(priority)));
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation, priority, cancel: cancel.clone(), live: live.clone() });
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Loading, touched: Instant::now(), generation, priority, cancel: cancel.clone(), live: live.clone(), pages_pending: false });
         let mut q = self.queue.jobs.lock();
         q.jobs.push(Job { path: path.to_path_buf(), priority, preview_side, generation, cancel, live });
         self.queue.cv.notify_one();
@@ -193,16 +204,17 @@ impl Loader {
         }
         let mut q = self.queue.jobs.lock();
         let queued_ok = q.jobs.iter().all(|j| keep.contains(&j.path));
-        let running_ok = self.entries.iter().all(|(p, e)| !e.loading() || keep.contains(p));
+        let running_ok = self.entries.iter().all(|(p, e)| !e.busy() || keep.contains(p));
         if queued_ok && running_ok {
             return; // common case (every frame): nothing to drop, no allocation
         }
         q.jobs.retain(|j| keep.contains(&j.path));
         drop(q);
         // Queued or running, an unwanted load goes: a late result is dropped
-        // (its generation is gone) and a later request starts over.
+        // (its generation is gone) and a later request starts over. So does an
+        // image whose other pages are still being decoded.
         self.entries.retain(|p, e| {
-            let unwanted = e.loading() && !keep.contains(p);
+            let unwanted = e.busy() && !keep.contains(p);
             if unwanted {
                 e.cancel.store(true, Ordering::Relaxed);
             }
@@ -248,7 +260,7 @@ impl Loader {
     pub fn insert(&mut self, path: &Path, img: LoadedImage) {
         let generation = self.next_generation;
         self.next_generation += 1;
-        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation, priority: u32::MAX, cancel: Default::default(), live: Default::default() });
+        self.entries.insert(path.to_path_buf(), Entry { state: LoadState::Ready(Arc::new(img)), touched: Instant::now(), generation, priority: u32::MAX, cancel: Default::default(), live: Default::default(), pages_pending: false });
     }
 
     /// Drain finished jobs. Returns paths whose state changed.
@@ -264,16 +276,38 @@ impl Loader {
                         }
                     }
                 }
-                Msg::Done(p, g, res) => {
+                Msg::Done(p, g, res, more) => {
                     // Ignore results for entries that were dropped or invalidated meanwhile.
                     if let Some(e) = self.entries.get_mut(&p) {
                         if e.generation == g {
+                            e.pages_pending = more && res.is_ok();
                             e.state = match res {
                                 Ok(img) => LoadState::Ready(Arc::new(img)),
                                 Err(err) => LoadState::Failed(err),
                             };
                             e.touched = Instant::now();
                             changed.push(p);
+                        }
+                    }
+                }
+                Msg::Pages(p, g, frames) => {
+                    if let Some(e) = self.entries.get_mut(&p) {
+                        if e.generation == g {
+                            e.pages_pending = false;
+                            // The same image with its pages (the pyramid is shared, so
+                            // the viewer keeps its textures).
+                            let paged = match (frames, &e.state) {
+                                (Some(frames), LoadState::Ready(img)) => {
+                                    let mut decoded = img.decoded.clone();
+                                    decoded.frames = Some(frames);
+                                    Some(LoadedImage { decoded, pyramid: img.pyramid.clone(), load_ms: img.load_ms, file_size: img.file_size, modified: img.modified })
+                                }
+                                _ => None,
+                            };
+                            if let Some(paged) = paged {
+                                e.state = LoadState::Ready(Arc::new(paged));
+                                changed.push(p);
+                            }
                         }
                     }
                 }
@@ -330,7 +364,10 @@ impl Loader {
             if total <= self.budget_bytes {
                 break;
             }
-            self.entries.remove(&p);
+            // Its other pages, if still being decoded, are not wanted either.
+            if let Some(e) = self.entries.remove(&p) {
+                e.cancel.store(true, Ordering::Relaxed);
+            }
             self.evicted.insert(p, now);
             total -= b;
         }
@@ -390,7 +427,8 @@ fn run_job(job: Job, opts: &Mutex<DecodeOptions>, tx: &Sender<Msg>, ctx: &egui::
         }
     }
     let o = *opts.lock();
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode::with_cancel(&job.cancel, || decode::decode_file(&job.path, o))));
+    // A multi-page TIFF: its first page now, the others below.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode::with_cancel(&job.cancel, || decode::decode_first_page(&job.path, o))));
     if !wanted() {
         return None;
     }
@@ -412,7 +450,19 @@ fn run_job(job: Job, opts: &Mutex<DecodeOptions>, tx: &Sender<Msg>, ctx: &egui::
         Ok(Err(e)) => Err(decode::friendly_error(&e)),
         Err(_) => Err("The decoder crashed on this file (it may be corrupt).".into()),
     };
-    Some(Msg::Done(job.path, job.generation, res))
+    let first_page = res.as_ref().ok().filter(|l| decode::has_more_pages(&l.decoded)).map(|l| l.decoded.clone());
+    let Some(first_page) = first_page else {
+        return Some(Msg::Done(job.path, job.generation, res, false));
+    };
+    // The first page goes on screen while the other pages are decoded (each
+    // one only while the image is still wanted).
+    let _ = tx.send(Msg::Done(job.path.clone(), job.generation, res, true));
+    ctx.request_repaint();
+    let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode::with_cancel(&job.cancel, || decode::decode_more_pages(&job.path, &first_page, o.color_manage))));
+    if !wanted() {
+        return None;
+    }
+    Some(Msg::Pages(job.path, job.generation, pages.ok().flatten()))
 }
 
 #[cfg(test)]

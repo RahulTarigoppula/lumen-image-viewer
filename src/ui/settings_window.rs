@@ -104,6 +104,8 @@ struct State {
     scale_edit: Option<f32>,
     cache_size: Option<u64>,
     cache_checked_at: f64,
+    /// The thumbnail cache size being counted on a worker thread.
+    cache_size_rx: Option<crossbeam_channel::Receiver<u64>>,
     shell: Option<crate::shell::ShellStatus>,
     confirm_reset: bool,
     confirm_clear_cache: bool,
@@ -248,6 +250,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
                     Err(e) => core.toasts.error(format!("Could not clear the thumbnail cache: {e}")),
                 }
                 st.cache_size = None;
+                st.cache_size_rx = None;
             }
             Some(false) => st.confirm_clear_cache = false,
             None => {}
@@ -267,6 +270,7 @@ pub fn show(ctx: &egui::Context, core: &mut Core, open: &mut bool) -> bool {
         core.settings.save();
         st.shell = None;
         st.cache_size = None;
+        st.cache_size_rx = None;
     }
     st.editing = ctx.text_edit_focused();
     ctx.data_mut(|d| d.insert_temp(state_id, st));
@@ -819,8 +823,13 @@ fn editing(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
 fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     let mut changed = false;
     let now = ui.input(|i| i.time);
-    if st.cache_size.is_none() || now - st.cache_checked_at > 5.0 {
-        st.cache_size = Some(core.thumbs.disk_cache_size());
+    // Counted on a worker every few seconds (listing the cache folder takes a while).
+    if let Some(size) = st.cache_size_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        st.cache_size = Some(size);
+        st.cache_size_rx = None;
+    }
+    if st.cache_size_rx.is_none() && (st.cache_size.is_none() || now - st.cache_checked_at > 5.0) {
+        st.cache_size_rx = Some(core.thumbs.disk_cache_size_in_background());
         st.cache_checked_at = now;
     }
     if st.total_ram.is_none() {
@@ -851,7 +860,8 @@ fn performance(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> boo
     card(ui, p, |ui| {
         changed |= toggle_row(ui, p, "Cache thumbnails on disk", "Folders you have visited before open instantly.", &mut s.thumb_disk_cache);
         let size = st.cache_size.unwrap_or(0);
-        row(ui, p, "Disk cache", &format!("{} used", fmt_bytes(size)), |ui| {
+        let used = st.cache_size.map_or_else(|| "Counting...".to_string(), |n| format!("{} used", fmt_bytes(n)));
+        row(ui, p, "Disk cache", &used, |ui| {
             if ui.add_enabled(size > 0, egui::Button::new(format!("{}  Clear", I::BROOM))).on_hover_text("Delete the saved thumbnails; they are made again when needed").clicked() {
                 st.confirm_clear_cache = true;
             }

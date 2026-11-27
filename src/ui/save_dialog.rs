@@ -12,6 +12,7 @@ use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Entry of the last-used choices in `tools.json`.
 const MEMORY_KEY: &str = "save_as";
@@ -67,8 +68,19 @@ impl LastUsed {
         memory::clamp(&mut opts.webp_quality, 1.0..=100.0);
         opts.webp_lossless = self.webp_lossless;
         opts.png_best_compression = self.png_best_compression;
-        self.folder.filter(|d| d.is_dir())
+        self.folder.filter(|d| is_dir_within(d, Duration::from_millis(500)))
     }
+}
+
+/// Whether `dir` is a folder, asked on another thread and taken as no after
+/// `limit` (a disconnected network drive can take half a minute to answer).
+fn is_dir_within(dir: &Path, limit: Duration) -> bool {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(dir.is_dir());
+    });
+    rx.recv_timeout(limit).unwrap_or(false)
 }
 
 pub struct SaveDialog {
@@ -88,6 +100,11 @@ pub struct SaveDialog {
     focused: bool,
     /// The name field as typed (`path` follows it while it is not empty).
     name: String,
+    /// Whether the target exists, as last checked: (path checked, it exists).
+    /// Checked on another thread (a network folder can take seconds to answer).
+    exists: Option<(PathBuf, bool)>,
+    /// The check running: (path, its answer).
+    exists_rx: Option<(PathBuf, Receiver<bool>)>,
 }
 
 pub enum SaveOutcome {
@@ -112,13 +129,40 @@ impl SaveDialog {
         if let (Some(dir), Some(name)) = (folder, path.file_name().map(|n| n.to_os_string())) {
             path = dir.join(name);
         }
-        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false, focused: false, name: String::new() }.with_name()
+        SaveDialog { path, opts, image, estimate: None, est_rx: None, est_version: 0, version: 1, error: None, original, confirm_replace: false, focused: false, name: String::new(), exists: None, exists_rx: None }.with_name()
     }
 
-    /// The target is an existing file other than the one being edited.
+    /// The target is the file being edited (saving over it needs no question).
+    fn is_original(&self) -> bool {
+        self.path.to_string_lossy().to_lowercase() == self.original.to_string_lossy().to_lowercase()
+    }
+
+    /// The target is an existing file other than the one being edited, as far
+    /// as known yet (see `check_exists`).
     fn overwrites_other(&self) -> bool {
-        let same = self.path.to_string_lossy().to_lowercase() == self.original.to_string_lossy().to_lowercase();
-        !same && self.path.exists()
+        !self.is_original() && self.exists.as_ref().is_some_and(|(p, e)| *e && *p == self.path)
+    }
+
+    /// Find out on another thread whether the target exists, when it changed.
+    fn check_exists(&mut self, ctx: &egui::Context) {
+        if let Some((p, rx)) = &self.exists_rx {
+            match rx.try_recv() {
+                Ok(e) => self.exists = Some((p.clone(), e)),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+            }
+            self.exists_rx = None;
+        }
+        if self.exists.as_ref().is_some_and(|(p, _)| *p == self.path) {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (path, ctx) = (self.path.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(path.exists());
+            ctx.request_repaint();
+        });
+        self.exists_rx = Some((self.path.clone(), rx));
     }
 
     /// Show the file name of `path` in the name field.
@@ -157,6 +201,7 @@ impl SaveDialog {
 
     pub fn show(&mut self, ctx: &egui::Context, p: &super::theme::Palette) -> SaveOutcome {
         let mut out = SaveOutcome::Open;
+        self.check_exists(ctx);
         if let Some(rx) = &self.est_rx {
             if let Ok((v, r)) = rx.try_recv() {
                 if v == self.version {
@@ -339,7 +384,10 @@ impl SaveDialog {
             self.version += 1;
         }
         if save_clicked && !matches!(out, SaveOutcome::Cancel) {
-            if self.overwrites_other() && !self.confirm_replace {
+            // Asked again now (once, on the click): the file may have appeared since.
+            let exists = !self.is_original() && self.path.exists();
+            self.exists = Some((self.path.clone(), exists));
+            if exists && !self.confirm_replace {
                 self.confirm_replace = true;
             } else {
                 if let Some(v) = memory::to_value(&LastUsed::of(self)) {

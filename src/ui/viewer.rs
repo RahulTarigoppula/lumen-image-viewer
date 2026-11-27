@@ -323,7 +323,7 @@ pub struct Viewer {
     hist_cache: crate::bg::BgSlot<(PathBuf, u64, usize), Histogram>,
     exif_cache: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
     /// (size, mtime) per file so thumbnail lookups never stat() every frame.
-    stat_cache: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    stat_cache: FileStats,
     drag_pan: bool,
     /// Show the pop-out panels when the pointer dwells at a window edge.
     pub edge_panels: bool,
@@ -416,15 +416,13 @@ impl Viewer {
     }
 
     fn thumb_key(&mut self, path: &Path) -> ThumbKey {
-        let (size, mtime) = *self.stat_cache.entry(path.to_path_buf()).or_insert_with(|| {
-            std::fs::metadata(path).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
-        });
+        let (size, mtime) = self.stat_cache.get_or_stat(path);
         ThumbKey::new(path, size, mtime)
     }
 
     /// The thumbnail key of `path` when its file size and date are cached (no file access).
     fn cached_thumb_key(&self, path: &Path) -> Option<ThumbKey> {
-        self.stat_cache.get(path).map(|&(size, mtime)| ThumbKey::new(path, size, mtime))
+        self.stat_cache.get(path).map(|(size, mtime)| ThumbKey::new(path, size, mtime))
     }
 
     /// Drop cached file stats after the file changed on disk.
@@ -1833,25 +1831,19 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             // Thumbnails for the cells in view and half a view to either side.
             let margin = viewport.width() * 0.5;
             let want = layout.range(viewport.min.x - margin, viewport.max.x + margin);
-            // Keys nearest the current image first; a file not seen yet costs a
-            // stat on this thread, so only a few of those per frame.
+            // Keys nearest the current image first; the size and date of a file
+            // not seen yet are looked up on a worker thread (a network folder
+            // answers slowly), which repaints when they are known.
             let mut order: Vec<usize> = want.clone().collect();
             order.sort_by_key(|&i| i.abs_diff(self.index));
+            self.stat_cache.poll();
+            self.stat_cache.trim(&self.list);
             let mut keys: Vec<Option<ThumbKey>> = vec![None; want.len()];
-            let mut new_stats = 0;
             for &i in &order {
-                keys[i - want.start] = match self.cached_thumb_key(&self.list[i]) {
-                    Some(k) => Some(k),
-                    None if new_stats < FILM_STATS_PER_FRAME => {
-                        new_stats += 1;
-                        let path = self.list[i].clone();
-                        Some(self.thumb_key(&path))
-                    }
-                    None => None,
-                };
-            }
-            if keys.iter().any(|k| k.is_none()) {
-                ui.ctx().request_repaint();
+                keys[i - want.start] = self.cached_thumb_key(&self.list[i]);
+                if keys[i - want.start].is_none() {
+                    self.stat_cache.request(&self.list[i], ui.ctx());
+                }
             }
             // Requested farthest first: the newest request is served first, so the
             // current image and its neighbours come before the margins.
@@ -3031,8 +3023,90 @@ mod tests {
 /// Drag payload of a filmstrip thumbnail: its index in the viewer list.
 struct FilmDrag(usize);
 
-/// At most this many files not seen before are stat()ed for the filmstrip per frame.
-const FILM_STATS_PER_FRAME: usize = 24;
+/// At most this many files are waiting for the filmstrip's stat worker at once
+/// (the nearest are asked for first; scrolling on asks for the next ones).
+const FILM_STATS_IN_FLIGHT: usize = 24;
+/// File stats are kept for the files of the list and this many others.
+const FILM_STATS_SLACK: usize = 1024;
+
+/// A file's size and modification time.
+type FileStat = (u64, Option<std::time::SystemTime>);
+
+/// File sizes and dates for thumbnail keys. The filmstrip has them looked up
+/// on a worker thread; stats of files that left the list are dropped.
+#[derive(Default)]
+struct FileStats {
+    map: std::collections::HashMap<PathBuf, FileStat>,
+    /// The worker: where to send paths, where its answers arrive (started on first use).
+    worker: Option<(crossbeam_channel::Sender<PathBuf>, Receiver<(PathBuf, FileStat)>)>,
+    /// Paths sent to the worker and not answered yet.
+    asked: std::collections::HashSet<PathBuf>,
+}
+
+impl FileStats {
+    fn stat(path: &Path) -> FileStat {
+        std::fs::metadata(path).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None))
+    }
+
+    fn get(&self, path: &Path) -> Option<FileStat> {
+        self.map.get(path).copied()
+    }
+
+    /// The stat of `path`, read now when it is not known.
+    fn get_or_stat(&mut self, path: &Path) -> FileStat {
+        *self.map.entry(path.to_path_buf()).or_insert_with(|| Self::stat(path))
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.map.remove(path);
+        // An answer on its way may be older than the change.
+        self.asked.remove(path);
+    }
+
+    /// Have the worker look up `path` (unless enough are waiting already).
+    fn request(&mut self, path: &Path, ctx: &egui::Context) {
+        if self.asked.len() >= FILM_STATS_IN_FLIGHT || self.asked.contains(path) {
+            return;
+        }
+        let (tx, _) = self.worker.get_or_insert_with(|| {
+            let (tx, jobs) = crossbeam_channel::unbounded::<PathBuf>();
+            let (done, rx) = crossbeam_channel::unbounded();
+            let ctx = ctx.clone();
+            let _ = std::thread::Builder::new().name("lumen-film-stat".into()).spawn(move || {
+                // Ends when the viewer (holding the sender) is gone.
+                for p in jobs {
+                    let st = FileStats::stat(&p);
+                    if done.send((p, st)).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            });
+            (tx, rx)
+        });
+        if tx.send(path.to_path_buf()).is_ok() {
+            self.asked.insert(path.to_path_buf());
+        }
+    }
+
+    /// Take in the worker's answers.
+    fn poll(&mut self) {
+        let Some((_, rx)) = &self.worker else { return };
+        while let Ok((p, st)) = rx.try_recv() {
+            if self.asked.remove(&p) {
+                self.map.insert(p, st);
+            }
+        }
+    }
+
+    /// Drop the stats of files not in `list` once there are many of them.
+    fn trim(&mut self, list: &[PathBuf]) {
+        if self.map.len() > list.len() + FILM_STATS_SLACK {
+            let keep: std::collections::HashSet<&PathBuf> = list.iter().collect();
+            self.map.retain(|p, _| keep.contains(p));
+        }
+    }
+}
 /// Space between filmstrip cells.
 const FILM_GAP: f32 = 6.0;
 
