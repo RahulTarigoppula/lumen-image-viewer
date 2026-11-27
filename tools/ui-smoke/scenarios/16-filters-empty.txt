@@ -13,7 +13,7 @@ shot cleared.png
 click 928 22
 wait 800
 shot funnel_menu.png
-click 985 124
+click 960 129
 wait 800
 click 1100 650
 wait 800

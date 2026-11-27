@@ -585,7 +585,9 @@ impl FolderTree {
         if self.scroll_cursor {
             if let Some(i) = cursor_row {
                 self.scroll_cursor = false;
-                let offset = egui::scroll_area::State::load(&ctx, ui.make_persistent_id("folder-tree")).map(|s| s.clamped_offset().y).unwrap_or(0.0);
+                // The scroll area hashes its `IdSalt` once more: build the same id.
+                let id = ui.make_persistent_id(egui::IdSalt::new("folder-tree"));
+                let offset = egui::scroll_area::State::load(&ctx, id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
                 let y = i as f32 * row_h;
                 if y < offset {
                     scroll = scroll.vertical_scroll_offset(y);

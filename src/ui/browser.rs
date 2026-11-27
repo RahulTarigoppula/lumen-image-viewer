@@ -840,9 +840,11 @@ impl Browser {
                             ev.push(BrowserEvent::Navigate(parent.to_path_buf()));
                         }
                     } else if !typed.is_empty() {
-                        // Not there: say so and keep the text to correct (the field
-                        // takes the focus again next frame).
+                        // Not there: say so and keep the text to correct. The field
+                        // takes the focus back now: egui reports `lost_focus` for
+                        // two frames, and the next one would close the field.
                         self.address_error = Some("Folder not found");
+                        r.request_focus();
                         return;
                     }
                 }
@@ -1125,7 +1127,7 @@ impl Browser {
             if let Some(f) = self.focus {
                 let row = f / cols;
                 let y = row as f32 * (cell.y + ui.spacing().item_spacing.y);
-                let id = ui.make_persistent_id(("grid", &self.folder));
+                let id = ui.make_persistent_id(egui::IdSalt::new(("grid", &self.folder)));
                 let offset = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
                 let view_h = ui.available_height();
                 if y < offset {
@@ -1151,7 +1153,7 @@ impl Browser {
                     0.0
                 };
                 if dy != 0.0 {
-                    let id = ui.make_persistent_id(("grid", &self.folder));
+                    let id = ui.make_persistent_id(egui::IdSalt::new(("grid", &self.folder)));
                     let offset = egui::scroll_area::State::load(ui.ctx(), id).map(|s| s.clamped_offset().y).unwrap_or(0.0);
                     scroll = scroll.vertical_scroll_offset((offset + dy * 0.35).max(0.0));
                     ui.ctx().request_repaint();
@@ -1818,9 +1820,6 @@ impl Browser {
 
     fn context_menu(&mut self, ui: &mut Ui, bg: &egui::Response, ev: &mut Vec<BrowserEvent>, open_now: bool) {
         let popup_id = ui.scope_id().with("item-context");
-        if open_now {
-            egui::Popup::open_id(ui.ctx(), popup_id);
-        }
         let has_sel = !self.selected.is_empty() || self.focus.is_some();
         let build = |ui: &mut Ui, ev: &mut Vec<BrowserEvent>| {
             let item = |ui: &mut Ui, cmd: Command, ev: &mut Vec<BrowserEvent>| {
@@ -1884,7 +1883,14 @@ impl Browser {
                 item(ui, Command::AddFavorite, ev);
             }
         };
-        egui::Popup::context_menu(bg).id(popup_id).show(|ui| {
+        let mut popup = egui::Popup::context_menu(bg).id(popup_id);
+        if open_now {
+            // A right-click on a file (the empty space behind opens it by itself):
+            // open at the pointer. `Popup::open_id` stores no position, and a
+            // context menu without one is never shown.
+            popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+        }
+        popup.show(|ui| {
             ui.set_min_width(240.0);
             build(ui, ev);
         });
