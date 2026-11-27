@@ -339,10 +339,18 @@ impl ThumbService {
         Ok(freed)
     }
 
-    pub fn disk_cache_size(&self) -> u64 {
-        std::fs::read_dir(&self.cache_dir)
-            .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
-            .unwrap_or(0)
+    /// Bytes used by the disk cache, counted on a worker thread (the cache can
+    /// hold tens of thousands of files); the answer arrives on the receiver.
+    pub fn disk_cache_size_in_background(&self) -> Receiver<u64> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (dir, ctx) = (self.cache_dir.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            crate::bg::background_priority();
+            let size: u64 = std::fs::read_dir(&dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+            let _ = tx.send(size);
+            ctx.request_repaint();
+        });
+        rx
     }
 }
 

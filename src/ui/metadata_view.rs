@@ -61,19 +61,29 @@ pub struct MetadataWindow {
     pending: HashMap<PathBuf, Receiver<Inspection>>,
     filter: String,
     only_diff: bool,
+    /// Bumped whenever the files shown or their results change.
+    rev: u64,
+    /// The rows of a tab as last built: (`rev`, tab, sections). Building them
+    /// merges every field of every file, too slow to repeat every frame.
+    shown: Option<(u64, MetaTab, Arc<Vec<Section>>)>,
 }
 
 impl Default for MetadataWindow {
     fn default() -> Self {
-        MetadataWindow { open: false, tab: MetaTab::Capture, items: Vec::new(), cache: HashMap::new(), pending: HashMap::new(), filter: String::new(), only_diff: false }
+        MetadataWindow { open: false, tab: MetaTab::Capture, items: Vec::new(), cache: HashMap::new(), pending: HashMap::new(), filter: String::new(), only_diff: false, rev: 0, shown: None }
     }
 }
+
+/// A group title and its rows.
+type Section = (String, Vec<Row>);
 
 /// A row of the table: the field name, its explanation and one value per file.
 struct Row {
     name: String,
     note: String,
     values: Vec<Option<String>>,
+    /// The name and the values in lower case, one per line (for the filter).
+    search: String,
 }
 
 impl Row {
@@ -96,37 +106,40 @@ fn cell(ui: &mut egui::Ui, w: f32, h: f32, label: egui::Label) -> egui::Response
 /// Rows of one group across files, in the order fields first appear.
 fn merge_rows(groups: &[Option<&Vec<Field>>]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
+    // The row of the nth field of a name (repeated names in one group are
+    // lists, and stay separate rows).
+    let mut row_of: HashMap<(&str, usize), usize> = HashMap::new();
     let n = groups.len();
     for (k, g) in groups.iter().enumerate() {
         let Some(fields) = g else { continue };
-        // Repeated names in one group (lists) stay separate rows.
         let mut seen: HashMap<&str, usize> = HashMap::new();
         for f in fields.iter() {
             let nth = seen.entry(f.name.as_str()).or_insert(0);
-            let mut count = 0;
-            let pos = rows.iter().position(|r| {
-                if r.name == f.name {
-                    count += 1;
-                    count > *nth
-                } else {
-                    false
-                }
-            });
+            let key = (f.name.as_str(), *nth);
             *nth += 1;
-            match pos {
-                Some(i) => {
+            match row_of.get(&key) {
+                Some(&i) => {
                     rows[i].values[k] = Some(f.value.clone());
                     if rows[i].note.is_empty() {
                         rows[i].note = f.note.clone();
                     }
                 }
                 None => {
+                    row_of.insert(key, rows.len());
                     let mut values = vec![None; n];
                     values[k] = Some(f.value.clone());
-                    rows.push(Row { name: f.name.clone(), note: f.note.clone(), values });
+                    rows.push(Row { name: f.name.clone(), note: f.note.clone(), values, search: String::new() });
                 }
             }
         }
+    }
+    for r in &mut rows {
+        let mut search = r.name.to_lowercase();
+        for v in r.values.iter().flatten() {
+            search.push('\n');
+            search.push_str(&v.to_lowercase());
+        }
+        r.search = search;
     }
     rows
 }
@@ -156,6 +169,7 @@ impl MetadataWindow {
         self.items = files.into_iter().map(|(label, path, color)| Item { label, path, color }).collect();
         self.tab = tab;
         self.open = true;
+        self.rev += 1;
         if self.items.len() < 2 {
             self.only_diff = false;
         }
@@ -193,6 +207,7 @@ impl MetadataWindow {
         for (p, r) in done {
             self.pending.remove(&p);
             self.cache.insert(p, Arc::new(r));
+            self.rev += 1;
         }
     }
 
@@ -256,9 +271,9 @@ impl MetadataWindow {
             }
         });
         ui.separator();
-        let loading = self.items.iter().any(|i| !self.cache.contains_key(&i.path));
-        let warnings: Vec<String> = self.items.iter().filter_map(|i| self.cache.get(&i.path)).flat_map(|r| r.warnings.clone()).collect();
         let sections = self.sections();
+        let loading = self.items.iter().any(|i| !self.cache.contains_key(&i.path));
+        let warnings: Vec<&String> = self.items.iter().filter_map(|i| self.cache.get(&i.path)).flat_map(|r| r.warnings.iter()).collect();
         let filter = self.filter.trim().to_lowercase();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if loading {
@@ -268,12 +283,8 @@ impl MetadataWindow {
                 });
             }
             let mut shown_any = false;
-            for (title, rows) in &sections {
-                let rows: Vec<&Row> = rows
-                    .iter()
-                    .filter(|r| !self.only_diff || r.differs())
-                    .filter(|r| filter.is_empty() || r.name.to_lowercase().contains(&filter) || r.values.iter().flatten().any(|v| v.to_lowercase().contains(&filter)))
-                    .collect();
+            for (title, rows) in sections.iter() {
+                let rows: Vec<&Row> = rows.iter().filter(|r| !self.only_diff || r.differs()).filter(|r| filter.is_empty() || r.search.contains(&filter)).collect();
                 if rows.is_empty() {
                     continue;
                 }
@@ -325,8 +336,20 @@ impl MetadataWindow {
         });
     }
 
-    /// (group title, rows) of the current tab.
-    fn sections(&self) -> Vec<(String, Vec<Row>)> {
+    /// (group title, rows) of the current tab, built again only when the
+    /// files, their results or the tab changed.
+    fn sections(&mut self) -> Arc<Vec<Section>> {
+        match &self.shown {
+            Some((rev, tab, s)) if *rev == self.rev && *tab == self.tab => s.clone(),
+            _ => {
+                let s = Arc::new(self.build_sections());
+                self.shown = Some((self.rev, self.tab, s.clone()));
+                s
+            }
+        }
+    }
+
+    fn build_sections(&self) -> Vec<Section> {
         let results: Vec<Option<&Arc<Inspection>>> = self.items.iter().map(|i| self.cache.get(&i.path)).collect();
         match self.tab {
             MetaTab::Capture => {
@@ -334,13 +357,13 @@ impl MetadataWindow {
                 vec![("Capture".to_string(), merge_rows(&groups))]
             }
             MetaTab::Exif | MetaTab::Other => {
-                let pick = |r: &Inspection| -> Vec<Group> { if self.tab == MetaTab::Exif { r.exif.clone() } else { r.other.clone() } };
-                let lists: Vec<Option<Vec<Group>>> = results.iter().map(|r| r.map(|r| pick(r))).collect();
-                let names = group_names(lists.iter().flatten());
+                let exif = self.tab == MetaTab::Exif;
+                let lists: Vec<Option<&Vec<Group>>> = results.iter().map(|r| r.map(|r| if exif { &r.exif } else { &r.other })).collect();
+                let names = group_names(lists.iter().flatten().copied());
                 names
                     .into_iter()
                     .map(|name| {
-                        let groups: Vec<Option<&Vec<Field>>> = lists.iter().map(|l| l.as_ref().and_then(|l| l.iter().find(|g| g.name == name)).map(|g| &g.fields)).collect();
+                        let groups: Vec<Option<&Vec<Field>>> = lists.iter().map(|l| l.and_then(|l| l.iter().find(|g| g.name == name)).map(|g| &g.fields)).collect();
                         let rows = merge_rows(&groups);
                         (name, rows)
                     })
@@ -358,7 +381,7 @@ impl MetadataWindow {
             out.push_str(&it.path.display().to_string());
         }
         out.push('\n');
-        for (title, rows) in self.sections() {
+        for (title, rows) in self.build_sections() {
             for r in rows {
                 out.push_str(&format!("{title}: {}", r.name));
                 for v in &r.values {

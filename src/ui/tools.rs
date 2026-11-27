@@ -663,8 +663,7 @@ fn scan(files: Vec<PathBuf>, folder: PathBuf, recursive: bool, similar: bool, pr
                 let p = &items[i].path;
                 // A decoder panic on one broken file must not take the whole scan down.
                 let r = std::panic::catch_unwind(|| {
-                    let dims = crate::decode::probe_dimensions(p);
-                    let taken = crate::meta::read_taken(p);
+                    let crate::meta::QuickMeta { dims, taken } = crate::meta::quick_meta(p);
                     let h = if similar { crate::decode::decode_thumbnail(p, 256).ok().map(|t| dupes::dhash_detail(&t)) } else { None };
                     (dims, taken, h)
                 });

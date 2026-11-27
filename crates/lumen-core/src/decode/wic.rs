@@ -88,7 +88,8 @@ pub fn frame_count(path: &Path) -> Result<usize> {
 }
 
 /// Decode frames `from..to` (pages of a multi-page TIFF), stopping once
-/// `budget` bytes of RGBA have been produced.
+/// `budget` bytes of RGBA have been produced. Gives up before a frame once
+/// the decode is no longer wanted (see [`super::with_cancel`]).
 pub fn decode_frames(path: &Path, from: usize, to: usize, color_manage: bool, budget: u64) -> Result<Vec<RgbaImage>> {
     with_factory(|factory| unsafe {
         let decoder = open_decoder(factory, path)?;
@@ -96,6 +97,7 @@ pub fn decode_frames(path: &Path, from: usize, to: usize, color_manage: bool, bu
         let mut out = Vec::new();
         let mut used = 0u64;
         for i in from..n {
+            super::check_cancel()?;
             let frame = decoder.GetFrame(i as u32)?;
             let (mut w, mut h) = (0u32, 0u32);
             frame.GetSize(&mut w, &mut h)?;
@@ -204,7 +206,7 @@ fn container_name(decoder: &IWICBitmapDecoder) -> String {
 
 /// HEIF/AVIF decoders already apply the container's rotation; EXIF orientation
 /// in those files must not be applied a second time.
-fn needs_exif_orientation(path: &Path) -> bool {
+pub(crate) fn needs_exif_orientation(path: &Path) -> bool {
     let ext = formats::ext_of(path);
     !matches!(ext.as_str(), "heic" | "heif" | "hif" | "avif" | "jxl")
 }

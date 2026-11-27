@@ -194,6 +194,9 @@ pub struct App {
     /// When the viewer last said "last image" / "first image" (and which way):
     /// a second press soon after goes on to the next / previous folder.
     end_notice: Option<(Instant, isize)>,
+    /// The next / previous folder being looked for on a worker thread: (the
+    /// folder it was asked from, the direction, the answer).
+    sibling_lookup: Option<(PathBuf, isize, Receiver<Option<(PathBuf, PathBuf)>>)>,
     /// "Next image after rating": when to step on (a short pause shows the new tag first).
     advance_at: Option<Instant>,
     /// Debounced settings autosave: the JSON last written (or loaded), the
@@ -346,6 +349,7 @@ impl App {
             viewer_from_browser: false,
             last_save: Instant::now(),
             end_notice: None,
+            sibling_lookup: None,
             advance_at: None,
             settings_saved: String::new(),
             settings_seen: String::new(),
@@ -1800,32 +1804,41 @@ impl App {
 
     /// From the viewer at the end of a folder: open the first (or, going back,
     /// the last) picture of the next (`d` > 0) or previous sibling folder that
-    /// has pictures, in natural name order.
+    /// has pictures, in natural name order. The folders are listed on a worker
+    /// thread (a network drive answers slowly); `poll_sibling_folder` opens it.
     fn open_sibling_folder(&mut self, d: isize) {
         let Some(cur) = self.viewer.current().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
-        let Some(parent) = cur.parent() else { return };
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent)
-            .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
-            .unwrap_or_default();
-        dirs.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-        let Some(at) = dirs.iter().position(|p| fileops::same_path(p, &cur)) else { return };
-        let candidates: Vec<&PathBuf> = if d > 0 { dirs[at + 1..].iter().take(50).collect() } else { dirs[..at].iter().rev().take(50).collect() };
-        for dir in candidates {
-            let mut pics: Vec<PathBuf> = std::fs::read_dir(dir)
-                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| crate::formats::is_image_path(p)).take(20000).collect())
-                .unwrap_or_default();
-            if pics.is_empty() {
-                continue;
-            }
-            pics.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-            let pick = if d > 0 { pics.first() } else { pics.last() };
-            if let Some(p) = pick.cloned() {
-                self.core.toasts.info(format!("Folder: {}", crate::ui::viewer::file_name(dir)));
-                self.open_file(&p);
-            }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (from, ctx) = (cur.clone(), self.core.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(sibling_folder_picture(&from, d));
+            ctx.request_repaint();
+        });
+        self.sibling_lookup = Some((cur, d, rx));
+    }
+
+    /// Open what `open_sibling_folder` found, if the viewer is still on the
+    /// folder it was asked from.
+    fn poll_sibling_folder(&mut self) {
+        let Some((from, d, rx)) = &self.sibling_lookup else { return };
+        let found = match rx.try_recv() {
+            Ok(found) => found,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => None,
+        };
+        let (from, d) = (from.clone(), *d);
+        self.sibling_lookup = None;
+        let here = self.viewer.current().and_then(|p| p.parent()).is_some_and(|p| fileops::same_path(p, &from));
+        if self.mode != Mode::Viewer || !here {
             return;
         }
-        self.core.toasts.info(if d > 0 { "No later folder with pictures" } else { "No earlier folder with pictures" });
+        match found {
+            Some((dir, pic)) => {
+                self.core.toasts.info(format!("Folder: {}", crate::ui::viewer::file_name(&dir)));
+                self.open_file(&pic);
+            }
+            None => self.core.toasts.info(if d > 0 { "No later folder with pictures" } else { "No earlier folder with pictures" }),
+        }
     }
 
     /// Ctrl+Z with no edit to undo: put the last moved / renamed files back, or
@@ -3213,6 +3226,7 @@ impl eframe::App for App {
             self.set_fullscreen(false);
         }
         crate::analysis_ui::tick(&mut self.core);
+        self.poll_sibling_folder();
         if let Some(t) = self.advance_at {
             if Instant::now() >= t {
                 self.advance_at = None;
@@ -3771,6 +3785,30 @@ impl App {
         self.core.tags.save_if_dirty();
         self.core.orders.save_if_dirty();
     }
+}
+
+/// The first (`d` > 0) or last picture of the next or previous sibling folder
+/// of `cur` that has pictures, in natural name order, with that folder.
+fn sibling_folder_picture(cur: &Path, d: isize) -> Option<(PathBuf, PathBuf)> {
+    let parent = cur.parent()?;
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent)
+        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    dirs.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    let at = dirs.iter().position(|p| fileops::same_path(p, cur))?;
+    let candidates: Vec<&PathBuf> = if d > 0 { dirs[at + 1..].iter().take(50).collect() } else { dirs[..at].iter().rev().take(50).collect() };
+    for dir in candidates {
+        let mut pics: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| crate::formats::is_image_path(p)).take(20000).collect())
+            .unwrap_or_default();
+        if pics.is_empty() {
+            continue;
+        }
+        pics.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+        let pick = if d > 0 { pics.first() } else { pics.last() };
+        return pick.map(|p| (dir.clone(), p.clone()));
+    }
+    None
 }
 
 #[allow(dead_code)]
