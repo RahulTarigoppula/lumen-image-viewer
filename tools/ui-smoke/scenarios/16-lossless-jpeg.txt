@@ -15,7 +15,9 @@ drag 60 100 700 520
 wait 1000
 shot crop_snapped.png
 key Enter
-wait 6000
+wait 2500
+shot cropped_toast.png
+wait 3500
 shot cropped.png
 state
 key Ctrl+Z
@@ -25,7 +27,9 @@ state
 open {media}\RoundA\DeviceZ\scene_03.jpg
 wait 3000
 run RotateRight
-wait 6000
+wait 2500
+shot turned_toast.png
+wait 3500
 shot turned.png
 state
 key Ctrl+Z

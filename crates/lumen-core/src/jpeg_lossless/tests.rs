@@ -127,10 +127,6 @@ fn diff(got: &RgbaImage, want: &RgbaImage, (ox, oy): (u32, u32), margin: u32) ->
     (worst, sum as f64 / n.max(1) as f64)
 }
 
-fn to_rgba(img: RgbImage) -> RgbaImage {
-    image::DynamicImage::ImageRgb8(img).to_rgba8()
-}
-
 #[test]
 fn round_trip_keeps_every_coefficient() {
     let img = picture(75, 53, 1);
