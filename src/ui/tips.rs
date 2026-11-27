@@ -111,7 +111,7 @@ pub fn describe(c: Command) -> &'static str {
         SelectFlagged => "Select the flagged files in the folder, ready to copy, move or compare",
         MoveEarlier => "Arrange the folder by hand: the selected files move one place earlier",
         MoveLater => "Arrange the folder by hand: the selected files move one place later",
-        CycleInspect => "Cycle clipping warnings, false color, focus peaking and single channels (in Compare: O)",
+        CycleInspect => "Cycle clipping, false color, focus peaking, channels and HDR gain map views (in Compare: O)",
         _ => "",
     }
 }

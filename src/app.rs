@@ -1402,7 +1402,7 @@ impl App {
                 }
             }
             CycleInspect => {
-                self.viewer.inspect = self.viewer.inspect.next();
+                self.viewer.cycle_inspect();
                 self.core.toasts.info(format!("Inspect view: {}. {}", self.viewer.inspect.label(), self.viewer.inspect.tip()));
             }
             ToggleFilmstrip => self.viewer.show_filmstrip = !self.viewer.show_filmstrip,

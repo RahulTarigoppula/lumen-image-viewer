@@ -414,17 +414,57 @@ fn property(c: &El, out: &mut Vec<(String, String)>, path: &str, depth: usize) {
     push(out, name, &value);
 }
 
+/// Encrypted Google Camera blocks in the XMP: (property names, ignoring
+/// case, as Google spelled them over the years; what the block is).
+pub(crate) const GOOGLE_ENCRYPTED: [(&[&str], &str); 2] = [
+    (&["GCamera:HdrPlusMakernote", "GCamera:hdrp_makernote"], "HDR+ notes"),
+    (&["GCamera:ShotLogData", "GCamera:shot_log_data"], "shot log"),
+];
+
+/// Whether the property is one of [`GOOGLE_ENCRYPTED`].
+pub(crate) fn is_google_encrypted(key: &str) -> bool {
+    let leaf = key.rsplit(" / ").next().unwrap_or(key);
+    GOOGLE_ENCRYPTED.iter().any(|(names, _)| names.iter().any(|n| leaf.eq_ignore_ascii_case(n)))
+}
+
+/// Display value of an encrypted block (base64 text): its size, not the text.
+pub(crate) fn encrypted_value(v: &str) -> String {
+    match v.strip_prefix("(binary data, ") {
+        Some(rest) => format!("(encrypted Google data, {rest}"),
+        None => format!("(encrypted Google data, {} bytes)", v.trim().len() * 3 / 4),
+    }
+}
+
 /// Hover notes for well-known XMP properties.
 pub(crate) fn note_for(key: &str) -> &'static str {
     let leaf = key.rsplit(" / ").next().unwrap_or(key);
+    if is_google_encrypted(key) {
+        return if leaf.to_ascii_lowercase().contains("shot") {
+            "Encrypted Google Camera shot log (capture details); only Google's own tools read it."
+        } else {
+            "Encrypted Google HDR+ processing data: the photo was merged from several frames. Only Google's own tools read it."
+        };
+    }
     match leaf {
         "GCamera:MotionPhoto" | "Camera:MotionPhoto" => "1 = this is a motion photo with a short video stored after the image.",
+        "GCamera:MotionPhotoVersion" | "Camera:MotionPhotoVersion" => "Version of the motion photo format.",
         "GCamera:MicroVideo" => "1 = older Google motion photo format with an embedded video.",
+        "GCamera:MicroVideoVersion" => "Version of the older Google motion photo format.",
         "GCamera:MicroVideoOffset" => "Size of the embedded video in bytes, counted from the end of the file.",
-        "GCamera:MotionPhotoPresentationTimestampUs" => "Video frame (in microseconds) that matches the still photo.",
-        "GCamera:HdrPlusMakernote" => "Encrypted Google HDR+ processing data: the photo was merged from several frames.",
+        "GCamera:MotionPhotoPresentationTimestampUs" | "GCamera:MicroVideoPresentationTimestampUs" => "Video frame (in microseconds) that matches the still photo.",
         "GCamera:SpecialTypeID" => "Google Camera mode identifier (for example portrait or night sight).",
+        "GCamera:BurstID" => "Shared by all photos of one burst.",
+        "GCamera:BurstPrimary" => "1 = the photo the camera picked as the best of its burst.",
+        "GCamera:PortraitNote" | "GCamera:PortraitRequest" | "GCamera:PortraitVersion" => "Portrait mode (background blur) data of the Google Camera app.",
+        "GCamera:DisableAutoCreation" => "Google Photos creations (collages, animations) the camera asked not to make from this photo.",
         "hdrgm:Version" => "Ultra HDR gain map version: the file carries an HDR gain map.",
+        "hdrgm:GainMapMin" => "Boost at gain map black, as a power of 2 (0 = x1, no change).",
+        "hdrgm:GainMapMax" => "Boost at gain map white, as a power of 2 (2 = x4 brighter).",
+        "hdrgm:Gamma" => "Curve applied to the gain map values before use (1 = straight).",
+        "hdrgm:OffsetSDR" | "hdrgm:OffsetHDR" => "Small value added before the boost and removed after it, so dark pixels can be brightened too.",
+        "hdrgm:HDRCapacityMin" => "Screen headroom (power of 2) from which the gain map starts to apply.",
+        "hdrgm:HDRCapacityMax" => "Screen headroom (power of 2) at which the gain map applies fully.",
+        "hdrgm:BaseRenditionIsHDR" => "True when the main image is the HDR version and the map makes the SDR one.",
         "HDRGainMap:HDRGainMapVersion" => "Apple HDR gain map version.",
         "Item:Semantic" => "Role of an embedded item: Primary image, GainMap, Depth or MotionPhoto.",
         "Item:Length" => "Size of the embedded item in bytes.",

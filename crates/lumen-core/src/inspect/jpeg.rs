@@ -48,7 +48,7 @@ const STD_BITS: [[u8; 16]; 4] = [
 pub(crate) const XMP_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 pub(crate) const XMP_EXT_PREFIX: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const ICC_PREFIX: &[u8] = b"ICC_PROFILE\0";
-const ISO_GAINMAP_PREFIX: &[u8] = b"urn:iso:std:iso:ts:21496:-1";
+pub(crate) const ISO_GAINMAP_PREFIX: &[u8] = b"urn:iso:std:iso:ts:21496:-1";
 
 /// IJG table scaled to quality `q` (jcparam.c `jpeg_quality_scaling` + `jpeg_add_quant_table`).
 pub(crate) fn ijg_table(std: &[u16; 64], q: u32, baseline: bool) -> [u16; 64] {
@@ -288,9 +288,14 @@ pub(crate) fn parse(b: &[u8], p: &mut Parts, warn: &mut Vec<String>) {
                 } else if d.starts_with(b"MPF\0") {
                     if p.mpf.is_none() {
                         p.mpf = Some(d[4..].to_vec());
+                        p.mpf_at = Some(pos + 8);
                     }
                 } else if d.starts_with(ISO_GAINMAP_PREFIX) {
                     p.iso_gain_map = true;
+                    if p.iso_gain_map_data.is_none() {
+                        let rest = &d[ISO_GAINMAP_PREFIX.len()..];
+                        p.iso_gain_map_data = Some(rest.strip_prefix(&[0u8][..]).unwrap_or(rest).to_vec());
+                    }
                 } else {
                     *other_app.entry(2).or_default() += 1;
                 }
@@ -368,6 +373,7 @@ pub(crate) fn parse(b: &[u8], p: &mut Parts, warn: &mut Vec<String>) {
             p.dims = Some((s.width as u32, s.height as u32));
             p.dims_note = "Stored size from the JPEG frame header (before EXIF rotation).".into();
         }
+        p.components = s.comps.len().min(255) as u8;
         let progressive = matches!(s.marker, 0xC2 | 0xC6 | 0xCA | 0xCE);
         let mut note = String::new();
         if progressive {
@@ -580,10 +586,13 @@ pub(crate) fn mpf_group(ctx: &Ctx) -> Group {
             ctx.mpf.len().to_string(),
             "Number of images in the file according to the multi-picture (MPF) index.",
         ));
+        let gain_at = ctx.gain.and_then(|g| g.mpf_index);
         for (i, im) in ctx.mpf.iter().enumerate() {
             let code = im.type_code();
             let mut name = mp_type_name(code).to_string();
-            if code == 0 && i > 0 && gain_hint {
+            if gain_at == Some(i) {
+                name = "HDR gain map".into();
+            } else if code == 0 && i > 0 && gain_hint {
                 name.push_str(" (probably a gain map)");
             } else if name == "Other" {
                 name = format!("Type 0x{code:06X}");

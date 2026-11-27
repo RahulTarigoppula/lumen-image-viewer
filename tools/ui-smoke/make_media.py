@@ -12,15 +12,20 @@ Layout (like a camera test project):
     Compare3/                                      scene_01 from X, Y and Z
     Undo/scene_01.jpg ... scene_03.jpg             copies of DeviceX (delete and undo)
     Explorer/Source/, Target/, Outside/            cut / paste and drops (three Flat pictures, an empty folder, one file)
+    HDR/samsung_ultrahdr.jpg                       Ultra HDR gain map (XMP), Samsung maker note and trailer
+    HDR/pixel_hdrplus.jpg                          ISO 21496-1 gain map, Google HDR+ maker note and XMP
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
 with the `imageio-ffmpeg` pip package; without either they are skipped.
 """
 
+import base64
+import io
 import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -255,6 +260,235 @@ def make_explorer(out):
     shutil.copyfile(os.path.join(flat, "text_card.png"), os.path.join(base, "Outside", "dropped.png"))
 
 
+# ---- HDR gain map photos (byte-built metadata, like the Rust unit tests) ----
+
+
+def _tiff_value(kind, v):
+    """(type, count, bytes) of a little-endian TIFF value."""
+    if kind == "A":
+        b = v.encode("ascii") + b"\0"
+        return 2, len(b), b
+    if kind == "U":
+        return 7, len(v), bytes(v)
+    if kind == "S":
+        return 3, len(v), b"".join(struct.pack("<H", x) for x in v)
+    if kind == "L":
+        return 4, len(v), b"".join(struct.pack("<I", x) for x in v)
+    if kind == "R":
+        return 5, len(v), b"".join(struct.pack("<II", n, d) for n, d in v)
+    if kind == "SR":
+        return 10, len(v), b"".join(struct.pack("<ii", n, d) for n, d in v)
+    raise ValueError(kind)
+
+
+def tiff_ifd(entries, at):
+    """A little-endian IFD that will sit at offset `at`; long values follow it."""
+    entries = sorted(entries, key=lambda e: e[0])
+    data_at = at + 2 + 12 * len(entries) + 4
+    head, data = struct.pack("<H", len(entries)), b""
+    for tag, kind, v in entries:
+        typ, count, b = _tiff_value(kind, v)
+        if len(b) <= 4:
+            head += struct.pack("<HHI", tag, typ, count) + b.ljust(4, b"\0")
+        else:
+            head += struct.pack("<HHII", tag, typ, count, data_at + len(data))
+            data += b + (b"\0" if len(b) % 2 else b"")
+    return head + struct.pack("<I", 0) + data
+
+
+def exif_block(ifd0, exif):
+    """TIFF-structured EXIF: IFD0 at 8, then the EXIF IFD."""
+    first = tiff_ifd(ifd0 + [(0x8769, "L", [0])], 8)
+    exif_at = 8 + len(first)
+    first = tiff_ifd(ifd0 + [(0x8769, "L", [exif_at])], 8)
+    return b"II*\0" + struct.pack("<I", 8) + first + tiff_ifd(exif, exif_at)
+
+
+def segment(marker, payload):
+    return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+
+def with_segments(jpeg, segments):
+    """Insert complete segments right after the start-of-image marker."""
+    return jpeg[:2] + b"".join(segments) + jpeg[2:]
+
+
+def jpeg_bytes(img, quality):
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+XMP_PREFIX = b"http://ns.adobe.com/xap/1.0/\0"
+ISO_PREFIX = b"urn:iso:std:iso:ts:21496:-1\0"
+
+
+def xmp_segment(description):
+    packet = (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        + description
+        + "</rdf:RDF></x:xmpmeta>"
+    )
+    return segment(0xE1, XMP_PREFIX + packet.encode("ascii"))
+
+
+def main_xmp(gain_len, extra_attrs=""):
+    """Main image XMP: Ultra HDR version and the GContainer directory."""
+    return xmp_segment(
+        '<rdf:Description rdf:about="" xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"'
+        ' xmlns:Container="http://ns.google.com/photos/1.0/container/"'
+        ' xmlns:Item="http://ns.google.com/photos/1.0/container/item/"'
+        ' xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" hdrgm:Version="1.0"' + extra_attrs + ">"
+        "<Container:Directory><rdf:Seq>"
+        '<rdf:li rdf:parseType="Resource"><Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg"/></rdf:li>'
+        f'<rdf:li rdf:parseType="Resource"><Container:Item Item:Semantic="GainMap" Item:Mime="image/jpeg" Item:Length="{gain_len}"/></rdf:li>'
+        "</rdf:Seq></Container:Directory></rdf:Description>"
+    )
+
+
+def mpf_segment(main_len, mpf_at, gain_len):
+    """MPF index: the main image and the gain map (offsets count from the MPF header)."""
+    entries = struct.pack("<IIIHH", 0x20030000, main_len, 0, 0, 0) + struct.pack("<IIIHH", 0, gain_len, max(main_len - mpf_at, 0), 0, 0)
+    t = b"II*\0" + struct.pack("<I", 8) + tiff_ifd([(0xB000, "U", b"0100"), (0xB001, "L", [2]), (0xB002, "U", entries)], 8)
+    return segment(0xE2, b"MPF\0" + t)
+
+
+def iso_gain_metadata(max_log2, den=10000):
+    """ISO 21496-1 payload: one channel, one common denominator."""
+    m = round(max_log2 * den)
+    return struct.pack(">HHBIIIiiIii", 0, 0, 0x08, den, 0, m, 0, m, den, 156, 156)
+
+
+def ultra_hdr(base_rgb, gain_l, main_segments, gain_segments, main_extra_xmp=""):
+    """Main JPEG + gain map JPEG, linked by XMP (GContainer) and an MPF index."""
+    gain = with_segments(jpeg_bytes(gain_l, 90), gain_segments)
+    body = jpeg_bytes(base_rgb, 92)
+
+    def build(main_len, mpf_at):
+        return with_segments(body, main_segments + [main_xmp(len(gain), main_extra_xmp), mpf_segment(main_len, mpf_at, len(gain))])
+
+    first = build(0, 0)
+    mpf_at = first.index(b"MPF\0") + 4
+    main = build(len(first), mpf_at)
+    assert len(main) == len(first)
+    return main + gain
+
+
+def gain_from(img, threshold, scale=4):
+    """Gain map: bright areas (above `threshold` luma) boosted, at 1/scale size."""
+    a = np.asarray(img, dtype=np.float64) / 255.0
+    y = 0.2126 * a[:, :, 0] + 0.7152 * a[:, :, 1] + 0.0722 * a[:, :, 2]
+    g = np.clip((y - threshold) / (1.0 - threshold), 0.0, 1.0) ** 0.7
+    small = Image.fromarray((g * 255).astype(np.uint8), "L").resize((img.width // scale, img.height // scale), Image.Resampling.BILINEAR)
+    return small.filter(ImageFilter.GaussianBlur(1.5))
+
+
+def sef_trailer(entries):
+    """Samsung SEF trailer (same layout as the Rust tests)."""
+    data, starts = b"", []
+    for name, payload in entries:
+        starts.append((len(data), 8 + len(name) + len(payload)))
+        data += bytes([0, 0, 0x01, 0x0A]) + struct.pack("<I", len(name)) + name.encode("ascii") + payload
+    d = b"SEFH" + struct.pack("<II", 106, len(entries))
+    for start, size in starts:
+        d += bytes([0, 0, 0x01, 0x0A]) + struct.pack("<II", len(data) - start, size)
+    return data + d + struct.pack("<I", len(d)) + b"SEFT"
+
+
+def make_hdr(out):
+    hdr = os.path.join(out, "HDR")
+    os.makedirs(hdr, exist_ok=True)
+    rng = np.random.default_rng(21)
+
+    # Samsung-style: Ultra HDR XMP gain map, Type2 maker note, SEF trailer.
+    street = frame(scene_street(np.random.default_rng(100)), 1.0, (0, 0))
+    note = tiff_ifd(
+        [
+            (0x0001, "U", b"0100"),
+            (0x0002, "L", [0x12000]),
+            (0x0003, "L", [0]),
+            (0x0041, "L", [0]),
+            (0x0100, "S", [1]),
+            (0xA001, "A", "S928BXXU1AXB5"),
+            (0xA003, "S", [0]),
+            (0xA010, "L", [0, 0, 4080, 3060, 8, 6, 4072, 3054]),
+            (0xA011, "S", [0]),
+            (0xA012, "S", [0]),
+            (0xA013, "SR", [(0, 10)]),
+            (0xA014, "L", [50]),
+            (0xA018, "R", [(1, 120)]),
+            (0xA019, "R", [(17, 10)]),
+            (0xA01A, "L", [230]),
+        ],
+        0,
+    )
+    exif = exif_block(
+        [(0x010F, "A", "samsung"), (0x0110, "A", "SM-S928B"), (0x0112, "S", [1]), (0x0131, "A", "S928BXXU1AXB5"), (0x0132, "A", "2026:11:04 10:30:00")],
+        [
+            (0x829A, "R", [(1, 120)]),
+            (0x829D, "R", [(17, 10)]),
+            (0x8827, "S", [50]),
+            (0x9003, "A", "2026:11:04 10:30:00"),
+            (0x9207, "S", [2]),
+            (0x9209, "S", [0]),
+            (0x920A, "R", [(63, 10)]),
+            (0x927C, "U", note),
+            (0xA001, "S", [1]),
+            (0xA403, "S", [0]),
+            (0xA405, "S", [23]),
+            (0xA406, "S", [0]),
+            (0xA420, "A", "M08LLKA00SM"),
+        ],
+    )
+    gain_xmp = xmp_segment(
+        '<rdf:Description rdf:about="" xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/" hdrgm:Version="1.0"'
+        ' hdrgm:GainMapMin="0" hdrgm:GainMapMax="2" hdrgm:Gamma="1" hdrgm:OffsetSDR="0.015625" hdrgm:OffsetHDR="0.015625"'
+        ' hdrgm:HDRCapacityMin="0" hdrgm:HDRCapacityMax="2" hdrgm:BaseRenditionIsHDR="False"/>'
+    )
+    data = ultra_hdr(street, gain_from(street, 0.55), [segment(0xE1, b"Exif\0\0" + exif)], [gain_xmp])
+    data += sef_trailer(
+        [
+            ("Image_UTC_Data", b"1793701800000"),
+            ("MCC_Data", b"450"),
+            ("Camera_Capture_Mode_Info", b"1"),
+            ("Photo_HDR_Info", bytes(rng.integers(0, 256, 24, dtype=np.uint8))),
+        ]
+    )
+    with open(os.path.join(hdr, "samsung_ultrahdr.jpg"), "wb") as f:
+        f.write(data)
+
+    # Pixel-style: ISO 21496-1 gain map, encrypted HDR+ maker note and XMP blocks.
+    night = frame(scene_night(np.random.default_rng(102)), 1.0, (0, 0))
+    hdrp = b"HDRP\x03" + bytes(rng.integers(0, 256, 300, dtype=np.uint8))
+    exif = exif_block(
+        [(0x010F, "A", "Google"), (0x0110, "A", "Pixel 8 Pro"), (0x0112, "S", [1]), (0x0131, "A", "HDR+ 1.0.612345678zd")],
+        [
+            (0x829A, "R", [(1, 4)]),
+            (0x829D, "R", [(168, 100)]),
+            (0x8827, "S", [1600]),
+            (0x9003, "A", "2026:11:05 21:10:00"),
+            (0x920A, "R", [(69, 10)]),
+            (0x927C, "U", b"HDRP\x03" + bytes(rng.integers(0, 256, 120, dtype=np.uint8))),
+            (0xA405, "S", [24]),
+            (0xA434, "A", "Pixel 8 Pro back camera 6.9mm f/1.68"),
+        ],
+    )
+    extra = (
+        f' GCamera:HdrPlusMakernote="{base64.b64encode(hdrp).decode()}"'
+        f' GCamera:ShotLogData="{base64.b64encode(bytes(rng.integers(0, 256, 240, dtype=np.uint8))).decode()}"'
+        ' GCamera:BurstID="7c2a1e1b-0d6f-4f3c-9e0a-1f2b3c4d5e6f" GCamera:BurstPrimary="1"'
+    )
+    data = ultra_hdr(
+        night,
+        gain_from(night, 0.25),
+        [segment(0xE1, b"Exif\0\0" + exif), segment(0xE2, ISO_PREFIX + struct.pack(">HH", 0, 0))],
+        [segment(0xE2, ISO_PREFIX + iso_gain_metadata(2.3))],
+        extra,
+    )
+    with open(os.path.join(hdr, "pixel_hdrplus.jpg"), "wb") as f:
+        f.write(data)
+
+
 def find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -304,6 +538,7 @@ def main():
     make_photos(out)
     make_flat(out)
     make_explorer(out)
+    make_hdr(out)
     videos = False if "--no-video" in sys.argv else make_videos(out)
     count = sum(len(f) for _, _, f in os.walk(out))
     print(f"make_media: {count} files in {out} (videos: {'yes' if videos else 'no'})")

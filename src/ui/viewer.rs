@@ -312,9 +312,11 @@ pub struct Viewer {
     pub show_histogram: bool,
     /// Pixel values under the pointer (Shift+V).
     pub show_pixel: bool,
-    /// Clipping, false color, peaking or one channel over the image (Shift+O).
+    /// Clipping, false color, peaking, one channel or a gain map view over the image (Shift+O).
     pub inspect: super::inspect_view::InspectMode,
     inspect_cache: super::inspect_view::InspectCache,
+    /// Screen headroom of the HDR rendition view (clamped to each gain map's range).
+    hdr_headroom: f32,
     pub show_filmstrip: bool,
     /// A filmstrip thumbnail was dragged to a new place: (moved file, the file it
     /// was dropped on, after it). The app saves it as the folder's custom order.
@@ -380,6 +382,7 @@ impl Viewer {
             show_pixel: false,
             inspect: super::inspect_view::InspectMode::Off,
             inspect_cache: Default::default(),
+            hdr_headroom: f32::INFINITY,
             show_filmstrip: false,
             film_arranged: None,
             magnifier_locked: false,
@@ -494,6 +497,13 @@ impl Viewer {
 
     pub fn current(&self) -> Option<&PathBuf> {
         self.list.get(self.index)
+    }
+
+    /// The next inspect view (Shift+O); the gain map views are skipped for a
+    /// file known to have no gain map.
+    pub fn cycle_inspect(&mut self) {
+        let skip = self.current().is_some_and(|p| self.inspect_cache.lacks_gain_map(p));
+        self.inspect = self.inspect.next_for(!skip);
     }
 
     pub fn open(&mut self, list: Vec<PathBuf>, index: usize, fit: FitMode) {
@@ -1107,12 +1117,24 @@ impl Viewer {
             if self.inspect != super::inspect_view::InspectMode::Off && self.tool.is_none() {
                 if let (Some(path), Some(l)) = (self.current().cloned(), self.loaded(core)) {
                     let img = l.decoded.image.clone();
-                    self.inspect_cache.paint(ui, &path, &img, self.inspect, dest, view);
+                    let gain_view = self.inspect.is_gain();
+                    if gain_view {
+                        self.inspect_cache.paint_gain(ui, &path, &img, self.inspect, self.hdr_headroom, dest, view);
+                    } else {
+                        self.inspect_cache.paint(ui, &path, &img, self.inspect, dest, view);
+                    }
+                    // Also tells the Shift+O cycle whether this file has a gain map.
+                    let gain = self.inspect_cache.gain_info(ui.ctx(), &path);
                     let label = format!("{}  {}", I::EYE, self.inspect.label());
                     let g = painter.layout_no_wrap(label, FontId::proportional(12.0), Color32::WHITE);
                     let r = Rect::from_min_size(view.min + Vec2::new(12.0, 46.0), g.size() + Vec2::new(16.0, 8.0));
                     painter.rect_filled(r, CornerRadius::same(10), Color32::from_black_alpha(160));
                     painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
+                    if gain_view {
+                        let at = Pos2::new(r.min.x, r.max.y + 8.0);
+                        let id = ui.id().with("viewer-gain-legend");
+                        super::inspect_view::gain_legend(ui, id, at, view.width() - 24.0, &gain, self.inspect, &mut self.hdr_headroom);
+                    }
                 }
             }
             // Edit-tool canvas hook (interactive tools: draw board, retouch,

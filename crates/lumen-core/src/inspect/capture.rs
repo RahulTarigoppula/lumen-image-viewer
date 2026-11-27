@@ -4,6 +4,7 @@
 //! listed; guesses say so in their note.
 
 use super::exifview::{apple_capture_type, Ex};
+use super::xmp::GOOGLE_ENCRYPTED;
 use super::{Ctx, Field};
 use crate::catalog::human_size;
 use exif::Tag;
@@ -21,7 +22,7 @@ pub(crate) fn fmt_exposure(t: f64) -> String {
 }
 
 /// "1.8", "2", "11".
-fn fmt_num(v: f64) -> String {
+pub(crate) fn fmt_num(v: f64) -> String {
     let s = format!("{v:.1}");
     s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
 }
@@ -94,6 +95,11 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
         sef_names.iter().copied().find(|s| s.to_ascii_lowercase().contains(&n))
     };
     let semantics = ctx.item_semantics();
+    let sam = ctx.samsung;
+    let sam_int = |t: u16| sam.and_then(|s| s.int(t));
+    // Google Camera mode ("...SpecialType-PORTRAIT", "...-NIGHT"...), upper case.
+    let special = ctx.xget("GCamera:SpecialTypeID").map(|v| v.to_ascii_uppercase());
+    let special_has = |w: &str| special.as_deref().is_some_and(|s| s.contains(w));
 
     // Camera, software, lens, module.
     let make = text(Tag::Make);
@@ -150,10 +156,15 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
         add("Focal length", format!("{} mm", fmt_num(real)), "");
     }
 
-    // Exposure.
-    let t = num(Tag::ExposureTime).filter(|&v| v > 0.0);
-    let n = num(Tag::FNumber).filter(|&v| v > 0.0);
-    let iso = uint(Tag::PhotographicSensitivity).filter(|&v| v > 0).or_else(|| uint(Tag::ISOSpeed).filter(|&v| v > 0));
+    // Exposure: EXIF, or the Samsung maker note where EXIF has no value.
+    use super::makernote::tag as st;
+    let t_exif = num(Tag::ExposureTime).filter(|&v| v > 0.0);
+    let n_exif = num(Tag::FNumber).filter(|&v| v > 0.0);
+    let iso_exif = uint(Tag::PhotographicSensitivity).filter(|&v| v > 0).or_else(|| uint(Tag::ISOSpeed).filter(|&v| v > 0));
+    let t = t_exif.or_else(|| sam.and_then(|s| s.real(st::EXPOSURE_TIME)).filter(|&v| v > 0.0 && v < 3600.0));
+    let n = n_exif.or_else(|| sam.and_then(|s| s.real(st::F_NUMBER)).filter(|&v| v > 0.0 && v < 100.0));
+    let iso = iso_exif.or_else(|| sam_int(st::ISO).filter(|&v| v > 0 && v < 10_000_000).map(|v| v as u32));
+    let from_maker_note = (t.is_some() && t_exif.is_none()) || (n.is_some() && n_exif.is_none()) || (iso.is_some() && iso_exif.is_none());
     let mut parts = Vec::new();
     if let Some(t) = t {
         parts.push(fmt_exposure(t));
@@ -165,7 +176,12 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
         parts.push(format!("ISO {i}"));
     }
     if !parts.is_empty() {
-        add("Exposure", parts.join(" \u{00B7} "), "Shutter time, aperture and ISO sensitivity.");
+        let note = if from_maker_note {
+            "Shutter time, aperture and ISO sensitivity. Values missing from EXIF were read from the Samsung maker note."
+        } else {
+            "Shutter time, aperture and ISO sensitivity."
+        };
+        add("Exposure", parts.join(" \u{00B7} "), note);
     }
     if let (Some(t), Some(n), Some(i)) = (t, n, iso) {
         if let Some(ev) = ev100(n, t, i as f64) {
@@ -205,6 +221,10 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     }
     if let Some(b) = num(Tag::ExposureBiasValue).filter(|b| b.abs() > 0.001) {
         add("Exposure bias", format!("{b:+.1} EV"), "Exposure compensation: positive brightens, negative darkens.");
+    } else if num(Tag::ExposureBiasValue).is_none() {
+        if let Some(b) = sam.and_then(|s| s.real(st::EXPOSURE_COMP)).filter(|b| b.abs() > 0.001 && b.abs() < 20.0) {
+            add("Exposure bias", format!("{b:+.1} EV"), "Exposure compensation: positive brightens, negative darkens. From the Samsung maker note.");
+        }
     }
     if let Some(v) = uint(Tag::MeteringMode).filter(|&v| v > 0) {
         let s = match v {
@@ -220,6 +240,8 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     }
     if let Some(v) = uint(Tag::WhiteBalance) {
         add("White balance", if v == 1 { "Manual" } else { "Auto" }.into(), "");
+    } else if let Some(v) = sam_int(st::WHITE_BALANCE).filter(|v| *v == 0 || *v == 1) {
+        add("White balance", if v == 1 { "Manual" } else { "Auto" }.into(), "From the Samsung maker note.");
     }
     if let Some(v) = uint(Tag::LightSource).filter(|&v| v > 0) {
         let s = match v {
@@ -249,6 +271,10 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     }
     if let Some(v) = uint(Tag::Flash) {
         add("Flash", flash_text(v), "");
+    }
+    if sam_int(st::FACE_DETECT) == Some(1) {
+        let v = if sam_int(st::FACE_RECOGNITION) == Some(1) { "On, with face recognition" } else { "On" };
+        add("Face detection", v.into(), "Samsung maker note FaceDetect = On: the camera looked for faces to set focus and exposure.");
     }
     if let Some(v) = uint(Tag::SceneCaptureType) {
         let s = match v {
@@ -315,8 +341,22 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     if let Some(name) = sef_has("hdr") {
         mf.push(("Samsung HDR processing".into(), format!("Samsung trailer entry {name}.")));
     }
-    if ctx.xget("GCamera:HdrPlusMakernote").is_some() {
-        mf.push(("HDR+ multi-frame processing (Google)".into(), "XMP GCamera:HdrPlusMakernote is present.".into()));
+    if sam_int(st::SMART_RANGE) == Some(1) {
+        mf.push(("Samsung Smart Range (wider dynamic range)".into(), "Samsung maker note SmartRange = On.".into()));
+    }
+    // Google HDR+: one entry with every clue as its source.
+    let mut hdrp: Vec<String> = Vec::new();
+    if let Some((k, _)) = ctx.xfind(GOOGLE_ENCRYPTED[0].0) {
+        hdrp.push(format!("XMP {k} is present."));
+    }
+    if ctx.google_hdrp {
+        hdrp.push("The EXIF maker note is Google's HDR+ note (HDRP).".into());
+    }
+    if let Some(s) = text(Tag::Software).filter(|s| s.starts_with("HDR+")) {
+        hdrp.push(format!("EXIF Software is {s}."));
+    }
+    if !hdrp.is_empty() {
+        mf.push(("HDR+ multi-frame processing (Google)".into(), hdrp.join(" ")));
     }
     if mf.is_empty() && composite == Some(1) {
         mf.push(("Single frame (not a composite)".into(), "EXIF CompositeImage = 1.".into()));
@@ -331,34 +371,46 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     }
 
     // HDR gain map.
-    let mut gm: Vec<&str> = Vec::new();
+    let mut gm: Vec<String> = Vec::new();
     if ctx.xhas_ns("hdrgm:") {
-        gm.push("XMP hdrgm (Ultra HDR / Adobe gain map)");
+        gm.push("XMP hdrgm (Ultra HDR / Adobe gain map)".into());
     }
     if ctx.xhas_ns("HDRGainMap:") {
-        gm.push("XMP HDRGainMap (Apple)");
+        gm.push("XMP HDRGainMap (Apple)".into());
     }
     if semantics.iter().any(|s| s.eq_ignore_ascii_case("GainMap")) {
-        gm.push("GContainer GainMap item");
+        gm.push("GContainer GainMap item".into());
     }
-    if ctx.aux.iter().any(|a| a.to_ascii_lowercase().contains("hdrgainmap")) {
-        gm.push("HEIF auxiliary HDR gain map image");
+    let heif_map = ctx.aux.iter().any(|a| a.to_ascii_lowercase().contains("hdrgainmap"));
+    if heif_map {
+        gm.push("HEIF auxiliary HDR gain map image".into());
     }
     if ctx.iso_gain_map {
-        gm.push("ISO 21496-1 gain map segment");
+        gm.push("ISO 21496-1 gain map segment".into());
+    }
+    if let Some(g) = ctx.gain {
+        gm.push(format!("{} metadata in {}", g.meta.kind.label(), g.source));
     }
     if !gm.is_empty() {
-        add(
-            "HDR gain map",
-            "Yes (Ultra HDR / Apple HDR)".into(),
-            &format!("HDR gain map (Ultra HDR / Apple HDR): the photo can show brighter highlights on HDR screens; other screens show the normal image. Found: {}.", gm.join(", ")),
-        );
+        let value = match ctx.gain {
+            Some(g) => format!("Yes, highlights up to {}x brighter", fmt_num(g.meta.max_boost() as f64)),
+            None => "Yes (Ultra HDR / Apple HDR)".into(),
+        };
+        let mut note = format!("HDR gain map (Ultra HDR / Apple HDR): the photo can show brighter highlights on HDR screens; other screens show the normal image. Found: {}.", gm.join(", "));
+        if heif_map {
+            note.push_str(" The viewer's gain map views read JPEG files only, not HEIC.");
+        }
+        add("HDR gain map", value, &note);
     }
 
     // Night mode / long exposure.
     let mut night: Option<(String, String)> = None;
     if uint(Tag::SceneCaptureType) == Some(3) {
         night = Some(("Night scene mode".into(), "EXIF SceneCaptureType = Night scene.".into()));
+    }
+    if night.is_none() && (special_has("ASTRO") || special_has("NIGHT")) {
+        let v = if special_has("ASTRO") { "Astrophotography (Google Night Sight)" } else { "Night Sight (Google)" };
+        night = Some((v.into(), format!("XMP GCamera:SpecialTypeID = {}.", ctx.xget("GCamera:SpecialTypeID").unwrap_or_default())));
     }
     if night.is_none() {
         let xmp_night = ctx.xmp.iter().find(|(k, v)| k.to_ascii_lowercase().contains("night") || (k.ends_with("SpecialTypeID") && v.to_ascii_lowercase().contains("night")));
@@ -412,8 +464,17 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     }) {
         depth.push("HEIF auxiliary depth / matte image".into());
     }
+    // Google Camera portrait clues say the mode, not that a depth map is stored.
+    let with_map = !depth.is_empty();
+    if special_has("PORTRAIT") {
+        depth.push("XMP GCamera:SpecialTypeID (portrait)".into());
+    }
+    if let Some((k, _)) = ctx.xfind(&["GCamera:PortraitNote", "GCamera:PortraitRequest", "GCamera:PortraitVersion"]) {
+        depth.push(format!("XMP {k}"));
+    }
     if !depth.is_empty() {
-        add("Portrait / depth", "Portrait (background blur) with a depth map".into(), &format!("Found: {}.", depth.join(", ")));
+        let v = if with_map { "Portrait (background blur) with a depth map" } else { "Portrait (background blur)" };
+        add("Portrait / depth", v.into(), &format!("Found: {}.", depth.join(", ")));
     }
 
     // Motion photo.
@@ -469,6 +530,9 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
     if ctx.xhas_ns("GPano:") {
         pano.push("XMP GPano (photo sphere / panorama)".into());
     }
+    if special_has("PANO") || special_has("SPHERE") {
+        pano.push("XMP GCamera:SpecialTypeID (panorama)".into());
+    }
     if !pano.is_empty() {
         add("Panorama", "Yes".into(), &format!("Found: {}.", pano.join(", ")));
     }
@@ -483,10 +547,37 @@ pub(crate) fn build(ctx: &Ctx) -> Vec<Field> {
         burst.push(format!("XMP {k}"));
     }
     if !burst.is_empty() {
-        add("Burst", "Part of a burst sequence".into(), &format!("Found: {}.", burst.join(", ")));
+        let best = ctx.xfind(&["GCamera:BurstPrimary"]).is_some_and(|(_, v)| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+        if best {
+            burst.push("XMP GCamera:BurstPrimary = 1 (the camera picked this photo)".into());
+        }
+        let v = if best { "Part of a burst sequence (the best shot)" } else { "Part of a burst sequence" };
+        add("Burst", v.into(), &format!("Found: {}.", burst.join(", ")));
     }
     if let Some(name) = sef_has("single_take").or_else(|| sef_has("singletake")) {
         add("Single Take", "Yes".into(), &format!("Samsung trailer entry {name}."));
+    }
+    // Encrypted Google Camera blocks: only their presence can be shown.
+    let mut blocks: Vec<&str> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    if ctx.google_hdrp {
+        blocks.push(GOOGLE_ENCRYPTED[0].1);
+        found.push("the EXIF maker note (HDRP)".into());
+    }
+    for (names, what) in GOOGLE_ENCRYPTED.iter() {
+        if let Some((k, _)) = ctx.xfind(names) {
+            if !blocks.contains(what) {
+                blocks.push(*what);
+            }
+            found.push(format!("XMP {k}"));
+        }
+    }
+    if !blocks.is_empty() {
+        add(
+            "Google Camera data",
+            format!("{} (encrypted)", blocks.join(", ")),
+            &format!("Blocks the Google Camera app stores encrypted; only Google's own tools read them. They show the photo came from a Pixel's camera app. Found: {}.", found.join(", ")),
+        );
     }
     if let Some(v) = ctx.apple.capture_type.and_then(apple_capture_type) {
         add("Apple capture type", v.into(), "From the Apple maker note.");
