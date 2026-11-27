@@ -69,6 +69,8 @@ pub struct Browser {
     pub label_filter: u8,
     /// Files and folders among `items`, counted in `rebuild` (the status bar reads them every frame).
     counts: (usize, usize),
+    /// Files in the folder before filtering ("3 of 120 files").
+    total_files: usize,
     pub loading: bool,
     pub error: Option<String>,
     list_rx: Option<Receiver<Listing>>,
@@ -82,6 +84,8 @@ pub struct Browser {
     pub back: Vec<PathBuf>,
     pub forward: Vec<PathBuf>,
     address: Option<String>,
+    /// The typed path is not there: shown beside the address field, which stays open.
+    address_error: Option<&'static str>,
     pub tree: FolderTree,
     pub scroll_to_focus: bool,
     pub focus_filter: bool,
@@ -127,6 +131,7 @@ impl Browser {
             min_rating: 0,
             label_filter: 0,
             counts: (0, 0),
+            total_files: 0,
             loading: false,
             error: None,
             list_rx: None,
@@ -136,6 +141,7 @@ impl Browser {
             back: Vec::new(),
             forward: Vec::new(),
             address: None,
+            address_error: None,
             tree: FolderTree::default(),
             scroll_to_focus: false,
             focus_filter: false,
@@ -269,11 +275,59 @@ impl Browser {
     /// Start typing in the address bar (Ctrl+L, Alt+D, F4).
     pub fn edit_address(&mut self) {
         self.address = Some(self.folder.display().to_string());
+        self.address_error = None;
+    }
+
+    /// True while the folder tree has the keyboard (not the files, not the address bar).
+    pub fn tree_focused(&self) -> bool {
+        self.tree.focused && self.address.is_none()
+    }
+
+    /// F6 / Shift+F6: move the keyboard to the next (or previous) part of the
+    /// browser, in the order address bar, folder tree, files.
+    pub fn cycle_focus(&mut self, ctx: &egui::Context, forward: bool) {
+        let now = if self.address.is_some() {
+            0
+        } else if self.tree.focused {
+            1
+        } else {
+            2
+        };
+        // Leave any text field (the address bar, the filter box).
+        ctx.memory_mut(|m| m.stop_text_input());
+        self.address = None;
+        self.address_error = None;
+        match (now + if forward { 1 } else { 2 }) % 3 {
+            0 => self.edit_address(),
+            1 => {
+                let f = self.folder.clone();
+                self.tree.focus(&f);
+            }
+            _ => {
+                self.tree.focused = false;
+                self.scroll_to_focus = true;
+            }
+        }
     }
 
     /// True when a flag, rating or color label filter hides files.
     pub fn tag_filter_on(&self) -> bool {
         self.flagged_only || self.min_rating > 0 || self.label_filter > 0
+    }
+
+    /// True when the name filter, the media type or a flag, rating or label filter hides files.
+    pub fn filters_on(&self) -> bool {
+        !self.filter.is_empty() || self.tag_filter_on() || self.media_filter != MediaFilter::All
+    }
+
+    /// Show every file again: name, media type, flag, rating and label filters off.
+    fn clear_filters(&mut self) {
+        self.filter.clear();
+        self.flagged_only = false;
+        self.min_rating = 0;
+        self.label_filter = 0;
+        self.media_filter = MediaFilter::All;
+        self.resort_needed = true;
     }
 
     /// Select the flagged files among those shown.
@@ -357,6 +411,7 @@ impl Browser {
             .collect();
         let folders = self.items.iter().filter(|&&e| self.entries[e].is_folder()).count();
         self.counts = (self.items.len() - folders, folders);
+        self.total_files = self.entries.iter().filter(|e| !e.is_folder()).count();
         self.focus = focus_path.and_then(|p| self.index_of(&p)).or(if self.items.is_empty() { None } else { self.focus.map(|f| f.min(self.items.len() - 1)) });
         // Re-resolve the Shift-selection anchor by path: indices are stale after
         // a re-sort, filter change or reload. Fall back to the focus.
@@ -756,24 +811,43 @@ impl Browser {
     fn address_bar(&mut self, ui: &mut Ui, width: f32, p: &Palette, ev: &mut Vec<BrowserEvent>) {
         let h = 28.0;
         if let Some(text) = &mut self.address {
-            let r = ui.add_sized([width, h], egui::TextEdit::singleline(text).hint_text("Type a folder path...").align(egui::Align2::LEFT_CENTER));
+            // A path that is not there keeps the field open, with a note beside it.
+            let note = self.address_error.map(|e| ui.painter().layout_no_wrap(format!("{}  {e}", I::WARNING), text::body(), p.danger));
+            let gap = ui.spacing().item_spacing.x;
+            let note_w = note.as_ref().map_or(0.0, |g| (g.size().x + 8.0 + gap).min(width * 0.5));
+            let r = ui.add_sized([width - note_w, h], egui::TextEdit::singleline(text).id_salt("address-bar").hint_text("Type a folder path...").align(egui::Align2::LEFT_CENTER));
+            if let Some(g) = note {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(note_w - gap, h), Sense::hover());
+                ui.painter().with_clip_rect(rect).galley(Pos2::new(rect.min.x + 6.0, rect.center().y - g.size().y / 2.0), g, p.danger);
+            }
+            if r.changed() {
+                self.address_error = None;
+            }
             if !r.has_focus() && !r.lost_focus() {
                 r.request_focus();
             }
             if r.lost_focus() {
                 // Consume Enter so the grid does not also open the focused item.
                 if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
-                    let path = crate::fileops::true_case(Path::new(text.trim().trim_matches('"')));
+                    let typed = text.trim().trim_matches('"').trim();
+                    let path = crate::fileops::true_case(Path::new(typed));
                     if path.is_dir() {
                         ev.push(BrowserEvent::Navigate(path));
                     } else if path.is_file() {
+                        // A file: open its folder with the file selected.
                         if let Some(parent) = path.parent() {
                             self.pending_select = Some(path.clone());
                             ev.push(BrowserEvent::Navigate(parent.to_path_buf()));
                         }
+                    } else if !typed.is_empty() {
+                        // Not there: say so and keep the text to correct (the field
+                        // takes the focus again next frame).
+                        self.address_error = Some("Folder not found");
+                        return;
                     }
                 }
                 self.address = None;
+                self.address_error = None;
             }
             return;
         }
@@ -853,7 +927,14 @@ impl Browser {
         let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
         tree_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
         self.tree.set_show_hidden(core.settings.show_hidden_files);
-        let tree_action = self.tree.ui(&mut tree_ui, &self.folder.clone(), &favs, &p);
+        // A click in the tree gives it the keyboard (a click in the grid takes it back).
+        if pressed_in(ui, rect) {
+            self.tree.focused = true;
+        }
+        let ctx = ui.ctx().clone();
+        let shown = self.tree_focused() && !ctx.egui_wants_keyboard_input();
+        let keys = shown && !self.suppress_keys && !egui::Popup::is_any_open(&ctx);
+        let tree_action = self.tree.ui(&mut tree_ui, &self.folder.clone(), &favs, &p, shown, keys);
         ui.advance_cursor_after_rect(rect);
         if let Some(a) = tree_action {
             ev.push(match a {
@@ -964,6 +1045,10 @@ impl Browser {
                 ev.push(BrowserEvent::Command(Command::GoForward));
             }
         }
+        // A click in the grid (or the details list) gives it the keyboard back from the tree.
+        if pressed_in(ui, ui.max_rect()) {
+            self.tree.focused = false;
+        }
         // Drop target for files dragged in from Explorer is handled by the app.
         if let Some(err) = &self.error {
             ui.centered_and_justified(|ui| {
@@ -972,11 +1057,22 @@ impl Browser {
             return;
         }
         if self.items.is_empty() {
+            if !self.loading && self.filters_on() && !self.entries.is_empty() {
+                // Every file is hidden by a filter: say so, with the way back.
+                let h = ui.available_height();
+                ui.vertical_centered(|ui| {
+                    ui.add_space((h / 2.0 - 40.0).max(0.0));
+                    ui.label(RichText::new(format!("{}  No files match the filters", I::FUNNEL)).color(p.muted));
+                    ui.add_space(space::M);
+                    if ui.button("Clear filters").on_hover_text("Show every file in the folder again").clicked() {
+                        self.clear_filters();
+                    }
+                });
+                return;
+            }
             ui.centered_and_justified(|ui| {
                 if self.loading {
                     ui.spinner();
-                } else if !self.filter.is_empty() || self.flagged_only || self.min_rating > 0 {
-                    ui.label(RichText::new(format!("{}  No files match the current filter", I::FUNNEL)).color(p.muted));
                 } else {
                     ui.label(RichText::new(format!("{}  No images or videos in this folder\n\nDrop files or folders here, or pick a folder on the left.", I::IMAGES)).color(p.muted));
                 }
@@ -1459,10 +1555,13 @@ impl Browser {
         }
         if captions != ThumbCaption::None {
             let name_rect = Rect::from_min_max(Pos2::new(rect.min.x + 8.0, img_area.max.y + 4.0), Pos2::new(rect.max.x - 8.0, rect.max.y - 4.0));
-            let galley = ui.painter().layout(entry.name.clone(), FontId::proportional(CAPTION_NAME), p.text, name_rect.width());
+            // One line; a long name loses its middle, so its start and its
+            // extension stay readable (the tooltip has the whole name).
+            let font = FontId::proportional(CAPTION_NAME);
+            let shown = super::compare::middle_ellipsis(ui, &entry.name, &font, name_rect.width());
+            let galley = ui.painter().layout_no_wrap(shown, font, p.text);
             let painter = ui.painter().with_clip_rect(Rect::from_min_max(name_rect.min, Pos2::new(name_rect.max.x, name_rect.min.y + 17.0)));
-            let first_w = galley.rows.first().map(|r| r.rect().width()).unwrap_or(0.0);
-            painter.galley(Pos2::new(name_rect.center().x - first_w / 2.0, name_rect.min.y), galley, p.text);
+            painter.galley(Pos2::new(name_rect.center().x - galley.size().x / 2.0, name_rect.min.y), galley, p.text);
             if captions == ThumbCaption::Name {
                 return;
             }
@@ -1741,6 +1840,8 @@ impl Browser {
                 item(ui, Command::Rename, ev);
                 item(ui, Command::Delete, ev);
                 ui.separator();
+                item(ui, Command::RotateLeft, ev);
+                item(ui, Command::RotateRight, ev);
                 widgets::submenu(ui, I::STAR, "Rate & tag", |ui| {
                     for n in 0..=5 {
                         item(ui, Command::Rate(n), ev);
@@ -1790,7 +1891,8 @@ impl Browser {
     }
 
     fn keyboard(&mut self, ui: &mut Ui, _core: &mut Core, ev: &mut Vec<BrowserEvent>) {
-        if self.suppress_keys || ui.ctx().egui_wants_keyboard_input() || self.items.is_empty() {
+        // The folder tree (F6) or a text field has the keyboard.
+        if self.suppress_keys || ui.ctx().egui_wants_keyboard_input() || self.items.is_empty() || self.tree_focused() {
             return;
         }
         let cols = self.current_cols(ui, _core);
@@ -1880,17 +1982,9 @@ impl Browser {
 
     pub fn status_text(&self, core: &Core) -> String {
         let (files, folders) = self.counts;
-        let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-        let mut s = match (files, folders) {
-            (0, f) if f > 0 => plural(f, "folder"),
-            (n, 0) => plural(n, "file"),
-            (n, f) => format!("{}, {}", plural(n, "file"), plural(f, "folder")),
-        };
+        let mut s = count_text(files, folders, self.total_files, self.filters_on());
         if self.recursive {
             s += if self.truncated { "   ·   with subfolders (first 50,000)" } else { "   ·   with subfolders" };
-        }
-        if self.tag_filter_on() || self.media_filter != MediaFilter::All || !self.filter.is_empty() {
-            s += "   ·   filtered";
         }
         if !self.selected.is_empty() {
             let (n, bytes) = selection_totals(&self.entries, &self.selected);
@@ -1992,6 +2086,24 @@ impl DetailCol {
             DetailCol::Rating => Column::initial(80.0).at_least(72.0),
         }
     }
+}
+
+/// The status bar's count: "12 files, 3 folders", or with a filter on
+/// "3 of 120 files (filtered)" so the hidden files are not forgotten.
+fn count_text(files: usize, folders: usize, total_files: usize, filtered: bool) -> String {
+    let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    let files_part = if filtered { format!("{files} of {} (filtered)", plural(total_files, "file")) } else { plural(files, "file") };
+    match (files, folders) {
+        (0, f) if f > 0 && !filtered => plural(f, "folder"),
+        (_, 0) => files_part,
+        (_, f) => format!("{files_part}, {}", plural(f, "folder")),
+    }
+}
+
+/// True when a mouse button went down inside `rect` this frame, on `ui`'s own
+/// layer (not on a window or menu above it).
+fn pressed_in(ui: &Ui, rect: Rect) -> bool {
+    ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|p| rect.contains(p))) && super::pointer_on_layer(ui)
 }
 
 fn seg_name(p: &Path) -> String {
@@ -2107,6 +2219,19 @@ mod anchor_tests {
         // Big sources are unaffected.
         assert_eq!(cap_upscale(0.5, Vec2::splat(256.0), Some((4000, 3000))), 0.5);
         assert_eq!(cap_upscale(3.0, Vec2::splat(10.0), None), 3.0);
+    }
+
+    #[test]
+    fn status_counts_say_how_many_are_hidden() {
+        use super::count_text;
+        assert_eq!(count_text(12, 0, 12, false), "12 files");
+        assert_eq!(count_text(1, 0, 1, false), "1 file");
+        assert_eq!(count_text(0, 3, 0, false), "3 folders");
+        assert_eq!(count_text(12, 3, 12, false), "12 files, 3 folders");
+        assert_eq!(count_text(3, 0, 120, true), "3 of 120 files (filtered)");
+        assert_eq!(count_text(0, 0, 1, true), "0 of 1 file (filtered)");
+        // "Videos only" keeps the folders: the hidden files are still counted.
+        assert_eq!(count_text(0, 2, 7, true), "0 of 7 files (filtered), 2 folders");
     }
 
     #[test]

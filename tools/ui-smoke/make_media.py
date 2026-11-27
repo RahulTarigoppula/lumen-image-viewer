@@ -10,6 +10,7 @@ Layout (like a camera test project):
     Flat/                                          single images of different kinds
     Compare2/                                      scene_01 from X and Y (select all, compare)
     Compare3/                                      scene_01 from X, Y and Z
+    LongNames/                                     files and a folder with names too long for a caption
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
@@ -237,6 +238,19 @@ def make_flat(out):
     ic.save(os.path.join(flat, "icon_alpha.png"))
 
 
+def make_long_names(out):
+    """Names too long for a thumbnail caption (the middle gives way to "...")."""
+    d = os.path.join(out, "LongNames")
+    os.makedirs(os.path.join(d, "A folder whose name is far too long to fit under its thumbnail"), exist_ok=True)
+    src = os.path.join(out, "RoundA", "DeviceX", "scene_01.jpg")
+    for name in (
+        "IMG_20261112_142233_holiday_on_the_beach_with_the_whole_family_final_edit.jpg",
+        "Screenshot 2026-11-12 at 14.22.33 - quarterly report draft (2).jpg",
+        "short.jpg",
+    ):
+        shutil.copyfile(src, os.path.join(d, name))
+
+
 def find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -285,6 +299,7 @@ def main():
     os.makedirs(out)
     make_photos(out)
     make_flat(out)
+    make_long_names(out)
     videos = False if "--no-video" in sys.argv else make_videos(out)
     count = sum(len(f) for _, _, f in os.walk(out))
     print(f"make_media: {count} files in {out} (videos: {'yes' if videos else 'no'})")

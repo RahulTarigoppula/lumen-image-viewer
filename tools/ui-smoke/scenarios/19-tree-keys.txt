@@ -1,0 +1,41 @@
+# Folder tree by keyboard. F6 goes address bar, folder tree, files; in the tree
+# the arrows move a cursor with a focus ring, Left goes to the parent, Enter
+# opens, letters jump by name, and Enter on the open folder hands over to the files.
+open {media}\RoundA\DeviceX
+wait 3000
+key F6
+wait 600
+shot f6_address.png
+key F6
+wait 800
+shot f6_tree.png
+key Down
+wait 300
+key Down
+wait 500
+shot tree_down.png
+key Left
+wait 500
+shot tree_parent.png
+key Enter
+wait 2500
+shot tree_opened.png
+type devicey
+wait 500
+shot tree_typeahead.png
+key Enter
+wait 2500
+key Enter
+wait 500
+key Right
+wait 800
+shot grid_after_tree.png
+key Shift+F6
+wait 800
+shot shift_f6_tree.png
+key End
+wait 800
+shot tree_end.png
+key Home
+wait 800
+shot tree_home.png

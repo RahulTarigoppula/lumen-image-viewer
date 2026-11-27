@@ -105,6 +105,8 @@ pub fn describe(c: Command) -> &'static str {
         MoveEarlier => "Arrange the folder by hand: the selected files move one place earlier",
         MoveLater => "Arrange the folder by hand: the selected files move one place later",
         CycleInspect => "Cycle clipping warnings, false color, focus peaking and single channels (in Compare: O)",
+        NextPane => "In the browser: move the keyboard to the address bar, the folder tree or the files",
+        PrevPane => "In the browser: move the keyboard back to the files, the folder tree or the address bar",
         _ => "",
     }
 }

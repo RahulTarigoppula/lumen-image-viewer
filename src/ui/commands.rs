@@ -152,6 +152,10 @@ pub enum Command {
     MoveEarlier,
     /// Move the selected files one place later in the folder's custom order.
     MoveLater,
+    /// Browser: move the keyboard to the next part (address bar, folder tree, files).
+    NextPane,
+    /// Browser: move the keyboard to the previous part.
+    PrevPane,
 }
 
 use Command::*;
@@ -284,6 +288,8 @@ impl Command {
             CopyImageText => "Copy text in image (OCR)".into(),
             MoveEarlier => "Move earlier (custom order)".into(),
             MoveLater => "Move later (custom order)".into(),
+            NextPane => "Next pane: address bar, folders, files".into(),
+            PrevPane => "Previous pane".into(),
         }
     }
 
@@ -418,6 +424,8 @@ impl Command {
             CopyImageText => I::SCAN,
             MoveEarlier => I::ARROW_LEFT,
             MoveLater => I::ARROW_RIGHT,
+            NextPane => I::ARROW_SQUARE_RIGHT,
+            PrevPane => I::ARROW_SQUARE_LEFT,
         }
     }
 
@@ -483,6 +491,7 @@ impl Command {
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
         v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater]);
+        v.extend([NextPane, PrevPane]);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

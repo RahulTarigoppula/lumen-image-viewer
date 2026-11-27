@@ -1,0 +1,20 @@
+# Filters that hide every file: the grid says so and offers Clear filters, and
+# the status bar counts the hidden files ("0 of 3 files (filtered)").
+open {media}\RoundA\DeviceX
+wait 2500
+run ShowFlaggedOnly
+wait 1000
+shot flagged_empty.png
+# The Clear filters button under the message (middle of the grid).
+click 770 425
+wait 1000
+shot cleared.png
+# "Videos only" from the funnel menu, in a folder of images.
+click 928 22
+wait 800
+shot funnel_menu.png
+click 985 124
+wait 800
+click 1100 650
+wait 800
+shot videos_only.png
