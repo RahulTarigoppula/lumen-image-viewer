@@ -519,7 +519,7 @@ fn damaged_files_fail_cleanly() {
             assert!(decode::parse(&data[..n]).is_err(), "cut at {n}");
             let _ = probe(&data[..n]);
         }
-        let err = decode::parse(&data[..data.len() * 2 / 3]).unwrap_err().to_string();
+        let err = decode::parse(&data[..data.len() * 2 / 3]).err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("incomplete") || err.contains("damaged"), "{err}");
         // A few bytes changed anywhere: never a panic.
         for _ in 0..250 {
