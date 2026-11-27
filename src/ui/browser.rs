@@ -1772,6 +1772,7 @@ impl Browser {
                 });
                 ui.separator();
                 item(ui, Command::ShowInExplorer, ev);
+                item(ui, Command::Share, ev);
                 item(ui, Command::CopyPath, ev);
                 item(ui, Command::Properties, ev);
             } else {

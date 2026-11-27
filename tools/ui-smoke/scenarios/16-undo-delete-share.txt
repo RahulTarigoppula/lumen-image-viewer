@@ -1,0 +1,40 @@
+# Delete to the Recycle Bin and undo: the photo comes back where it was, selected.
+open {media}\Undo
+wait 3000
+shot before.png
+state
+# Deletes the focused (first) photo; the confirmation takes Enter.
+run Delete
+wait 800
+shot confirm.png
+key Enter
+wait 2500
+shot deleted.png
+state
+run Undo
+wait 5000
+shot restored.png
+state
+# From the viewer: delete the photo shown, then undo there shows it again.
+key Enter
+wait 2500
+run Delete
+wait 800
+key Enter
+wait 2500
+shot viewer_deleted.png
+state
+run Undo
+wait 5000
+shot viewer_restored.png
+state
+key Escape
+wait 1500
+# Share opens the Windows share window outside Lumen (or says why it cannot):
+# it must neither hang nor crash.
+run Share
+wait 4000
+shot share.png
+key Escape
+wait 1000
+state

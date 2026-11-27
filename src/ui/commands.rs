@@ -28,6 +28,8 @@ pub enum Command {
     NewFolder,
     AddFavorite,
     ShowInExplorer,
+    /// Open the Windows share window for the files.
+    Share,
     CopyPath,
     CopyFiles,
     PasteFiles,
@@ -182,6 +184,7 @@ impl Command {
             NewFolder => "New folder".into(),
             AddFavorite => "Add folder to favorites".into(),
             ShowInExplorer => "Show in Explorer".into(),
+            Share => "Share...".into(),
             CopyPath => "Copy path".into(),
             CopyFiles => "Copy files to clipboard".into(),
             PasteFiles => "Paste files".into(),
@@ -319,6 +322,7 @@ impl Command {
             NewFolder => I::FOLDER_PLUS,
             AddFavorite => I::STAR,
             ShowInExplorer => I::FOLDER_OPEN,
+            Share => I::SHARE_NETWORK,
             CopyPath => I::LINK,
             CopyFiles => I::COPY,
             PasteFiles => I::CLIPBOARD,
@@ -437,7 +441,7 @@ impl Command {
         let mut v = vec![
             OpenFile, OpenFolder, Settings, ShortcutsHelp, About, ToggleFullscreen, ToggleTheme, Refresh, GoUp, GoBack,
             GoForward, SelectAll, SelectNone, InvertSelection, CopyTo, MoveTo, Delete, Rename, NewFolder, AddFavorite,
-            ShowInExplorer, CopyPath, ThumbBigger, ThumbSmaller, ToggleDetails, TogglePreviewPane, FocusFilter,
+            ShowInExplorer, Share, CopyPath, ThumbBigger, ThumbSmaller, ToggleDetails, TogglePreviewPane, FocusFilter,
             BatchConvert, BatchRename, ContactSheet, FindDuplicates, Slideshow, Compare, ToggleFlag, ShowFlaggedOnly,
             OpenVideoMode, OpenViewer, CloseViewer, NextImage, PrevImage, FirstImage, LastImage, ZoomIn, ZoomOut,
             ZoomActual, ZoomFit, CycleFit,
@@ -466,7 +470,7 @@ impl Command {
         let mut v = vec![
             OpenFile, OpenFolder, CommandPalette, Settings, ShortcutsHelp, About, ToggleFullscreen, ToggleTheme, Exit,
             Refresh, GoUp, GoBack, GoForward, SelectAll, SelectNone, InvertSelection, CopyTo, MoveTo, Delete, Rename,
-            NewFolder, AddFavorite, ShowInExplorer, CopyPath, CopyFiles, PasteFiles, ThumbBigger, ThumbSmaller,
+            NewFolder, AddFavorite, ShowInExplorer, Share, CopyPath, CopyFiles, PasteFiles, ThumbBigger, ThumbSmaller,
             ToggleDetails, TogglePreviewPane, FocusFilter, BatchConvert, BatchRename, ContactSheet, FindDuplicates,
             Slideshow, Compare, ToggleFlag,
         ];

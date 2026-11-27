@@ -100,6 +100,18 @@ enum FileChange {
     Transform { t: Transform, files: Vec<Transformed> },
     /// A folder was arranged by hand: its previous custom order (none) and sort key.
     Order { folder: PathBuf, previous: Option<Vec<String>>, active: bool },
+    /// Moved to the Recycle Bin at `at` (undo takes them out again).
+    Delete { files: Vec<DeletedItem>, at: std::time::SystemTime },
+}
+
+/// One file or folder moved to the Recycle Bin, as kept for undo.
+#[derive(Clone)]
+struct DeletedItem {
+    path: PathBuf,
+    /// Its rating, flag and label (dropped with the file, put back with it).
+    tag: crate::tags::Tag,
+    /// Its place in the viewer's list, when it was there.
+    viewer_at: Option<usize>,
 }
 
 /// One file rotated / flipped on disk, as kept for undo.
@@ -118,7 +130,7 @@ impl FileUndo {
     fn bytes(&self) -> usize {
         match &self.change {
             FileChange::Transform { files, .. } => files.iter().filter_map(|f| f.before.as_ref()).map(Vec::len).sum(),
-            FileChange::Moves(_) | FileChange::Order { .. } => 0,
+            FileChange::Moves(_) | FileChange::Order { .. } | FileChange::Delete { .. } => 0,
         }
     }
 }
@@ -143,6 +155,15 @@ fn inverse(t: Transform) -> Transform {
 /// "1 file", "3 files".
 fn count(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The main window's HWND, from eframe's window handle.
+fn main_window(cc: &eframe::CreationContext<'_>) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
 }
 
 struct TransferDialog {
@@ -238,6 +259,8 @@ pub struct App {
     fullscreen_from_viewer: bool,
     /// The window was maximized before going full screen.
     maximized_before_fullscreen: bool,
+    /// The main window's handle (HWND), for the Windows share window.
+    hwnd: Option<isize>,
 }
 
 /// Floating windows that Esc can close, most recently opened first.
@@ -369,6 +392,7 @@ impl App {
             window_stack: Vec::new(),
             fullscreen_from_viewer: false,
             maximized_before_fullscreen: false,
+            hwnd: main_window(cc),
         };
         crate::devhook::mark("app_struct");
         crate::ui::keymap::install(&app.core.settings);
@@ -792,6 +816,20 @@ impl App {
                     fileops::show_in_explorer(p);
                 } else {
                     fileops::open_with_default(&self.browser.folder);
+                }
+            }
+            Share => {
+                // Files only: folders cannot be shared this way.
+                let files: Vec<PathBuf> = self.targets().into_iter().filter(|p| p.is_file()).collect();
+                if files.is_empty() {
+                    self.core.toasts.info("Select the files to share");
+                    return;
+                }
+                if self.mode == Mode::Viewer && self.viewer.is_dirty() {
+                    self.core.toasts.info("Sharing the file as saved: your edits are not in it");
+                }
+                if let Err(e) = crate::share::share_files(self.hwnd, &files) {
+                    self.core.toasts.error(e);
                 }
             }
             CopyPath => {
@@ -1563,6 +1601,9 @@ impl App {
     }
 
     fn delete_files(&mut self, files: Vec<PathBuf>) {
+        // For undo: when they went, their tags and their places in the viewer.
+        let at = std::time::SystemTime::now();
+        let kept: Vec<DeletedItem> = files.iter().map(|f| DeletedItem { path: f.clone(), tag: self.core.tags.get(f), viewer_at: self.viewer.list.iter().position(|p| p == f) }).collect();
         match fileops::recycle(&files) {
             Ok(outcome) => {
                 for f in &files {
@@ -1573,10 +1614,17 @@ impl App {
                     self.viewer.remove_path(f);
                     self.browser.selected.remove(f);
                 }
-                self.core.toasts.success(match outcome {
-                    fileops::TrashOutcome::Recycled => format!("Moved {} to the Recycle Bin", count(files.len(), "item")),
-                    fileops::TrashOutcome::DeletedPermanently => format!("Deleted {} (network or removable drive: no Recycle Bin)", count(files.len(), "item")),
-                });
+                match outcome {
+                    fileops::TrashOutcome::Recycled => {
+                        let key = Command::Undo.shortcut();
+                        let undo = if key.is_empty() { "Undo".to_string() } else { key };
+                        self.core.toasts.success(format!("Moved {} to the Recycle Bin - {undo} to undo", count(files.len(), "item")));
+                        self.push_undo(FileUndo { label: format!("Delete {}", count(files.len(), "item")), change: FileChange::Delete { files: kept, at } });
+                    }
+                    fileops::TrashOutcome::DeletedPermanently => {
+                        self.core.toasts.success(format!("Deleted {} (network or removable drive: no Recycle Bin)", count(files.len(), "item")));
+                    }
+                }
                 if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
                     self.mode = Mode::Browser;
                 }
@@ -1647,6 +1695,7 @@ impl App {
                     }
                 }
             }
+            JobResult::Restore { files, res } => self.finish_restore(files, res),
             JobResult::Panicked(label) => self.core.toasts.error(format!("{label} stopped unexpectedly; check the folder")),
             JobResult::Message { ok: true, text } => self.core.toasts.success(text),
             JobResult::Message { ok: false, text } => self.core.toasts.error(text),
@@ -1731,6 +1780,84 @@ impl App {
         self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
         if self.mode == Mode::Viewer && self.viewer.list.is_empty() {
             self.mode = Mode::Browser;
+        }
+    }
+
+    /// Deleted files are back from the Recycle Bin: show them again (selected
+    /// in the browser, at their old places in the viewer) with their tags.
+    fn finish_restore(&mut self, files: Vec<DeletedItem>, res: crate::recycle::Restored) {
+        let mut select: Vec<PathBuf> = Vec::new();
+        let mut folders: Vec<PathBuf> = Vec::new();
+        // (place in the viewer's list, path now)
+        let mut back: Vec<(usize, PathBuf)> = Vec::new();
+        for (orig, now) in &res.done {
+            self.forget_file(orig);
+            self.forget_file(now);
+            if let Some(f) = files.iter().find(|f| &f.path == orig) {
+                let tag = f.tag;
+                if !tag.is_empty() {
+                    self.core.tags.update(now, |t| *t = tag);
+                }
+                if let Some(at) = f.viewer_at {
+                    back.push((at, now.clone()));
+                }
+            }
+            if let Some(dir) = now.parent() {
+                if !folders.iter().any(|f| f == dir) {
+                    folders.push(dir.to_path_buf());
+                }
+                if dir == self.browser.folder.as_path() {
+                    select.push(now.clone());
+                }
+            }
+        }
+        // Back at their places in the viewer, when it still shows that folder.
+        back.sort_by_key(|(at, _)| *at);
+        let in_viewer = !back.is_empty() && back.iter().all(|(_, p)| self.viewer.list.iter().any(|q| q.parent() == p.parent()));
+        if in_viewer {
+            for (at, p) in &back {
+                if self.viewer.list.contains(p) {
+                    continue;
+                }
+                let at = (*at).min(self.viewer.list.len());
+                if at <= self.viewer.index {
+                    self.viewer.index += 1;
+                }
+                self.viewer.list.insert(at, p.clone());
+            }
+            if self.mode == Mode::Viewer && !self.viewer.has_unsaved_work() {
+                if let Some(i) = self.viewer.list.iter().position(|q| q == &back[0].1) {
+                    self.viewer.go_to(i, self.core.settings.fit_mode);
+                }
+            }
+        }
+        for f in &folders {
+            self.browser.tree.invalidate(f);
+        }
+        if !select.is_empty() {
+            self.browser.selected = select.iter().cloned().collect();
+            self.browser.pending_select = select.first().cloned();
+        }
+        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        let name = crate::ui::viewer::file_name;
+        let n = res.done.len();
+        if n > 0 {
+            self.core.toasts.success(format!("Restored {} from the Recycle Bin", count(n, "item")));
+        }
+        let renamed: Vec<&(PathBuf, PathBuf)> = res.done.iter().filter(|(orig, now)| orig != now).collect();
+        match renamed.as_slice() {
+            [] => {}
+            [(orig, now)] => self.core.toasts.info(format!("The name \"{}\" is taken, so it came back as \"{}\"", name(orig), name(now))),
+            many => self.core.toasts.info(format!("{} names are taken, so those items came back with a number added", many.len())),
+        }
+        match res.failed.as_slice() {
+            [] => {}
+            [(p, why)] => self.core.toasts.error(format!("Could not restore \"{}\": {why}", name(p))),
+            all => {
+                let names: Vec<String> = all.iter().take(3).map(|(p, _)| name(p)).collect();
+                let more = if all.len() > 3 { ", ..." } else { "" };
+                self.core.toasts.error(format!("Could not restore {} of {}: {}{more} ({})", all.len(), count(all.len() + n, "item"), names.join(", "), all[0].1));
+            }
         }
     }
 
@@ -1877,6 +2004,12 @@ impl App {
                 }
                 self.browser.mark_resort();
                 ok += 1;
+            }
+            FileChange::Delete { files, at } => {
+                // Off the UI thread: the Recycle Bin can be large. The job
+                // refreshes the views and reports when it is done.
+                self.file_jobs.submit(format!("Restoring {}", count(files.len(), "item")), restore_job(files.clone(), *at));
+                return;
             }
             FileChange::Transform { t, files } => {
                 // (path, its stamp before this change, its stamp once restored)
@@ -3819,6 +3952,8 @@ enum JobResult {
     /// Changed files with their previous bytes for undo (`None` once the
     /// budget for keeping them is used up).
     Rotate { t: Transform, lossless: Vec<Transformed>, reencoded: Vec<Transformed>, skipped: Vec<String>, errs: Vec<String> },
+    /// Deleted files taken out of the Recycle Bin again (undo of a delete).
+    Restore { files: Vec<DeletedItem>, res: crate::recycle::Restored },
     Panicked(String),
     /// A job that only reports a line to the user.
     Message { ok: bool, text: String },
@@ -3921,6 +4056,15 @@ fn transfer_job(files: Vec<PathBuf>, dest: PathBuf, do_move: bool) -> FileJob {
             errs.extend(e);
         }
         JobResult::Transfer { done, errs, dest, do_move }
+    })
+}
+
+/// Put deleted files back from the Recycle Bin where they were.
+fn restore_job(files: Vec<DeletedItem>, at: std::time::SystemTime) -> FileJob {
+    Box::new(move |pr| {
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        let res = crate::recycle::restore(&paths, at, &|done: usize, total: usize| pr.set(done, total));
+        JobResult::Restore { files, res }
     })
 }
 

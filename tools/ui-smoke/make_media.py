@@ -10,6 +10,7 @@ Layout (like a camera test project):
     Flat/                                          single images of different kinds
     Compare2/                                      scene_01 from X and Y (select all, compare)
     Compare3/                                      scene_01 from X, Y and Z
+    Undo/scene_01.jpg ... scene_03.jpg             copies of DeviceX (delete and undo)
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
@@ -204,6 +205,10 @@ def make_photos(out):
         os.makedirs(os.path.join(out, n), exist_ok=True)
         for dev in devs:
             shutil.copyfile(os.path.join(out, "RoundA", dev[0], "scene_01.jpg"), os.path.join(out, n, f"scene_01_{dev[0]}.jpg"))
+    # A folder of its own for deleting to the Recycle Bin and restoring.
+    os.makedirs(os.path.join(out, "Undo"), exist_ok=True)
+    for scene, _ in SCENES:
+        shutil.copyfile(os.path.join(out, "RoundA", DEVICES[0][0], f"{scene}.jpg"), os.path.join(out, "Undo", f"{scene}.jpg"))
 
 
 def make_flat(out):
