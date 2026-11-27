@@ -278,7 +278,7 @@ impl Command {
             ShowMetadata => "Metadata and capture features".into(),
             ExportMetadataCsv => "Export metadata of images as CSV".into(),
             TogglePixelValues => "Pixel values under the pointer".into(),
-            CycleInspect => "Inspect view: clipping, false color, peaking, channels".into(),
+            CycleInspect => "Inspect view: clipping, false color, peaking, channels, gain map".into(),
             SelectFlagged => "Select flagged files".into(),
             FocusAddress => "Type a folder path".into(),
             CopyImageText => "Copy text in image (OCR)".into(),

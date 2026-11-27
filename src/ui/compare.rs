@@ -531,9 +531,11 @@ pub struct Compare {
     profile_mode: bool,
     /// The line as fractions of each image (start, end).
     profile: Option<([f32; 2], [f32; 2])>,
-    /// Clipping, false color, peaking or one channel in every pane (O).
+    /// Clipping, false color, peaking, one channel or a gain map view in every pane (O).
     inspect: super::inspect_view::InspectMode,
     inspect_cache: super::inspect_view::InspectCache,
+    /// Screen headroom of the HDR rendition view, shared by the panes.
+    hdr_headroom: f32,
     /// "Align to A" is on (panes B-D show their aligned images).
     align_on: bool,
     align_job: Option<Receiver<AlignMsg>>,
@@ -681,6 +683,7 @@ impl Compare {
             profile: None,
             inspect: super::inspect_view::InspectMode::Off,
             inspect_cache: Default::default(),
+            hdr_headroom: f32::INFINITY,
             align_on: false,
             align_job: None,
             pending_fov: None,
@@ -1467,7 +1470,8 @@ impl Compare {
             }
         }
         if take(Key::O) {
-            self.inspect = self.inspect.next();
+            let gain_maps = !self.panes.iter().all(|p| self.inspect_cache.lacks_gain_map(&p.path));
+            self.inspect = self.inspect.next_for(gain_maps);
             core.toasts.info(format!("Inspect view: {}. {}", self.inspect.label(), self.inspect.tip()));
         }
         if take(Key::M) {
@@ -1972,10 +1976,21 @@ impl Compare {
             if self.inspect != super::inspect_view::InspectMode::Off {
                 if let Some(g) = &geos[i] {
                     let pane = &self.panes[i];
-                    let img = if pane.showing_aligned { pane.aligned.clone() } else { pane.loaded.as_ref().map(|l| l.decoded.image.clone()) };
-                    if let Some(img) = img {
-                        let key = if pane.showing_aligned { pane.path.with_extension("aligned") } else { pane.path.clone() };
-                        self.inspect_cache.paint(ui, &key, &img, self.inspect, g.dest, g.clip);
+                    let path = pane.path.clone();
+                    if self.inspect.is_gain() {
+                        // The gain map fits the original image only, not the aligned one.
+                        let img = pane.loaded.as_ref().filter(|_| !pane.showing_aligned).map(|l| l.decoded.image.clone());
+                        if let Some(img) = img {
+                            self.inspect_cache.paint_gain(ui, &path, &img, self.inspect, self.hdr_headroom, g.dest, g.clip);
+                        }
+                    } else {
+                        let img = if pane.showing_aligned { pane.aligned.clone() } else { pane.loaded.as_ref().map(|l| l.decoded.image.clone()) };
+                        if let Some(img) = img {
+                            let key = if pane.showing_aligned { pane.path.with_extension("aligned") } else { pane.path.clone() };
+                            self.inspect_cache.paint(ui, &key, &img, self.inspect, g.dest, g.clip);
+                        }
+                        // Also tells the O cycle whether the panes have gain maps.
+                        let _ = self.inspect_cache.gain_info(ui.ctx(), &path);
                     }
                 }
             }
@@ -1992,6 +2007,18 @@ impl Compare {
             let keep_w = Self::keep_size(ui, i).x + 8.0;
             let show_keep = self.shows_keep(i, rect) && Self::pill_width(ui, &text, true) + keep_w <= room;
             let caption = Self::pill(ui, rect.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, Some((LETTERS[i], self.pane_color(core, i))), room);
+            if self.inspect.is_gain() {
+                use super::inspect_view::GainInfo;
+                let info = if self.panes[i].showing_aligned {
+                    GainInfo::Missing(lumen_core::inspect::gainmap::NoGainMap { reason: "The gain map views show the original image: turn off Align to A.".into(), announced: true })
+                } else {
+                    let path = self.panes[i].path.clone();
+                    self.inspect_cache.gain_info(ui.ctx(), &path)
+                };
+                let at = Pos2::new(caption.min.x, caption.max.y + 8.0);
+                let id = ui.id().with(("cmp-gain-legend", i));
+                super::inspect_view::gain_legend(ui, id, at, rect.width() - 20.0, &info, self.inspect, &mut self.hdr_headroom);
+            }
             if self.show_hist {
                 let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
                 self.paint_hist(ui, core, i, hr);

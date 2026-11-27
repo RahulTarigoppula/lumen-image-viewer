@@ -36,7 +36,10 @@ The job summary on the run page has a table of scenarios and problems.
    framed, colored, blurred and noised differently per device, with EXIF make,
    model, ISO and exposure), a `Flat/` folder (gradient PNG, noise JPEG, text
    card, tall portrait, icon with alpha), `Compare2/` and `Compare3/` (two and
-   three versions of scene 01, for "select all, compare") and `Video/` with two
+   three versions of scene 01, for "select all, compare"), `HDR/` (a
+   Samsung-style Ultra HDR photo with a Type2 maker note and SEF trailer, and a
+   Pixel-style one with an ISO 21496-1 gain map and an encrypted HDR+ maker
+   note; the metadata is written byte by byte) and `Video/` with two
    4 s clips when an ffmpeg binary is found (PATH, or the `imageio-ffmpeg` pip
    package that CI installs).
 3. `run.ps1` copies `lumen.exe` and the Mesa DLLs into a temporary folder with

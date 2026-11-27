@@ -1,14 +1,17 @@
 //! Inspect views drawn over the image in the viewer and in every Compare pane:
-//! clipping warnings, false-color exposure, focus peaking and single
-//! channels. Each view is computed off the UI thread on a copy of at most
-//! `MAX_SIDE` pixels and drawn as a texture over the image.
+//! clipping warnings, false-color exposure, focus peaking, single channels
+//! and, for photos with an HDR gain map, the gain map itself and the HDR
+//! rendition. Each view is computed off the UI thread on a copy of at most
+//! `MAX_SIDE` pixels and drawn as a texture over the image; gain maps are
+//! read and decoded in the background once per file.
 
 use crossbeam_channel::Receiver;
-use egui::{Color32, Rect, TextureHandle};
+use egui::{Color32, Pos2, Rect, RichText, TextureHandle, Vec2};
 use image::RgbaImage;
+use lumen_core::inspect::gainmap::{self, NoGainMap, Prepared};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Long side of the computed views (pixels).
@@ -27,10 +30,25 @@ pub enum InspectMode {
     Red,
     Green,
     Blue,
+    /// The HDR gain map image, scaled to the picture.
+    GainMap,
+    /// The picture with its gain map applied for a chosen screen headroom.
+    HdrRendition,
 }
 
 impl InspectMode {
-    pub const ALL: [InspectMode; 8] = [InspectMode::Off, InspectMode::Clipping, InspectMode::FalseColor, InspectMode::Peaking, InspectMode::Luma, InspectMode::Red, InspectMode::Green, InspectMode::Blue];
+    pub const ALL: [InspectMode; 10] = [
+        InspectMode::Off,
+        InspectMode::Clipping,
+        InspectMode::FalseColor,
+        InspectMode::Peaking,
+        InspectMode::Luma,
+        InspectMode::Red,
+        InspectMode::Green,
+        InspectMode::Blue,
+        InspectMode::GainMap,
+        InspectMode::HdrRendition,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -42,6 +60,8 @@ impl InspectMode {
             InspectMode::Red => "Red channel",
             InspectMode::Green => "Green channel",
             InspectMode::Blue => "Blue channel",
+            InspectMode::GainMap => "Gain map",
+            InspectMode::HdrRendition => "HDR rendition",
         }
     }
 
@@ -55,13 +75,27 @@ impl InspectMode {
             InspectMode::Red => "The red channel alone as gray",
             InspectMode::Green => "The green channel alone as gray",
             InspectMode::Blue => "The blue channel alone as gray (usually the noisiest)",
+            InspectMode::GainMap => "The photo's HDR gain map, scaled to the picture: the brighter, the more an HDR screen brightens that area (JPEG files with an Ultra HDR, ISO 21496-1 or Apple gain map)",
+            InspectMode::HdrRendition => "The photo with its HDR gain map applied for the chosen screen headroom, drawn with a straight curve: the headroom's peak is white and SDR white is gray, so the areas an HDR screen brightens stand out",
         }
     }
 
-    /// Next mode (keyboard cycling).
-    pub fn next(self) -> InspectMode {
-        let i = InspectMode::ALL.iter().position(|m| *m == self).unwrap_or(0);
-        InspectMode::ALL[(i + 1) % InspectMode::ALL.len()]
+    /// The gain map views (they need a photo with a gain map).
+    pub fn is_gain(self) -> bool {
+        matches!(self, InspectMode::GainMap | InspectMode::HdrRendition)
+    }
+
+    /// Next mode (keyboard cycling); the gain map views only when `gain_maps`.
+    pub fn next_for(self, gain_maps: bool) -> InspectMode {
+        let step = |m: InspectMode| {
+            let i = InspectMode::ALL.iter().position(|x| *x == m).unwrap_or(0);
+            InspectMode::ALL[(i + 1) % InspectMode::ALL.len()]
+        };
+        let mut m = step(self);
+        while !gain_maps && m.is_gain() {
+            m = step(m);
+        }
+        m
     }
 
     /// Drawn over the image (true) or replacing it (false).
@@ -159,7 +193,7 @@ pub fn render(src: &RgbaImage, mode: InspectMode) -> RgbaImage {
                         InspectMode::Red => [p[0], p[0], p[0], 255],
                         InspectMode::Green => [p[1], p[1], p[1], 255],
                         InspectMode::Blue => [p[2], p[2], p[2], 255],
-                        InspectMode::Off | InspectMode::Peaking => p,
+                        InspectMode::Off | InspectMode::Peaking | InspectMode::GainMap | InspectMode::HdrRendition => p,
                     };
                     op.copy_from_slice(&v);
                 }
@@ -169,19 +203,197 @@ pub fn render(src: &RgbaImage, mode: InspectMode) -> RgbaImage {
     out
 }
 
+/// A gain map being read, read, or known to be missing.
+enum GainLoad {
+    Loading(Receiver<Result<gainmap::GainMap, NoGainMap>>),
+    Ready(Arc<gainmap::GainMap>),
+    Missing(NoGainMap),
+}
+
+/// What the gain map views know about a file.
+#[derive(Clone)]
+pub enum GainInfo {
+    Loading,
+    Missing(NoGainMap),
+    Ready(Arc<gainmap::GainMap>),
+}
+
+/// Result of an HDR rendition job: the reduced base with the resampled map, and the view.
+type HdrJob = Receiver<(Arc<(RgbaImage, Prepared)>, RgbaImage)>;
+
+/// The HDR rendition of one file: the newest texture and the job making the next.
+#[derive(Default)]
+struct HdrView {
+    /// Identity of the base image the rest was made from.
+    base: usize,
+    /// The base reduced to at most `MAX_SIDE` and the gain map resampled to it (made once).
+    prepared: Option<Arc<(RgbaImage, Prepared)>>,
+    /// (headroom, texture) of the newest finished view.
+    tex: Option<(f32, TextureHandle)>,
+    job: Option<(f32, HdrJob)>,
+    /// A job failed at this headroom: do not start it again.
+    failed: Option<f32>,
+}
+
+/// Gain maps of this many files are kept.
+const GAIN_KEEP: usize = 6;
+
 /// Computed views as textures, per (file, mode); a few kept.
 #[derive(Default)]
 pub struct InspectCache {
     done: HashMap<(PathBuf, InspectMode), TextureHandle>,
     pending: HashMap<(PathBuf, InspectMode), Receiver<RgbaImage>>,
     order: Vec<(PathBuf, InspectMode)>,
+    gain: HashMap<PathBuf, GainLoad>,
+    gain_order: Vec<PathBuf>,
+    map_tex: HashMap<PathBuf, TextureHandle>,
+    hdr: HashMap<PathBuf, HdrView>,
 }
 
 impl InspectCache {
+    /// The gain map of the file at `path`, read in the background on first ask.
+    pub fn gain_info(&mut self, ctx: &egui::Context, path: &Path) -> GainInfo {
+        if let Some(GainLoad::Loading(rx)) = self.gain.get(path) {
+            let state = match rx.try_recv() {
+                Ok(Ok(m)) => Some(GainLoad::Ready(Arc::new(m))),
+                Ok(Err(e)) => Some(GainLoad::Missing(e)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Some(GainLoad::Missing(NoGainMap { reason: "Reading the gain map failed unexpectedly (the file may be damaged).".into(), announced: true })),
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+            };
+            if let Some(s) = state {
+                self.gain.insert(path.to_path_buf(), s);
+            }
+        }
+        match self.gain.get(path) {
+            Some(GainLoad::Ready(m)) => return GainInfo::Ready(m.clone()),
+            Some(GainLoad::Missing(e)) => return GainInfo::Missing(e.clone()),
+            Some(GainLoad::Loading(_)) => return GainInfo::Loading,
+            None => {}
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (p, ctx2) = (path.to_path_buf(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::bg::background_priority();
+            if let Ok(r) = std::panic::catch_unwind(|| gainmap::load(&p)) {
+                let _ = tx.send(r);
+            }
+            ctx2.request_repaint();
+        });
+        self.gain.insert(path.to_path_buf(), GainLoad::Loading(rx));
+        self.gain_order.retain(|p| p != path);
+        self.gain_order.push(path.to_path_buf());
+        while self.gain_order.len() > GAIN_KEEP {
+            let old = self.gain_order.remove(0);
+            self.gain.remove(&old);
+            self.map_tex.remove(&old);
+            self.hdr.remove(&old);
+        }
+        GainInfo::Loading
+    }
+
+    /// The file is known to have no gain map and does not claim one: cycling
+    /// skips the gain map views for it.
+    pub fn lacks_gain_map(&self, path: &Path) -> bool {
+        matches!(self.gain.get(path), Some(GainLoad::Missing(e)) if !e.announced)
+    }
+
+    /// Draw the gain map view `mode` of the file at `path` (whose decoded
+    /// pixels are `img`) at `dest`, clipped to `clip`. Nothing is drawn while
+    /// the gain map is read or when the file has none (the legend says why).
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_gain(&mut self, ui: &egui::Ui, path: &Path, img: &Arc<RgbaImage>, mode: InspectMode, headroom: f32, dest: Rect, clip: Rect) {
+        let map = match self.gain_info(ui.ctx(), path) {
+            GainInfo::Ready(m) => m,
+            GainInfo::Loading => {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            GainInfo::Missing(_) => return,
+        };
+        let tex = match mode {
+            InspectMode::GainMap => Some(self.map_texture(ui.ctx(), path, &map)),
+            InspectMode::HdrRendition => self.hdr_texture(ui.ctx(), path, img, &map, headroom),
+            _ => None,
+        };
+        if let Some(tex) = tex {
+            let painter = ui.painter().with_clip_rect(clip);
+            painter.image(tex.id(), dest, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+    }
+
+    fn map_texture(&mut self, ctx: &egui::Context, path: &Path, map: &gainmap::GainMap) -> TextureHandle {
+        if let Some(t) = self.map_tex.get(path) {
+            return t.clone();
+        }
+        let im = &map.image;
+        let ci = egui::ColorImage::from_rgba_unmultiplied([im.width() as usize, im.height() as usize], im.as_raw());
+        let tex = ctx.load_texture(format!("gainmap:{}", path.display()), ci, egui::TextureOptions::LINEAR);
+        self.map_tex.insert(path.to_path_buf(), tex.clone());
+        tex
+    }
+
+    /// The newest HDR rendition texture (possibly for another headroom while
+    /// the one for `headroom` is made in the background).
+    fn hdr_texture(&mut self, ctx: &egui::Context, path: &Path, img: &Arc<RgbaImage>, map: &Arc<gainmap::GainMap>, headroom: f32) -> Option<TextureHandle> {
+        let h = headroom.clamp(1.0, map.meta.headroom_max());
+        let base = Arc::as_ptr(img) as usize;
+        let v = self.hdr.entry(path.to_path_buf()).or_default();
+        if v.base != base {
+            *v = HdrView { base, ..Default::default() };
+        }
+        let finished = match v.job.as_ref().map(|(jh, rx)| (*jh, rx.try_recv())) {
+            Some((jh, Ok(r))) => Some((jh, Some(r))),
+            Some((jh, Err(crossbeam_channel::TryRecvError::Disconnected))) => Some((jh, None)),
+            _ => None,
+        };
+        if let Some((jh, r)) = finished {
+            v.job = None;
+            match r {
+                Some((prep, out)) => {
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([out.width() as usize, out.height() as usize], out.as_raw());
+                    if let Some((th, t)) = v.tex.as_mut() {
+                        t.set(ci, egui::TextureOptions::LINEAR);
+                        *th = jh;
+                    } else {
+                        v.tex = Some((jh, ctx.load_texture(format!("hdr:{}", path.display()), ci, egui::TextureOptions::LINEAR)));
+                    }
+                    v.prepared = Some(prep);
+                }
+                None => v.failed = Some(jh),
+            }
+        }
+        let stale = v.tex.as_ref().is_none_or(|(th, _)| (th - h).abs() > 1e-3);
+        if stale && v.job.is_none() && v.failed != Some(h) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (img, map, prepared, ctx2) = (img.clone(), map.clone(), v.prepared.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                crate::bg::background_priority();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let prep = prepared.unwrap_or_else(|| {
+                        let small = lumen_core::imaging::resize_to_fit(&img, MAX_SIDE, MAX_SIDE);
+                        let gain = gainmap::prepare(&map, small.width(), small.height());
+                        Arc::new((small, gain))
+                    });
+                    let out = gainmap::render_hdr(&prep.0, &prep.1, &map.meta, h);
+                    (prep, out)
+                }));
+                if let Ok(r) = r {
+                    let _ = tx.send(r);
+                }
+                ctx2.request_repaint();
+            });
+            v.job = Some((h, rx));
+        }
+        if v.job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        v.tex.as_ref().map(|(_, t)| t.clone())
+    }
+
     /// The texture of `mode` for `path` (whose pixels are `img`), started in
     /// the background when missing.
     pub fn get(&mut self, ctx: &egui::Context, path: &std::path::Path, img: &Arc<RgbaImage>, mode: InspectMode) -> Option<TextureHandle> {
-        if mode == InspectMode::Off {
+        if mode == InspectMode::Off || mode.is_gain() {
             return None;
         }
         let key = (path.to_path_buf(), mode);
@@ -236,6 +448,71 @@ impl InspectCache {
     }
 }
 
+/// "4", "2.5".
+fn trim_x(v: f32) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// Legend text: small, in `c`.
+fn small(s: &str, c: Color32) -> RichText {
+    RichText::new(s).size(super::theme::text::SMALL).color(c)
+}
+
+/// The legend of the gain map views in a box whose top left is `at` (at most
+/// `max_w` wide), with the screen headroom slider in the HDR rendition.
+/// `headroom` may be shared by several panes; the slider shows it within
+/// this map's range and writes it back only when moved. Returns the box.
+pub fn gain_legend(ui: &mut egui::Ui, id: egui::Id, at: Pos2, max_w: f32, info: &GainInfo, mode: InspectMode, headroom: &mut f32) -> Rect {
+    let p = super::theme::palette(ui.ctx());
+    let w = max_w.clamp(160.0, 330.0);
+    let builder = egui::UiBuilder::new().id_salt(id).max_rect(Rect::from_min_size(at, Vec2::new(w, 600.0))).layout(egui::Layout::top_down(egui::Align::Min));
+    let mut child = ui.new_child(builder);
+    let frame = egui::Frame::new().fill(p.overlay).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(10, 8));
+    let r = frame.show(&mut child, |ui| {
+        ui.set_max_width(w - 20.0);
+        ui.spacing_mut().item_spacing.y = 3.0;
+        match info {
+            GainInfo::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(small("Reading the gain map...", p.muted));
+                });
+            }
+            GainInfo::Missing(e) => {
+                ui.add(egui::Label::new(small(&e.reason, p.text)).wrap());
+                if !e.announced {
+                    ui.add(egui::Label::new(small("The gain map views need a JPEG with an Ultra HDR, ISO 21496-1 or Apple gain map.", p.muted)).wrap());
+                }
+            }
+            GainInfo::Ready(map) => {
+                for (k, l) in map.legend().iter().enumerate() {
+                    ui.add(egui::Label::new(small(l, if k == 0 { p.text } else { p.muted })).wrap());
+                }
+                if mode == InspectMode::HdrRendition {
+                    let max = map.meta.headroom_max();
+                    let mut h = headroom.clamp(1.0, max);
+                    if max > 1.01 {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(small("Screen headroom", p.text)).on_hover_text("How much brighter than SDR white the screen can show: x1 is a normal (SDR) screen, x4 an HDR screen whose highlights reach four times SDR white. Phones and HDR monitors reach about x2 to x16.");
+                            let slider = super::widgets::Slider::new(&mut h, 1.0..=max).logarithmic(true).fixed_decimals(1).prefix("x").default_value(max).width(100.0).value_width(52.0);
+                            if ui.add(slider).on_hover_text("Double-click for the map's full headroom").changed() {
+                                *headroom = h;
+                            }
+                        });
+                    }
+                    let used = gainmap::weight(&map.meta, h);
+                    ui.label(small(&format!("Map applied: {:.0}%", used * 100.0), p.muted)).on_hover_text("How much of the gain map a screen with this headroom uses, from the headroom range stored in the file.");
+                    ui.label(small(&format!("Straight curve: x{} peak = white, SDR white = 1/{}", trim_x(h), trim_x(h)), p.muted))
+                        .on_hover_text("The HDR version is scaled down so the brightest a screen with this headroom shows is white. The areas the HDR version lifts stay bright; the rest looks darker than in the normal view.");
+                }
+            }
+        }
+    });
+    r.response.rect
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,9 +564,24 @@ mod tests {
     fn modes_cycle() {
         let mut m = InspectMode::Off;
         for _ in 0..InspectMode::ALL.len() {
-            m = m.next();
+            m = m.next_for(true);
         }
         assert_eq!(m, InspectMode::Off);
         assert!(InspectMode::Clipping.is_overlay() && !InspectMode::Luma.is_overlay());
+        // Without a gain map the cycle skips the gain map views.
+        assert_eq!(InspectMode::Blue.next_for(false), InspectMode::Off);
+        assert_eq!(InspectMode::Blue.next_for(true), InspectMode::GainMap);
+        assert_eq!(InspectMode::GainMap.next_for(false), InspectMode::Off);
+        assert!(InspectMode::HdrRendition.is_gain() && !InspectMode::HdrRendition.is_overlay());
+        assert_eq!(trim_x(4.0), "4");
+        assert_eq!(trim_x(2.46), "2.5");
+    }
+
+    #[test]
+    fn gain_views_pass_pixels_through_render() {
+        // The gain map views are drawn from their own textures; the per-pixel renderer leaves them alone.
+        let img = RgbaImage::from_pixel(2, 1, image::Rgba([10, 20, 30, 255]));
+        assert_eq!(render(&img, InspectMode::GainMap), img);
+        assert_eq!(render(&img, InspectMode::HdrRendition), img);
     }
 }

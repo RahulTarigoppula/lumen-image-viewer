@@ -1,0 +1,90 @@
+# HDR gain maps: capture summary and maker notes of a Samsung-style Ultra HDR
+# photo, its Gain map and HDR rendition views, a Pixel-style photo (ISO 21496-1
+# gain map, encrypted HDR+ maker note), then both views in Compare.
+@timeout 90
+open {media}\HDR\samsung_ultrahdr.jpg
+wait 3000
+run ShowMetadata
+wait 3000
+shot samsung_capture.png
+click 628 148
+wait 1500
+shot samsung_file_encoding.png
+hover 640 450
+scroll -500
+wait 800
+shot samsung_file_encoding_2.png
+scroll -500
+wait 800
+shot samsung_file_encoding_3.png
+scroll -3000
+wait 800
+shot samsung_file_encoding_end.png
+run ShowMetadata
+wait 500
+run ShowMetadata
+wait 800
+# Shift+O seven times reaches Blue, the eighth the gain map views.
+run CycleInspect
+wait 1500
+run CycleInspect
+wait 800
+run CycleInspect
+wait 800
+run CycleInspect
+wait 800
+run CycleInspect
+wait 800
+run CycleInspect
+wait 800
+run CycleInspect
+wait 1500
+run CycleInspect
+wait 3000
+shot viewer_gain_map.png
+run CycleInspect
+wait 6000
+shot viewer_hdr_rendition.png
+open {media}\HDR\pixel_hdrplus.jpg
+wait 6000
+shot pixel_hdr_rendition.png
+run CycleInspect
+wait 800
+run ShowMetadata
+wait 3000
+shot pixel_capture.png
+click 628 148
+wait 1500
+hover 640 450
+scroll -3000
+wait 800
+shot pixel_file_encoding_end.png
+run ShowMetadata
+wait 500
+run ShowMetadata
+wait 800
+open {media}\HDR
+wait 2500
+run SelectAll
+run Compare
+wait 4000
+key O
+wait 1500
+key O
+wait 800
+key O
+wait 800
+key O
+wait 800
+key O
+wait 800
+key O
+wait 800
+key O
+wait 1500
+key O
+wait 3000
+shot compare_gain_map.png
+key O
+wait 8000
+shot compare_hdr_rendition.png

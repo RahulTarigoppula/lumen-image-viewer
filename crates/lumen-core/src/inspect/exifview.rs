@@ -1,6 +1,7 @@
 //! EXIF tag groups, maker note summary (with a few robust Apple tags) and
 //! typed accessors used by the Capture section.
 
+use super::makernote::{google_hdrp, samsung_fields, SamsungNote};
 use super::{Field, Group};
 use exif::{Context, In, Tag, Value};
 
@@ -200,15 +201,19 @@ pub(crate) struct AppleNote {
     pub content_id: Option<String>,
     /// 0x0014 ImageCaptureType.
     pub capture_type: Option<i64>,
+    /// 0x0021 HDRHeadroom: with 0x0030, gives the headroom of Apple's HDR gain map.
+    pub hdr_headroom: Option<f64>,
+    /// 0x0030, the second input of Apple's gain map headroom formula.
+    pub hdr_gain: Option<f64>,
 }
 
 impl AppleNote {
     fn is_empty(&self) -> bool {
-        self.hdr_type.is_none() && self.burst.is_none() && self.content_id.is_none() && self.capture_type.is_none()
+        self.hdr_type.is_none() && self.burst.is_none() && self.content_id.is_none() && self.capture_type.is_none() && self.hdr_headroom.is_none()
     }
 }
 
-fn maker_note_bytes(e: &exif::Exif) -> Option<&[u8]> {
+pub(crate) fn maker_note_bytes(e: &exif::Exif) -> Option<&[u8]> {
     match &e.get_field(Tag::MakerNote, In::PRIMARY)?.value {
         Value::Undefined(v, _) => Some(v),
         Value::Byte(v) => Some(v),
@@ -241,6 +246,22 @@ pub(crate) fn apple_note(e: &exif::Exif) -> AppleNote {
                 _ => None,
             }
         };
+        // One (signed) rational, a float or an integer, as a number.
+        let real = || -> Option<f64> {
+            let at = |o: usize| -> Option<(f64, f64)> {
+                let o = be32(o)? as usize;
+                Some(match typ {
+                    5 => (be32(o)? as f64, be32(o + 4)? as f64),
+                    _ => (be32(o)? as i32 as f64, be32(o + 4)? as i32 as f64),
+                })
+            };
+            let v = match (typ, cnt) {
+                (5 | 10, 1) => at(o + 8).map(|(n, d)| n / d)?,
+                (11, 1) => f32::from_bits(be32(o + 8)?) as f64,
+                _ => int()? as f64,
+            };
+            v.is_finite().then_some(v)
+        };
         let ascii = || -> Option<String> {
             if typ != 2 || cnt == 0 || cnt > 256 {
                 return None;
@@ -254,6 +275,8 @@ pub(crate) fn apple_note(e: &exif::Exif) -> AppleNote {
             0x000b => out.burst = ascii(),
             0x0011 => out.content_id = ascii(),
             0x0014 => out.capture_type = int(),
+            0x0021 => out.hdr_headroom = real(),
+            0x0030 => out.hdr_gain = real(),
             _ => {}
         }
     }
@@ -271,20 +294,28 @@ pub(crate) fn apple_capture_type(v: i64) -> Option<&'static str> {
     })
 }
 
-/// "Maker note" group: size, maker, recognizable format and Apple tags.
-pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote) -> Option<Group> {
+/// "Maker note" group: size, maker, recognizable format, the decoded Samsung
+/// note, the Apple tags read, and what Google's encrypted note is.
+/// `google_xmp` names the encrypted Google Camera blocks found in the XMP.
+pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote, samsung: Option<&SamsungNote>, google_xmp: &[&str]) -> Option<Group> {
     let m = maker_note_bytes(e)?;
     let ex = Ex(e);
     let mut f = Vec::new();
     if let Some(make) = ex.text(Tag::Make) {
         f.push(Field::new("Maker", make, "From the EXIF Make tag."));
     }
-    f.push(Field::new(
-        "Size",
-        format!("{} bytes", super::thousands(m.len() as u64)),
-        "Maker notes hold the manufacturer's private data (processing settings, focus, face detection...). Their layout is proprietary and is not decoded here.",
-    ));
-    let sigs: [(&[u8], &str); 12] = [
+    let hdrp = google_hdrp(m);
+    let size_note = if samsung.is_some() {
+        "Maker notes hold the manufacturer's private data. This Samsung note is decoded below; tags Samsung does not document are shown as stored."
+    } else if hdrp.is_some() {
+        "Maker notes hold the manufacturer's private data. Google encrypts this one, so its content cannot be shown."
+    } else if !apple.is_empty() {
+        "Maker notes hold the manufacturer's private data. Only a few well-known Apple tags are decoded."
+    } else {
+        "Maker notes hold the manufacturer's private data (processing settings, focus, face detection...). Their layout is proprietary and is not decoded here."
+    };
+    f.push(Field::new("Size", format!("{} bytes", super::thousands(m.len() as u64)), size_note));
+    let sigs: [(&[u8], &str); 13] = [
         (b"Apple iOS\0", "Apple"),
         (b"Nikon\0", "Nikon"),
         (b"OLYMPUS\0", "Olympus"),
@@ -297,13 +328,34 @@ pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote) -> Option<Group> {
         (b"AOC\0", "Pentax"),
         (b"HUAWEI", "Huawei"),
         (b"HDRP", "Google HDR+"),
+        (b"STMN", "Samsung (older camera)"),
     ];
-    let format = sigs
-        .iter()
-        .find(|(sig, _)| m.starts_with(sig))
-        .map(|(_, n)| *n);
-    if let Some(fm) = format {
+    if let Some(s) = samsung {
+        let mut note = "Recognized from its first entry (the maker note version). Tag names follow ExifTool's Samsung Type2 table.".to_string();
+        if s.absolute {
+            note.push_str(" Its long values are located from the start of the EXIF block rather than of the maker note.");
+        }
+        f.push(Field::new("Format", "Samsung maker note (Type2)", note));
+        f.extend(samsung_fields(s));
+    } else if let Some((_, fm)) = sigs.iter().find(|(sig, _)| m.starts_with(sig)) {
         f.push(Field::new("Format", format!("{fm} maker note"), "Recognized from the maker note header."));
+    }
+    if let Some(v) = hdrp {
+        f.push(Field::new(
+            "Contents",
+            "Encrypted (not readable)",
+            "Google encrypts its HDR+ maker note; only Google's own tools read it. It is there when the photo went through HDR+ multi-frame processing.",
+        ));
+        if (1..=9).contains(&v) {
+            f.push(Field::new("HDR+ data version", v.to_string(), "The version byte after the HDRP header."));
+        }
+    }
+    if !google_xmp.is_empty() {
+        f.push(Field::new(
+            "Also stored (XMP)",
+            format!("{} (encrypted)", google_xmp.join(", ")),
+            "Other encrypted blocks the Google Camera app writes into the XMP; only Google's own tools read them.",
+        ));
     }
     if !apple.is_empty() {
         let note = "Decoded from the Apple maker note.";
@@ -323,6 +375,13 @@ pub(crate) fn maker_group(e: &exif::Exif, apple: &AppleNote) -> Option<Group> {
         }
         if let Some(v) = &apple.content_id {
             f.push(Field::new("Live Photo ID", v.clone(), "Pairs the photo with its Live Photo video (a separate .MOV file)."));
+        }
+        if let (Some(a), Some(b)) = (apple.hdr_headroom, apple.hdr_gain) {
+            f.push(Field::new(
+                "HDR headroom",
+                format!("x{:.2}", super::gainmap::apple_headroom(a, b)),
+                "How much brighter than SDR white the HDR version may go: Apple's formula on maker note tags 0x0021 and 0x0030.",
+            ));
         }
     }
     Some(Group { name: "Maker note".into(), fields: f })

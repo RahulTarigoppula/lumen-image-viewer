@@ -19,8 +19,10 @@
 mod capture;
 mod containers;
 mod exifview;
+pub mod gainmap;
 mod icc;
 mod jpeg;
+mod makernote;
 mod samsung;
 mod table;
 mod xmp;
@@ -58,7 +60,7 @@ pub struct Inspection {
     pub capture: Vec<Field>,
     /// Every EXIF tag: groups "Image", "EXIF", "GPS", "Interop", "Thumbnail" (tag name -> display value with units).
     pub exif: Vec<Group>,
-    /// Everything else, in this order when present: "File", "Encoding", "Color profile (ICC)", "XMP", "Samsung trailer", "Multi-picture (MPF)", "Maker note", "PNG text", "Comments".
+    /// Everything else, in this order when present: "File", "Encoding", "Color profile (ICC)", "XMP", "Samsung trailer", "Multi-picture (MPF)", "HDR gain map", "Maker note", "PNG text", "Comments".
     pub other: Vec<Group>,
     /// Problems while reading (truncated segment, unreadable XMP, ...), shown in the UI.
     pub warnings: Vec<String>,
@@ -157,6 +159,8 @@ pub(crate) struct Parts {
     pub encoding: Vec<Field>,
     /// MPF APP2 payload after "MPF\0" (TIFF structured).
     pub mpf: Option<Vec<u8>>,
+    /// Where that payload starts in the file (MPF image offsets count from there).
+    pub mpf_at: Option<usize>,
     pub comments: Vec<String>,
     pub png_text: Vec<Field>,
     /// End of the primary JPEG image (just after its EOI marker).
@@ -167,6 +171,10 @@ pub(crate) struct Parts {
     pub aux: Vec<String>,
     /// JPEG has an ISO 21496-1 gain map APP2 segment.
     pub iso_gain_map: bool,
+    /// The first such segment's payload after the name (only a version in a main image).
+    pub iso_gain_map_data: Option<Vec<u8>>,
+    /// Color components in the JPEG frame header (0 when unknown).
+    pub components: u8,
 }
 
 /// Everything the Capture and group builders read.
@@ -182,6 +190,12 @@ pub(crate) struct Ctx<'a> {
     pub aux: &'a [String],
     pub apple: &'a exifview::AppleNote,
     pub iso_gain_map: bool,
+    /// The decoded Samsung Type2 maker note.
+    pub samsung: Option<&'a makernote::SamsungNote>,
+    /// The EXIF maker note is Google's encrypted HDR+ note.
+    pub google_hdrp: bool,
+    /// The gain map, when one was found and its metadata read.
+    pub gain: Option<&'a gainmap::Found>,
 }
 
 impl Ctx<'_> {
@@ -189,6 +203,18 @@ impl Ctx<'_> {
     pub fn xget(&self, name: &str) -> Option<&str> {
         let suffix = format!(" / {name}");
         self.xmp.iter().find(|(k, _)| k == name || k.ends_with(&suffix)).map(|(_, v)| v.as_str())
+    }
+
+    /// The first XMP property (name, value) whose last name part is one of
+    /// `names`, ignoring case (Google wrote "shot_log_data" and "ShotLogData").
+    pub fn xfind(&self, names: &[&str]) -> Option<(&str, &str)> {
+        self.xmp
+            .iter()
+            .find(|(k, _)| {
+                let leaf = k.rsplit(" / ").next().unwrap_or(k.as_str());
+                names.iter().any(|n| leaf.eq_ignore_ascii_case(n))
+            })
+            .map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
     /// Whether any XMP property uses the namespace prefix (e.g. "hdrgm:").
@@ -367,7 +393,9 @@ pub(crate) fn inspect_impl(b: &[u8], ext: &str, total: u64) -> Inspection {
         }
     }
 
-    // EXIF.
+    // EXIF. The raw block is kept for maker notes that count offsets from
+    // its start (a TIFF file is its own block).
+    let exif_block = if kind == Kind::Tiff { None } else { p.exif_raw.clone() };
     let exif = match (p.exif_parsed.take(), p.exif_raw.take()) {
         (Some(e), _) => Some(e),
         (None, Some(raw)) => exifview::read_raw(raw, kind == Kind::Tiff, &mut warn),
@@ -376,6 +404,11 @@ pub(crate) fn inspect_impl(b: &[u8], ext: &str, total: u64) -> Inspection {
     if kind == Kind::Tiff {
         containers::tiff_after_exif(exif.as_ref(), &mut p);
     }
+    let tiff_block: Option<&[u8]> = if kind == Kind::Tiff { Some(b) } else { exif_block.as_deref() };
+    let maker_note = exif.as_ref().and_then(exifview::maker_note_bytes);
+    let make = exif.as_ref().and_then(|e| exifview::Ex(e).text(exif::Tag::Make));
+    let samsung_note = maker_note.and_then(|m| makernote::samsung(m, tiff_block, make.as_deref(), &mut warn));
+    let google_hdrp = maker_note.and_then(makernote::google_hdrp).is_some();
 
     // XMP: containers that have no dedicated slot get a raw packet search.
     if p.xmp.is_none() && !matches!(kind, Kind::Jpeg | Kind::Png | Kind::WebP) {
@@ -400,6 +433,24 @@ pub(crate) fn inspect_impl(b: &[u8], ext: &str, total: u64) -> Inspection {
     let apple = exif.as_ref().map(exifview::apple_note).unwrap_or_default();
     let icc_info = p.icc.as_deref().map(|d| icc::group(d, &mut warn));
 
+    // HDR gain map: where it is and what its metadata says (no pixels decoded here).
+    let gain = if kind == Kind::Jpeg {
+        let orientation = exif.as_ref().and_then(|e| exifview::Ex(e).uint(exif::Tag::Orientation)).map_or(1, |o| o.clamp(1, 8) as u8);
+        let pr = gainmap::Primary { mpf: &mpf, mpf_at: p.mpf_at, end: p.image_end, items: &items, xmp: &xmp_fields, orientation, apple: &apple, iso: p.iso_gain_map };
+        match (pr.announced() || mpf.len() > 1).then(|| gainmap::locate_in(b, &pr)) {
+            Some(Ok(f)) => Some(f),
+            Some(Err(e)) => {
+                if e.announced {
+                    warn.push(e.reason);
+                }
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let ctx = Ctx {
         exif: exif.as_ref(),
         xmp: &xmp_fields,
@@ -412,6 +463,9 @@ pub(crate) fn inspect_impl(b: &[u8], ext: &str, total: u64) -> Inspection {
         aux: &p.aux,
         apple: &apple,
         iso_gain_map: p.iso_gain_map,
+        samsung: samsung_note.as_ref(),
+        google_hdrp,
+        gain: gain.as_ref(),
     };
 
     let mut out = Inspection { capture: capture::build(&ctx), ..Default::default() };
@@ -436,8 +490,12 @@ pub(crate) fn inspect_impl(b: &[u8], ext: &str, total: u64) -> Inspection {
     if !mpf.is_empty() || !items.is_empty() {
         out.other.push(jpeg::mpf_group(&ctx));
     }
+    if let Some(g) = gain.as_ref() {
+        out.other.push(gainmap::group(g));
+    }
     if let Some(e) = exif.as_ref() {
-        if let Some(g) = exifview::maker_group(e, &apple) {
+        let google_blocks: Vec<&str> = xmp::GOOGLE_ENCRYPTED.iter().filter(|(names, _)| ctx.xfind(names).is_some()).map(|(_, what)| *what).collect();
+        if let Some(g) = exifview::maker_group(e, &apple, samsung_note.as_ref(), &google_blocks) {
             out.other.push(g);
         }
     }
@@ -534,7 +592,8 @@ fn xmp_group(text: Option<&str>, ext: Option<(usize, u64)>, fields: &[(String, S
         ));
     }
     for (k, v) in fields {
-        f.push(Field::new(k.clone(), v.clone(), xmp::note_for(k)));
+        let value = if xmp::is_google_encrypted(k) { xmp::encrypted_value(v) } else { v.clone() };
+        f.push(Field::new(k.clone(), value, xmp::note_for(k)));
     }
     Group { name: "XMP".into(), fields: f }
 }
