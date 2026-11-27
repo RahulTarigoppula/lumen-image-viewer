@@ -103,7 +103,7 @@ pub fn describe(c: Command) -> &'static str {
         BlindTest => "Judge random pairs of the project with names hidden; devices are ranked from the votes",
         MeasureProject => "Measure sharpness, noise, clipping and color of every capture in the project",
         ShowExif => "Every EXIF tag of the image; in Compare all images side by side with differences marked",
-        ShowMetadata => "Which camera features fired (HDR, night, zoom, lens), encoding, color profile, XMP and more",
+        ShowMetadata => "Capture features (HDR, night, zoom), EXIF, encoding, color profile; opens on the tab used last",
         TogglePixelValues => "Show RGB, hex, L*a*b* and luma of the pixel under the pointer (in Compare: V)",
         ExportMetadataCsv => "One row per image: camera features, exposure, every EXIF tag, JPEG quality",
         CopyImageText => "Read the text in the picture (screenshots, signs, documents) and copy it",

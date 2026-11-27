@@ -26,24 +26,131 @@ use std::sync::Arc;
 
 // ---------------------------------------------------------------- layout
 
-/// Pane rectangles: 1 = full, 2 = halves, 3 = three columns, 4 = 2×2 grid.
-pub fn pane_rects(n: usize, area: Rect, gap: f32) -> Vec<Rect> {
-    let col = |cols: usize, i: usize, r: Rect| -> Rect {
-        let w = (r.width() - gap * (cols as f32 - 1.0)) / cols as f32;
-        let x = r.min.x + i as f32 * (w + gap);
-        Rect::from_min_max(Pos2::new(x, r.min.y), Pos2::new(x + w, r.max.y))
-    };
-    match n {
-        0 => Vec::new(),
-        1 => vec![area],
-        2 | 3 => (0..n).map(|i| col(n, i, area)).collect(),
-        _ => {
-            let h = (area.height() - gap) / 2.0;
-            let top = Rect::from_min_max(area.min, Pos2::new(area.max.x, area.min.y + h));
-            let bottom = Rect::from_min_max(Pos2::new(area.min.x, area.max.y - h), area.max);
-            vec![col(2, 0, top), col(2, 1, top), col(2, 0, bottom), col(2, 1, bottom)]
+/// How Side by side arranges the panes (the Show menu). Auto picks
+/// whichever of the others shows these images largest in this window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaneLayout {
+    Auto,
+    Columns,
+    Rows,
+    Grid,
+}
+
+impl PaneLayout {
+    const ALL: [PaneLayout; 4] = [PaneLayout::Auto, PaneLayout::Columns, PaneLayout::Rows, PaneLayout::Grid];
+
+    fn label(self) -> &'static str {
+        match self {
+            PaneLayout::Auto => "Auto",
+            PaneLayout::Columns => "Columns",
+            PaneLayout::Rows => "Rows",
+            PaneLayout::Grid => "Grid",
         }
     }
+
+    fn icon(self) -> &'static str {
+        match self {
+            PaneLayout::Auto => I::LAYOUT,
+            PaneLayout::Columns => I::COLUMNS,
+            PaneLayout::Rows => I::ROWS,
+            PaneLayout::Grid => I::GRID_FOUR,
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            PaneLayout::Auto => "Columns, rows or a grid: whichever shows the images largest for their shape and the window",
+            PaneLayout::Columns => "The images next to each other in one row",
+            PaneLayout::Rows => "The images one above the other",
+            PaneLayout::Grid => "Two rows of two",
+        }
+    }
+
+    /// The cells of `n` panes (`None` for Auto, which depends on the images).
+    fn grid(self, n: usize) -> Option<Grid> {
+        let n = n.max(1);
+        match self {
+            PaneLayout::Auto => None,
+            PaneLayout::Columns => Some(Grid { cols: n, rows: 1 }),
+            PaneLayout::Rows => Some(Grid { cols: 1, rows: n }),
+            PaneLayout::Grid => {
+                let cols = (n as f32).sqrt().ceil() as usize;
+                Some(Grid { cols, rows: n.div_ceil(cols) })
+            }
+        }
+    }
+}
+
+/// Panes in `cols` x `rows` cells, filled row by row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Grid {
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl Grid {
+    /// The named layout this is (for "Auto (grid)").
+    fn kind(self) -> PaneLayout {
+        if self.rows <= 1 {
+            PaneLayout::Columns
+        } else if self.cols <= 1 {
+            PaneLayout::Rows
+        } else {
+            PaneLayout::Grid
+        }
+    }
+}
+
+/// Rectangles of `n` panes in `g` cells, `gap` points apart. A last row
+/// with fewer panes is centred, its panes as wide as the others.
+pub fn grid_rects(n: usize, g: Grid, area: Rect, gap: f32) -> Vec<Rect> {
+    let (cols, rows) = (g.cols.max(1), g.rows.max(1));
+    let w = (area.width() - gap * (cols as f32 - 1.0)) / cols as f32;
+    let h = (area.height() - gap * (rows as f32 - 1.0)) / rows as f32;
+    (0..n)
+        .map(|i| {
+            let (row, col) = (i / cols, i % cols);
+            let in_row = (n - row * cols).min(cols);
+            let x = area.min.x + (cols - in_row) as f32 * (w + gap) / 2.0 + col as f32 * (w + gap);
+            let y = area.min.y + row as f32 * (h + gap);
+            Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
+        })
+        .collect()
+}
+
+/// The cells Auto uses for images of `aspects` (width / height) in `area`:
+/// one row, one column or (3 or 4 images) a grid, whichever has the images,
+/// each fitted to its cell, cover the most of the area. Another layout has
+/// to win by more than 2% to replace one row, then the grid.
+pub fn auto_grid(aspects: &[f32], area: Vec2, gap: f32) -> Grid {
+    let n = aspects.len().max(1);
+    let mut options = vec![Grid { cols: n, rows: 1 }];
+    if n >= 3 {
+        options.extend(PaneLayout::Grid.grid(n));
+    }
+    if n >= 2 {
+        options.push(Grid { cols: 1, rows: n });
+    }
+    let covered = |g: Grid| -> f32 {
+        let cells = grid_rects(aspects.len(), g, Rect::from_min_size(Pos2::ZERO, area), gap);
+        cells
+            .iter()
+            .zip(aspects)
+            .map(|(c, a)| {
+                let a = if a.is_finite() && *a > 0.0 { *a } else { 4.0 / 3.0 };
+                let w = c.width().min(c.height() * a).max(0.0);
+                w * w / a
+            })
+            .sum()
+    };
+    let mut best = (options[0], covered(options[0]));
+    for g in options.into_iter().skip(1) {
+        let c = covered(g);
+        if c > best.1 * 1.02 {
+            best = (g, c);
+        }
+    }
+    best.0
 }
 
 // ---------------------------------------------------------------- view maths
@@ -277,20 +384,29 @@ struct DiffState {
 
 // ---------------------------------------------------------------- panes
 
-/// A view mode's segment label: icon and name, or the icon alone when narrow.
+/// A view mode's segment label: its name (like the app's other segmented
+/// controls), or its icon when the bar is narrow.
 fn mode_label(m: CmpMode, with_name: bool) -> String {
-    if with_name { format!("{}  {}", m.icon(), m.label()) } else { m.icon().to_string() }
+    if with_name { m.label().to_string() } else { m.icon().to_string() }
 }
 
 /// Names shown next to the toolbar icons when the bar has room.
 const SYNC_LABEL: &str = "Sync";
-const HIST_LABEL: &str = "Histogram";
-const EXIF_LABEL: &str = "Camera";
-const TAGS_LABEL: &str = "EXIF";
-const META_LABEL: &str = "Metadata";
+/// The Show menu's button always has its name.
+const SHOW_LABEL: &str = "Show";
 const SWAP_LABEL: &str = "Swap";
 const MARKUP_LABEL: &str = "Mark up";
 const REVIEW_LABEL: &str = "Review";
+
+/// A small muted heading over a group of menu rows ("Layout").
+fn menu_caption(ui: &mut Ui, label: &str) {
+    let p = theme::palette(ui.ctx());
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(10.0);
+        ui.label(RichText::new(label).font(text::caption()).color(p.muted));
+    });
+}
 
 /// A toolbar toggle or action: icon and name when `labels`, else the icon.
 fn bar_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, selected: bool, labels: bool) -> egui::Response {
@@ -334,11 +450,10 @@ impl CmpMode {
 
 /// Toolbar parts that move into the "..." menu when the toolbar is too
 /// narrow (the Analysis panel open, a large UI scale), first to go first.
-/// Help goes after the view toggles and the framing choice: the mode's own
-/// controls (Difference's Amplify) widen the bar, and the "?" button
-/// should not be what comes and goes when the mode changes.
+/// Help goes earlier, before the mode names (see `Compare::bar_plan`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BarPart {
+    /// The Show menu: overlays, layout, Metadata.
     Views,
     Basis,
     Help,
@@ -386,7 +501,7 @@ struct BarPlan {
     title: bool,
     /// Mode buttons with their names (else icons, names in the tooltips).
     labels: bool,
-    /// Sync, the view toggles and Swap with their names next to the icons.
+    /// Sync, Swap, Mark up and Review with their names next to the icons.
     icon_labels: bool,
     /// Difference's "Amplify" word before its slider (the tooltip says it too).
     amp_label: bool,
@@ -395,8 +510,8 @@ struct BarPlan {
     /// Parts moved into the "..." menu.
     hidden: Vec<BarPart>,
     /// Parts not offered at all, not even in the "..." menu: in a blind test
-    /// culling, swapping, mark up and review (and the camera, EXIF and
-    /// Metadata buttons of Views) would show what is hidden or change the
+    /// culling, swapping, mark up and review (and the camera strip and
+    /// Metadata of the Show menu) would show what is hidden or change the
     /// sides being voted on.
     omitted: Vec<BarPart>,
 }
@@ -424,6 +539,9 @@ struct Pane {
     hist: Option<Histogram>,
     hist_rx: Option<Receiver<Histogram>>,
     exif: crate::bg::BgSlot<PathBuf, Option<crate::meta::ExifSummary>>,
+    /// The file is on a drive without a Recycle Bin (network, removable):
+    /// deleting it is permanent.
+    no_bin: bool,
 }
 
 // ---------------------------------------------------------------- culling
@@ -495,10 +613,10 @@ pub struct SceneLink {
     pub done: bool,
 }
 
-/// The EXIF or Metadata window was asked for (the app opens it).
+/// The Metadata window was asked for (the app opens it, on the tab used
+/// last).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InfoRequest {
-    Exif,
     Metadata,
 }
 
@@ -523,7 +641,7 @@ pub struct Compare {
     pub link_requests: Vec<LinkRequest>,
     /// The workbench scorecard panel is shown (the app draws it).
     pub scorecard: bool,
-    /// The toolbar asked for the EXIF or Metadata window.
+    /// The Show menu asked for the Metadata window.
     pub info_request: Option<InfoRequest>,
     /// Pixel values under the pointer, at the same spot in every pane (V).
     probe: bool,
@@ -543,6 +661,8 @@ pub struct Compare {
     panes: Vec<Pane>,
     views: Vec<View>,
     mode: CmpMode,
+    /// How Side by side arranges the panes.
+    arrange: PaneLayout,
     sync: bool,
     basis: Basis,
     selected: usize,
@@ -558,9 +678,9 @@ pub struct Compare {
     /// The pane the open context menu acts on.
     menu_pane: usize,
     show_exif: bool,
-    /// Pane waiting for "move to Recycle Bin" confirmation.
+    /// Pane waiting for the delete confirmation.
     confirm_delete: Option<usize>,
-    /// Files moved to the Recycle Bin from compare mode (the app refreshes views).
+    /// Files deleted from compare mode (the app refreshes views).
     deleted: Vec<PathBuf>,
     /// "Analyze..." was chosen in a pane's context menu.
     analyze: bool,
@@ -665,7 +785,7 @@ impl Compare {
         let paths: Vec<PathBuf> = paths.into_iter().take(4).collect();
         let panes = paths
             .iter()
-            .map(|p| Pane { path: p.clone(), loaded: None, gpu: None, alt_gpu: None, aligned: None, align: None, showing_aligned: false, error: None, hist: None, hist_rx: None, exif: Default::default() })
+            .map(|p| Pane { path: p.clone(), loaded: None, gpu: None, alt_gpu: None, aligned: None, align: None, showing_aligned: false, error: None, hist: None, hist_rx: None, exif: Default::default(), no_bin: crate::fileops::is_permanent_delete(std::slice::from_ref(p)) })
             .collect();
         let (mode, sync, basis) = START;
         let views = vec![View::fitted(basis); paths.len()];
@@ -687,6 +807,7 @@ impl Compare {
             panes,
             views,
             mode,
+            arrange: PaneLayout::Auto,
             sync,
             basis,
             selected: 0,
@@ -723,7 +844,7 @@ impl Compare {
         self.rv.metrics = t;
     }
 
-    /// Files moved to the Recycle Bin while comparing, since the last call.
+    /// Files deleted while comparing, since the last call.
     pub fn take_deleted(&mut self) -> Vec<PathBuf> {
         std::mem::take(&mut self.deleted)
     }
@@ -763,20 +884,33 @@ impl Compare {
 
     fn delete_pane(&mut self, core: &mut Core, i: usize) {
         let Some(path) = self.panes.get(i).map(|p| p.path.clone()) else { return };
-        match crate::fileops::delete_to_trash(std::slice::from_ref(&path)) {
-            Ok(()) => {
+        match crate::fileops::recycle(std::slice::from_ref(&path)) {
+            Ok(outcome) => {
                 core.loader.invalidate(&path);
                 core.thumbs.forget(&path);
                 core.meta.forget(&path);
                 core.tags.removed(&path);
                 self.drop_pane(i);
                 self.deleted.push(path.clone());
-                core.toasts.success(format!("Moved {} to the Recycle Bin", name_of(&path)));
+                core.toasts.success(match outcome {
+                    crate::fileops::TrashOutcome::Recycled => format!("Moved {} to the Recycle Bin", name_of(&path)),
+                    crate::fileops::TrashOutcome::DeletedPermanently => format!("Deleted {} (network or removable drive: no Recycle Bin)", name_of(&path)),
+                });
                 if self.panes.is_empty() {
                     self.exit = true;
                 }
             }
             Err(e) => core.toasts.error(format!("Could not delete {}: {e}", name_of(&path))),
+        }
+    }
+
+    /// What deleting pane `i` does, as its menu item says it.
+    fn delete_label(&self, i: usize) -> String {
+        let letter = LETTERS[i.min(3)];
+        if self.panes.get(i).is_some_and(|p| p.no_bin) {
+            format!("Delete {letter} permanently (no Recycle Bin on its drive)")
+        } else {
+            format!("Move {letter} to the Recycle Bin")
         }
     }
 
@@ -1159,7 +1293,8 @@ impl Compare {
         }
     }
 
-    /// Rect each pane's image is laid out in (single shared rect for pair modes).
+    /// Rect each pane's image is laid out in (single shared rect for pair
+    /// modes). Everything that maps the panes to the screen uses this.
     fn layout(&self, area: Rect) -> Vec<Rect> {
         if !area.is_positive() {
             return Vec::new();
@@ -1167,8 +1302,32 @@ impl Compare {
         if self.pair_mode() {
             vec![area; self.panes.len()]
         } else {
-            pane_rects(self.panes.len(), area, 1.0)
+            grid_rects(self.panes.len(), self.grid(area), area, 1.0)
         }
+    }
+
+    /// The cells Side by side uses in `area`: the chosen layout, or Auto's.
+    fn grid(&self, area: Rect) -> Grid {
+        self.arrange.grid(self.panes.len()).unwrap_or_else(|| self.auto_layout(area))
+    }
+
+    /// The cells Auto picks for the images' shapes in `area` (4:3 for an
+    /// image still loading).
+    fn auto_layout(&self, area: Rect) -> Grid {
+        let aspects: Vec<f32> = self.panes.iter().map(|p| p.dims().map_or(4.0 / 3.0, |(w, h)| w as f32 / h.max(1) as f32)).collect();
+        auto_grid(&aspects, area.size(), 1.0)
+    }
+
+    /// "Match framing" and "Match pixels" differ only for images of
+    /// different sizes, and not in Difference (one image on screen): the
+    /// choice is offered only then.
+    fn basis_matters(&self) -> bool {
+        if self.pair_mode() && self.mode == CmpMode::Difference {
+            return false;
+        }
+        let mut dims = self.panes.iter().filter_map(|p| p.dims());
+        let Some(first) = dims.next() else { return false };
+        dims.any(|d| d != first)
     }
 
     fn effective(&self, i: usize, rects: &[Rect], ppp: f32, fit_ref: f32) -> Option<(f32, Vec2, (u32, u32))> {
@@ -1597,22 +1756,37 @@ impl Compare {
 
     fn delete_dialog(&mut self, ctx: &egui::Context, core: &mut Core) {
         let Some(i) = self.confirm_delete else { return };
-        let Some(path) = self.panes.get(i).map(|p| p.path.clone()) else {
+        let Some((path, permanent)) = self.panes.get(i).map(|p| (p.path.clone(), p.no_bin)) else {
             self.confirm_delete = None;
             return;
         };
+        // As in the browser: ask when the setting says so, and always when the
+        // file cannot go to the Recycle Bin (network and removable drives).
+        if !core.settings.confirm_delete && !permanent {
+            self.confirm_delete = None;
+            self.delete_pane(core, i);
+            return;
+        }
         let p = core.pal;
         let mut decision = None;
         widgets::modal(ctx, egui::Id::NULL.with("cmp-delete"), 400.0, |ui| {
-            widgets::modal_title(ui, "Move to Recycle Bin?");
+            widgets::modal_title(ui, if permanent { "Delete permanently?" } else { "Move to Recycle Bin?" });
             ui.label(RichText::new(format!("{}  {}", LETTERS[i.min(3)], name_of(&path))).color(p.text));
             ui.add_space(4.0);
-            widgets::modal_body(ui, "The image is removed from the comparison. You can restore it from the Recycle Bin.");
-            if let Some(r) = widgets::dialog_buttons(ui, &p, "Cancel", "Move to Recycle Bin", widgets::ButtonKind::Danger, true) {
+            widgets::modal_body(
+                ui,
+                if permanent {
+                    "The image is removed from the comparison. This drive has no Recycle Bin, so this cannot be undone."
+                } else {
+                    "The image is removed from the comparison. You can restore it from the Recycle Bin."
+                },
+            );
+            if let Some(r) = widgets::dialog_buttons(ui, &p, "Cancel", if permanent { "Delete permanently" } else { "Move to Recycle Bin" }, widgets::ButtonKind::Danger, true) {
                 decision = Some(r);
             }
-            // The Recycle Bin can undo it, so Enter confirms (as Delete does in Explorer).
-            if ui.input(|i| i.key_pressed(Key::Enter)) {
+            // The Recycle Bin can undo it, so Enter confirms (as Delete does in
+            // Explorer); a permanent delete takes the button.
+            if !permanent && ui.input(|i| i.key_pressed(Key::Enter)) {
                 decision = Some(true);
             }
             if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1764,7 +1938,7 @@ impl Compare {
             if toggle(ui, flagged, I::FLAG, &format!("Flag {letter}"), "Q") {
                 self.toggle_flag(core, pane);
             }
-            if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del") {
+            if item(ui, I::TRASH, &self.delete_label(pane), "Del") {
                 self.confirm_delete = Some(pane);
             }
         }
@@ -2013,25 +2187,84 @@ impl Compare {
         if self.probe {
             self.paint_probe(ui, &geos);
         }
-        // Thin separators.
-        for (i, r) in rects.iter().enumerate() {
-            if i > 0 {
-                let prev = rects[i - 1];
-                if (prev.min.y - r.min.y).abs() < 0.5 {
-                    let x = (prev.max.x + r.min.x) / 2.0;
-                    ui.painter().line_segment([Pos2::new(x, r.min.y), Pos2::new(x, r.max.y)], Stroke::new(1.0, p.border));
-                } else {
-                    let y = (prev.max.y.min(r.min.y) + r.min.y) / 2.0;
-                    let full = self.last_area;
-                    ui.painter().line_segment([Pos2::new(full.min.x, y), Pos2::new(full.max.x, y)], Stroke::new(1.0, p.border));
-                }
+        // Thin separators on the panes' inner edges, in the 1 pt gaps (a
+        // centred last row of a grid gets them on both sides).
+        let full = self.last_area;
+        let line = Stroke::new(1.0, p.border);
+        for r in rects {
+            let e = r.expand(0.5);
+            if r.min.x > full.min.x + 0.5 {
+                ui.painter().line_segment([e.left_top(), e.left_bottom()], line);
+            }
+            if r.max.x < full.max.x - 0.5 {
+                ui.painter().line_segment([e.right_top(), e.right_bottom()], line);
+            }
+            if r.min.y > full.min.y + 0.5 {
+                ui.painter().line_segment([e.left_top(), e.right_top()], line);
+            }
+            if r.max.y < full.max.y - 0.5 {
+                ui.painter().line_segment([e.left_bottom(), e.right_bottom()], line);
             }
         }
         if self.profile_mode {
             self.paint_profile(ui, core, &geos);
         }
+        // The selected pane's navigator, clear of what is in its corner.
+        if let Some(&r) = rects.get(self.selected.min(self.panes.len().saturating_sub(1))) {
+            let avoid = self.corner_overlays(r);
+            self.navigator(ui, core, rects, ppp, &avoid);
+        }
         if let Some(i) = remove {
             self.remove_pane(i);
+        }
+    }
+
+    /// What a pane drawn in `rect` shows in its bottom-right corner (the
+    /// histogram, see `paint_hist`, and the camera strip), for the navigator
+    /// to keep clear of.
+    fn corner_overlays(&self, rect: Rect) -> Vec<Rect> {
+        let mut v = Vec::new();
+        let hr = if self.show_exif { Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0)) } else { rect };
+        if self.show_hist {
+            v.push(Rect::from_min_max(hr.max - Vec2::new(226.0, 134.0), hr.max - Vec2::splat(8.0)));
+        }
+        if self.show_exif {
+            v.push(Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - 26.0), rect.max));
+        }
+        v
+    }
+
+    /// The zoom navigator of the pane the zoom keys act on (A in Split and
+    /// Difference) while its image is larger than the pane: an overview with
+    /// the part on screen framed, to drag; linked panes follow it. `avoid`:
+    /// overlays it keeps clear of. Not while marking up or drawing a line
+    /// profile, where a drag in the corner draws.
+    fn navigator(&mut self, ui: &mut Ui, core: &Core, rects: &[Rect], ppp: f32, avoid: &[Rect]) {
+        if !core.settings.zoom_navigator || self.profile_mode || (self.rv.markup && self.markup_allowed()) {
+            return;
+        }
+        let i = if self.pair_mode() { 0 } else { self.selected.min(self.panes.len().saturating_sub(1)) };
+        let fit_ref = self.fit_ref(rects, ppp);
+        let (Some((z, c, d)), Some(&pane)) = (self.effective(i, rects, ppp, fit_ref), rects.get(i)) else { return };
+        let dest = dest_rect(pane, ppp, d, z, c);
+        if dest.width() <= pane.width() + 1.0 && dest.height() <= pane.height() + 1.0 {
+            return;
+        }
+        // Difference shows |A - B| in A's place.
+        let tex = if self.pair_mode() && self.mode == CmpMode::Difference { self.diff.gpu.as_ref().and_then(|(_, g)| g.overview()) } else { self.panes[i].gpu.as_ref().and_then(|g| g.overview()) };
+        let Some(tex) = tex else { return };
+        let on = pane.intersect(dest);
+        let shown = Rect::from_min_max(((on.min - dest.min) / dest.size()).to_pos2(), ((on.max - dest.min) / dest.size()).to_pos2());
+        let Some(r) = widgets::navigator_rect(pane, d.0 as f32 / d.1.max(1) as f32, avoid) else { return };
+        let id = ui.scope_id().with("cmp-navigator");
+        let out = widgets::navigator(ui, id, r, tex, shown);
+        if out.visible {
+            crate::analysis_ui::canvas::occlude(ui.ctx(), r.expand(4.0));
+        }
+        if let Some(f) = out.pan_to {
+            let basis = self.basis;
+            let target = Vec2::new(f.x * d.0 as f32, f.y * d.1 as f32);
+            self.apply(i, |_| from_effective(basis, d, pane.size() * ppp, z, target));
         }
     }
 
@@ -2355,6 +2588,8 @@ impl Compare {
                 if !hresp.dragged() {
                     self.view_input(ui, core, &resp, 0, rects, ppp, &geos);
                 }
+                let avoid = self.corner_overlays(area);
+                self.navigator(ui, core, rects, ppp, &avoid);
             }
             CmpMode::Difference => {
                 let mut zshow = None;
@@ -2386,26 +2621,28 @@ impl Compare {
                     text.push_str(&format!("  ·  {:.0}%", z * 100.0));
                 }
                 Self::pill(ui, area.min + Vec2::new(10.0, 10.0), Align2::LEFT_TOP, &text, None, area.width() - 20.0);
+                let mut avoid = Vec::new();
                 if let Some(s) = self.diff.stats {
                     let psnr = if s.psnr.is_infinite() { "∞ (identical)".to_string() } else { format!("{:.2} dB", s.psnr) };
                     let mut st = format!("PSNR {psnr}  ·  mean Δ {:.2}  ·  max Δ {}  ·  {:.2}% pixels differ", s.mean, s.max, s.changed_pct);
                     if let Some(n) = &self.diff.note {
                         st.push_str(&format!("  ·  {n}"));
                     }
-                    Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None, area.width() - 20.0);
+                    avoid.push(Self::pill(ui, Pos2::new(area.center().x, area.max.y - 14.0), Align2::CENTER_BOTTOM, &st, None, area.width() - 20.0));
                 }
                 let src = 0;
                 self.view_input(ui, core, &resp, src, rects, ppp, &[]);
+                self.navigator(ui, core, rects, ppp, &avoid);
             }
             CmpMode::SideBySide => {}
         }
     }
 
     /// What fits in a toolbar of `avail` points: the image count goes first,
-    /// then the button names (Sync, Histogram, Camera, Swap), the mode names
-    /// and the title, then parts move into the "..." menu in [`BarPart`]
-    /// order (back, the mode buttons, zoom and the Analysis button always
-    /// stay).
+    /// then the button names (Sync, Swap, Mark up, Review), Difference's
+    /// "Amplify", the title and the "?" button, then the mode names, then
+    /// parts move into the "..." menu in [`BarPart`] order (back, the mode
+    /// buttons, Fit and the Analysis button always stay).
     fn bar_plan(&self, ui: &Ui, avail: f32) -> BarPlan {
         let s = ui.spacing().item_spacing.x;
         let pad = ui.spacing().button_padding.x * 2.0;
@@ -2428,9 +2665,8 @@ impl Compare {
             let labels = plan.icon_labels;
             match b {
                 BarPart::Help => icon,
-                // A blind test keeps only the histograms.
-                BarPart::Views if blind => sep + button(HIST_LABEL, labels),
-                BarPart::Views => sep + button(HIST_LABEL, labels) + button(EXIF_LABEL, labels) + button(TAGS_LABEL, labels) + button(META_LABEL, labels),
+                BarPart::Views => sep + widgets::labeled_menu_button_width(ui, SHOW_LABEL) + s,
+                BarPart::Basis if !self.basis_matters() => 0.0,
                 BarPart::Basis => 126.0 + s,
                 BarPart::Sync => sep + button(SYNC_LABEL, labels),
                 BarPart::Cull => {
@@ -2463,24 +2699,34 @@ impl Compare {
             w += if p.title { title } else { 0.0 } + if p.count { count } else { 0.0 };
             w + BarPart::ALL.iter().filter(|b| p.shown(**b)).map(|b| part(*b, p)).sum::<f32>()
         };
-        let hideable: Vec<BarPart> = BarPart::ALL.iter().copied().filter(|b| !plan.omitted.contains(b)).collect();
-        for step in 0..6 + hideable.len() {
+        let hideable: Vec<BarPart> = BarPart::ALL.iter().copied().filter(|b| *b != BarPart::Help && !plan.omitted.contains(b)).collect();
+        for step in 0..7 + hideable.len() {
             if width(&plan) <= avail {
                 break;
             }
             match step {
                 0 => plan.count = false,
                 1 => plan.icon_labels = false,
-                2 => plan.labels = false,
                 // Difference's "Amplify" goes before the title, so the bar
                 // keeps its left part when the mode changes.
-                3 => plan.amp_label = false,
-                4 => plan.title = false,
-                n if n - 5 < hideable.len() => plan.hidden.push(hideable[n - 5]),
+                2 => plan.amp_label = false,
+                // The title and "?" (the ? key and the "..." menu have it
+                // too) go before the mode names.
+                3 => plan.title = false,
+                4 => plan.hidden.push(BarPart::Help),
+                5 => plan.labels = false,
+                n if n - 6 < hideable.len() => plan.hidden.push(hideable[n - 6]),
                 _ => plan.modes_menu = true,
             }
         }
-        // What went first may fit again once the mode names are icons.
+        // What went first may fit again once later steps made room (the mode
+        // names became icons, a part moved into "...").
+        if plan.hidden.contains(&BarPart::Help) {
+            plan.hidden.retain(|b| *b != BarPart::Help);
+            if width(&plan) > avail {
+                plan.hidden.push(BarPart::Help);
+            }
+        }
         if !plan.title {
             plan.title = true;
             plan.title = width(&plan) <= avail;
@@ -2560,7 +2806,7 @@ impl Compare {
                     self.toggle_sync();
                 }
             }
-            if shown(BarPart::Basis) {
+            if shown(BarPart::Basis) && self.basis_matters() {
                 let mut basis = self.basis;
                 widgets::combo("cmp-basis")
                     .width(118.0)
@@ -2596,21 +2842,17 @@ impl Compare {
             }
             if shown(BarPart::Views) {
                 widgets::separator_v(ui);
-                if bar_button(ui, I::CHART_BAR, HIST_LABEL, "Histograms  (G)", self.show_hist, plan.icon_labels).clicked() {
-                    self.show_hist = !self.show_hist;
-                }
                 // Camera data and file names stay hidden in a blind test.
-                if !blind {
-                    if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
-                        self.show_exif = !self.show_exif;
-                    }
-                    if bar_button(ui, I::APERTURE, TAGS_LABEL, "EXIF of every image side by side, differences marked  (Ctrl+Shift+X)", false, plan.icon_labels).clicked() {
-                        self.info_request = Some(InfoRequest::Exif);
-                    }
-                    if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, "Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP  (Ctrl+Shift+I)", false, plan.icon_labels).clicked() {
-                        self.info_request = Some(InfoRequest::Metadata);
-                    }
-                }
+                let tip = if blind {
+                    "Show: histograms, pixel values, inspect views and how the panes are laid out"
+                } else {
+                    "Show: histograms, camera info, pixel values, inspect views, how the panes are laid out, and the Metadata window"
+                };
+                let open_id = ui.scope_id().with("cmp-show-open");
+                let was_open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+                let r = widgets::labeled_menu_button(ui, I::STACK, SHOW_LABEL, tip, was_open);
+                let open = egui::Popup::menu(&r).show(|ui| self.show_menu(ui)).is_some();
+                ui.data_mut(|d| d.insert_temp(open_id, open));
             }
             // Culling on the selected pane (keys act on the pane under the pointer).
             let sel = self.selected.min(self.panes.len().saturating_sub(1));
@@ -2632,7 +2874,7 @@ impl Compare {
                     if widgets::icon_button(ui, I::FLAG, &format!("Flag {letter}  (Q or `)"), flagged).clicked() {
                         self.toggle_flag(core, sel);
                     }
-                    if widgets::icon_button(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin  (Del)"), false).clicked() {
+                    if widgets::icon_button(ui, I::TRASH, &format!("{}  (Del)", self.delete_label(sel)), false).clicked() {
                         self.confirm_delete = Some(sel);
                     }
                 }
@@ -2663,6 +2905,62 @@ impl Compare {
                 widgets::separator_v(ui);
             });
         });
+    }
+
+    /// The Show menu: what is drawn over the images, how Side by side lays
+    /// out the panes, and the Metadata window.
+    fn show_menu(&mut self, ui: &mut Ui) {
+        ui.set_min_width(250.0);
+        let blind = self.blind();
+        let toggle = |ui: &mut Ui, on: bool, icon: &str, label: &str, key: &str, tip: &str| {
+            let r = widgets::menu_check(ui, on, icon, label, key).on_hover_text(tip).clicked();
+            if r {
+                ui.close();
+            }
+            r
+        };
+        if toggle(ui, self.show_hist, I::CHART_BAR, "Histograms", "G", "A histogram in the corner of every pane") {
+            self.show_hist = !self.show_hist;
+        }
+        // Camera data and file names stay hidden in a blind test.
+        if !blind && toggle(ui, self.show_exif, I::CAMERA, "Camera info strip", "H", "Camera, lens, exposure, aperture, ISO and focal length under every image") {
+            self.show_exif = !self.show_exif;
+        }
+        if toggle(ui, self.probe, I::EYEDROPPER, "Pixel values", "V", "RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane") {
+            self.probe = !self.probe;
+        }
+        widgets::submenu(ui, I::EYE, "Inspect view", |ui| {
+            for m in super::inspect_view::InspectMode::ALL {
+                if widgets::menu_toggle(ui, self.inspect == m, m.label(), "").on_hover_text(m.tip()).clicked() {
+                    self.inspect = m;
+                    ui.close();
+                }
+            }
+        });
+        if !self.pair_mode() && self.panes.len() >= 2 {
+            ui.separator();
+            menu_caption(ui, "Layout");
+            let auto = self.auto_layout(self.last_area).kind();
+            for l in PaneLayout::ALL {
+                if l == PaneLayout::Grid && self.panes.len() < 3 {
+                    continue;
+                }
+                let label = if l == PaneLayout::Auto { format!("Auto ({})", auto.label().to_lowercase()) } else { l.label().to_string() };
+                if widgets::menu_check(ui, self.arrange == l, l.icon(), &label, "").on_hover_text(l.tip()).clicked() {
+                    self.arrange = l;
+                    ui.close();
+                }
+            }
+        }
+        if !blind {
+            ui.separator();
+            let cmd = crate::ui::commands::Command::ShowMetadata;
+            let tip = "Metadata of every image side by side: capture features (HDR, night, zoom, lens), every EXIF tag, JPEG quality, color profile, XMP. Opens on the tab you used last";
+            if widgets::menu_item(ui, cmd.icon(), "Metadata...", &cmd.shortcut()).on_hover_text(tip).clicked() {
+                self.info_request = Some(InfoRequest::Metadata);
+                ui.close();
+            }
+        }
     }
 
     fn basis_choices(ui: &mut Ui, basis: &mut Basis) {
@@ -2699,18 +2997,6 @@ impl Compare {
             Some(on) => widgets::menu_check(ui, on, icon, label, key).clicked(),
             None => widgets::menu_item(ui, icon, label, key).clicked(),
         };
-        widgets::submenu(ui, I::EYE, "Inspect view", |ui| {
-            for m in super::inspect_view::InspectMode::ALL {
-                if widgets::menu_toggle(ui, self.inspect == m, m.label(), "").on_hover_text(m.tip()).clicked() {
-                    self.inspect = m;
-                    ui.close();
-                }
-            }
-        });
-        if widgets::menu_check(ui, self.probe, I::EYEDROPPER, "Pixel values", "V").on_hover_text("Show RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane").clicked() {
-            self.probe = !self.probe;
-            ui.close();
-        }
         let busy = self.align_job.is_some();
         let label = if busy { "Aligning..." } else { "Align to A (match field of view)" };
         if widgets::menu_check(ui, self.align_on, I::FRAME_CORNERS, label, "A")
@@ -2749,7 +3035,7 @@ impl Compare {
                         self.toggle_sync();
                     }
                 }
-                BarPart::Basis => {
+                BarPart::Basis if self.basis_matters() => {
                     let mut basis = self.basis;
                     widgets::submenu(ui, I::FRAME_CORNERS, "Framing", |ui| {
                         if widgets::menu_toggle(ui, basis == Basis::Relative, "Match framing", "").on_hover_text("Same relative position/zoom: images of different sizes stay aligned").clicked() {
@@ -2762,21 +3048,7 @@ impl Compare {
                     self.set_basis(basis);
                 }
                 BarPart::Views => {
-                    if item(ui, I::CHART_BAR, "Histograms", "G", Some(self.show_hist)) {
-                        self.show_hist = !self.show_hist;
-                    }
-                    if self.blind() {
-                        continue;
-                    }
-                    if item(ui, I::CAMERA, "Camera info strip", "H", Some(self.show_exif)) {
-                        self.show_exif = !self.show_exif;
-                    }
-                    if item(ui, I::APERTURE, "EXIF of every image", "Ctrl+Shift+X", None) {
-                        self.info_request = Some(InfoRequest::Exif);
-                    }
-                    if item(ui, I::FILE_MAGNIFYING_GLASS, "Metadata of every image", "Ctrl+Shift+I", None) {
-                        self.info_request = Some(InfoRequest::Metadata);
-                    }
+                    widgets::submenu(ui, I::STACK, SHOW_LABEL, |ui| self.show_menu(ui));
                 }
                 BarPart::Cull if !self.panes.is_empty() => {
                     sep(ui);
@@ -2787,7 +3059,7 @@ impl Compare {
                     if item(ui, I::FLAG, &format!("Flag {letter}"), "Q", Some(flagged)) {
                         self.toggle_flag(core, sel);
                     }
-                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del", None) {
+                    if item(ui, I::TRASH, &self.delete_label(sel), "Del", None) {
                         self.confirm_delete = Some(sel);
                         ui.close();
                     }
@@ -2850,7 +3122,7 @@ impl Compare {
             ("0 - 5", "Rate the image under the pointer"),
             ("Q  or  `", "Flag / unflag it"),
             ("K", "Keep it, reject the others (red label)"),
-            ("Del", "Move it to the Recycle Bin (no mark selected)"),
+            ("Del", "Delete it (no mark selected)"),
             ("H", "Camera info strip"),
             ("G", "Histograms"),
             ("?", "This help"),
@@ -2899,24 +3171,29 @@ mod tests {
         Rect::from_min_size(Pos2::new(0.0, 40.0), Vec2::new(1201.0, 801.0))
     }
 
+    /// The rects of `n` panes in `l` (not Auto).
+    fn rects_of(n: usize, l: PaneLayout, a: Rect) -> Vec<Rect> {
+        grid_rects(n, l.grid(n).unwrap(), a, 1.0)
+    }
+
     #[test]
     fn layout_two_three_four() {
         let a = area();
-        assert_eq!(pane_rects(1, a, 1.0), vec![a]);
-        let r2 = pane_rects(2, a, 1.0);
+        assert_eq!(rects_of(1, PaneLayout::Columns, a), vec![a]);
+        let r2 = rects_of(2, PaneLayout::Columns, a);
         assert_eq!(r2.len(), 2);
         assert!((r2[0].width() - 600.0).abs() < 1e-3 && (r2[1].width() - 600.0).abs() < 1e-3);
         assert_eq!(r2[0].min, a.min);
         assert_eq!(r2[1].max, a.max);
         assert!((r2[1].min.x - r2[0].max.x - 1.0).abs() < 1e-3);
-        let r3 = pane_rects(3, a, 1.0);
+        let r3 = rects_of(3, PaneLayout::Columns, a);
         assert_eq!(r3.len(), 3);
         for r in &r3 {
             assert!((r.width() - 399.6667).abs() < 1e-2);
             assert_eq!(r.height(), a.height());
         }
         assert!((r3[2].max.x - a.max.x).abs() < 1e-3);
-        let r4 = pane_rects(4, a, 1.0);
+        let r4 = rects_of(4, PaneLayout::Grid, a);
         assert_eq!(r4.len(), 4);
         assert_eq!(r4[0].min, a.min);
         assert_eq!(r4[3].max, a.max);
@@ -2932,6 +3209,47 @@ mod tests {
                 }
             }
         }
+        // Rows: full width, stacked with the gap between.
+        let rows = rects_of(3, PaneLayout::Rows, a);
+        assert!(rows.iter().all(|r| r.min.x == a.min.x && r.max.x == a.max.x));
+        assert!((rows[1].min.y - rows[0].max.y - 1.0).abs() < 1e-3 && (rows[2].max.y - a.max.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn three_in_a_grid_centre_the_last_one() {
+        let a = area();
+        let r = rects_of(3, PaneLayout::Grid, a);
+        assert_eq!(PaneLayout::Grid.grid(3), Some(Grid { cols: 2, rows: 2 }));
+        assert_eq!(r.len(), 3);
+        // Two on top, the third as big, centred below.
+        assert!((r[0].size() - r[2].size()).length() < 1e-3);
+        assert!((r[2].center().x - a.center().x).abs() < 1e-3);
+        assert!((r[2].min.y - r[0].max.y - 1.0).abs() < 1e-3 && (r[2].max.y - a.max.y).abs() < 1e-3);
+        // A grid of two is one row.
+        assert_eq!(PaneLayout::Grid.grid(2), Some(Grid { cols: 2, rows: 1 }));
+        assert_eq!(PaneLayout::Auto.grid(3), None);
+    }
+
+    #[test]
+    fn auto_layout_shows_the_images_largest() {
+        // The compare area of a 1280 x 800 window (below the toolbar).
+        let area = Vec2::new(1280.0, 756.0);
+        let landscape = 4.0 / 3.0;
+        let portrait = 3.0 / 4.0;
+        // Two landscape images: side by side.
+        assert_eq!(auto_grid(&[landscape; 2], area, 1.0).kind(), PaneLayout::Columns);
+        // Three landscape images: a 2 x 2 grid (31% zoom instead of 27% for 1600 px wide images).
+        assert_eq!(auto_grid(&[landscape; 3], area, 1.0), Grid { cols: 2, rows: 2 });
+        // Four landscape images: a grid; four portrait ones: one row.
+        assert_eq!(auto_grid(&[landscape; 4], area, 1.0).kind(), PaneLayout::Grid);
+        assert_eq!(auto_grid(&[portrait; 4], area, 1.0), Grid { cols: 4, rows: 1 });
+        // Wide panoramas in a tall area: one above the other.
+        assert_eq!(auto_grid(&[3.0, 3.0], Vec2::new(800.0, 1000.0), 1.0).kind(), PaneLayout::Rows);
+        // Square images in a square area: a near tie keeps one row.
+        assert_eq!(auto_grid(&[1.0; 2], Vec2::new(1000.0, 1000.0), 1.0).kind(), PaneLayout::Columns);
+        // An image still loading (no size yet) counts as 4:3; one image is one cell.
+        assert_eq!(auto_grid(&[f32::NAN; 3], area, 1.0).kind(), PaneLayout::Grid);
+        assert_eq!(auto_grid(&[landscape], area, 1.0), Grid { cols: 1, rows: 1 });
     }
 
     #[test]
@@ -3074,7 +3392,7 @@ mod tests {
 
     #[test]
     fn pane_at_finds_the_pane() {
-        let rects = pane_rects(4, area(), 1.0);
+        let rects = rects_of(4, PaneLayout::Grid, area());
         assert_eq!(pane_at(&rects, Pos2::new(10.0, 50.0)), Some(0));
         assert_eq!(pane_at(&rects, Pos2::new(1190.0, 50.0)), Some(1));
         assert_eq!(pane_at(&rects, Pos2::new(10.0, 830.0)), Some(2));

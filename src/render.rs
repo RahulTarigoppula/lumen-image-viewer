@@ -154,6 +154,13 @@ impl GpuImage {
         GpuImage { width, height, pyramid, levels, top, nearest0, frame_counter: 0, name: name.to_string() }
     }
 
+    /// The whole image as one small texture (the coarsest level, at most
+    /// [`TOP_MAX`] pixels on its long side, always resident): for overviews
+    /// such as the zoom navigator.
+    pub fn overview(&self) -> Option<egui::TextureId> {
+        self.top.as_ref().map(|t| t.id())
+    }
+
     /// Choose the pyramid level for a zoom factor (physical px per image px).
     fn level_for_zoom(&self, zoom: f32) -> usize {
         if zoom >= 1.0 {

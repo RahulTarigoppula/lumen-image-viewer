@@ -33,8 +33,7 @@ shot compare_metadata.png
 click 518 148
 wait 1500
 shot compare_metadata_other.png
-run ShowMetadata
-wait 500
+# Metadata opens on the tab used last, so the same command closes it again.
 run ShowMetadata
 wait 800
 key V

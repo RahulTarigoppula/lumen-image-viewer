@@ -2294,8 +2294,13 @@ impl MetricsTab {
         }
     }
 
-    /// The problem-area list (and its zoom clicks).
+    /// The problem-area list (and its zoom clicks). With no areas it says
+    /// so only when the checks above found nothing either: next to "5
+    /// things to check", "no problem areas" would read as a contradiction.
     fn areas_card(&mut self, ui: &mut Ui, p: &Palette, stale: bool) {
+        if self.area_sets().iter().all(|s| s.regions.is_empty()) && self.checks_found_something() {
+            return;
+        }
         let named = self.kind == Kind::Compare;
         let mut hovered = self.hover_area;
         let mut show = self.show_areas;
@@ -2305,6 +2310,16 @@ impl MetricsTab {
         if zoom.is_some() {
             self.zoom = zoom;
             self.show_areas = true;
+        }
+    }
+
+    /// The checks shown above the problem areas flag something: a summary
+    /// line worth a look (one image), or a Check or Poor verdict for any
+    /// image (compare).
+    fn checks_found_something(&self) -> bool {
+        match self.kind {
+            Kind::Compare => self.each.shots.iter().any(|s| each_image::CHECKS.iter().any(|c| each_image::cell(c, &s.values).and_then(|x| x.1).is_some_and(|v| v >= each_image::Verdict::Check))),
+            _ => self.summary.as_ref().is_some_and(|s| s.lines.iter().any(|l| l.level >= summary::Level::Fair)),
         }
     }
 

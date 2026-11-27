@@ -100,13 +100,18 @@ pub fn occlude(ctx: &Context, rect: Rect) {
     });
 }
 
+/// The controls recorded with [`occlude`] so far this frame (so other
+/// overlays, such as the zoom navigator, can keep clear of them).
+pub fn occluders(ctx: &Context) -> Vec<Rect> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<Frame>(id())).filter(|f| f.pass == pass).map(|f| f.occluders).unwrap_or_default()
+}
+
 /// `clip` without the controls drawn over the images: up to four rectangles
 /// per control (above, below, left and right of it).
 pub fn uncovered(ctx: &Context, clip: Rect) -> Vec<Rect> {
-    let pass = ctx.cumulative_pass_nr();
-    let occluders = ctx.data(|d| d.get_temp::<Frame>(id())).filter(|f| f.pass == pass).map(|f| f.occluders).unwrap_or_default();
     let mut parts = vec![clip];
-    for o in occluders {
+    for o in occluders(ctx) {
         parts = parts.into_iter().flat_map(|r| subtract(r, o)).collect();
     }
     parts
