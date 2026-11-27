@@ -838,7 +838,7 @@ impl InlineVideo {
         ui.painter().rect_stroke(rect, radius, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(6.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         // Clicks between the buttons stay on the bar (on the video they would pause it).
-        let _ = child.interact(rect, child.id().with("video-bar-blocker"), Sense::click_and_drag());
+        let _ = child.interact(rect, child.scope_id().with("video-bar-blocker"), Sense::click_and_drag());
         child.spacing_mut().item_spacing.x = 2.0;
         let mut out = None;
 

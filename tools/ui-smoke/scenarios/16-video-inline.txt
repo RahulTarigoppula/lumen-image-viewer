@@ -34,7 +34,8 @@ run Slideshow
 wait 2500
 shot slideshow.png
 state
-wait 5500
+# The first clip ends about a second later; the other one plays then.
+wait 2200
 shot slideshow_next.png
 state
 key Escape
