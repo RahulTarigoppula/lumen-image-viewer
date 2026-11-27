@@ -2,7 +2,8 @@ name: Dev check
 
 # Fast feedback for work branches: every push to dev/** compiles the full app
 # (FFmpeg video and AI included), runs clippy for hard errors and runs all unit
-# tests. The release build with the dist profile stays in build.yml.
+# tests, then tests the installer and the UI on that build. The release build
+# with the dist profile stays in build.yml.
 on:
   push:
     branches: ["dev/**"]
@@ -99,6 +100,38 @@ jobs:
         with:
           name: lumen-dev-pdb
           path: target/debug/lumen.pdb
+          retention-days: 3
+
+  # Installer test: builds Lumen-Setup.exe around the debug build from the check
+  # job (same script as the release in build.yml), installs it silently for the
+  # current user, installs over it and uninstalls, checking files, uninstall
+  # entry, shortcuts and file-type registration (installer/test-install.ps1).
+  # windows-2022 like the release job, so the same Inno Setup is used.
+  installer:
+    needs: check
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lumen-dev
+          path: installer-bin
+
+      - name: Build installer
+        shell: pwsh
+        run: installer/build.ps1 -Exe installer-bin/lumen.exe -Out installer-out -Compression lzma2/fast
+
+      - name: Test installer (silent install, upgrade, uninstall)
+        shell: pwsh
+        run: installer/test-install.ps1 -Setup installer-out/Lumen-Setup.exe
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lumen-setup-dev
+          path: installer-out/Lumen-Setup.exe
           retention-days: 3
 
   # UI smoke test: runs the debug build from the check job on Mesa's software

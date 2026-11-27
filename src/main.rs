@@ -26,10 +26,13 @@ fn main() -> eframe::Result {
     #[cfg(feature = "video")]
     lumen_core::video::set_thumbnailer(video::engine::thumbnail);
     logging::init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = shell_switch(&args) {
+        std::process::exit(code);
+    }
     // Rayon runs decoders, resizing and histograms: below the UI thread.
     let _ = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("lumen-rayon-{i}")).start_handler(|_| bg::background_priority()).build_global();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let initial: Option<PathBuf> = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
     let settings = settings::Settings::load();
@@ -101,4 +104,28 @@ fn main() -> eframe::Result {
 ", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
     }
     res
+}
+
+/// Switches for the installer: `--register-file-types` adds Lumen to "Open
+/// with" (as Settings, Windows integration, Register does) and `--unregister`
+/// removes all Windows integration (Remove all integration). Both work on the
+/// current user's registry, never open a window and return the exit code
+/// (0 = done, 1 = error, written to lumen.log).
+fn shell_switch(args: &[String]) -> Option<i32> {
+    let has = |s: &str| args.iter().any(|a| a == s);
+    let result = if has("--register-file-types") {
+        shell::register_file_types().map(|n| log::info!("registered {n} file types"))
+    } else if has("--unregister") {
+        shell::unregister_all()
+    } else {
+        return None;
+    };
+    Some(match result {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("{}: {e}", args.join(" "));
+            eprintln!("{e}");
+            1
+        }
+    })
 }
