@@ -12,6 +12,7 @@ pub mod encode;
 pub mod formats;
 pub mod imaging;
 pub mod inspect;
+pub mod jpeg_lossless;
 pub mod meta;
 pub mod metaedit;
 pub mod order;

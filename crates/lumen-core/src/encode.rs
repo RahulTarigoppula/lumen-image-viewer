@@ -447,12 +447,30 @@ pub fn compose_orientation(current: u8, op: crate::edit::Transform) -> u8 {
     1
 }
 
-/// Rotate/flip a JPEG losslessly by rewriting its EXIF orientation (no recompression).
-pub fn lossless_jpeg_transform(path: &Path, op: crate::edit::Transform) -> Result<u8> {
+/// How [`lossless_jpeg_transform`] turned a JPEG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LosslessTurn {
+    /// The EXIF orientation now in the file.
+    pub orientation: u8,
+    /// The picture itself was turned (its EXIF has no orientation tag), not
+    /// just the tag.
+    pub physical: bool,
+    /// Pixels cut off the new width and height to stay lossless (physical
+    /// turns of pictures that are not whole blocks wide or high).
+    pub trimmed: (u32, u32),
+    /// An HDR gain map was removed (physical turns only).
+    pub gain_map_removed: bool,
+}
+
+/// Rotate/flip a JPEG losslessly. Normally only its EXIF orientation is
+/// rewritten (instant, nothing trimmed). When the file has EXIF without an
+/// orientation tag, the picture itself is turned by moving its DCT blocks
+/// (`jpeg_lossless::rotate`).
+pub fn lossless_jpeg_transform(path: &Path, op: crate::edit::Transform) -> Result<LosslessTurn> {
     use img_parts::jpeg::Jpeg;
     use img_parts::{Bytes, ImageEXIF};
     let data = std::fs::read(path)?;
-    let mut jpeg = Jpeg::from_bytes(Bytes::from(data)).map_err(|e| anyhow!("Not a valid JPEG: {e}"))?;
+    let mut jpeg = Jpeg::from_bytes(Bytes::copy_from_slice(&data)).map_err(|e| anyhow!("Not a valid JPEG: {e}"))?;
     let current = jpeg.exif().map(|e| crate::decode::exif_orientation(&e)).unwrap_or(1);
     let new = compose_orientation(current, op);
     let mut exif = match jpeg.exif() {
@@ -460,10 +478,13 @@ pub fn lossless_jpeg_transform(path: &Path, op: crate::edit::Transform) -> Resul
         None => minimal_exif(1),
     };
     if !exif_set_orientation(&mut exif, new as u16) {
-        // EXIF present but without an orientation tag: replace with a minimal block
-        // only when it is tiny, otherwise refuse to avoid losing metadata.
+        // EXIF without an orientation tag: replace it with a minimal block
+        // only when it is tiny; otherwise turn the picture itself so no
+        // metadata is lost.
         if exif.len() > 64 {
-            return Err(anyhow!("This JPEG's metadata has no orientation tag; use regular rotation instead"));
+            let turned = crate::jpeg_lossless::rotate(&data, op)?;
+            write_atomic(path, &turned.bytes)?;
+            return Ok(LosslessTurn { orientation: 1, physical: true, trimmed: turned.trimmed, gain_map_removed: turned.gain_map_removed });
         }
         exif = minimal_exif(new as u16);
     }
@@ -471,7 +492,7 @@ pub fn lossless_jpeg_transform(path: &Path, op: crate::edit::Transform) -> Resul
     let mut out = Vec::new();
     jpeg.encoder().write_to(&mut out)?;
     write_atomic(path, &out)?;
-    Ok(new)
+    Ok(LosslessTurn { orientation: new, physical: false, trimmed: (0, 0), gain_map_removed: false })
 }
 
 /// A tiny little-endian TIFF block containing only the orientation tag.

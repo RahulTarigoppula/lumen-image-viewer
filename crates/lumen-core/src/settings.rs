@@ -195,6 +195,8 @@ pub struct Settings {
     pub jpeg_quality: u8,
     pub keep_exif_on_save: bool,
     pub lossless_jpeg_rotate: bool,
+    /// The crop tool's Lossless choice for JPEGs (last used).
+    pub lossless_crop: bool,
     pub color_manage: bool,
     pub magnifier_zoom: f32,
     pub magnifier_size: f32,
@@ -303,6 +305,7 @@ impl Default for Settings {
             jpeg_quality: 92,
             keep_exif_on_save: true,
             lossless_jpeg_rotate: true,
+            lossless_crop: false,
             color_manage: true,
             magnifier_zoom: 3.0,
             magnifier_size: 260.0,

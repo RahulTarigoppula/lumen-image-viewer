@@ -1,0 +1,33 @@
+# Lossless JPEG crop: on an unedited JPEG the crop tool offers Lossless; the
+# area snaps to the 16 px block grid (4:2:0) and Crop rewrites the file
+# without re-encoding it. Ctrl+Z puts the file back. Then a lossless turn of
+# a JPEG whose EXIF has no orientation tag: the picture itself is turned.
+@timeout 90
+open {media}\RoundA\DeviceZ\scene_02.jpg
+wait 3000
+run Crop
+wait 1500
+shot crop_tool.png
+click 990 62
+wait 1000
+shot crop_lossless.png
+drag 60 100 700 520
+wait 1000
+shot crop_snapped.png
+key Enter
+wait 6000
+shot cropped.png
+state
+key Ctrl+Z
+wait 4000
+shot crop_undone.png
+state
+open {media}\RoundA\DeviceZ\scene_03.jpg
+wait 3000
+run RotateRight
+wait 6000
+shot turned.png
+state
+key Ctrl+Z
+wait 4000
+state
