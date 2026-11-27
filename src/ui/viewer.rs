@@ -2,7 +2,7 @@
 //! preview editing, info panel, filmstrip and animation playback.
 
 use super::commands::Command;
-use super::roi::{ImageTransform, RoiEditor, RoiOptions};
+use super::roi::{AxisSnap, ImageTransform, RoiEditor, RoiOptions, RoiSnap};
 use super::safe::{safe_clamp, sane_zoom};
 use super::icons as I;
 use super::theme::{self, size, text, Palette};
@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 pub enum ViewerEvent {
     Command(Command),
     Close,
+    /// Crop the JPEG file `path` in place without re-encoding it: (x, y, w,
+    /// h) in the file's displayed pixels.
+    LosslessCrop { path: PathBuf, rect: (u32, u32, u32, u32) },
 }
 
 struct Anim {
@@ -257,6 +260,33 @@ pub struct CropState {
     pub roi: RoiEditor,
     /// The area the crop started with (in the same pixels): anything else is the user's work.
     initial: [f32; 4],
+    /// Lossless crop of an unedited JPEG: its block grid, or why it cannot
+    /// be done. `None` for other files and for edited images.
+    lossless: Option<Result<LosslessGrid, String>>,
+}
+
+/// The block grid of the JPEG being cropped, for lossless crop.
+struct LosslessGrid {
+    grid: lumen_core::jpeg_lossless::CropGrid,
+    /// Pixels of the image shown per displayed pixel of the file (1 unless
+    /// the image shown is scaled).
+    scale: (f32, f32),
+}
+
+impl LosslessGrid {
+    /// The grid in the crop tool's pixels.
+    fn snap(&self) -> RoiSnap {
+        let (ax, ay) = self.grid.axes();
+        RoiSnap { x: AxisSnap { step: ax.step as f32 * self.scale.0, from_end: ax.from_end }, y: AxisSnap { step: ay.step as f32 * self.scale.1, from_end: ay.from_end } }
+    }
+
+    /// "The left and top edges snap to a 16 px grid".
+    fn edges_text(&self) -> String {
+        let (ax, ay) = self.grid.axes();
+        let step = if ax.step == ay.step { format!("{} px", ax.step) } else { format!("{} × {} px", ax.step, ay.step) };
+        let (x, y) = (if ax.from_end { "right" } else { "left" }, if ay.from_end { "bottom" } else { "top" });
+        format!("The {x} and {y} edges snap to a {step} grid")
+    }
 }
 
 impl CropState {
@@ -779,9 +809,26 @@ impl Viewer {
         }
         self.tool = None;
         let (w, h) = (img.width() as f32, img.height() as f32);
-        let roi = RoiEditor::new((w, h), RoiOptions::crop()).with_rect([w * 0.1, h * 0.1, w * 0.9, h * 0.9]);
+        let mut roi = RoiEditor::new((w, h), RoiOptions::crop()).with_rect([w * 0.1, h * 0.1, w * 0.9, h * 0.9]);
+        let lossless = self.lossless_grid((w, h));
+        if let Some(Ok(g)) = lossless.as_ref().filter(|_| core.settings.lossless_crop) {
+            roi.set_snap(Some(g.snap()));
+        }
         let initial = roi.rect().unwrap_or_default();
-        self.crop = Some(CropState { roi, initial });
+        self.crop = Some(CropState { roi, initial, lossless });
+    }
+
+    /// Lossless crop for the open file, shown at `size`: only an unedited
+    /// JPEG whose blocks can be read (otherwise why not).
+    fn lossless_grid(&self, (w, h): (f32, f32)) -> Option<Result<LosslessGrid, String>> {
+        let path = self.current().filter(|p| crate::formats::is_jpeg_ext(&crate::formats::ext_of(p)))?;
+        if self.is_dirty() {
+            return None;
+        }
+        Some(lumen_core::jpeg_lossless::probe_file(path).map_err(|e| e.to_string()).map(|grid| {
+            let (dw, dh) = grid.display_size();
+            LosslessGrid { grid, scale: (w / dw.max(1) as f32, h / dh.max(1) as f32) }
+        }))
     }
 
     /// Where a fitted picture goes. In a window the caption (top) and the bottom
@@ -947,7 +994,7 @@ impl Viewer {
             egui::Panel::right("viewer-tool").resizable(false).exact_size(TOOL_PANEL_W).frame(tool_frame).show(ui, |ui| self.tool_panel(ui, core, &mut ev));
         }
         if self.crop.is_some() {
-            egui::Panel::right("viewer-crop").resizable(false).exact_size(TOOL_PANEL_W).frame(tool_frame).show(ui, |ui| self.crop_panel(ui, core));
+            egui::Panel::right("viewer-crop").resizable(false).exact_size(TOOL_PANEL_W).frame(tool_frame).show(ui, |ui| self.crop_panel(ui, core, &mut ev));
         }
         if self.show_filmstrip {
             // 64 pt cells with 10 pt above and below.
@@ -2469,7 +2516,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         let _ = ev;
     }
 
-    fn crop_panel(&mut self, ui: &mut Ui, core: &mut Core) {
+    fn crop_panel(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
         let Some(img) = self.current_image(core) else { return };
         let (iw, ih) = (img.width() as f32, img.height() as f32);
@@ -2484,6 +2531,26 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         }
         let body_h = (ui.available_height() - footer_height(false) - ui.spacing().item_spacing.y * 2.0).max(60.0);
         egui::ScrollArea::vertical().id_salt("crop-body").auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
+            // Unedited JPEGs: crop the file itself without re-saving it.
+            match &c.lossless {
+                Some(Ok(g)) => {
+                    let mut on = core.settings.lossless_crop;
+                    let tip = format!("Crops without re-saving the picture, so no quality is lost. {}.", g.edges_text());
+                    if widgets::checkbox(ui, &mut on, "Lossless").on_hover_text(tip).changed() {
+                        core.settings.lossless_crop = on;
+                        c.roi.set_snap(on.then(|| g.snap()));
+                    }
+                    if on {
+                        ui.label(RichText::new(format!("{}. Crop saves the file right away.", g.edges_text())).size(text::SMALL).color(p.muted));
+                    }
+                    ui.add_space(6.0);
+                }
+                Some(Err(why)) => {
+                    ui.add_enabled_ui(false, |ui| widgets::checkbox(ui, &mut false, "Lossless")).inner.on_disabled_hover_text(format!("Lossless crop is not possible here: {why}"));
+                    ui.add_space(6.0);
+                }
+                None => {}
+            }
             widgets::section_title(ui, &p, "Aspect ratio");
             // Free and Original as segments; fixed ratios in a combo beside them.
             let ratios: [(&str, f32); 8] = [("1:1", 1.0), ("4:3", 4.0 / 3.0), ("3:2", 1.5), ("16:9", 16.0 / 9.0), ("5:4", 1.25), ("3:4", 0.75), ("2:3", 2.0 / 3.0), ("9:16", 9.0 / 16.0)];
@@ -2562,10 +2629,23 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         }
         if apply {
             let (x, y, w, h) = super::roi::pixel_rect(c.rect());
+            let lossless = match &c.lossless {
+                Some(Ok(g)) if core.settings.lossless_crop => Some(g.scale),
+                _ => None,
+            };
             self.crop = None;
-            self.apply_simple(core, "Crop", |img| crate::edit::ops::crop(img, x, y, w, h));
-            self.auto_fit = Some(core.settings.fit_mode);
-            self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
+            match (lossless, self.current().cloned()) {
+                // The app writes the file and shows it again.
+                (Some((kx, ky)), Some(path)) => {
+                    let px = |v: u32, k: f32| (v as f32 / k.max(1e-6)).round() as u32;
+                    ev.push(ViewerEvent::LosslessCrop { path, rect: (px(x, kx), px(y, ky), px(w, kx).max(1), px(h, ky).max(1)) });
+                }
+                _ => {
+                    self.apply_simple(core, "Crop", |img| crate::edit::ops::crop(img, x, y, w, h));
+                    self.auto_fit = Some(core.settings.fit_mode);
+                    self.refit_on_size = Some((self.view_img, core.settings.fit_mode));
+                }
+            }
         } else if cancel {
             self.crop = None;
         }
