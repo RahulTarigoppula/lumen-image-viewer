@@ -2,8 +2,8 @@
 .SYNOPSIS
   Builds Lumen-Setup.exe from a built lumen.exe with Inno Setup 6.
 .DESCRIPTION
-  Finds ISCC.exe (installs Inno Setup with Chocolatey when it is missing or
-  older than 6.3), reads the version from Cargo.toml ([workspace.package]) and
+  Finds ISCC.exe (installs Inno Setup with Chocolatey when it is missing; 6.3
+  or later is needed), reads the version from Cargo.toml ([workspace.package]) and
   compiles installer\lumen.iss. Used by .github/workflows/build.yml (release)
   and dev.yml (install test).
 .EXAMPLE
@@ -30,8 +30,8 @@ New-Item -ItemType Directory -Force $Out | Out-Null
 $outPath = (Resolve-Path $Out).Path
 
 function Find-Iscc {
-    # The install folder first: the iscc.exe on PATH of the GitHub images is a
-    # Chocolatey shim without version information.
+    # The install folder first; on the GitHub images the iscc.exe on PATH is a
+    # Chocolatey shim for it.
     foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles, (Join-Path $env:LOCALAPPDATA "Programs"))) {
         if (-not $base) { continue }
         $p = Join-Path $base "Inno Setup 6\ISCC.exe"
@@ -42,22 +42,17 @@ function Find-Iscc {
     return $null
 }
 
-function Get-IsccVersion([string] $path) {
-    $v = (Get-Item $path).VersionInfo
-    return [version]::new($v.FileMajorPart, $v.FileMinorPart, $v.FileBuildPart)
-}
-
-# x64compatible needs Inno Setup 6.3 or later (0.0.0: no version information, assume it is new enough).
+# ISCC prints its own version ("Compiler engine version") and rejects the
+# script if it is older than 6.3 (x64compatible).
 $iscc = Find-Iscc
-$old = $iscc -and (Get-IsccVersion $iscc) -gt [version]"0.0.0" -and (Get-IsccVersion $iscc) -lt [version]"6.3.0"
-if (-not $iscc -or $old) {
-    Write-Host "Inno Setup 6.3+ not found (have: $iscc), installing it with Chocolatey"
-    choco upgrade innosetup -y --no-progress
-    if ($LASTEXITCODE -ne 0) { throw "choco upgrade innosetup failed (exit code $LASTEXITCODE)" }
+if (-not $iscc) {
+    Write-Host "Inno Setup not found, installing it with Chocolatey"
+    choco install innosetup -y --no-progress
+    if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed (exit code $LASTEXITCODE)" }
     $iscc = Find-Iscc
     if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
 }
-Write-Host "Inno Setup $(Get-IsccVersion $iscc): $iscc"
+Write-Host "ISCC: $iscc"
 Write-Host "Lumen $Version from $exePath, $Compression"
 
 & $iscc "/DMyAppVersion=$Version" "/DMyAppExe=$exePath" "/DMyCompression=$Compression" "/O$outPath" (Join-Path $PSScriptRoot "lumen.iss")
