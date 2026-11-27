@@ -1,0 +1,35 @@
+# Compare: the zoom navigator at 100% (dragged to pan both linked panes), the
+# Show menu, and a manual pane layout (Rows) for three images.
+open {media}\Compare2
+wait 2500
+run SelectAll
+run Compare
+wait 3000
+key Z
+wait 800
+hover 540 722
+wait 800
+shot navigator.png
+drag 540 722 495 700
+wait 800
+shot navigator_dragged.png
+# The Show menu button (left of Keep A).
+click 690 22
+wait 800
+shot show_menu.png
+key Escape
+wait 500
+key Escape
+wait 1500
+open {media}\Compare3
+wait 2500
+run SelectAll
+run Compare
+wait 3500
+click 470 22
+wait 800
+shot three_show_menu.png
+# Layout: Rows.
+click 526 288
+wait 1500
+shot three_rows.png

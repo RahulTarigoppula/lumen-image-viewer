@@ -123,6 +123,57 @@ pub fn labeled_icon_button_width(ui: &Ui, label: &str) -> f32 {
     (8.0 + size::ICON_TOOLBAR + 6.0 + w + 10.0).round()
 }
 
+/// A toolbar button that opens a menu ("Show"): a [`labeled_icon_button`]
+/// with a caret after the label, drawn selected while `open`. Show the menu
+/// with `egui::Popup::menu(&response)`. Width: [`labeled_menu_button_width`].
+pub fn labeled_menu_button(ui: &mut Ui, icon: &str, label: &str, tip: &str, open: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(labeled_menu_button_width(ui, label), 30.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let vis = ui.visuals();
+        let hovered = resp.hovered();
+        let bg = if open {
+            vis.selection.bg_fill
+        } else if resp.is_pointer_button_down_on() {
+            vis.widgets.active.weak_bg_fill
+        } else if hovered {
+            vis.widgets.hovered.weak_bg_fill
+        } else {
+            Color32::TRANSPARENT
+        };
+        let fg = if open {
+            vis.selection.stroke.color
+        } else if hovered {
+            vis.strong_text_color()
+        } else {
+            vis.text_color()
+        };
+        let muted = theme::palette(ui.ctx()).muted;
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(radius::CONTROL), bg);
+        let x = rect.left() + 8.0;
+        painter.text(egui::pos2(x + size::ICON_TOOLBAR / 2.0, rect.center().y), Align2::CENTER_CENTER, icon, FontId::proportional(size::ICON_TOOLBAR), fg);
+        let g = painter.layout_no_wrap(label.to_string(), text::body(), fg);
+        let lx = x + size::ICON_TOOLBAR + 6.0;
+        let caret_x = lx + g.size().x + 6.0 + size::ICON_CARET / 2.0;
+        painter.galley(egui::pos2(lx, rect.center().y - g.size().y / 2.0), g, fg);
+        paint_caret(painter, egui::pos2(caret_x, rect.center().y), std::f32::consts::FRAC_PI_2, size::ICON_CARET, if open { fg } else { muted });
+        if resp.has_focus() {
+            painter.rect_stroke(rect, CornerRadius::same(radius::CONTROL), Stroke::new(1.0, vis.text_color()), StrokeKind::Inside);
+        }
+    }
+    if !tip.is_empty() {
+        resp.on_hover_text(tip)
+    } else {
+        resp
+    }
+}
+
+/// Width of a [`labeled_menu_button`] with `label`: a
+/// [`labeled_icon_button`] plus the caret and its gap.
+pub fn labeled_menu_button_width(ui: &Ui, label: &str) -> f32 {
+    labeled_icon_button_width(ui, label) + 6.0 + size::ICON_CARET
+}
+
 /// Run `add` with button visuals filled with `fill` and `fg` text in every state
 /// (hover lightens, press darkens), no border.
 fn filled_button_scope<R>(ui: &mut Ui, fill: Color32, fg: Color32, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -848,6 +899,13 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) -> bool {
     changed
 }
 
+/// The width [`segmented`] takes when it has room for every label: equal
+/// segments as wide as the widest label plus 24 pt, in a 2 pt inset track.
+pub fn segmented_width(ui: &Ui, labels: &[&str]) -> f32 {
+    let widest = labels.iter().map(|l| ui.painter().layout_no_wrap(l.to_string(), text::body(), Color32::WHITE).size().x).fold(0.0, f32::max);
+    (widest + 24.0) * labels.len().max(1) as f32 + 4.0
+}
+
 /// [`segmented`] over values: `options` pairs each value with its label.
 pub fn segmented_value<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let mut idx = options.iter().position(|(v, _)| *v == *value).unwrap_or(usize::MAX);
@@ -1534,6 +1592,147 @@ pub fn show_confirm_with(ctx: &egui::Context, title: &str, body: &str, confirm: 
     result
 }
 
+// ====================================================================== zoom navigator
+
+/// Largest size of the zoom navigator's overview (points).
+const NAVIGATOR_MAX: Vec2 = Vec2::new(176.0, 132.0);
+/// Gap between the navigator and the edge of its area (and what it avoids).
+const NAVIGATOR_MARGIN: f32 = 12.0;
+/// Seconds the navigator stays after the view last moved; then it fades out.
+const NAVIGATOR_LINGER: f64 = 1.6;
+
+/// Where the zoom navigator of an image `aspect` (width / height) goes in
+/// `area`: at most [`NAVIGATOR_MAX`] and 30% of the area, in the
+/// bottom-right corner, else clear of the rectangles in `avoid` (a toolbar,
+/// a histogram): above them at the right edge, or failing that left of
+/// them, as far right and as low as it goes. `None` when it would be too
+/// small or nothing is clear.
+pub fn navigator_rect(area: Rect, aspect: f32, avoid: &[Rect]) -> Option<Rect> {
+    if !area.is_positive() || !aspect.is_finite() || aspect <= 0.0 {
+        return None;
+    }
+    let max = Vec2::new(NAVIGATOR_MAX.x.min(area.width() * 0.3), NAVIGATOR_MAX.y.min(area.height() * 0.3));
+    let size = if max.x / max.y > aspect { Vec2::new(max.y * aspect, max.y) } else { Vec2::new(max.x, max.x / aspect) };
+    if size.min_elem() < 36.0 {
+        return None;
+    }
+    let m = NAVIGATOR_MARGIN;
+    let corner = area.max - size - Vec2::splat(m);
+    let mut xs: Vec<f32> = std::iter::once(corner.x).chain(avoid.iter().map(|a| a.min.x - m - size.x)).filter(|x| *x <= corner.x).collect();
+    let mut ys: Vec<f32> = std::iter::once(corner.y).chain(avoid.iter().map(|a| a.min.y - m - size.y)).filter(|y| *y <= corner.y).collect();
+    xs.sort_by(|a, b| b.total_cmp(a));
+    ys.sort_by(|a, b| b.total_cmp(a));
+    let clear = |r: &Rect| area.contains_rect(*r) && !avoid.iter().any(|a| a.intersects(r.expand(m / 2.0)));
+    xs.iter().flat_map(|x| ys.iter().map(move |y| Rect::from_min_size(Pos2::new(*x, *y), size))).find(clear)
+}
+
+/// What the zoom navigator keeps between frames.
+#[derive(Clone, Copy, Default)]
+struct NavigatorState {
+    /// The part of the image on screen last frame.
+    shown: Option<Rect>,
+    /// When the view last moved or the pointer was last on the navigator
+    /// (input time, seconds).
+    active_at: f64,
+    /// While dragging: the pointer's offset from the frame's centre.
+    grab: Option<Vec2>,
+    /// The pass it was last shown in: not shown in the previous pass (the
+    /// image fitted, another image) counts as a change of view.
+    pass: u64,
+}
+
+/// What [`navigator`] did this frame.
+pub struct NavigatorOut {
+    /// It was drawn (callers keep their image overlays off it).
+    pub visible: bool,
+    /// The user moved the view: its new centre, as fractions of the image.
+    pub pan_to: Option<Pos2>,
+}
+
+/// The zoom navigator: the whole image (`tex`) in `rect` (see
+/// [`navigator_rect`]) with the part on screen (`shown`, fractions 0..1 of
+/// the image) framed and the rest dimmed. Drag the frame to pan; click or
+/// drag beside it to jump there. It shows while the view moves and while
+/// the pointer is over it, and fades out a moment after.
+pub fn navigator(ui: &mut Ui, id: Id, rect: Rect, tex: egui::TextureId, shown: Rect) -> NavigatorOut {
+    let unit = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    let shown = Rect::from_min_max(unit.clamp(shown.min), unit.clamp(shown.max));
+    let now = ui.input(|i| i.time);
+    let mut st: NavigatorState = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let pass = ui.ctx().cumulative_pass_nr();
+    let moved = st.pass + 1 != pass || st.shown.is_none_or(|s| (s.min - shown.min).length() > 1e-4 || (s.max - shown.max).length() > 1e-4);
+    st.shown = Some(shown);
+    st.pass = pass;
+    if moved || st.grab.is_some() || ui.rect_contains_pointer(rect) {
+        st.active_at = now;
+    }
+    let left = NAVIGATOR_LINGER - (now - st.active_at);
+    let t = ui.ctx().animate_bool_with_time(id.with("fade"), left > 0.0, 0.25);
+    if left > 0.0 {
+        ui.ctx().request_repaint_after(Duration::from_secs_f64(left));
+    }
+    let mut out = NavigatorOut { visible: t > 0.0, pan_to: None };
+    if t <= 0.0 {
+        // Faded out: the corner belongs to the image again (hovering it
+        // brings the navigator back).
+        st.grab = None;
+        ui.data_mut(|d| d.insert_temp(id, st));
+        return out;
+    }
+    let frame = Rect::from_min_max(rect.lerp_inside(shown.min.to_vec2()), rect.lerp_inside(shown.max.to_vec2()));
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    let to_image = |p: Pos2| unit.clamp(((p - rect.min) / rect.size()).to_pos2());
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        // The frame moves from where it was taken; pressed beside it, it jumps there.
+        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(frame.center());
+        st.grab = Some(if frame.contains(origin) { origin - frame.center() } else { Vec2::ZERO });
+    }
+    let dragging = st.grab.is_some() && resp.dragged_by(egui::PointerButton::Primary);
+    if dragging {
+        if let (Some(g), Some(p)) = (st.grab, resp.interact_pointer_pos()) {
+            out.pan_to = Some(to_image(p - g));
+        }
+    } else {
+        st.grab = None;
+        if resp.clicked() {
+            out.pan_to = resp.interact_pointer_pos().map(to_image);
+        }
+    }
+    if ui.is_rect_visible(rect) {
+        let a = |v: u8| (v as f32 * t).round() as u8;
+        let painter = ui.painter();
+        let back = rect.expand(3.0);
+        painter.rect_filled(back, CornerRadius::same(radius::CONTROL), Color32::from_black_alpha(a(190)));
+        let mut mesh = egui::Mesh::with_texture(tex);
+        mesh.add_rect_with_uv(rect, unit, Color32::WHITE.gamma_multiply(t));
+        painter.add(egui::Shape::mesh(mesh));
+        // What is off screen is dimmed; what is on it is framed.
+        let dim = Color32::from_black_alpha(a(130));
+        for r in [
+            Rect::from_min_max(rect.min, egui::pos2(rect.max.x, frame.min.y)),
+            Rect::from_min_max(egui::pos2(rect.min.x, frame.max.y), rect.max),
+            Rect::from_min_max(egui::pos2(rect.min.x, frame.min.y), egui::pos2(frame.min.x, frame.max.y)),
+            Rect::from_min_max(egui::pos2(frame.max.x, frame.min.y), egui::pos2(rect.max.x, frame.max.y)),
+        ] {
+            if r.is_positive() {
+                painter.rect_filled(r, CornerRadius::ZERO, dim);
+            }
+        }
+        let frame = frame.intersect(rect.shrink(1.0));
+        painter.rect_stroke(frame, CornerRadius::ZERO, Stroke::new(3.0, Color32::from_black_alpha(a(150))), StrokeKind::Outside);
+        painter.rect_stroke(frame, CornerRadius::ZERO, Stroke::new(1.5, Color32::from_white_alpha(a(240))), StrokeKind::Inside);
+        painter.rect_stroke(back, CornerRadius::same(radius::CONTROL), Stroke::new(1.0, Color32::from_white_alpha(a(36))), StrokeKind::Inside);
+    }
+    if dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        resp.on_hover_text("Navigator: the framed part is on screen. Drag the frame to pan, or click to jump there");
+    }
+    ui.data_mut(|d| d.insert_temp(id, st));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,5 +1755,29 @@ mod tests {
         }
         let r = Rail { x0: 0.0, x1: 100.0, min: -5.0, max: 5.0, log: false };
         assert_eq!(r.x_of(0.0), 50.0);
+    }
+
+    #[test]
+    fn navigator_sits_in_the_corner_clear_of_other_controls() {
+        let near = |a: Pos2, b: Pos2| (a - b).length() < 1e-3;
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let r = navigator_rect(area, 4.0 / 3.0, &[]).unwrap();
+        assert!((r.size() - Vec2::new(176.0, 132.0)).length() < 1e-3, "{r:?}");
+        assert!(near(r.max, Pos2::new(1268.0, 788.0)), "{r:?}");
+        // A portrait image keeps its shape and the size limit.
+        let p = navigator_rect(area, 0.75, &[]).unwrap();
+        assert!((p.width() / p.height() - 0.75).abs() < 1e-3 && p.height() <= 132.01 && near(p.max, r.max), "{p:?}");
+        // A toolbar across the bottom: above it, still at the right.
+        let bar = Rect::from_min_max(Pos2::new(200.0, 744.0), Pos2::new(1270.0, 788.0));
+        let r = navigator_rect(area, 4.0 / 3.0, &[bar]).unwrap();
+        assert!(!r.intersects(bar) && near(r.max, Pos2::new(1268.0, bar.min.y - 12.0)), "{r:?}");
+        // A panel down the right side: left of it, at the bottom.
+        let side = Rect::from_min_max(Pos2::new(1100.0, 0.0), Pos2::new(1280.0, 800.0));
+        let r = navigator_rect(area, 4.0 / 3.0, &[side]).unwrap();
+        assert!(!r.intersects(side) && near(r.max, Pos2::new(side.min.x - 12.0, 788.0)), "{r:?}");
+        // Too small an area, or nowhere clear: none.
+        assert!(navigator_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 80.0)), 1.5, &[]).is_none());
+        assert!(navigator_rect(area, 4.0 / 3.0, &[area]).is_none());
+        assert!(navigator_rect(area, f32::NAN, &[]).is_none());
     }
 }

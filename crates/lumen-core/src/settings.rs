@@ -177,6 +177,9 @@ pub struct Settings {
     pub checkerboard_alpha: bool,
     pub smooth_zoom_in: bool,
     pub animate_zoom: bool,
+    /// Viewer and Compare: a small overview with the visible part framed
+    /// while the image is larger than the window (drag it to pan).
+    pub zoom_navigator: bool,
     pub loop_navigation: bool,
     /// Viewer: after rating, flagging or labelling, go on to the next image.
     pub advance_after_tag: bool,
@@ -286,6 +289,7 @@ impl Default for Settings {
             checkerboard_alpha: true,
             smooth_zoom_in: true,
             animate_zoom: true,
+            zoom_navigator: true,
             loop_navigation: false,
             advance_after_tag: false,
             preload_neighbors: true,

@@ -608,13 +608,52 @@ impl ReviewUi {
 
     // ------------------------------------------------------------ strip
 
-    /// The mark-up tool strip. `dims` per pane, for width changes of the selection.
+    /// The mark-up tool strip. `dims` per pane, for width changes of the
+    /// selection. Undo, redo, delete, clear and Done are laid out first, from
+    /// the right end, so they always show; the tools take the room left of
+    /// them, and when it is short the hint goes first, then the title.
     pub fn strip(&mut self, ui: &mut Ui, p: &theme::Palette, dims: &[Option<(u32, u32)>]) {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(RichText::new("Mark up").font(text::body_strong()).color(p.text));
-            ui.add_space(4.0);
-            let labels: Vec<&str> = Tool::ALL.iter().map(|t| t.icon()).collect();
+        let row = ui.available_rect_before_wrap();
+        let mut right = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        right.spacing_mut().item_spacing.x = 4.0;
+        if widgets::secondary_button(&mut right, "Done").on_hover_text("Stop marking up; drag pans again  (M or Esc)").clicked() {
+            self.markup = false;
+            self.drag = None;
+        }
+        widgets::separator_v(&mut right);
+        if right.add_enabled_ui(self.has_marks(), |ui| widgets::icon_button(ui, I::BROOM, "Clear: remove every mark and detail from all images (Ctrl+Z brings them back)", false)).inner.clicked() {
+            self.clear_all();
+        }
+        if right.add_enabled_ui(self.sel.is_some(), |ui| widgets::icon_button(ui, I::TRASH, "Delete the selected mark or detail  (Del)", false)).inner.clicked() {
+            self.delete_selected();
+        }
+        if right.add_enabled_ui(self.can_redo(), |ui| widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Redo  (Ctrl+Y)", false)).inner.clicked() {
+            self.redo();
+        }
+        if right.add_enabled_ui(self.can_undo(), |ui| widgets::icon_button(ui, I::ARROW_COUNTER_CLOCKWISE, "Undo  (Ctrl+Z)", false)).inner.clicked() {
+            self.undo();
+        }
+        let buttons_left = right.min_rect().left();
+        // The tools: the title only when they all have their full width beside it.
+        let tool_icons: Vec<&str> = Tool::ALL.iter().map(|t| t.icon()).collect();
+        let width_names: Vec<&str> = WIDTHS.iter().map(|w| w.0).collect();
+        let s = 4.0;
+        let sep = 9.0 + s;
+        let tools_w = widgets::segmented_width(ui, &tool_icons) + s + sep + COLORS.len() as f32 * (22.0 + s) + sep + widgets::segmented_width(ui, &width_names) + s;
+        let title = "Mark up";
+        let title_w = ui.painter().layout_no_wrap(title.to_string(), text::body_strong(), p.text).size().x + s + 4.0 + s;
+        let room = (buttons_left - 12.0 - row.left()).max(0.0);
+        let left_rect = Rect::from_min_max(row.min, Pos2::new(row.left() + room, row.max.y));
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(left_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        left.set_clip_rect(left_rect.intersect(ui.clip_rect()));
+        {
+            let ui = &mut left;
+            ui.spacing_mut().item_spacing.x = s;
+            if title_w + tools_w <= room {
+                ui.label(RichText::new(title).font(text::body_strong()).color(p.text));
+                ui.add_space(4.0);
+            }
+            let labels = tool_icons;
             let tips: Vec<&str> = Tool::ALL.iter().map(|t| t.tip()).collect();
             let mut idx = Tool::ALL.iter().position(|t| *t == self.tool).unwrap_or(1);
             if widgets::segmented_with_tips(ui, &mut idx, &labels, &tips) {
@@ -648,10 +687,9 @@ impl ReviewUi {
                 }
             }
             widgets::separator_v(ui);
-            let wl: Vec<&str> = WIDTHS.iter().map(|w| w.0).collect();
             let wt = ["Thin lines", "Medium lines", "Thick lines"];
             let mut w = self.width;
-            if widgets::segmented_with_tips(ui, &mut w, &wl, &wt) {
+            if widgets::segmented_with_tips(ui, &mut w, &width_names, &wt) {
                 self.width = w;
                 if let Some(Sel::Mark(pn, i)) = self.sel {
                     if let (Some(m), Some(Some(d))) = (self.review.images.get(pn).and_then(|im| im.marks.get(i)).cloned(), dims.get(pn)) {
@@ -661,28 +699,15 @@ impl ReviewUi {
                     }
                 }
             }
-            widgets::separator_v(ui);
-            if ui.add_enabled_ui(self.can_undo(), |ui| widgets::icon_button(ui, I::ARROW_COUNTER_CLOCKWISE, "Undo  (Ctrl+Z)", false)).inner.clicked() {
-                self.undo();
-            }
-            if ui.add_enabled_ui(self.can_redo(), |ui| widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Redo  (Ctrl+Y)", false)).inner.clicked() {
-                self.redo();
-            }
-            if ui.add_enabled_ui(self.sel.is_some(), |ui| widgets::icon_button(ui, I::TRASH, "Delete the selected mark or detail  (Del)", false)).inner.clicked() {
-                self.delete_selected();
-            }
-            if ui.add_enabled_ui(self.has_marks(), |ui| widgets::icon_button(ui, I::BROOM, "Clear: remove every mark and detail from all images (Ctrl+Z brings them back)", false)).inner.clicked() {
-                self.clear_all();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::secondary_button(ui, "Done").on_hover_text("Stop marking up; drag pans again  (M or Esc)").clicked() {
-                    self.markup = false;
-                    self.drag = None;
-                }
-                let hint = "Drag on an image to draw · Space+drag or middle-drag pans · wheel zooms";
-                ui.add(egui::Label::new(RichText::new(hint).size(text::SMALL).color(p.muted)).truncate());
-            });
-        });
+        }
+        // The hint, right-aligned in the room between the tools and the
+        // buttons when there is enough of it.
+        let gap = Rect::from_min_max(Pos2::new(left.min_rect().right() + 12.0, row.min.y), Pos2::new(buttons_left - 12.0, row.max.y));
+        if gap.width() >= 160.0 {
+            let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(gap).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            let hint = "Drag on an image to draw · Space+drag or middle-drag pans · wheel zooms";
+            mid.add(egui::Label::new(RichText::new(hint).size(text::SMALL).color(p.muted)).truncate());
+        }
     }
 
     // ------------------------------------------------------------ panel

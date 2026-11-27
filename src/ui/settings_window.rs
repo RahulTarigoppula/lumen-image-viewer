@@ -729,6 +729,7 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
     card(ui, p, |ui| {
         changed |= toggle_row(ui, p, "Smooth zoom-in filtering", "Off shows crisp pixels when enlarging (good for pixel art).", &mut s.smooth_zoom_in);
         changed |= toggle_row(ui, p, "Animated zoom", "Ease between zoom levels.", &mut s.animate_zoom);
+        changed |= toggle_row(ui, p, "Zoom navigator", "When an image is larger than the window, a small overview in the corner frames the part on screen. Drag it to pan.", &mut s.zoom_navigator);
         changed |= row(ui, p, "Magnifier zoom", "Magnification of the loupe.", |ui| {
             slider_box(ui, widgets::Slider::new(&mut s.magnifier_zoom, 1.5..=8.0).step_by(0.5).default_value(Settings::default().magnifier_zoom).custom_formatter(|x, _| format!("{x:.1}×")))
                 .on_hover_text("How much the loupe enlarges (press and hold on an image to use it)")

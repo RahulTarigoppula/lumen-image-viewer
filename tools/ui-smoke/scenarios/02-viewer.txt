@@ -1,10 +1,16 @@
-# Viewer: fit, 100%, next image, info panel.
+# Viewer: fit, 100% with the zoom navigator (dragged to pan), next image, info panel.
 open {media}\RoundA\DeviceX\scene_01.jpg
 wait 3000
 shot fit.png
 run ZoomActual
 wait 1500
 shot actual.png
+hover 1180 722
+wait 800
+shot navigator.png
+drag 1180 722 1130 690
+wait 800
+shot navigator_dragged.png
 run ZoomFit
 run NextImage
 wait 2500

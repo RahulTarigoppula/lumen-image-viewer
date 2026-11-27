@@ -603,7 +603,8 @@ impl App {
             },
             ShowExif | ShowMetadata => {
                 use crate::ui::metadata_view::MetaTab;
-                let tab = if cmd == ShowExif { MetaTab::Exif } else { MetaTab::Capture };
+                // EXIF opens its tab; Metadata the tab used last (Capture at first).
+                let tab = if cmd == ShowExif { MetaTab::Exif } else { self.meta_window.tab };
                 let blind = self.compare.as_ref().is_some_and(|c| c.link.as_ref().is_some_and(|l| l.blind));
                 if self.mode == Mode::Compare && blind {
                     self.core.toasts.info("Metadata is hidden during a blind test");
@@ -3503,7 +3504,6 @@ impl eframe::App for App {
                 self.compare_link_requests();
                 if let Some(r) = self.compare.as_mut().and_then(|c| c.info_request.take()) {
                     self.run(match r {
-                        crate::ui::compare::InfoRequest::Exif => Command::ShowExif,
                         crate::ui::compare::InfoRequest::Metadata => Command::ShowMetadata,
                     });
                 }

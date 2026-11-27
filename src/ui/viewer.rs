@@ -1113,6 +1113,8 @@ impl Viewer {
         } else if fullscreen && self.crop.is_none() && self.tool.is_none() && !edge_open {
             ui.ctx().set_cursor_icon(egui::CursorIcon::None);
         }
+        // After the bar, so it keeps clear of it.
+        self.zoom_navigator(ui, core, view);
         if !idle {
             ui.ctx().request_repaint_after(Duration::from_millis(2300));
         }
@@ -1458,6 +1460,38 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         ui.painter().text(lens.left_bottom() + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, format!("{}, {}  ·  {:.0}%", px.0, px.1, z * 100.0), FontId::proportional(11.0), Color32::from_white_alpha(220));
     }
 
+    /// The zoom navigator while the image is larger than the view: an
+    /// overview in the bottom-right corner with the part on screen framed,
+    /// to drag around (see `widgets::navigator`).
+    fn zoom_navigator(&mut self, ui: &mut Ui, core: &Core, view: Rect) {
+        if !core.settings.zoom_navigator || self.crop.is_some() || self.tool.is_some() {
+            return;
+        }
+        let Some(path) = self.current().cloned() else { return };
+        let Some((tex, w, h)) = self.gpu.as_ref().filter(|g| g.0 == path).and_then(|(_, _, g)| Some((g.overview()?, g.width as f32, g.height as f32))) else { return };
+        let ppp = ui.ctx().pixels_per_point();
+        // Where the image was drawn this frame.
+        let size = Vec2::new(w, h) * self.zoom / ppp;
+        if size.x <= view.width() + 1.0 && size.y <= view.height() + 1.0 {
+            return;
+        }
+        let dest = Rect::from_min_size(view.center() - self.center * self.zoom / ppp, size);
+        let on = view.intersect(dest);
+        let shown = Rect::from_min_max(((on.min - dest.min) / size).to_pos2(), ((on.max - dest.min) / size).to_pos2());
+        let avoid = crate::analysis_ui::canvas::occluders(ui.ctx());
+        let Some(rect) = widgets::navigator_rect(view, w / h, &avoid) else { return };
+        let id = ui.id().with("viewer-navigator");
+        let out = widgets::navigator(ui, id, rect, tex, shown);
+        if out.visible {
+            crate::analysis_ui::canvas::occlude(ui.ctx(), rect.expand(4.0));
+        }
+        if let Some(c) = out.pan_to {
+            self.center = Vec2::new(c.x * w, c.y * h);
+            self.auto_fit = None;
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Histogram of the displayed image (computed off the UI thread, cached per
     /// image version) for the overlay and the info panel.
     fn histogram_for(&mut self, core: &Core, ctx: &egui::Context, path: &Path) -> Option<&Histogram> {
@@ -1781,7 +1815,6 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             B::Film => Command::ToggleFilmstrip,
             B::Fullscreen => Command::ToggleFullscreen,
             B::Analysis => Command::ToggleAnalysis,
-            B::Exif => Command::ShowExif,
             B::Meta => Command::ShowMetadata,
             B::Sep | B::ZoomPct | B::Edit | B::More => return None,
         })
@@ -1801,11 +1834,10 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             B::RotL => (I::ARROW_COUNTER_CLOCKWISE, tip("Rotate left"), false),
             B::RotR => (I::ARROW_CLOCKWISE, tip("Rotate right"), false),
             B::Crop => (I::CROP, tip("Crop"), self.crop.is_some()),
-            B::Info => (I::INFO, tip("Info panel: file details, camera settings and histogram"), self.show_info),
+            B::Info => (I::INFO, tip("Info panel: show or hide the side panel with file details, camera settings and the histogram"), self.show_info),
             B::Film => (I::FILM_STRIP, tip("Filmstrip: thumbnails of the folder"), self.show_filmstrip),
             B::Analysis => (cmd.icon(), tip("Analysis: quality metrics and AI review"), false),
-            B::Exif => (cmd.icon(), tip("EXIF: every tag the camera stored"), false),
-            B::Meta => (cmd.icon(), tip("Metadata: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP and more"), false),
+            B::Meta => (cmd.icon(), tip("Metadata window: capture features (HDR, night, zoom, lens), every EXIF tag, encoding, color profile and more. Opens on the tab you used last"), false),
             B::Fullscreen => (if self.is_fullscreen { I::CORNERS_IN } else { I::CORNERS_OUT }, tip(if self.is_fullscreen { "Leave full screen" } else { "Full screen" }), false),
             B::Sep | B::ZoomPct | B::Edit | B::More => (I::DOTS_THREE, String::new(), false),
         }
@@ -2500,7 +2532,6 @@ enum BarItem {
     Crop,
     Edit,
     Info,
-    Exif,
     Meta,
     Analysis,
     Film,
@@ -2530,14 +2561,14 @@ impl BarItem {
 /// commands (lock zoom, histogram, save, delete, slideshow...).
 fn bar_layout(avail: f32) -> (Vec<BarItem>, Vec<BarItem>) {
     use BarItem as B;
-    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Exif, B::Meta, B::Analysis, B::Film, B::Fullscreen, B::More];
+    let full = [B::Browser, B::Sep, B::Prev, B::Next, B::Sep, B::ZoomOut, B::ZoomPct, B::ZoomIn, B::Fit, B::Sep, B::RotL, B::RotR, B::Crop, B::Edit, B::Sep, B::Info, B::Meta, B::Analysis, B::Film, B::Fullscreen, B::More];
     let width = |v: &[BarItem]| v.iter().map(|i| i.width()).sum::<f32>();
     if width(&full) <= avail {
         return (full.to_vec(), Vec::new());
     }
     let mut items: Vec<BarItem> = full.iter().copied().filter(|i| *i != B::Sep).collect();
     // Least important first; Prev / Next / the zoom figure / Fit / Edit / More always stay.
-    let drop_order = [B::Fullscreen, B::Film, B::Meta, B::Exif, B::Info, B::Analysis, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
+    let drop_order = [B::Fullscreen, B::Film, B::Meta, B::Info, B::Analysis, B::RotR, B::RotL, B::Crop, B::Browser, B::ZoomOut, B::ZoomIn];
     let mut hidden = Vec::new();
     for d in drop_order {
         if width(&items) <= avail {
@@ -2854,7 +2885,7 @@ mod tests {
                 assert!(items.contains(&keep), "{avail}: {keep:?}");
             }
             // Nothing is lost: what does not fit is in the More menu.
-            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Exif, BarItem::Meta, BarItem::Analysis, BarItem::Film, BarItem::Fullscreen] {
+            for b in [BarItem::Browser, BarItem::RotL, BarItem::Crop, BarItem::Info, BarItem::Meta, BarItem::Analysis, BarItem::Film, BarItem::Fullscreen] {
                 assert!(items.contains(&b) != hidden.contains(&b), "{avail}: {b:?}");
             }
         }
