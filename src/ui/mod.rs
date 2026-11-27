@@ -24,6 +24,7 @@ pub mod slideshow;
 pub mod tools;
 pub mod workbench;
 pub mod workbench_export;
+pub mod tagrow;
 
 /// Tooltip delay set by the theme (seconds).
 pub const TOOLTIP_DELAY: f32 = 0.35;

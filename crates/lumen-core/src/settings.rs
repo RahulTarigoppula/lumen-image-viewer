@@ -47,6 +47,46 @@ impl ViewerHistogram {
     }
 }
 
+/// When a viewer extra is on: only in full screen, always, or never
+/// (the edge panels and the caption's camera line).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShowWhen {
+    #[default]
+    FullScreen,
+    Always,
+    Never,
+}
+
+impl ShowWhen {
+    /// On for a viewer that is (`fullscreen`) or is not full screen.
+    pub fn applies(self, fullscreen: bool) -> bool {
+        match self {
+            ShowWhen::FullScreen => fullscreen,
+            ShowWhen::Always => true,
+            ShowWhen::Never => false,
+        }
+    }
+}
+
+/// What the second line of the viewer caption shows (camera settings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CaptionFields {
+    pub exposure: bool,
+    pub aperture: bool,
+    pub iso: bool,
+    pub focal: bool,
+    pub taken: bool,
+    pub camera: bool,
+    pub lens: bool,
+}
+
+impl Default for CaptionFields {
+    fn default() -> Self {
+        CaptionFields { exposure: true, aperture: true, iso: true, focal: true, taken: true, camera: false, lens: false }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FitMode {
     /// Shrink large images to fit, show small images at 100%.
@@ -234,7 +274,18 @@ pub struct Settings {
     pub tree_width: f32,
     pub preview_height: f32,
     pub show_preview_pane: bool,
-    pub show_info_overlay: bool,
+    /// Viewer: the Info panel is open when Lumen starts. Settings files from
+    /// before 2.2 call it `show_info_overlay` (it also showed the caption in
+    /// full screen then).
+    #[serde(alias = "show_info_overlay")]
+    pub info_panel_on_start: bool,
+    /// Viewer: the caption (position, name, size, zoom, rating, flag, label)
+    /// shows in full screen too. In a window it always shows.
+    pub fullscreen_caption: bool,
+    /// Viewer: a second caption line with the camera settings.
+    pub caption_exif: ShowWhen,
+    /// Which camera settings that line shows.
+    pub caption_fields: CaptionFields,
     pub slideshow: SlideshowSettings,
     /// Videos in the viewer: where they open, volume and repeat.
     pub video: VideoSettings,
@@ -255,8 +306,11 @@ pub struct Settings {
     pub key_overrides: Vec<KeyOverride>,
     /// Text under thumbnails in the browser grid.
     pub thumb_caption: ThumbCaption,
-    /// Viewer: slide-in panels when the mouse touches a screen edge.
+    /// Viewer: slide-in panels when the mouse touches a screen edge. Kept for
+    /// settings files from before 2.2 (on meant everywhere); `edge_panel_mode`
+    /// says when, once chosen. Read both with [`Settings::edge_panels`].
     pub edge_panels: bool,
+    pub edge_panel_mode: Option<ShowWhen>,
     /// Viewer histogram: luminance, RGB or both (click the histogram to switch).
     pub viewer_histogram: ViewerHistogram,
     /// Skip the "this sends the coordinates to openstreetmap.org" confirmation.
@@ -345,7 +399,10 @@ impl Default for Settings {
             tree_width: 260.0,
             preview_height: 260.0,
             show_preview_pane: true,
-            show_info_overlay: false,
+            info_panel_on_start: false,
+            fullscreen_caption: true,
+            caption_exif: ShowWhen::FullScreen,
+            caption_fields: CaptionFields::default(),
             slideshow: SlideshowSettings::default(),
             video: VideoSettings::default(),
             window_maximized: true,
@@ -358,6 +415,7 @@ impl Default for Settings {
             key_overrides: Vec::new(),
             thumb_caption: ThumbCaption::NameDetails,
             edge_panels: true,
+            edge_panel_mode: None,
             viewer_histogram: ViewerHistogram::Both,
             gps_map_no_confirm: false,
             ai: serde_json::Value::Null,
@@ -462,6 +520,18 @@ impl Settings {
         }
     }
 
+    /// When the viewer's edge panels pop up. A file from before the choice
+    /// existed: on means full screen only (in a window the edges belong to the
+    /// window), off stays off.
+    pub fn edge_panels(&self) -> ShowWhen {
+        self.edge_panel_mode.unwrap_or(if self.edge_panels { ShowWhen::FullScreen } else { ShowWhen::Never })
+    }
+
+    pub fn set_edge_panels(&mut self, m: ShowWhen) {
+        self.edge_panel_mode = Some(m);
+        self.edge_panels = m != ShowWhen::Never;
+    }
+
     pub fn push_recent(&mut self, folder: &std::path::Path) {
         self.recent_folders.retain(|p| p != folder);
         self.recent_folders.insert(0, folder.to_path_buf());
@@ -488,5 +558,44 @@ mod tests {
         assert_eq!(s.viewer_histogram, ViewerHistogram::Both);
         let s: Settings = serde_json::from_str(r#"{"viewer_histogram": "Rgb"}"#).unwrap();
         assert_eq!(s.viewer_histogram, ViewerHistogram::Rgb);
+    }
+
+    #[test]
+    fn info_overlay_setting_splits_and_migrates() {
+        // Before 2.2 one switch opened the Info panel and showed the caption in full screen.
+        let s: Settings = serde_json::from_str(r#"{"show_info_overlay": true}"#).unwrap();
+        assert!(s.info_panel_on_start && s.fullscreen_caption);
+        let s: Settings = serde_json::from_str(r#"{"show_info_overlay": false}"#).unwrap();
+        assert!(!s.info_panel_on_start && s.fullscreen_caption);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.info_panel_on_start && s.fullscreen_caption);
+        assert_eq!(s.caption_exif, ShowWhen::FullScreen);
+        assert!(s.caption_fields.exposure && s.caption_fields.taken && !s.caption_fields.camera);
+        let s: Settings = serde_json::from_str(r#"{"caption_fields": {"camera": true}}"#).unwrap();
+        assert!(s.caption_fields.camera && s.caption_fields.iso);
+        // Saved again under the new names, it reads back the same.
+        let s = Settings { info_panel_on_start: true, fullscreen_caption: false, caption_exif: ShowWhen::Always, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.info_panel_on_start && !back.fullscreen_caption);
+        assert_eq!(back.caption_exif, ShowWhen::Always);
+    }
+
+    #[test]
+    fn edge_panels_choice_migrates_the_old_switch() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.edge_panels(), ShowWhen::FullScreen);
+        let s: Settings = serde_json::from_str(r#"{"edge_panels": true}"#).unwrap();
+        assert_eq!(s.edge_panels(), ShowWhen::FullScreen);
+        let s: Settings = serde_json::from_str(r#"{"edge_panels": false}"#).unwrap();
+        assert_eq!(s.edge_panels(), ShowWhen::Never);
+        let mut s = Settings::default();
+        s.set_edge_panels(ShowWhen::Always);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.edge_panels(), ShowWhen::Always);
+        assert!(back.edge_panels);
+        s.set_edge_panels(ShowWhen::Never);
+        assert!(!s.edge_panels);
+        assert!(ShowWhen::FullScreen.applies(true) && !ShowWhen::FullScreen.applies(false));
+        assert!(ShowWhen::Always.applies(false) && !ShowWhen::Never.applies(true));
     }
 }

@@ -690,6 +690,11 @@ pub struct Compare {
     rv: ReviewUi,
     /// The Analysis panel was open last frame (one right panel at a time).
     analysis_was_open: bool,
+    /// Tag changes since the app last asked (notice, each file's tags before):
+    /// the app puts them on its undo history and shows the notice.
+    tag_changes: Vec<(String, Vec<(PathBuf, crate::tags::Tag)>)>,
+    /// Ctrl+Z with no mark to undo: undo the last tag change.
+    undo_tags: bool,
 }
 
 fn name_of(p: &std::path::Path) -> String {
@@ -827,6 +832,8 @@ impl Compare {
             popup_open: false,
             rv,
             analysis_was_open: false,
+            tag_changes: Vec::new(),
+            undo_tags: false,
         }
     }
 
@@ -857,18 +864,26 @@ impl Compare {
         Some(self.hover_pane.filter(|&i| i < self.panes.len()).unwrap_or(self.selected.min(self.panes.len() - 1)))
     }
 
+    /// Tag changes made here since the last call (notice, tags before) and
+    /// whether Ctrl+Z asked to undo the last one. The app records them for undo.
+    pub fn take_tag_changes(&mut self) -> (Vec<(String, Vec<(PathBuf, crate::tags::Tag)>)>, bool) {
+        (std::mem::take(&mut self.tag_changes), std::mem::take(&mut self.undo_tags))
+    }
+
     fn rate(&mut self, core: &mut Core, i: usize, r: u8) {
         let Some(pane) = self.panes.get(i) else { return };
+        let before = vec![(pane.path.clone(), core.tags.get(&pane.path))];
         core.tags.update(&pane.path, |t| t.rating = r);
         let msg = if r == 0 { format!("{}: rating cleared", LETTERS[i]) } else { format!("{}: {} star{}", LETTERS[i], r, if r == 1 { "" } else { "s" }) };
-        core.toasts.info(msg);
+        self.tag_changes.push((msg, before));
     }
 
     fn toggle_flag(&mut self, core: &mut Core, i: usize) {
         let Some(pane) = self.panes.get(i) else { return };
+        let before = vec![(pane.path.clone(), core.tags.get(&pane.path))];
         core.tags.update(&pane.path, |t| t.flagged = !t.flagged);
         let on = core.tags.get(&pane.path).flagged;
-        core.toasts.info(format!("{}: {}", LETTERS[i], if on { "flagged" } else { "flag removed" }));
+        self.tag_changes.push((format!("{}: {}", LETTERS[i], if on { "flagged" } else { "flag removed" }), before));
     }
 
     fn keep_only(&mut self, core: &mut Core, keep: usize) {
@@ -876,10 +891,13 @@ impl Compare {
             return;
         }
         let tags: Vec<crate::tags::Tag> = self.panes.iter().map(|p| core.tags.get(&p.path)).collect();
+        let before: Vec<(PathBuf, crate::tags::Tag)> = self.panes.iter().map(|p| p.path.clone()).zip(tags.iter().copied()).collect();
         for (pane, t) in self.panes.iter().zip(keep_reject(&tags, keep)) {
             core.tags.update(&pane.path, |x| *x = t);
         }
-        core.toasts.success(format!("Kept {} (flagged), marked {} other{} as rejected (red label)", LETTERS[keep], self.panes.len() - 1, if self.panes.len() == 2 { "" } else { "s" }));
+        // The other images' labels and flags were overwritten: the notice can put them back.
+        let msg = format!("Kept {} (flagged), marked {} other{} as rejected (red label)", LETTERS[keep], self.panes.len() - 1, if self.panes.len() == 2 { "" } else { "s" });
+        self.tag_changes.push((msg, before));
     }
 
     fn delete_pane(&mut self, core: &mut Core, i: usize) {
@@ -1510,6 +1528,10 @@ impl Compare {
         let take = |k: Key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, k));
         if self.confirm_delete.is_some() || self.rv.dialog_open() || ui.ctx().egui_wants_keyboard_input() {
             return; // the dialog (or a text field) owns the keyboard
+        }
+        // Ctrl+Z with no mark to undo puts back the last rating, flag or Keep.
+        if !self.rv.can_undo() && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::COMMAND, Key::Z)) {
+            self.undo_tags = true;
         }
         // Undo / redo, export, delete the selected mark, Esc out of mark up.
         let rv_esc = self.rv.keys(ui);

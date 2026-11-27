@@ -13,7 +13,7 @@ use crate::catalog;
 use crate::edit::{EditSession, EditTool, Histogram, HistogramPaint, ToolUiCtx};
 use crate::loader::{LoadState, LoadedImage};
 use crate::render::{self, GpuImage};
-use crate::settings::{FitMode, ViewerHistogram, WheelAction};
+use crate::settings::{CaptionFields, FitMode, ShowWhen, ViewerHistogram, WheelAction};
 use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -126,6 +126,16 @@ const EDGE_DWELL: Duration = Duration::from_millis(400);
 
 /// Width of the tool and crop panels (every tool gets the same width).
 const TOOL_PANEL_W: f32 = 320.0;
+/// Below this window width the Info panel hides by itself (the picture would
+/// get too little room); it comes back when the window grows.
+pub const INFO_MIN_WINDOW: f32 = 700.0;
+
+/// Width range of the Info panel in a window `window_w` wide: 220 to 520
+/// points, never more than 40% of the window.
+pub fn info_panel_range(window_w: f32) -> (f32, f32) {
+    let max = safe_clamp(window_w * 0.4, 160.0, 520.0);
+    (220.0_f32.min(max), max)
+}
 /// Height of a filmstrip thumbnail cell.
 const FILM_CELL_H: f32 = 64.0;
 
@@ -325,8 +335,13 @@ pub struct Viewer {
     /// (size, mtime) per file so thumbnail lookups never stat() every frame.
     stat_cache: FileStats,
     drag_pan: bool,
-    /// Show the pop-out panels when the pointer dwells at a window edge.
-    pub edge_panels: bool,
+    /// When the pop-out panels show as the pointer dwells at a window edge.
+    pub edge_panels: ShowWhen,
+    /// The window is too narrow for the Info panel: it hides (and comes back
+    /// when the window grows) unless `info_forced`. Updated every frame.
+    info_narrow: bool,
+    /// The Info panel was asked for (I) while the window was narrow.
+    info_forced: bool,
     /// Keep zoom and (normalized) position when stepping to another image.
     pub lock_zoom: bool,
     /// (zoom, normalized centre) to apply once the next image's size is known.
@@ -378,7 +393,9 @@ impl Viewer {
             exif_cache: Default::default(),
             stat_cache: Default::default(),
             drag_pan: false,
-            edge_panels: true,
+            edge_panels: ShowWhen::FullScreen,
+            info_narrow: false,
+            info_forced: false,
             lock_zoom: false,
             pending_lock: None,
             view_img: (0, 0),
@@ -419,6 +436,24 @@ impl Viewer {
         self.lock_zoom = !self.lock_zoom;
         self.pending_lock = None;
         self.lock_zoom
+    }
+
+    /// The Info panel is on screen: wanted, and the window wide enough (or it
+    /// was asked for in the narrow window).
+    pub fn info_visible(&self) -> bool {
+        self.show_info && (!self.info_narrow || self.info_forced)
+    }
+
+    /// I / the Info button: show or hide the Info panel as it looks now. In a
+    /// narrow window that hid it, showing it again keeps it for this size.
+    pub fn toggle_info(&mut self) {
+        if self.info_visible() {
+            self.show_info = false;
+            self.info_forced = false;
+        } else {
+            self.show_info = true;
+            self.info_forced = self.info_narrow;
+        }
     }
 
     /// What step()/go_to() do with the view: reset to `fit`, or keep the
@@ -861,12 +896,19 @@ impl Viewer {
         let bgc = core.settings.viewer_background;
         ui.painter().rect_filled(full, 0.0, Color32::from_rgb(bgc[0], bgc[1], bgc[2]));
 
-        // Info panel on the right.
-        if self.show_info {
+        // Info panel on the right: at most 40% of the window, like the Analysis
+        // panel; a window narrower than INFO_MIN_WINDOW hides it until it grows.
+        let window_w = ui.ctx().content_rect().width();
+        self.info_narrow = window_w < INFO_MIN_WINDOW;
+        if !self.info_narrow {
+            self.info_forced = false;
+        }
+        if self.info_visible() {
+            let (min, max) = info_panel_range(window_w);
             egui::Panel::right("viewer-info")
                 .resizable(true)
-                .default_size(320.0)
-                .size_range(260.0..=520.0)
+                .default_size(safe_clamp(320.0, min, max))
+                .size_range(min..=max)
                 .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::same(12)))
                 .show(ui, |ui| self.info_panel(ui, core, &mut ev));
         }
@@ -1163,8 +1205,9 @@ impl Viewer {
         // ---- Overlays
         // The caption sits top-left: hide it while a top/left pop-out panel covers that corner.
         let caption_covered = matches!(self.edge.open, Some(Edge::Top) | Some(Edge::Left));
-        if (core.settings.show_info_overlay || !fullscreen) && !caption_covered {
-            self.overlay_caption(ui, core, view, size, &path);
+        if (core.settings.fullscreen_caption || !fullscreen) && !caption_covered {
+            let exif = if !is_video && core.settings.caption_exif.applies(fullscreen) { self.caption_exif_line(ui.ctx(), &path, &core.settings.caption_fields) } else { None };
+            self.overlay_caption(ui, core, view, size, &path, exif);
         }
         if self.show_histogram {
             self.histogram_overlay(ui, core, view, &path);
@@ -1346,10 +1389,10 @@ impl Viewer {
     /// shown every frame.
     fn context_menu(&mut self, resp: &egui::Response, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let dirty = self.is_dirty();
-        let (info, film, full) = (self.show_info, self.show_filmstrip, self.is_fullscreen);
+        let (info, film, full) = (self.info_visible(), self.show_filmstrip, self.is_fullscreen);
         resp.context_menu(|ui| {
             ui.set_min_width(240.0);
-            // 13 rows in five groups, about 430 pt tall: it fits a 1366 x 768
+            // 15 rows in five groups, about 480 pt tall: it fits a 1366 x 768
             // screen at 150%. The panels and modes share one View submenu. On a
             // shorter window it scrolls; otherwise it moves to fit, which a
             // scroll area would prevent (it would shrink to the room below the
@@ -1393,9 +1436,11 @@ impl Viewer {
                     }
                 });
                 ui.separator();
+                // The same submenu as the browser's (culling without the keys).
+                super::tagrow::rate_tag_menu(ui, |ui, c| menu_item(ui, c, ev));
                 menu_item(ui, Command::Delete, ev);
             };
-            if screen_h < 470.0 {
+            if screen_h < 500.0 {
                 // A visible bar and a fade on the cut edge say there is more.
                 widgets::visible_scrollbars(ui);
                 let out = egui::ScrollArea::vertical().max_height((screen_h - 24.0).max(120.0)).show(ui, rows);
@@ -1607,13 +1652,15 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
     /// bottom edge reveals the toolbar). Returns true while a panel is visible.
     fn edge_panels_ui(&mut self, ui: &mut Ui, core: &mut Core, view: Rect, ev: &mut Vec<ViewerEvent>) -> bool {
         let ctx = ui.ctx().clone();
-        let enabled = self.edge_panels && self.crop.is_none() && self.tool.is_none() && !self.confirm_discard && view.is_positive();
+        // In a window (by default) the edges are the window's own: resizing it
+        // or reaching for another program must not pop a panel.
+        let enabled = self.edge_panels.applies(self.is_fullscreen) && self.crop.is_none() && self.tool.is_none() && !self.confirm_discard && view.is_positive();
         let pos = ctx.input(|i| i.pointer.hover_pos());
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some() || egui::Popup::is_any_open(&ctx);
         let allowed = |e: Edge, s: &Self| match e {
             Edge::Top => true,
             Edge::Left => true,
-            Edge::Right => !s.show_info,
+            Edge::Right => !s.info_visible(),
             Edge::Bottom => false, // the toolbar already pops up at the bottom
         };
         if !enabled {
@@ -1760,7 +1807,18 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         }
     }
 
-    fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path) {
+    /// The caption's camera line for `path`, once its EXIF has been read (in
+    /// the background, shared with the Info panel). Nothing while it loads: the
+    /// previous image's values must not show under this one's name.
+    fn caption_exif_line(&mut self, ctx: &egui::Context, path: &Path, fields: &CaptionFields) -> Option<String> {
+        let key = path.to_path_buf();
+        let p2 = key.clone();
+        let _ = self.exif_cache.get(&key, ctx, move || crate::meta::read_exif(&p2));
+        let line = exif_caption(self.exif_cache.current(&key)?.as_ref()?, fields);
+        (!line.is_empty()).then_some(line)
+    }
+
+    fn overlay_caption(&self, ui: &mut Ui, core: &Core, view: Rect, size: Option<(u32, u32)>, path: &Path, exif: Option<String>) {
         let p = core.pal;
         let mut parts = vec![format!("{} / {}", self.index + 1, self.list.len()), file_name(path)];
         // No zoom while nothing is shown (still loading, or not decodable).
@@ -1774,7 +1832,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         if let Some((f, n, playing)) = self.animation_info(core) {
             parts.push(format!("frame {}/{}{}", f + 1, n, if playing { "" } else { " (paused)" }));
         }
-        let text = parts.join("   ·   ");
+        let text = parts.join(CAPTION_SEP);
         // Wrap inside the image area: a long name at a large UI scale must not
         // run under the tool / info panel beside it.
         let wrap = (view.width() - 44.0).max(40.0);
@@ -1785,11 +1843,11 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         // Rating, flag and color label, so culling full screen is not blind.
         let tag = core.tags.get(path);
         let mut tag_part = |s: String, color: Color32| {
-            job.append("   \u{00B7}   ", 0.0, base.clone());
+            job.append(CAPTION_SEP, 0.0, base.clone());
             job.append(&s, 0.0, egui::TextFormat { color, ..base.clone() });
         };
         if tag.rating > 0 {
-            tag_part("\u{2605}".repeat(tag.rating.min(5) as usize), Color32::from_rgb(250, 196, 60));
+            tag_part("\u{2605}".repeat(tag.rating.min(5) as usize), theme::STAR_ON_DARK);
         }
         if tag.flagged {
             tag_part(format!("{} flagged", I::FLAG), Color32::from_rgb(255, 170, 90));
@@ -1798,6 +1856,11 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             if let Some(&[r, g, b]) = crate::tags::LABEL_COLORS.get(tag.label as usize) {
                 tag_part(format!("\u{25CF} {}", crate::tags::LABEL_NAMES[tag.label as usize]), Color32::from_rgb(r, g, b));
             }
+        }
+        // Exposure, aperture, ISO, focal length and date on a second line.
+        if let Some(e) = exif {
+            job.append("\n", 0.0, base.clone());
+            job.append(&e, 0.0, egui::TextFormat { font_id: FontId::proportional(12.0), color: Color32::from_white_alpha(200), ..base.clone() });
         }
         let galley = ui.painter().layout_job(job);
         let r = Rect::from_min_size(view.min + Vec2::new(12.0, 12.0), galley.size() + Vec2::new(20.0, 10.0));
@@ -1875,7 +1938,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         for &h in hidden.iter().filter(|h| **h != BarItem::Analysis) {
             let Some(c) = self.bar_command(h) else { continue };
             match h {
-                BarItem::Info => menu_check(ui, c, "Info panel", self.show_info, ev),
+                BarItem::Info => menu_check(ui, c, "Info panel", self.info_visible(), ev),
                 BarItem::Film => menu_check(ui, c, "Filmstrip", self.show_filmstrip, ev),
                 BarItem::Fullscreen => menu_check(ui, c, "Full screen", self.is_fullscreen, ev),
                 _ => menu_item(ui, c, ev),
@@ -1938,7 +2001,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             B::RotL => (I::ARROW_COUNTER_CLOCKWISE, tip("Rotate left"), false),
             B::RotR => (I::ARROW_CLOCKWISE, tip("Rotate right"), false),
             B::Crop => (I::CROP, tip("Crop"), self.crop.is_some()),
-            B::Info => (I::INFO, tip("Info panel: show or hide the side panel with file details, camera settings and the histogram"), self.show_info),
+            B::Info => (I::INFO, tip("Info panel: show or hide the side panel with file details, camera settings and the histogram"), self.info_visible()),
             B::Film => (I::FILM_STRIP, tip("Filmstrip: thumbnails of the folder"), self.show_filmstrip),
             B::Analysis => (cmd.icon(), tip("Analysis: quality metrics and AI review"), false),
             B::Meta => (cmd.icon(), tip("Metadata window: capture features (HDR, night, zoom, lens), every EXIF tag, encoding, color profile and more. Opens on the tab you used last"), false),
@@ -2098,7 +2161,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         }
     }
 
-    fn info_panel(&mut self, ui: &mut Ui, core: &mut Core, _ev: &mut Vec<ViewerEvent>) {
+    fn info_panel(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<ViewerEvent>) {
         let p = core.pal;
         let Some(path) = self.current().cloned() else { return };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2116,27 +2179,10 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
                 }
             });
             ui.add_space(8.0);
-            let tag = core.tags.get(&path);
-            ui.horizontal(|ui| {
-                if let Some(r) = widgets::star_rating(ui, tag.rating, 15.0, &p) {
-                    core.tags.update(&path, |t| t.rating = r);
-                }
-                ui.add_space(8.0);
-                for l in 1..=5u8 {
-                    let c = crate::tags::LABEL_COLORS[l as usize];
-                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                    let col = Color32::from_rgb(c[0], c[1], c[2]);
-                    if tag.label == l {
-                        ui.painter().circle_filled(r.center(), 7.0, col);
-                        ui.painter().circle_stroke(r.center(), 7.5, Stroke::new(1.5, p.text));
-                    } else {
-                        ui.painter().circle_filled(r.center(), 5.5, col.gamma_multiply(0.75));
-                    }
-                    if resp.on_hover_text(crate::tags::LABEL_NAMES[l as usize]).clicked() {
-                        core.tags.update(&path, |t| t.label = if t.label == l { 0 } else { l });
-                    }
-                }
-            });
+            // A click works like the key (notice, undo, next image after rating).
+            if let Some(c) = super::tagrow::tag_row(ui, core.tags.get(&path), 15.0, &p) {
+                ev.push(ViewerEvent::Command(c));
+            }
             ui.add_space(8.0);
             let ctx = ui.ctx().clone();
             let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 80.0), Sense::click());
@@ -2953,6 +2999,41 @@ pub fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
+/// Between the parts of the viewer caption.
+const CAPTION_SEP: &str = "   \u{00B7}   ";
+
+/// The caption's camera line: "1/120 s · f/1.8 · ISO 100 · 5.4 mm (26 mm) ·
+/// 12 Mar 2026 14:05", the parts `f` asks for that the file has (empty when none).
+pub fn exif_caption(e: &crate::meta::ExifSummary, f: &CaptionFields) -> String {
+    let iso = e.iso.as_ref().map(|v| if v.to_ascii_uppercase().starts_with("ISO") { v.clone() } else { format!("ISO {v}") });
+    // "5.4 mm (26 mm eq.)" as "5.4 mm (26 mm)": the brackets say it already.
+    let focal = e.focal.as_ref().map(|v| v.replace(" eq.)", ")").replace("(35mm)", "(35 mm)"));
+    let taken = e
+        .taken_ts
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.format("%-d %b %Y %H:%M").to_string())
+        .or_else(|| e.taken.clone());
+    let parts = [
+        (f.camera, e.camera.clone()),
+        (f.lens, e.lens.clone()),
+        (f.exposure, e.exposure.as_deref().map(tidy_exposure)),
+        (f.aperture, e.aperture.clone()),
+        (f.iso, iso),
+        (f.focal, focal),
+        (f.taken, taken),
+    ];
+    parts.into_iter().filter(|(on, _)| *on).filter_map(|(_, v)| v.filter(|v| !v.trim().is_empty())).collect::<Vec<_>>().join(CAPTION_SEP)
+}
+
+/// "1/41.1522633744856 s" as "1/41 s"; other forms unchanged.
+fn tidy_exposure(e: &str) -> String {
+    let t = e.trim().trim_end_matches('s').trim();
+    if let Some(d) = t.strip_prefix("1/").and_then(|d| d.parse::<f64>().ok()) {
+        return format!("1/{} s", d.round().max(1.0));
+    }
+    e.to_string()
+}
+
 #[allow(dead_code)]
 fn _palette_unused(_: &Palette) {}
 
@@ -3396,5 +3477,65 @@ mod film_tests {
         f.sync(&moved, 32.0, |_| None);
         assert_eq!(f.w[0], 48.0);
         assert_eq!(f.w[1], 42.666668);
+    }
+
+    #[test]
+    fn caption_camera_line() {
+        let mut e = crate::meta::ExifSummary::default();
+        let all = CaptionFields::default();
+        assert_eq!(exif_caption(&e, &all), "");
+        e.exposure = Some("1/120 s".into());
+        e.aperture = Some("f/1.8".into());
+        e.iso = Some("ISO 100".into());
+        e.focal = Some("5.4 mm (26 mm eq.)".into());
+        e.taken = Some("2026-03-12 14:05:09".into());
+        e.taken_ts = chrono::NaiveDate::from_ymd_opt(2026, 3, 12).and_then(|d| d.and_hms_opt(14, 5, 9)).map(|n| n.and_utc().timestamp());
+        e.camera = Some("Pixel 9".into());
+        let sep = CAPTION_SEP;
+        assert_eq!(exif_caption(&e, &all), format!("1/120 s{sep}f/1.8{sep}ISO 100{sep}5.4 mm (26 mm){sep}12 Mar 2026 14:05"));
+        // Only the chosen fields, camera first.
+        let f = CaptionFields { camera: true, aperture: false, focal: false, taken: false, ..all };
+        assert_eq!(exif_caption(&e, &f), format!("Pixel 9{sep}1/120 s{sep}ISO 100"));
+        // Odd exposure values are rounded; a bare ISO number gets its name.
+        e.exposure = Some("1/41.1522633744856 s".into());
+        e.iso = Some("400".into());
+        e.taken_ts = None;
+        let f = CaptionFields { exposure: true, iso: true, taken: true, aperture: false, focal: false, camera: false, lens: false };
+        assert_eq!(exif_caption(&e, &f), format!("1/41 s{sep}ISO 400{sep}2026-03-12 14:05:09"));
+        e.focal = Some("26 mm (35mm eq.)".into());
+        let f = CaptionFields { focal: true, exposure: false, iso: false, taken: false, aperture: false, camera: false, lens: false };
+        assert_eq!(exif_caption(&e, &f), "26 mm (35 mm)");
+    }
+
+    #[test]
+    fn info_panel_fits_small_windows() {
+        // At most 40% of the window; never below 220 unless the window is tiny.
+        assert_eq!(info_panel_range(1920.0), (220.0, 520.0));
+        assert_eq!(info_panel_range(1000.0), (220.0, 400.0));
+        let (lo, hi) = info_panel_range(640.0);
+        assert!(hi <= 256.0 && lo <= hi);
+        let (lo, hi) = info_panel_range(f32::NAN);
+        assert!(lo <= hi && hi.is_finite());
+    }
+
+    #[test]
+    fn info_panel_hides_in_a_narrow_window_and_comes_back() {
+        let mut v = Viewer::new();
+        v.toggle_info();
+        assert!(v.info_visible());
+        // The window gets narrow: hidden, the choice kept.
+        v.info_narrow = true;
+        assert!(!v.info_visible() && v.show_info);
+        // Wide again: back.
+        v.info_narrow = false;
+        assert!(v.info_visible());
+        // Asked for in a narrow window: shown there.
+        v.info_narrow = true;
+        v.toggle_info();
+        assert!(v.info_visible());
+        v.toggle_info();
+        assert!(!v.info_visible() && !v.show_info);
+        v.info_narrow = false;
+        assert!(!v.info_visible());
     }
 }

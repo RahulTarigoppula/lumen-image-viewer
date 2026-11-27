@@ -22,6 +22,8 @@ const CAPTION_NAME: f32 = 12.5;
 /// Preview pane: the picture's maximum height and the text block below it.
 const PREVIEW_MAX_H: f32 = 180.0;
 const PREVIEW_TEXT_H: f32 = 92.0;
+/// Star size of the preview pane's tag row.
+const PREVIEW_TAG_SIZE: f32 = 13.0;
 
 /// Files shown at most with "Include subfolders".
 const MAX_TREE_FILES: usize = 50_000;
@@ -885,7 +887,7 @@ impl Browser {
                     ui.set_max_height(h);
                     // Nothing may draw above the panel onto the tree.
                     ui.set_clip_rect(ui.max_rect().expand2(Vec2::new(12.0, 8.0)).intersect(ui.clip_rect()));
-                    self.preview_pane(ui, core);
+                    self.preview_pane(ui, core, ev);
                 });
             tree_bottom = Some(r.response.rect.min.y);
         }
@@ -913,7 +915,7 @@ impl Browser {
         }
     }
 
-    fn preview_pane(&mut self, ui: &mut Ui, core: &mut Core) {
+    fn preview_pane(&mut self, ui: &mut Ui, core: &mut Core, ev: &mut Vec<BrowserEvent>) {
         let p = core.pal;
         let Some(entry) = self.focus.and_then(|i| self.item(i)).cloned() else {
             ui.centered_and_justified(|ui| {
@@ -922,9 +924,11 @@ impl Browser {
             return;
         };
         let avail = ui.available_size();
-        // The text block below the picture is about 90 points tall; the picture
-        // gets what is left (at most 180 points) and is dropped when that is too little.
-        let img_h = (avail.y - PREVIEW_TEXT_H).min(PREVIEW_MAX_H);
+        // The text block below the picture is about 90 points tall (one line
+        // more when the tag row wraps); the picture gets what is left (at most
+        // 180 points) and is dropped when that is too little.
+        let text_h = PREVIEW_TEXT_H + if entry.is_media() && super::tagrow::wraps(avail.x, PREVIEW_TAG_SIZE) { PREVIEW_TAG_SIZE + 6.0 } else { 0.0 };
+        let img_h = (avail.y - text_h).min(PREVIEW_MAX_H);
         let mut dims = core.meta.get(&entry.path).and_then(|m| m.dims);
         if img_h >= 40.0 {
             self.preview_image(ui, core, &entry, Vec2::new(avail.x, img_h), &mut dims);
@@ -944,20 +948,10 @@ impl Browser {
         ui.add(egui::Label::new(RichText::new(catalog::format_time(entry.modified)).color(p.faint).size(text::SMALL)).truncate());
         if entry.is_media() {
             ui.add_space(space::XS);
-            let tag = core.tags.get(&entry.path);
-            ui.horizontal(|ui| {
-                if let Some(r) = widgets::star_rating(ui, tag.rating, 13.0, &p) {
-                    core.tags.update(&entry.path, |t| t.rating = r);
-                }
-                ui.add_space(6.0);
-                let flag_color = if tag.flagged { p.accent } else { p.faint };
-                let font = if tag.flagged { theme::icon_fill(14.0) } else { FontId::proportional(14.0) };
-                let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                ui.painter().text(r.center(), Align2::CENTER_CENTER, I::FLAG, font, flag_color);
-                if resp.on_hover_text("Flag (Space)").clicked() {
-                    core.tags.update(&entry.path, |t| t.flagged = !t.flagged);
-                }
-            });
+            // A click works like the key: on the selected files, with a notice and undo.
+            if let Some(c) = super::tagrow::tag_row(ui, core.tags.get(&entry.path), PREVIEW_TAG_SIZE, &p) {
+                ev.push(BrowserEvent::Command(c));
+            }
         }
     }
 
@@ -1707,7 +1701,7 @@ impl Browser {
                                     DetailCol::Rating => {
                                         let r = core.tags.get(&entry.path).rating;
                                         if r > 0 {
-                                            ui.label(RichText::new(I::STAR.repeat(r as usize)).font(theme::icon_fill(11.0)).color(Color32::from_rgb(250, 196, 60)));
+                                            ui.label(RichText::new(I::STAR.repeat(r as usize)).font(theme::icon_fill(11.0)).color(p.star));
                                         }
                                     }
                                 }
@@ -1848,16 +1842,7 @@ impl Browser {
                 item(ui, Command::Rename, ev);
                 item(ui, Command::Delete, ev);
                 ui.separator();
-                widgets::submenu(ui, I::STAR, "Rate & tag", |ui| {
-                    for n in 0..=5 {
-                        item(ui, Command::Rate(n), ev);
-                    }
-                    ui.separator();
-                    item(ui, Command::ToggleFlag, ev);
-                    for n in 0..=5 {
-                        item(ui, Command::Label(n), ev);
-                    }
-                });
+                super::tagrow::rate_tag_menu(ui, |ui, c| item(ui, c, ev));
                 widgets::submenu(ui, I::WRENCH, "Tools", |ui| {
                     item(ui, Command::BatchConvert, ev);
                     item(ui, Command::BatchRename, ev);

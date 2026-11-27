@@ -7,7 +7,7 @@ use super::icons as I;
 use super::theme::{self, mix, radius, size, text, Palette};
 use super::widgets::{self, section_title};
 use crate::app::Core;
-use crate::settings::{ExternalEditor, FitMode, Settings, SortKey, ThemeChoice, ThumbCaption, WheelAction};
+use crate::settings::{ExternalEditor, FitMode, Settings, ShowWhen, SortKey, ThemeChoice, ThumbCaption, WheelAction};
 use crate::ui::commands::Command;
 use crate::ui::keymap::{self, KeyMode, Keymap, Preset};
 use egui::KeyboardShortcut;
@@ -725,8 +725,51 @@ fn viewer(ui: &mut Ui, p: &Palette, s: &mut Settings) -> bool {
         changed |= toggle_row(ui, p, "Loop at folder end", "Going past the last image wraps to the first. Off: a notice, and pressing again opens the next folder.", &mut s.loop_navigation);
         changed |= toggle_row(ui, p, "Next image after rating", "Rating, flagging or labelling an image moves on to the next one, for fast culling.", &mut s.advance_after_tag);
         changed |= toggle_row(ui, p, "Preload neighbours", "Decode the next and previous images in the background for instant switching.", &mut s.preload_neighbors);
-        changed |= toggle_row(ui, p, "Show info overlay", "File name, size and EXIF summary over the image.", &mut s.show_info_overlay);
-        changed |= toggle_row(ui, p, "Show panels when the mouse touches a screen edge", "Edit tools on the left, file info on the right, thumbnails at the bottom.", &mut s.edge_panels);
+    });
+
+    section_title(ui, p, "Caption & panels");
+    card(ui, p, |ui| {
+        changed |= toggle_row(ui, p, "Caption in full screen", "Position, file name, size, zoom, rating, flag and color label at the top left. In a window it always shows.", &mut s.fullscreen_caption);
+        changed |= row(ui, p, "Camera settings in the caption", "A second caption line: exposure, aperture, ISO, focal length and date taken.", |ui| {
+            segmented_tips(
+                ui,
+                &mut s.caption_exif,
+                &[
+                    (ShowWhen::FullScreen, "Full screen only", "The camera line shows when the viewer fills the screen"),
+                    (ShowWhen::Always, "Always", "The camera line shows in a window too"),
+                    (ShowWhen::Never, "Off", "No camera line"),
+                ],
+            )
+        });
+        changed |= row(ui, p, "Camera line shows", "Pick what the camera line lists.", |ui| {
+            let f = &mut s.caption_fields;
+            ui.add_enabled_ui(s.caption_exif != ShowWhen::Never, |ui| {
+                let mut c = false;
+                // Right to left: the last field first.
+                for (on, label) in [(&mut f.lens, "Lens"), (&mut f.camera, "Camera"), (&mut f.taken, "Date"), (&mut f.focal, "Focal length"), (&mut f.iso, "ISO"), (&mut f.aperture, "Aperture"), (&mut f.exposure, "Exposure")] {
+                    c |= widgets::checkbox(ui, on, label).changed();
+                }
+                c
+            })
+            .inner
+        });
+        changed |= toggle_row(ui, p, "Open the info panel on start", "File details, camera settings and the histogram beside the image (I). A window narrower than 700 points hides it until it grows.", &mut s.info_panel_on_start);
+        changed |= row(ui, p, "Edge panels", "Rest the mouse at a screen edge: edit tools on the left, file info on the right, thumbnails at the top.", |ui| {
+            let mut m = s.edge_panels();
+            let c = segmented_tips(
+                ui,
+                &mut m,
+                &[
+                    (ShowWhen::FullScreen, "Full screen only", "In a window the edges stay free for resizing it and for other programs"),
+                    (ShowWhen::Always, "Always", "In a window too"),
+                    (ShowWhen::Never, "Off", "No panels pop up at the edges"),
+                ],
+            );
+            if c {
+                s.set_edge_panels(m);
+            }
+            c
+        });
     });
 
     section_title(ui, p, "Videos");
