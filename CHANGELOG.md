@@ -130,9 +130,13 @@ second full pass over looks, ease of use, stability and speed.
 - SVG files can only show images embedded in them or stored in their own folder.
 - The Metadata window no longer rebuilds its table every frame; Save As, the filmstrip, going to the next folder
   and Settings > Performance no longer freeze while a slow or network drive answers.
-- Undoing a move, a rename or a rotation, saving, Save as, Copy image and Set as wallpaper now run in the
-  background with a progress card, so Lumen stays responsive with big files or a slow drive. Edits made while a save
-  runs stay unsaved until you save again, and an action that waits for the save goes on when it is done.
+- Undo (Ctrl+Z) of a move, rename, rotation or lossless crop runs in the background with a progress card, so undoing
+  a big move to another drive no longer freezes the window; files that could not be put back are named, and the ones
+  back in the folder shown are selected.
+- Save and Save as write in the background with a "Saving..." card. Opening another file or quitting right after
+  saving waits for the save instead of asking again; edits made while saving stay unsaved.
+- Copy image and Set as wallpaper no longer freeze the window while the picture is read, and say when they are done
+  or what went wrong (Set as wallpaper used to fail silently).
 
 ## 2.1.0 (27 November 2026)
 
