@@ -152,6 +152,41 @@ pub enum Command {
     MoveEarlier,
     /// Move the selected files one place later in the folder's custom order.
     MoveLater,
+    /// The round report of the open project (title, branding, format).
+    RoundReport,
+    // Compare (keys in the Compare and Blind test modes of the keymap)
+    PanLeft,
+    PanRight,
+    PanUp,
+    PanDown,
+    ViewSideBySide,
+    ViewSplit,
+    ViewDifference,
+    /// Split view: move the divider to one side.
+    JumpDivider,
+    /// Link or unlink zoom and pan of the panes.
+    ToggleLink,
+    SwapAB,
+    /// Warp B-D onto A so the same scene content lines up.
+    AlignToA,
+    /// The camera info strip under each pane.
+    ToggleCameraInfo,
+    /// Brightness along a line in every pane.
+    LineProfile,
+    ToggleMarkup,
+    ToggleReview,
+    /// The comparison review as PowerPoint, PDF or a web page.
+    ExportReport,
+    /// Keep the image under the pointer, reject the others.
+    KeepOnly,
+    NextScene,
+    PrevScene,
+    ToggleScorecard,
+    /// The shortcuts overlay of Compare.
+    CompareHelp,
+    VoteLeft,
+    VoteRight,
+    VoteSame,
 }
 
 use Command::*;
@@ -284,6 +319,31 @@ impl Command {
             CopyImageText => "Copy text in image (OCR)".into(),
             MoveEarlier => "Move earlier (custom order)".into(),
             MoveLater => "Move later (custom order)".into(),
+            RoundReport => "Round report (project)...".into(),
+            PanLeft => "Pan left".into(),
+            PanRight => "Pan right".into(),
+            PanUp => "Pan up".into(),
+            PanDown => "Pan down".into(),
+            ViewSideBySide => "View: side by side".into(),
+            ViewSplit => "View: split".into(),
+            ViewDifference => "View: difference".into(),
+            JumpDivider => "Split: jump the divider".into(),
+            ToggleLink => "Link zoom & pan".into(),
+            SwapAB => "Swap A and B".into(),
+            AlignToA => "Align to A (match field of view)".into(),
+            ToggleCameraInfo => "Camera info strip".into(),
+            LineProfile => "Line profile".into(),
+            ToggleMarkup => "Mark up".into(),
+            ToggleReview => "Review panel".into(),
+            ExportReport => "Export review report...".into(),
+            KeepOnly => "Keep this image, reject the others".into(),
+            NextScene => "Next scene (project)".into(),
+            PrevScene => "Previous scene (project)".into(),
+            ToggleScorecard => "Scorecard (project)".into(),
+            CompareHelp => "Compare shortcuts".into(),
+            VoteLeft => "Blind test: left is better".into(),
+            VoteRight => "Blind test: right is better".into(),
+            VoteSame => "Blind test: about the same".into(),
         }
     }
 
@@ -418,6 +478,31 @@ impl Command {
             CopyImageText => I::SCAN,
             MoveEarlier => I::ARROW_LEFT,
             MoveLater => I::ARROW_RIGHT,
+            RoundReport => I::PRESENTATION_CHART,
+            PanLeft => I::ARROW_LEFT,
+            PanRight => I::ARROW_RIGHT,
+            PanUp => I::ARROW_UP,
+            PanDown => I::ARROW_DOWN,
+            ViewSideBySide => I::COLUMNS,
+            ViewSplit => I::SQUARE_SPLIT_HORIZONTAL,
+            ViewDifference => I::SUBTRACT_SQUARE,
+            JumpDivider => I::ARROWS_HORIZONTAL,
+            ToggleLink => I::LINK,
+            SwapAB => I::ARROWS_LEFT_RIGHT,
+            AlignToA => I::FRAME_CORNERS,
+            ToggleCameraInfo => I::CAMERA,
+            LineProfile => I::CHART_LINE_UP,
+            ToggleMarkup => I::PENCIL_SIMPLE_LINE,
+            ToggleReview => I::CHAT_TEXT,
+            ExportReport => I::EXPORT,
+            KeepOnly => I::CHECK_CIRCLE,
+            NextScene => I::CARET_RIGHT,
+            PrevScene => I::CARET_LEFT,
+            ToggleScorecard => I::LIST_CHECKS,
+            CompareHelp => I::QUESTION,
+            VoteLeft => I::ARROW_FAT_LEFT,
+            VoteRight => I::ARROW_FAT_RIGHT,
+            VoteSame => I::EQUALS,
         }
     }
 
@@ -448,7 +533,10 @@ impl Command {
             ToggleHistogram, ToggleMagnifier, ToggleFilmstrip, PlayPause, OpenWithEditor, Properties, FitWidth,
             FitHeight, OpenGpsMap, ToggleLockZoom, EditComment, RemoveMetadata, ChangeDates, ExportXmp,
             CreateMultiPage, ImageStrip, CreateZip, ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater,
+            RoundReport,
         ]);
+        // Compare's own commands (the palette offers them only in Compare).
+        v.extend(Self::COMPARE);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v.push(Exit);
@@ -460,6 +548,12 @@ impl Command {
         }
         v
     }
+
+    /// Commands that act on Compare only, in menu order.
+    pub const COMPARE: [Command; 24] = [
+        ViewSideBySide, ViewSplit, ViewDifference, JumpDivider, ToggleLink, SwapAB, AlignToA, ToggleCameraInfo, LineProfile, ToggleMarkup, ToggleReview, ExportReport, KeepOnly, PanLeft,
+        PanRight, PanUp, PanDown, PrevScene, NextScene, ToggleScorecard, CompareHelp, VoteLeft, VoteRight, VoteSame,
+    ];
 
     /// Every command, including each numbered variant (keymap editor, dev hook).
     pub fn all() -> Vec<Command> {
@@ -483,6 +577,8 @@ impl Command {
         v.extend((2..=9).map(OpenWithEditorN));
         v.extend([Properties, OpenGpsMap, EditComment, RemoveMetadata, ChangeDates, ExportXmp, CreateMultiPage, ImageStrip, CreateZip]);
         v.extend([ToggleAnalysis, RunMetrics, OpenProject, Workbench, BlindTest, MeasureProject, ShowExif, ShowMetadata, ExportMetadataCsv, TogglePixelValues, CycleInspect, SelectFlagged, FocusAddress, CopyImageText, MoveEarlier, MoveLater]);
+        v.push(RoundReport);
+        v.extend(Self::COMPARE);
         #[cfg(feature = "ai")]
         v.push(RunAi);
         v

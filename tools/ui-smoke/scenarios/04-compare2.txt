@@ -5,6 +5,11 @@ run SelectAll
 run Compare
 wait 3000
 shot side_by_side.png
+key ?
+wait 800
+shot help.png
+key ?
+wait 500
 key W
 wait 1500
 shot split.png

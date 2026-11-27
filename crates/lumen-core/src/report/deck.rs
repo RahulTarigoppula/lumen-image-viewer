@@ -8,7 +8,7 @@
 //! PowerPoint and PDF writers are shared; the HTML version shows the slides
 //! as scalable pages.
 
-use super::{best_grid, contain, fitted, header, leading, text, text_width, wrap, Align, Box2, Detail, El, Format, Picture, Slide, Table, TextEl, ACCENT, INK, M, MUTED, PAGE_H, PAGE_W, PANEL, RULE};
+use super::{best_grid, branded_cover, contain, dark_cover_footer, fitted, header, leading, page_footer, text, text_width, wrap, Align, Box2, Brand, CoverInfo, Detail, El, Format, Picture, Slide, Table, TextEl, INK, M, MUTED, PAGE_H, PAGE_W, PANEL, RULE};
 use anyhow::Result;
 use std::path::Path;
 
@@ -107,20 +107,16 @@ pub struct Deck {
     /// Changes since the previous round.
     pub round: Option<DeckRound>,
     pub scenes: Vec<DeckScene>,
+    /// The project's name (the cover shows it when the title differs).
+    pub project: String,
+    /// Company branding (default: Lumen's look).
+    pub brand: Brand,
 }
 
 const BODY_TOP: f32 = M + 44.0 + 12.0;
 
 fn body() -> Box2 {
     Box2::new(M, BODY_TOP, PAGE_W - 2.0 * M, PAGE_H - BODY_TOP - M - 4.0)
-}
-
-fn footer(s: &mut Slide, title: &str, page: usize) {
-    let y = PAGE_H - M + 6.0;
-    s.els.push(text(Box2::new(M, y, PAGE_W / 2.0, 20.0), title.to_string(), 8.0, false, MUTED));
-    let num = page.to_string();
-    let w = text_width(&num, 8.0, false);
-    s.els.push(text(Box2::new(PAGE_W - M - w - 2.0, y, w + 4.0, 20.0), num, 8.0, false, MUTED));
 }
 
 fn centered(bx: Box2, t: &str, size: f32, bold: bool, color: [u8; 3]) -> El {
@@ -151,16 +147,22 @@ fn fmt_mean(v: f64) -> String {
 }
 
 fn title_page(d: &Deck) -> Slide {
+    let title = if d.title.trim().is_empty() { "Camera comparison".to_string() } else { d.title.clone() };
+    let sub = format!("{} device{} · {} scene{}", d.tally.len(), if d.tally.len() == 1 { "" } else { "s" }, d.scenes.len(), if d.scenes.len() == 1 { "" } else { "s" });
+    let device_name = |t: &DeckTally| if d.reference.as_deref() == Some(t.device.as_str()) { format!("{} (reference)", t.device) } else { t.device.clone() };
+    if d.brand.branded() {
+        let items = d.tally.iter().map(|t| (device_name(t), t.color)).collect();
+        let c = CoverInfo { title, project: d.project.clone(), stats: sub, items, date: d.date.clone(), author: d.author.clone() };
+        return branded_cover(&c, &d.brand);
+    }
     let mut s = Slide::default();
     s.els.push(El::Fill { bx: Box2::new(0.0, 0.0, PAGE_W, PAGE_H), color: [24, 30, 42] });
-    s.els.push(El::Fill { bx: Box2::new(72.0, 200.0, 64.0, 4.0), color: ACCENT });
-    let title = if d.title.trim().is_empty() { "Camera comparison".to_string() } else { d.title.clone() };
+    s.els.push(El::Fill { bx: Box2::new(72.0, 200.0, 64.0, 4.0), color: d.brand.accent });
     s.els.push(fitted(Box2::new(72.0, 216.0, PAGE_W - 144.0, 92.0), &title, &[40.0, 34.0, 28.0], true, [255, 255, 255]));
-    let sub = format!("{} device{} · {} scene{}", d.tally.len(), if d.tally.len() == 1 { "" } else { "s" }, d.scenes.len(), if d.scenes.len() == 1 { "" } else { "s" });
     s.els.push(text(Box2::new(72.0, 314.0, PAGE_W - 144.0, 22.0), sub, 16.0, false, [200, 208, 220]));
     let mut x = 72.0;
     for t in &d.tally {
-        let name = if d.reference.as_deref() == Some(t.device.as_str()) { format!("{} (reference)", t.device) } else { t.device.clone() };
+        let name = device_name(t);
         if x > PAGE_W - 200.0 {
             break;
         }
@@ -171,12 +173,13 @@ fn title_page(d: &Deck) -> Slide {
         s.els.push(text(Box2::new(72.0, 440.0, PAGE_W - 144.0, 18.0), by, 12.0, false, [200, 208, 220]));
     }
     s.els.push(text(Box2::new(72.0, PAGE_H - 48.0, 300.0, 14.0), "Made with Lumen", 9.0, false, [120, 130, 146]));
+    dark_cover_footer(&mut s, &d.brand);
     s
 }
 
 fn summary_page(d: &Deck, title: &str) -> Slide {
     let mut s = Slide::default();
-    header(&mut s, title, "Executive summary");
+    header(&mut s, &d.brand, title, "Executive summary");
     let b = body();
     let mut y = b.y;
     let mut lines: Vec<String> = d.headline.clone();
@@ -187,7 +190,7 @@ fn summary_page(d: &Deck, title: &str) -> Slide {
         let txt = lines.iter().map(|l| format!("•  {l}")).collect::<Vec<_>>().join("\n");
         let h = (wrap(&txt, 13.0, false, b.w - 28.0).len() as f32 * leading(13.0) + 20.0).min(b.h * 0.42);
         s.els.push(El::Fill { bx: Box2::new(b.x, y, b.w, h), color: PANEL });
-        s.els.push(El::Fill { bx: Box2::new(b.x, y, 3.0, h), color: ACCENT });
+        s.els.push(El::Fill { bx: Box2::new(b.x, y, 3.0, h), color: d.brand.accent });
         s.els.push(fitted(Box2::new(b.x + 14.0, y + 10.0, b.w - 28.0, h - 16.0), &txt, &[13.0, 11.0, 9.0], false, INK));
         y += h + 16.0;
     }
@@ -195,7 +198,7 @@ fn summary_page(d: &Deck, title: &str) -> Slide {
     let judged: Vec<&DeckTally> = d.tally.iter().filter(|t| t.win + t.par + t.lose > 0).collect();
     if !judged.is_empty() {
         let against = d.reference.as_deref().map(|r| format!("Against {r}")).unwrap_or_else(|| "Verdicts".into());
-        s.els.push(text(Box2::new(b.x, y, b.w, 14.0), against.to_uppercase(), 9.0, true, ACCENT));
+        s.els.push(text(Box2::new(b.x, y, b.w, 14.0), against.to_uppercase(), 9.0, true, d.brand.accent));
         y += 18.0;
         let label_w = 150.0;
         let bar_w = b.w - label_w - 120.0;
@@ -238,7 +241,7 @@ fn summary_page(d: &Deck, title: &str) -> Slide {
             .collect();
         let row_h = 22.0;
         let h = (row_h * (rows.len() + 1) as f32).min(b.y + b.h - y);
-        s.els.push(El::Table { bx: Box2::new(b.x, y, b.w, h), table: Table { header: header_row, rows, note: String::new() } });
+        s.els.push(El::Table { bx: Box2::new(b.x, y, b.w, h), table: Table { header: header_row, rows, note: String::new() }, head: d.brand.accent });
     }
     s
 }
@@ -251,7 +254,7 @@ fn attribute_page(d: &Deck, title: &str) -> Option<Slide> {
         return None;
     }
     let mut s = Slide::default();
-    header(&mut s, title, "Scorecard by attribute");
+    header(&mut s, &d.brand, title, "Scorecard by attribute");
     let b = body();
     let (lo, hi) = d.scale;
     let span = (hi - lo).max(1) as f32;
@@ -301,7 +304,7 @@ fn issues_page(d: &Deck, title: &str) -> Option<Slide> {
         return None;
     }
     let mut s = Slide::default();
-    header(&mut s, title, "Flagged artifacts");
+    header(&mut s, &d.brand, title, "Flagged artifacts");
     let b = body();
     let mut head = vec!["Artifact".to_string()];
     head.extend(d.tally.iter().map(|t| t.device.clone()));
@@ -317,7 +320,7 @@ fn issues_page(d: &Deck, title: &str) -> Option<Slide> {
         .collect();
     let row_h = 24.0;
     let h = (row_h * (rows.len() + 1) as f32).min(b.h - 30.0);
-    s.els.push(El::Table { bx: Box2::new(b.x, b.y, b.w, h), table: Table { header: head, rows, note: String::new() } });
+    s.els.push(El::Table { bx: Box2::new(b.x, b.y, b.w, h), table: Table { header: head, rows, note: String::new() }, head: d.brand.accent });
     s.els.push(fitted(Box2::new(b.x, b.y + h + 8.0, b.w, 24.0), "Number of marked areas per artifact and device, over all scenes. Fewer is better.", &[10.0], false, MUTED));
     Some(s)
 }
@@ -325,11 +328,11 @@ fn issues_page(d: &Deck, title: &str) -> Option<Slide> {
 fn measures_page(d: &Deck, title: &str) -> Option<Slide> {
     let t = d.measures.as_ref().filter(|t| !t.rows.is_empty())?;
     let mut s = Slide::default();
-    header(&mut s, title, "Measured quality");
+    header(&mut s, &d.brand, title, "Measured quality");
     let b = body();
     let row_h = 24.0;
     let h = (row_h * (t.rows.len() + 1) as f32).min(b.h - 50.0);
-    s.els.push(El::Table { bx: Box2::new(b.x, b.y, b.w, h), table: Table { header: t.header.clone(), rows: t.rows.clone(), note: String::new() } });
+    s.els.push(El::Table { bx: Box2::new(b.x, b.y, b.w, h), table: Table { header: t.header.clone(), rows: t.rows.clone(), note: String::new() }, head: d.brand.accent });
     if !t.note.is_empty() {
         s.els.push(fitted(Box2::new(b.x, b.y + h + 8.0, b.w, 40.0), &t.note, &[10.0, 9.0], false, MUTED));
     }
@@ -339,20 +342,20 @@ fn measures_page(d: &Deck, title: &str) -> Option<Slide> {
 fn round_page(d: &Deck, title: &str) -> Option<Slide> {
     let r = d.round.as_ref()?;
     let mut s = Slide::default();
-    header(&mut s, title, &r.title);
+    header(&mut s, &d.brand, title, &r.title);
     let b = body();
     let row_h = 24.0;
     let mut y = b.y;
     if !r.table.rows.is_empty() {
         let h = (row_h * (r.table.rows.len() + 1) as f32).min(b.h * 0.5);
-        s.els.push(El::Table { bx: Box2::new(b.x, y, b.w, h), table: Table { header: r.table.header.clone(), rows: r.table.rows.clone(), note: String::new() } });
+        s.els.push(El::Table { bx: Box2::new(b.x, y, b.w, h), table: Table { header: r.table.header.clone(), rows: r.table.rows.clone(), note: String::new() }, head: d.brand.accent });
         y += h + 8.0;
         s.els.push(fitted(Box2::new(b.x, y, b.w, 16.0), "Mean score change over the scenes scored in both rounds (positive is better).", &[10.0], false, MUTED));
         y += 24.0;
     }
     let head = if r.regressions.is_empty() { "No score went down".to_string() } else { format!("{} score{} went down", r.regressions.len(), if r.regressions.len() == 1 { "" } else { "s" }) };
     let head = format!("{head}; {} went up", r.improvements);
-    s.els.push(text(Box2::new(b.x, y, b.w, 16.0), head.to_uppercase(), 9.0, true, ACCENT));
+    s.els.push(text(Box2::new(b.x, y, b.w, 16.0), head.to_uppercase(), 9.0, true, d.brand.accent));
     y += 20.0;
     if !r.regressions.is_empty() && y < b.y + b.h - 20.0 {
         let list = r.regressions.iter().take(18).map(|l| format!("•  {l}")).collect::<Vec<_>>().join("\n");
@@ -366,7 +369,7 @@ fn ranking_page(d: &Deck, title: &str) -> Option<Slide> {
         return None;
     }
     let mut s = Slide::default();
-    header(&mut s, title, "Blind test");
+    header(&mut s, &d.brand, title, "Blind test");
     let b = body();
     let label_w = 170.0;
     let chart_w = b.w - label_w - 150.0;
@@ -399,7 +402,7 @@ fn ranking_page(d: &Deck, title: &str) -> Option<Slide> {
 
 fn scene_page(d: &Deck, k: usize, sc: &DeckScene) -> Slide {
     let mut s = Slide::default();
-    header(&mut s, &sc.name, &format!("Scene {} of {}", k + 1, d.scenes.len()));
+    header(&mut s, &d.brand, &sc.name, &format!("Scene {} of {}", k + 1, d.scenes.len()));
     let b = body();
     let mut notes_txt = String::new();
     if !sc.comment.trim().is_empty() {
@@ -456,7 +459,7 @@ fn scene_page(d: &Deck, k: usize, sc: &DeckScene) -> Slide {
     if bottom_h > 0.0 {
         let sb = Box2::new(b.x, b.y + b.h - bottom_h, b.w, bottom_h);
         s.els.push(El::Fill { bx: sb, color: PANEL });
-        s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: ACCENT });
+        s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: d.brand.accent });
         s.els.push(fitted(Box2::new(sb.x + 14.0, sb.y + 8.0, sb.w - 28.0, sb.h - 12.0), &notes_txt, &[10.0, 9.0, 8.0], false, INK));
     }
     s.notes = notes_txt;
@@ -466,7 +469,7 @@ fn scene_page(d: &Deck, k: usize, sc: &DeckScene) -> Slide {
 fn detail_page(d: &Deck, sc: &DeckScene, k: usize, det: &Detail) -> Slide {
     let mut s = Slide::default();
     let t = if det.title.trim().is_empty() { format!("{}: detail {}", sc.name, k + 1) } else { format!("{}: {}", sc.name, det.title.trim()) };
-    header(&mut s, &t, "Detail");
+    header(&mut s, &d.brand, &t, "Detail");
     let b = body();
     let ch_comment = if det.comment.trim().is_empty() { 0.0 } else { 54.0 };
     let area = Box2::new(b.x, b.y, b.w, b.h - ch_comment - if ch_comment > 0.0 { 10.0 } else { 0.0 });
@@ -479,7 +482,7 @@ fn detail_page(d: &Deck, sc: &DeckScene, k: usize, det: &Detail) -> Slide {
     for (i, (label, pic)) in det.crops.iter().enumerate() {
         let (cx, cy) = (i % cols.max(1), i / cols.max(1));
         let cell = Box2::new(area.x + cx as f32 * (cw + gap), area.y + cy as f32 * (chh + gap), cw, chh);
-        let color = d.tally.iter().find(|t| &t.device == label).map(|t| t.color).unwrap_or(ACCENT);
+        let color = d.tally.iter().find(|t| &t.device == label).map(|t| t.color).unwrap_or(d.brand.accent);
         let ib = contain(Box2::new(cell.x, cell.y + cap + 2.0, cell.w, cell.h - cap - 2.0), aspects[i]);
         chip(&mut s, ib.x, ib.y - cap, label, color, 10.0, (ib.w * 0.8).max(80.0));
         s.els.push(El::Image { bx: ib, pic: pic.clone() });
@@ -488,7 +491,7 @@ fn detail_page(d: &Deck, sc: &DeckScene, k: usize, det: &Detail) -> Slide {
     if ch_comment > 0.0 {
         let sb = Box2::new(b.x, b.y + b.h - ch_comment, b.w, ch_comment);
         s.els.push(El::Fill { bx: sb, color: PANEL });
-        s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: ACCENT });
+        s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: d.brand.accent });
         s.els.push(fitted(Box2::new(sb.x + 14.0, sb.y + 8.0, sb.w - 28.0, sb.h - 12.0), &det.comment, &[11.0, 9.0], false, INK));
     }
     s.notes = det.comment.clone();
@@ -515,7 +518,7 @@ pub fn layout(d: &Deck) -> Vec<Slide> {
         }
     }
     for (k, s) in slides.iter_mut().enumerate().skip(1) {
-        footer(s, &title, k + 1);
+        page_footer(s, &d.brand, &title, k + 1);
     }
     slides
 }
@@ -524,8 +527,8 @@ pub fn layout(d: &Deck) -> Vec<Slide> {
 pub fn write(d: &Deck, fmt: Format, path: &Path) -> Result<()> {
     let slides = layout(d);
     let bytes = match fmt {
-        Format::Pptx => super::pptx::render_slides(&slides, &d.title, &d.author)?,
-        Format::Pdf => super::pdf::render_slides(&slides, &d.title)?,
+        Format::Pptx => super::pptx::render_slides(&slides, &d.title, &d.author, &d.brand)?,
+        Format::Pdf => super::pdf::render_slides(&slides, &d.title, &d.author)?,
         Format::Html => super::html::render_slides(&slides, &d.title).into_bytes(),
     };
     crate::encode::write_atomic(path, &bytes)
@@ -575,7 +578,55 @@ mod tests {
             round: Some(DeckRound { title: "Since Round 2".into(), table: Table { header: vec!["Device".into(), "Noise".into()], rows: vec![vec!["PhoneX".into(), "-0.5".into()]], note: String::new() }, regressions: vec!["Night 1: PhoneX Noise 4 to 2".into()], improvements: 3 }),
             measures: Some(Table { header: vec!["Device".into(), "Sharpness".into(), "Noise".into()], rows: vec![vec!["A56".into(), "412".into(), "1.20 levels".into()]], note: "Higher sharpness is better.".into() }),
             scenes,
+            project: "Round 3".into(),
+            brand: Brand::default(),
         }
+    }
+
+    #[test]
+    fn branded_deck_has_logo_accent_and_footer_on_every_page() {
+        use crate::report::tests::{acme, boxes, on_page, overlaps};
+        let plain = layout(&sample());
+        let mut d = sample();
+        d.brand = acme(Some((800, 200)));
+        let slides = layout(&d);
+        assert_eq!(slides.len(), plain.len());
+        // White cover with the project, the devices and the footer line.
+        let cover_texts: Vec<&str> = slides[0].els.iter().filter_map(|e| if let El::Text(t) = e { Some(t.text.as_str()) } else { None }).collect();
+        for want in ["Acme Camera Lab", "Round 3 night", "Project: Round 3", "3 devices · 3 scenes", "A56 (reference)", "PhoneX", "17 November 2026  ·  Rahul", "Confidential"] {
+            assert!(cover_texts.contains(&want), "{want} missing from {cover_texts:?}");
+        }
+        assert!(!cover_texts.contains(&"Made with Lumen"));
+        for (k, s) in slides.iter().enumerate() {
+            assert!(boxes(s).into_iter().all(on_page), "page {k}");
+            if k == 0 {
+                continue;
+            }
+            // The header logo, the accent bar, the footer line.
+            let logo = s.els.iter().find_map(|e| if let El::Image { bx, .. } = e { (bx.y < 60.0).then_some(*bx) } else { None });
+            let logo = logo.unwrap_or_else(|| panic!("page {k} has no logo"));
+            assert!(s.els.iter().any(|e| matches!(e, El::Fill { color: [200, 30, 60], bx } if bx.x == 0.0)));
+            assert!(s.els.iter().any(|e| matches!(e, El::Text(t) if t.text == "Confidential")));
+            for e in &s.els {
+                if let El::Text(t) = e {
+                    assert!(!overlaps(t.bx, logo), "page {k}: {:?} over the logo", t.text);
+                }
+            }
+        }
+        // Tables take the accent; the unbranded deck keeps Lumen blue.
+        assert!(slides.iter().flat_map(|s| &s.els).all(|e| !matches!(e, El::Table { head, .. } if *head != [200, 30, 60])));
+        assert!(plain.iter().flat_map(|s| &s.els).all(|e| !matches!(e, El::Table { head, .. } if *head != crate::report::ACCENT)));
+        // The unbranded cover is today's dark one.
+        assert!(matches!(plain[0].els[0], El::Fill { color: [24, 30, 42], .. }));
+        // Every writer takes the branded deck.
+        let dir = std::env::temp_dir().join(format!("lumen-deck-brand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in Format::ALL {
+            write(&d, f, &dir.join(format!("deck.{}", f.ext()))).unwrap();
+        }
+        let html = std::fs::read_to_string(dir.join("deck.html")).unwrap();
+        assert!(html.contains("Acme Camera Lab") && html.contains("Confidential") && html.contains("rgb(200,30,60)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

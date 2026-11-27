@@ -7,11 +7,18 @@
 //! [`Slide`]s of positioned boxes in points (a 960 x 540 pt 16:9 page), and
 //! each writer renders those boxes. PPTX and PDF share the layout, so both
 //! look the same; HTML is a flowing page built from the report itself.
+//!
+//! Company branding ([`Branding`], resolved into a [`Brand`]) adds a logo,
+//! a company name, an accent color and a footer line to every page and a
+//! white cover page; without it reports keep Lumen's own look.
 
+pub mod brand;
 pub mod deck;
 pub mod html;
 pub mod pdf;
 pub mod pptx;
+
+pub use brand::{Brand, Branding};
 
 use anyhow::Result;
 use image::RgbaImage;
@@ -88,6 +95,11 @@ impl Picture {
     /// Encode `img` (alpha flattened on white) as a JPEG no larger than
     /// `max_side` pixels on its long side.
     pub fn from_rgba(img: &RgbaImage, max_side: u32) -> Result<Picture> {
+        Self::from_rgba_quality(img, max_side, 88)
+    }
+
+    /// [`Picture::from_rgba`] at JPEG `quality` (1-100).
+    pub fn from_rgba_quality(img: &RgbaImage, max_side: u32, quality: u8) -> Result<Picture> {
         let (w, h) = img.dimensions();
         anyhow::ensure!(w > 0 && h > 0, "empty image");
         let scaled;
@@ -100,11 +112,11 @@ impl Picture {
         let (w, h) = src.dimensions();
         let rgb = crate::encode::flatten_rgb(src, [255, 255, 255]);
         let mut out = Vec::new();
-        let enc = jpeg_encoder::Encoder::new(&mut out, 88);
+        let enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
         enc.encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)?;
         Ok(Picture { jpeg: std::sync::Arc::new(out), w, h })
     }
-    fn aspect(&self) -> f32 {
+    pub fn aspect(&self) -> f32 {
         self.w.max(1) as f32 / self.h.max(1) as f32
     }
 }
@@ -156,6 +168,8 @@ pub struct Report {
     pub details: Vec<Detail>,
     pub metrics: Option<Table>,
     pub sections: Sections,
+    /// Company branding (default: Lumen's look).
+    pub brand: Brand,
 }
 
 /// Accent colours per image label, as RGB.
@@ -191,6 +205,7 @@ impl Box2 {
 pub enum Align {
     Left,
     Center,
+    Right,
 }
 
 #[derive(Clone, Debug)]
@@ -210,7 +225,8 @@ pub enum El {
     Frame { bx: Box2, color: [u8; 3], width: f32 },
     Image { bx: Box2, pic: Picture },
     Text(TextEl),
-    Table { bx: Box2, table: Table },
+    /// A table; `head` fills the header row.
+    Table { bx: Box2, table: Table, head: [u8; 3] },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -359,22 +375,158 @@ pub fn best_grid(aspects: &[f32], w: f32, h: f32, gap: f32) -> (usize, usize) {
     (best.0, best.1)
 }
 
-fn header(s: &mut Slide, title: &str, kicker: &str) {
-    s.els.push(El::Fill { bx: Box2::new(0.0, 0.0, 6.0, PAGE_H), color: ACCENT });
+/// Slot of the logo at the right end of a page's title row.
+pub const HEAD_LOGO: Box2 = Box2 { x: PAGE_W - M - 130.0, y: M + 5.0, w: 130.0, h: TITLE_H - 10.0 };
+
+/// A content page's header: the accent bar at the left edge, the kicker
+/// ("SCENE 2 OF 9"), the title and a rule; the logo at the right of the
+/// title, which makes room for it.
+pub(crate) fn header(s: &mut Slide, b: &Brand, title: &str, kicker: &str) {
+    s.els.push(El::Fill { bx: Box2::new(0.0, 0.0, 6.0, PAGE_H), color: b.accent });
     if !kicker.is_empty() {
-        s.els.push(text(Box2::new(M, M - 14.0, PAGE_W - 2.0 * M, 14.0), kicker.to_uppercase(), 9.0, true, ACCENT));
+        s.els.push(text(Box2::new(M, M - 14.0, PAGE_W - 2.0 * M, 14.0), kicker.to_uppercase(), 9.0, true, b.accent));
     }
-    s.els.push(fitted(Box2::new(M, M, PAGE_W - 2.0 * M, TITLE_H), title, &[26.0, 22.0, 18.0], true, INK));
+    let mut title_w = PAGE_W - 2.0 * M;
+    if let Some(pic) = &b.logo {
+        let lb = brand::logo_box(HEAD_LOGO, pic.aspect(), true);
+        s.els.push(El::Image { bx: lb, pic: pic.clone() });
+        title_w = lb.x - M - 16.0;
+    }
+    s.els.push(fitted(Box2::new(M, M, title_w, TITLE_H), title, &[26.0, 22.0, 18.0], true, INK));
     s.els.push(El::Fill { bx: Box2::new(M, M + TITLE_H + 2.0, PAGE_W - 2.0 * M, 1.0), color: RULE });
 }
 
-fn footer(s: &mut Slide, r: &Report, page: usize) {
+/// A content page's footer: company and report title at the left, the
+/// footer line ("Confidential") in the middle, the page number at the right.
+/// Every part stays on one line, shortened with an ellipsis when long.
+pub(crate) fn page_footer(s: &mut Slide, b: &Brand, title: &str, page: usize) {
     let y = PAGE_H - M + 6.0;
-    let left = if r.title.is_empty() { "Lumen review".to_string() } else { r.title.clone() };
-    s.els.push(text(Box2::new(M, y, PAGE_W / 2.0, FOOT_H), left, 8.0, false, MUTED));
     let num = page.to_string();
     let w = text_width(&num, 8.0, false);
     s.els.push(text(Box2::new(PAGE_W - M - w - 2.0, y, w + 4.0, FOOT_H), num, 8.0, false, MUTED));
+    let line = leading(8.0);
+    let foot = b.footer.trim();
+    let mid_w = if foot.is_empty() { 0.0 } else { (text_width(foot, 8.0, true) + 4.0).min(PAGE_W * 0.36) };
+    if mid_w > 0.0 {
+        let (size, t) = fit_text(foot, Box2::new(0.0, 0.0, mid_w, line), &[8.0, 7.0], true);
+        s.els.push(El::Text(TextEl { bx: Box2::new((PAGE_W - mid_w) / 2.0, y, mid_w, line), text: t, size, bold: true, color: INK, align: Align::Center }));
+    }
+    let left_w = if mid_w > 0.0 { (PAGE_W - mid_w) / 2.0 - M - 16.0 } else { PAGE_W / 2.0 };
+    let left = [b.company.as_str(), title.trim()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("  ·  ");
+    s.els.push(fitted(Box2::new(M, y, left_w, line), &left, &[8.0, 7.0], false, MUTED));
+}
+
+fn footer(s: &mut Slide, r: &Report, page: usize) {
+    let left = if r.title.is_empty() { "Lumen review" } else { r.title.as_str() };
+    page_footer(s, &r.brand, left, page);
+}
+
+/// What a cover page says.
+#[derive(Clone, Debug, Default)]
+pub struct CoverInfo {
+    pub title: String,
+    /// The project's name, shown when it is not the title already.
+    pub project: String,
+    /// "3 devices · 12 scenes", "2 images compared".
+    pub stats: String,
+    /// The devices (or images) compared, with their colors.
+    pub items: Vec<(String, [u8; 3])>,
+    pub date: String,
+    pub author: String,
+}
+
+/// Device chips in rows from (`x0`, `y`) up to `x1`, at most `max_rows`
+/// rows; when not all fit, a last chip says how many more there are.
+pub(crate) fn chip_rows(items: &[(String, [u8; 3])], x0: f32, y: f32, x1: f32, size: f32, max_rows: usize) -> Vec<(Box2, String, [u8; 3])> {
+    let h = leading(size) + 4.0;
+    let max_w = 240.0f32.min(x1 - x0).max(h);
+    let width = |t: &str| (text_width(t, size, true) + 14.0).min(max_w).max(h);
+    // The first `shown` items and the "+N more" chip, if they fit the rows.
+    let place = |shown: usize| -> Option<Vec<(Box2, String, [u8; 3])>> {
+        let more = items.len() - shown;
+        let extra = (more > 0).then(|| (format!("+{more} more"), MUTED));
+        let mut out = Vec::new();
+        let (mut x, mut row) = (x0, 0usize);
+        for (t, c) in items[..shown].iter().cloned().chain(extra) {
+            let w = width(&t);
+            if x > x0 && x + w > x1 {
+                row += 1;
+                x = x0;
+            }
+            if row >= max_rows {
+                return None;
+            }
+            out.push((Box2::new(x, y + row as f32 * (h + 6.0), w, h), t, c));
+            x += w + 8.0;
+        }
+        Some(out)
+    };
+    (0..=items.len()).rev().find_map(place).unwrap_or_default()
+}
+
+/// A colored chip with a name in white.
+pub(crate) fn push_chip(s: &mut Slide, bx: Box2, name: &str, color: [u8; 3], size: f32) {
+    s.els.push(El::Fill { bx, color });
+    s.els.push(fitted(Box2::new(bx.x + 7.0, bx.y + 2.0, (bx.w - 10.0).max(1.0), leading(size)), name, &[size, size * 0.85], true, [255, 255, 255]));
+}
+
+/// The branded cover: a white page with the accent band at the left, the
+/// logo and the company name at the top, then the title, the project, what
+/// was compared, the date and the author, and the footer line at the bottom.
+/// Logos of any shape and long names stay inside their slots.
+pub fn branded_cover(c: &CoverInfo, b: &Brand) -> Slide {
+    let mut s = Slide::default();
+    let (x0, x1) = (72.0, PAGE_W - 72.0);
+    let w = x1 - x0;
+    s.els.push(El::Fill { bx: Box2::new(0.0, 0.0, 16.0, PAGE_H), color: b.accent });
+    // Top row: the logo, a thin rule, the company name.
+    let top = Box2::new(x0, 52.0, w, 64.0);
+    let mut name_x = x0;
+    if let Some(pic) = &b.logo {
+        let lb = brand::logo_box(Box2::new(x0, top.y, 260.0, top.h), pic.aspect(), false);
+        s.els.push(El::Image { bx: lb, pic: pic.clone() });
+        name_x = lb.x + lb.w + 18.0;
+        if !b.company.is_empty() {
+            s.els.push(El::Fill { bx: Box2::new(name_x, top.y + 12.0, 1.0, top.h - 24.0), color: RULE });
+            name_x += 18.0;
+        }
+    }
+    if !b.company.is_empty() {
+        let (size, color) = if b.logo.is_some() { (16.0, INK) } else { (18.0, b.accent) };
+        s.els.push(fitted(Box2::new(name_x, top.y + 12.0, x1 - name_x, top.h - 24.0), &b.company, &[size, size * 0.85, 12.0, 10.0], true, color));
+    }
+    s.els.push(El::Fill { bx: Box2::new(x0, 196.0, 64.0, 4.0), color: b.accent });
+    s.els.push(fitted(Box2::new(x0, 212.0, w, 96.0), &c.title, &[40.0, 34.0, 28.0, 22.0], true, INK));
+    let mut y = 316.0;
+    let project = c.project.trim();
+    if !project.is_empty() && project != c.title.trim() {
+        s.els.push(fitted(Box2::new(x0, y, w, 20.0), &format!("Project: {project}"), &[13.0, 11.0], false, MUTED));
+        y += 22.0;
+    }
+    if !c.stats.is_empty() {
+        s.els.push(fitted(Box2::new(x0, y, w, 20.0), &c.stats, &[14.0, 12.0], false, MUTED));
+        y += 26.0;
+    }
+    for (bx, name, color) in chip_rows(&c.items, x0, y, x1, 11.0, 2) {
+        push_chip(&mut s, bx, &name, color, 11.0);
+    }
+    let by = [c.date.as_str(), c.author.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("  ·  ");
+    if !by.is_empty() {
+        s.els.push(fitted(Box2::new(x0, 436.0, w, 18.0), &by, &[12.0, 10.0], false, INK));
+    }
+    s.els.push(El::Fill { bx: Box2::new(x0, PAGE_H - 60.0, w, 0.75), color: RULE });
+    if !b.footer.is_empty() {
+        s.els.push(fitted(Box2::new(x0, PAGE_H - 50.0, w, 16.0), &b.footer, &[10.0, 9.0], true, INK));
+    }
+    s
+}
+
+/// The footer line on the dark (unbranded) cover, at the bottom right.
+pub(crate) fn dark_cover_footer(s: &mut Slide, b: &Brand) {
+    if !b.footer.is_empty() {
+        let (size, t) = fit_text(&b.footer, Box2::new(0.0, 0.0, PAGE_W / 2.0 - 72.0, 14.0), &[9.0, 8.0], true);
+        s.els.push(El::Text(TextEl { bx: Box2::new(PAGE_W / 2.0, PAGE_H - 48.0, PAGE_W / 2.0 - 72.0, 14.0), text: t, size, bold: true, color: [200, 208, 220], align: Align::Right }));
+    }
 }
 
 /// The coloured "A" badge and file name above an image.
@@ -405,13 +557,18 @@ pub fn layout(r: &Report) -> Vec<Slide> {
     let n = r.items.len();
     let title = if r.title.trim().is_empty() { "Image comparison".to_string() } else { r.title.clone() };
 
-    if r.sections.title {
+    let brand = &r.brand;
+    let sub = format!("{} image{} compared", n, if n == 1 { "" } else { "s" });
+    if r.sections.title && brand.branded() {
+        let items = r.items.iter().enumerate().map(|(i, it)| (format!("{}  {}", it.label, it.name), label_color(i))).collect();
+        let c = CoverInfo { title: title.clone(), project: String::new(), stats: sub, items, date: r.date.clone(), author: r.author.clone() };
+        slides.push(branded_cover(&c, brand));
+    } else if r.sections.title {
         let mut s = Slide::default();
         s.els.push(El::Fill { bx: Box2::new(0.0, 0.0, PAGE_W, PAGE_H), color: [24, 30, 42] });
-        s.els.push(El::Fill { bx: Box2::new(72.0, 214.0, 64.0, 4.0), color: ACCENT });
+        s.els.push(El::Fill { bx: Box2::new(72.0, 214.0, 64.0, 4.0), color: brand.accent });
         s.els.push(fitted(Box2::new(72.0, 230.0, PAGE_W - 144.0, 92.0), &title, &[40.0, 34.0, 28.0], true, [255, 255, 255]));
         let names: Vec<String> = r.items.iter().map(|it| format!("{}  {}", it.label, it.name)).collect();
-        let sub = format!("{} image{} compared", n, if n == 1 { "" } else { "s" });
         s.els.push(text(Box2::new(72.0, 330.0, PAGE_W - 144.0, 22.0), sub, 16.0, false, [200, 208, 220]));
         s.els.push(fitted(Box2::new(72.0, 356.0, PAGE_W - 144.0, 60.0), &names.join("\n"), &[11.0, 9.0], false, [160, 170, 186]));
         let by = [r.date.as_str(), r.author.as_str()].iter().filter(|t| !t.is_empty()).cloned().collect::<Vec<_>>().join("  ·  ");
@@ -419,12 +576,13 @@ pub fn layout(r: &Report) -> Vec<Slide> {
             s.els.push(text(Box2::new(72.0, 440.0, PAGE_W - 144.0, 18.0), by, 12.0, false, [200, 208, 220]));
         }
         s.els.push(text(Box2::new(72.0, PAGE_H - 48.0, 300.0, 14.0), "Made with Lumen", 9.0, false, [120, 130, 146]));
+        dark_cover_footer(&mut s, brand);
         slides.push(s);
     }
 
     if r.sections.overview && n > 0 {
         let mut s = Slide::default();
-        header(&mut s, &title, "Side by side");
+        header(&mut s, brand, &title, "Side by side");
         let b = body();
         let summary_h = if r.summary.trim().is_empty() { 0.0 } else { (b.h * 0.26).clamp(60.0, 120.0) };
         let cap = 20.0;
@@ -446,15 +604,15 @@ pub fn layout(r: &Report) -> Vec<Slide> {
         if summary_h > 0.0 {
             let sb = Box2::new(b.x, b.y + b.h - summary_h, b.w, summary_h);
             s.els.push(El::Fill { bx: sb, color: PANEL });
-            s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: ACCENT });
-            s.els.push(text(Box2::new(sb.x + 14.0, sb.y + 8.0, 200.0, 14.0), "SUMMARY", 9.0, true, ACCENT));
+            s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: brand.accent });
+            s.els.push(text(Box2::new(sb.x + 14.0, sb.y + 8.0, 200.0, 14.0), "SUMMARY", 9.0, true, brand.accent));
             s.els.push(fitted(Box2::new(sb.x + 14.0, sb.y + 24.0, sb.w - 28.0, sb.h - 30.0), &r.summary, &[13.0, 11.0, 9.0], false, INK));
         }
         s.notes = r.summary.clone();
         slides.push(s);
     } else if !r.summary.trim().is_empty() && n == 0 {
         let mut s = Slide::default();
-        header(&mut s, &title, "Summary");
+        header(&mut s, brand, &title, "Summary");
         s.els.push(fitted(body(), &r.summary, &[16.0, 13.0, 11.0], false, INK));
         slides.push(s);
     }
@@ -462,7 +620,7 @@ pub fn layout(r: &Report) -> Vec<Slide> {
     if r.sections.per_image {
         for (i, it) in r.items.iter().enumerate() {
             let mut s = Slide::default();
-            header(&mut s, &format!("{}  ·  {}", it.label, it.name), &format!("Image {} of {}", i + 1, n));
+            header(&mut s, brand, &format!("{}  ·  {}", it.label, it.name), &format!("Image {} of {}", i + 1, n));
             let b = body();
             let has_text = !it.comment.trim().is_empty() || !it.notes.is_empty() || !it.details.is_empty();
             let side_w = if has_text { (b.w * 0.32).max(220.0) } else { 0.0 };
@@ -508,7 +666,7 @@ pub fn layout(r: &Report) -> Vec<Slide> {
         for (k, d) in r.details.iter().enumerate() {
             let mut s = Slide::default();
             let t = if d.title.trim().is_empty() { format!("Detail {}", k + 1) } else { d.title.clone() };
-            header(&mut s, &t, &format!("Detail {} of {}", k + 1, r.details.len()));
+            header(&mut s, brand, &t, &format!("Detail {} of {}", k + 1, r.details.len()));
             let b = body();
             let ch_comment = if d.comment.trim().is_empty() { 0.0 } else { 70.0 };
             let area = Box2::new(b.x, b.y, b.w, b.h - ch_comment - if ch_comment > 0.0 { 10.0 } else { 0.0 });
@@ -532,7 +690,7 @@ pub fn layout(r: &Report) -> Vec<Slide> {
             if ch_comment > 0.0 {
                 let sb = Box2::new(b.x, b.y + b.h - ch_comment, b.w, ch_comment);
                 s.els.push(El::Fill { bx: sb, color: PANEL });
-                s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: ACCENT });
+                s.els.push(El::Fill { bx: Box2::new(sb.x, sb.y, 3.0, sb.h), color: brand.accent });
                 s.els.push(fitted(Box2::new(sb.x + 14.0, sb.y + 8.0, sb.w - 28.0, sb.h - 14.0), &d.comment, &[13.0, 11.0, 9.0], false, INK));
             }
             s.notes = d.comment.clone();
@@ -548,14 +706,14 @@ pub fn layout(r: &Report) -> Vec<Slide> {
             for p in 0..pages {
                 let mut s = Slide::default();
                 let kicker = if pages > 1 { format!("Measurements {} of {}", p + 1, pages) } else { "Measurements".to_string() };
-                header(&mut s, "Measured quality", &kicker);
+                header(&mut s, brand, "Measured quality", &kicker);
                 let b = body();
                 let rows: Vec<Vec<String>> = t.rows[p * per_page..((p + 1) * per_page).min(t.rows.len())].to_vec();
                 let row_h = 24.0;
                 let th = row_h * (rows.len() as f32 + 1.0);
                 let note_h = if t.note.is_empty() { 0.0 } else { 40.0 };
                 let tb = Box2::new(b.x, b.y, b.w, th.min(b.h - note_h));
-                s.els.push(El::Table { bx: tb, table: Table { header: t.header.clone(), rows, note: String::new() } });
+                s.els.push(El::Table { bx: tb, table: Table { header: t.header.clone(), rows, note: String::new() }, head: brand.accent });
                 if note_h > 0.0 {
                     s.els.push(fitted(Box2::new(b.x, tb.y + tb.h + 10.0, b.w, note_h - 10.0), &t.note, &[10.0, 9.0], false, MUTED));
                 }
@@ -566,7 +724,7 @@ pub fn layout(r: &Report) -> Vec<Slide> {
 
     if slides.is_empty() {
         let mut s = Slide::default();
-        header(&mut s, &title, "");
+        header(&mut s, brand, &title, "");
         slides.push(s);
     }
     let first_content = usize::from(r.sections.title);
@@ -635,6 +793,151 @@ pub(crate) mod tests {
                 note: "Higher sharpness is better; lower noise is better.".into(),
             }),
             sections: Sections::default(),
+            brand: Brand::default(),
+        }
+    }
+
+    /// Every element's box on the page.
+    pub fn boxes(s: &Slide) -> Vec<Box2> {
+        s.els
+            .iter()
+            .map(|e| match e {
+                El::Fill { bx, .. } | El::Frame { bx, .. } | El::Image { bx, .. } | El::Table { bx, .. } => *bx,
+                El::Text(t) => t.bx,
+            })
+            .collect()
+    }
+
+    pub fn on_page(b: Box2) -> bool {
+        b.x >= -0.01 && b.y >= -0.01 && b.x + b.w <= PAGE_W + 0.01 && b.y + b.h <= PAGE_H + 0.01
+    }
+
+    pub fn overlaps(a: Box2, b: Box2) -> bool {
+        a.x < b.x + b.w - 0.01 && b.x < a.x + a.w - 0.01 && a.y < b.y + b.h - 0.01 && b.y < a.y + a.h - 0.01
+    }
+
+    /// A logo of `w` x `h` pixels.
+    pub fn logo(w: u32, h: u32) -> Picture {
+        Picture::from_rgba(&RgbaImage::from_pixel(w, h, image::Rgba([20, 60, 120, 255])), 900).unwrap()
+    }
+
+    pub fn acme(logo_px: Option<(u32, u32)>) -> Brand {
+        Brand { company: "Acme Camera Lab".into(), logo: logo_px.map(|(w, h)| logo(w, h)), accent: [200, 30, 60], footer: "Confidential".into() }
+    }
+
+    #[test]
+    fn unbranded_report_keeps_the_lumen_look() {
+        let slides = layout(&sample(2));
+        // The dark title page, Lumen blue, no logo anywhere.
+        assert!(matches!(slides[0].els[0], El::Fill { color: [24, 30, 42], .. }));
+        assert!(slides.iter().flat_map(|s| &s.els).any(|e| matches!(e, El::Fill { color: ACCENT, .. })));
+        assert!(!slides.iter().flat_map(|s| &s.els).any(|e| matches!(e, El::Fill { color: [200, 30, 60], .. })));
+        let images: usize = slides.iter().flat_map(|s| &s.els).filter(|e| matches!(e, El::Image { .. })).count();
+        let mut r = sample(2);
+        r.brand = acme(Some((400, 100)));
+        let branded = layout(&r);
+        assert_eq!(branded.len(), slides.len());
+        // One logo on the cover and one per content page.
+        let logos: usize = branded.iter().flat_map(|s| &s.els).filter(|e| matches!(e, El::Image { .. })).count();
+        assert_eq!(logos, images + branded.len());
+        assert!(!matches!(branded[0].els[0], El::Fill { color: [24, 30, 42], .. }));
+        // The footer line is on every content page; tables use the accent.
+        for s in &branded[1..] {
+            assert!(s.els.iter().any(|e| matches!(e, El::Text(t) if t.text == "Confidential" && t.align == Align::Center)));
+            assert!(s.els.iter().any(|e| matches!(e, El::Text(t) if t.text.starts_with("Acme Camera Lab  ·  "))));
+        }
+        assert!(branded.iter().flat_map(|s| &s.els).any(|e| matches!(e, El::Table { head: [200, 30, 60], .. })));
+    }
+
+    #[test]
+    fn branded_cover_is_tidy_at_any_logo_shape_and_with_long_names() {
+        let long = "Night street, wet asphalt and neon signs: the longest scene name anyone ever typed into a camera comparison project title box".to_string();
+        let devices: Vec<(String, [u8; 3])> = (0..14).map(|i| (format!("Galaxy A{i}6 Ultra Pro Max build 2026.{i} (night mode on)"), label_color(i))).collect();
+        for logo_px in [None, Some((1600, 400)), Some((400, 400)), Some((120, 900)), Some((3000, 60)), Some((1, 1))] {
+            for company in ["", "Acme", "The Very Long Name Imaging Quality Engineering and Camera Tuning Department of Example Corporation Worldwide"] {
+                let b = Brand { company: company.into(), logo: logo_px.map(|(w, h)| logo(w, h)), accent: [10, 120, 90], footer: "Confidential - for internal review only, do not forward outside the company".into() };
+                let c = CoverInfo { title: long.clone(), project: "Round 3 (night)".into(), stats: "14 devices · 40 scenes".into(), items: devices.clone(), date: "27 November 2026".into(), author: "R. Tarigoppula".into() };
+                let s = branded_cover(&c, &b);
+                let boxes = boxes(&s);
+                for bx in &boxes {
+                    assert!(on_page(*bx), "{logo_px:?} {company}: {bx:?}");
+                }
+                // The logo stays in its slot and nothing written covers it.
+                let logo_box = s.els.iter().find_map(|e| if let El::Image { bx, .. } = e { Some(*bx) } else { None });
+                if let Some(lb) = logo_box {
+                    assert!(lb.x >= 72.0 - 0.01 && lb.x + lb.w <= 332.01 && lb.y >= 51.99 && lb.y + lb.h <= 116.01, "{lb:?}");
+                    for e in &s.els {
+                        if let El::Text(t) = e {
+                            assert!(!overlaps(t.bx, lb), "{:?} over the logo", t.text);
+                        }
+                    }
+                }
+                // Texts do not overlap each other.
+                let texts: Vec<Box2> = s.els.iter().filter_map(|e| if let El::Text(t) = e { Some(t.bx) } else { None }).collect();
+                for (i, a) in texts.iter().enumerate() {
+                    for b in &texts[i + 1..] {
+                        assert!(!overlaps(*a, *b) || chip_text(&s, *a) || chip_text(&s, *b), "{a:?} {b:?}");
+                    }
+                }
+                // Long text is shortened, not spilled: wrapped as the writers
+                // wrap it, every line fits its box.
+                for e in &s.els {
+                    if let El::Text(t) = e {
+                        let lines = wrap(&t.text, t.size, t.bold, t.bx.w);
+                        assert!(lines.len() as f32 * leading(t.size) <= t.bx.h + 0.5, "{:?} in {:?}", t.text, t.bx);
+                        for l in &lines {
+                            assert!(text_width(l, t.size, t.bold) <= t.bx.w + 0.5, "{l:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The text inside a chip (it sits on the chip's fill, not on other text).
+    fn chip_text(s: &Slide, t: Box2) -> bool {
+        s.els.iter().any(|e| matches!(e, El::Fill { bx, .. } if bx.x <= t.x && t.x + t.w <= bx.x + bx.w + 0.01 && bx.y <= t.y && bx.h < 30.0))
+    }
+
+    #[test]
+    fn chips_wrap_and_say_how_many_more() {
+        let items: Vec<(String, [u8; 3])> = (0..30).map(|i| (format!("Device number {i}"), label_color(i))).collect();
+        let chips = chip_rows(&items, 72.0, 360.0, 888.0, 11.0, 2);
+        let rows: Vec<f32> = chips.iter().map(|c| c.0.y).fold(Vec::new(), |mut v, y| {
+            if !v.contains(&y) {
+                v.push(y);
+            }
+            v
+        });
+        assert_eq!(rows.len(), 2);
+        let last = chips.last().unwrap();
+        assert_eq!(last.1, format!("+{} more", 30 - (chips.len() - 1)));
+        for c in &chips {
+            assert!(c.0.x >= 72.0 && c.0.x + c.0.w <= 888.01, "{c:?}");
+        }
+        // Few devices: all shown, no "more" chip.
+        let few = chip_rows(&items[..3], 72.0, 360.0, 888.0, 11.0, 2);
+        assert_eq!(few.len(), 3);
+        assert!(few.iter().all(|c| !c.1.contains("more")));
+        assert!(chip_rows(&[], 72.0, 360.0, 888.0, 11.0, 2).is_empty());
+    }
+
+    #[test]
+    fn header_makes_room_for_any_logo_and_footer_fits() {
+        for (w, h) in [(2000, 100), (100, 2000), (500, 500)] {
+            let b = acme(Some((w, h)));
+            let mut s = Slide::default();
+            header(&mut s, &b, &"W".repeat(200), "Scene 1 of 3");
+            page_footer(&mut s, &b, &"Long report title ".repeat(20), 12);
+            let lb = s.els.iter().find_map(|e| if let El::Image { bx, .. } = e { Some(*bx) } else { None }).unwrap();
+            assert!(lb.x >= HEAD_LOGO.x - 0.01 && lb.x + lb.w <= HEAD_LOGO.x + HEAD_LOGO.w + 0.01 && lb.y >= HEAD_LOGO.y - 0.01 && lb.y + lb.h <= HEAD_LOGO.y + HEAD_LOGO.h + 0.01);
+            for e in &s.els {
+                if let El::Text(t) = e {
+                    assert!(!overlaps(t.bx, lb), "{:?}", t.text);
+                    assert!(on_page(t.bx));
+                    assert!(t.text.lines().count() == 1 || t.bx.y < M + TITLE_H, "footer text on one line: {:?}", t.text);
+                }
+            }
         }
     }
 

@@ -15,6 +15,8 @@
 //!   ppp <scale>          act as if the window moved to a display with this
 //!                        scale (1.0 = 100%, 1.5 = 150%, ...)
 //!   size <w> <h>         resize the window (points)
+//!   dialog <path>        the next file dialog that supports it (report
+//!                        export, logo) returns <path> instead of opening
 //!   crash panic|native  end the app to test crash.log
 //!   bench <frames> [every <k> <line>]  time frames; optionally run <line>
 //!                        (any command above) every k frames meanwhile
@@ -43,6 +45,20 @@ pub fn prof_ms(name: &'static str, ms: f64) {
             v.push((name, ms));
         }
     }
+}
+
+/// `dialog <path>`: the answer for the next file dialog (dev only).
+static DIALOG_ANSWER: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The path set with `dialog <path>`, once; `None` outside automated tests.
+/// A file dialog asks this first, so scripted runs never block on a native dialog.
+pub fn dialog_answer() -> Option<PathBuf> {
+    DIALOG_ANSWER.lock().ok()?.take()
+}
+
+/// `dlg.pick_file()`, or the scripted answer.
+pub fn pick_file(dlg: rfd::FileDialog) -> Option<PathBuf> {
+    dialog_answer().or_else(|| dlg.pick_file())
 }
 
 static PROCESS_START:std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -285,6 +301,12 @@ impl DevHook {
             }
             "ai" => {
                 out.push(DevAction::Analysis(arg.to_string()));
+                false
+            }
+            "dialog" => {
+                if let Ok(mut a) = DIALOG_ANSWER.lock() {
+                    *a = Some(PathBuf::from(arg.trim()));
+                }
                 false
             }
             "bench" => {

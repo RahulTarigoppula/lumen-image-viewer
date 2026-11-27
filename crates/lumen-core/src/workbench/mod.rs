@@ -283,6 +283,10 @@ pub struct Project {
     /// The previous round's project folder (relative to this project's
     /// folder when possible) for regression tracking.
     pub previous: Option<String>,
+    /// The project's own report branding; `None` uses the defaults from the
+    /// settings. Its logo is kept in the project folder (`.lumen`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branding: Option<crate::report::Branding>,
 }
 
 impl Default for Project {
@@ -298,6 +302,7 @@ impl Default for Project {
             votes: Vec::new(),
             detected_by: String::new(),
             previous: None,
+            branding: None,
         }
     }
 }
@@ -885,5 +890,17 @@ mod tests {
         std::fs::write(root.join(PROJECT_FILE), br#"{"format":99}"#).unwrap();
         assert!(Workspace::load(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_branding_is_optional_and_round_trips() {
+        let mut p = sample();
+        // Without its own branding nothing is written for it.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("branding"));
+        assert_eq!(serde_json::from_str::<Project>(&json).unwrap().branding, None);
+        p.branding = Some(crate::report::Branding { company: "Acme".into(), logo: ".lumen/report-logo.png".into(), accent: Some([1, 2, 3]), footer: "Confidential".into() });
+        let back: Project = serde_json::from_str(&serde_json::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
     }
 }

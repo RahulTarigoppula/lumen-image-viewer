@@ -10,6 +10,7 @@ Layout (like a camera test project):
     Flat/                                          single images of different kinds
     Compare2/                                      scene_01 from X and Y (select all, compare)
     Compare3/                                      scene_01 from X, Y and Z
+    Brand/acme_logo.png                            a wide logo with transparency (report branding)
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
@@ -237,6 +238,19 @@ def make_flat(out):
     ic.save(os.path.join(flat, "icon_alpha.png"))
 
 
+def make_brand(out):
+    """A wide company logo with a transparent background (report branding)."""
+    folder = os.path.join(out, "Brand")
+    os.makedirs(folder, exist_ok=True)
+    logo = Image.new("RGBA", (640, 160), (0, 0, 0, 0))
+    d = ImageDraw.Draw(logo)
+    d.rounded_rectangle([0, 10, 140, 150], radius=28, fill=(20, 40, 90, 255))
+    d.text((34, 32), "A", font=font(84), fill=(255, 255, 255, 255))
+    d.text((164, 22), "ACME", font=font(76), fill=(20, 40, 90, 255))
+    d.text((168, 110), "CAMERA LAB", font=font(30), fill=(200, 30, 60, 255))
+    logo.save(os.path.join(folder, "acme_logo.png"))
+
+
 def find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -285,6 +299,7 @@ def main():
     os.makedirs(out)
     make_photos(out)
     make_flat(out)
+    make_brand(out)
     videos = False if "--no-video" in sys.argv else make_videos(out)
     count = sum(len(f) for _, _, f in os.walk(out))
     print(f"make_media: {count} files in {out} (videos: {'yes' if videos else 'no'})")

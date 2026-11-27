@@ -12,6 +12,7 @@ pub mod tree;
 pub mod viewer;
 pub mod widgets;
 pub mod batch;
+pub mod branding;
 pub mod compare;
 pub mod review;
 pub mod review_ui;

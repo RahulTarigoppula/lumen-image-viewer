@@ -1,15 +1,18 @@
 //! Remappable keyboard shortcuts.
 //!
-//! A [`Keymap`] holds the bindings of each mode (Global, Browser, Viewer). The
-//! defaults of every preset are defined once in [`Keymap::preset`]; user changes
-//! are stored in `Settings::key_overrides` as "this command in this mode uses
-//! exactly these keys". The active keymap is kept in a process-wide slot so that
+//! A [`Keymap`] holds the bindings of each mode (Global, Browser, Viewer,
+//! Compare and the blind test inside Compare). The defaults of every preset are
+//! defined once in [`Keymap::preset`]; user changes are stored in
+//! `Settings::key_overrides` as "this command in this mode uses exactly these
+//! keys". The active keymap is kept in a process-wide slot so that
 //! [`Command::shortcut`] text (menus, F1 help, palette) always matches what the
 //! keys actually do.
 //!
 //! Matching is exact: Ctrl+Shift+S never triggers Ctrl+S, Shift+Space never
 //! triggers Space. The only exception is Shift on keys that need Shift to be
-//! typed at all on common layouts (`+`, `?`, `:` ...).
+//! typed at all on common layouts (`+`, `?`, `:` ...). Compare keeps the
+//! leniency it always had ([`Keymap::lookup_lenient`]): a key also fires with
+//! extra Shift or Alt held when nothing is bound to that exact combination.
 
 use crate::settings::{KeyOverride, Settings};
 use crate::ui::commands::Command;
@@ -24,15 +27,21 @@ pub enum KeyMode {
     Global,
     Browser,
     Viewer,
+    /// Comparing 2-4 images (and project scenes).
+    Compare,
+    /// The blind test of a project: these keys win over Compare's while it runs.
+    Blind,
 }
 
 impl KeyMode {
-    pub const ALL: [KeyMode; 3] = [KeyMode::Global, KeyMode::Browser, KeyMode::Viewer];
+    pub const ALL: [KeyMode; 5] = [KeyMode::Global, KeyMode::Browser, KeyMode::Viewer, KeyMode::Compare, KeyMode::Blind];
     pub fn label(self) -> &'static str {
         match self {
             KeyMode::Global => "Global",
             KeyMode::Browser => "Browser",
             KeyMode::Viewer => "Viewer",
+            KeyMode::Compare => "Compare",
+            KeyMode::Blind => "Blind test",
         }
     }
     pub fn id(self) -> &'static str {
@@ -40,6 +49,8 @@ impl KeyMode {
             KeyMode::Global => "global",
             KeyMode::Browser => "browser",
             KeyMode::Viewer => "viewer",
+            KeyMode::Compare => "compare",
+            KeyMode::Blind => "blind",
         }
     }
     pub fn from_id(s: &str) -> Option<KeyMode> {
@@ -80,6 +91,8 @@ pub struct Keymap {
     pub global: Vec<Binding>,
     pub browser: Vec<Binding>,
     pub viewer: Vec<Binding>,
+    pub compare: Vec<Binding>,
+    pub blind: Vec<Binding>,
 }
 
 // ---------------------------------------------------------------- defaults
@@ -242,8 +255,54 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
             ("Ctrl+Shift+J", ImageStrip),
             ("Ctrl+Alt+Z", CreateZip),
         ],
+        // The keys Compare has always used (Esc to go back stays fixed).
+        KeyMode::Compare => vec![
+            ("PgDn", NextScene),
+            ("PgUp", PrevScene),
+            ("S", ToggleScorecard),
+            ("0", Rate(0)),
+            ("1", Rate(1)),
+            ("2", Rate(2)),
+            ("3", Rate(3)),
+            ("4", Rate(4)),
+            ("5", Rate(5)),
+            ("Q", ToggleFlag),
+            ("`", ToggleFlag),
+            ("K", KeepOnly),
+            ("Del", Delete),
+            ("Tab", JumpDivider),
+            ("Space", JumpDivider),
+            ("+", ZoomIn),
+            ("=", ZoomIn),
+            ("-", ZoomOut),
+            ("/", ZoomFit),
+            ("Z", ZoomActual),
+            ("Left", PanLeft),
+            ("Right", PanRight),
+            ("Up", PanUp),
+            ("Down", PanDown),
+            ("B", ViewSideBySide),
+            ("W", ViewSplit),
+            ("D", ViewDifference),
+            ("H", ToggleCameraInfo),
+            ("G", ToggleHistogram),
+            ("L", ToggleLink),
+            ("X", SwapAB),
+            ("A", AlignToA),
+            ("V", TogglePixelValues),
+            ("P", LineProfile),
+            ("O", CycleInspect),
+            ("M", ToggleMarkup),
+            ("C", ToggleReview),
+            ("?", CompareHelp),
+            ("Ctrl+Z", Undo),
+            ("Ctrl+Y", Redo),
+            ("Ctrl+Shift+Z", Redo),
+            ("Ctrl+Shift+E", ExportReport),
+        ],
+        KeyMode::Blind => vec![("Left", VoteLeft), ("Right", VoteRight), ("Down", VoteSame), ("Space", VoteSame)],
     };
-    if mode != KeyMode::Global {
+    if matches!(mode, KeyMode::Browser | KeyMode::Viewer) {
         const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
         const ALT_DIGITS: [&str; 10] = ["Alt+0", "Alt+1", "Alt+2", "Alt+3", "Alt+4", "Alt+5", "Alt+6", "Alt+7", "Alt+8", "Alt+9"];
         for n in 0..=5u8 {
@@ -264,7 +323,7 @@ fn common(mode: KeyMode) -> Vec<(&'static str, Command)> {
 fn lumen_extras(mode: KeyMode) -> Vec<(&'static str, Command)> {
     use Command::*;
     match mode {
-        KeyMode::Global => vec![],
+        KeyMode::Global | KeyMode::Compare | KeyMode::Blind => vec![],
         KeyMode::Browser => vec![("Space", ToggleFlag), ("`", ToggleFlag)],
         KeyMode::Viewer => vec![("Z", ZoomActual), ("C", Crop), ("`", ToggleFlag)],
     }
@@ -274,9 +333,53 @@ fn lumen_extras(mode: KeyMode) -> Vec<(&'static str, Command)> {
 fn faststone_extras(mode: KeyMode) -> Vec<(&'static str, Command)> {
     use Command::*;
     match mode {
-        KeyMode::Global => vec![],
-        KeyMode::Browser => vec![],
+        KeyMode::Global | KeyMode::Browser | KeyMode::Compare | KeyMode::Blind => vec![],
         KeyMode::Viewer => vec![("A", ZoomActual)],
+    }
+}
+
+/// Commands that only do something in Compare (they are listed and bound in
+/// the Compare tab only).
+pub const COMPARE_ONLY: [Command; 21] = [
+    Command::PanLeft,
+    Command::PanRight,
+    Command::PanUp,
+    Command::PanDown,
+    Command::ViewSideBySide,
+    Command::ViewSplit,
+    Command::ViewDifference,
+    Command::JumpDivider,
+    Command::ToggleLink,
+    Command::SwapAB,
+    Command::AlignToA,
+    Command::ToggleCameraInfo,
+    Command::LineProfile,
+    Command::ToggleMarkup,
+    Command::ToggleReview,
+    Command::ExportReport,
+    Command::KeepOnly,
+    Command::NextScene,
+    Command::PrevScene,
+    Command::ToggleScorecard,
+    Command::CompareHelp,
+];
+
+/// The blind test's votes.
+pub const BLIND_ONLY: [Command; 3] = [Command::VoteLeft, Command::VoteRight, Command::VoteSame];
+
+/// The commands that can have keys in `mode`, in the order the keyboard
+/// editor and the shortcuts window list them.
+pub fn commands_of(mode: KeyMode) -> Vec<Command> {
+    use Command::*;
+    match mode {
+        KeyMode::Compare => {
+            let mut v = vec![ZoomIn, ZoomOut, ZoomFit, ZoomActual, PanLeft, PanRight, PanUp, PanDown, ViewSideBySide, ViewSplit, ViewDifference, JumpDivider, ToggleLink, SwapAB, AlignToA, ToggleHistogram, ToggleCameraInfo, TogglePixelValues, CycleInspect, LineProfile, ToggleMarkup, ToggleReview, Undo, Redo, ExportReport];
+            v.extend((0..=5).map(Rate));
+            v.extend([ToggleFlag, KeepOnly, Delete, PrevScene, NextScene, ToggleScorecard, CompareHelp]);
+            v
+        }
+        KeyMode::Blind => BLIND_ONLY.to_vec(),
+        _ => Command::all().into_iter().filter(|c| !COMPARE_ONLY.contains(c) && !BLIND_ONLY.contains(c)).collect(),
     }
 }
 
@@ -314,6 +417,8 @@ impl Keymap {
             KeyMode::Global => &self.global,
             KeyMode::Browser => &self.browser,
             KeyMode::Viewer => &self.viewer,
+            KeyMode::Compare => &self.compare,
+            KeyMode::Blind => &self.blind,
         }
     }
 
@@ -322,6 +427,8 @@ impl Keymap {
             KeyMode::Global => &mut self.global,
             KeyMode::Browser => &mut self.browser,
             KeyMode::Viewer => &mut self.viewer,
+            KeyMode::Compare => &mut self.compare,
+            KeyMode::Blind => &mut self.blind,
         }
     }
 
@@ -356,16 +463,15 @@ impl Keymap {
 
     /// Other commands that would fire for `sc` when pressed in `mode` (same mode, or
     /// Global vs a mode). Used for the conflict warning in the keyboard editor.
+    /// Blind test keys win over Compare's while a test runs, by design, so the
+    /// two are not checked against each other.
     pub fn conflicts(&self, mode: KeyMode, sc: KeyboardShortcut, cmd: Command) -> Vec<(KeyMode, Command)> {
         let modes: &[KeyMode] = match mode {
-            KeyMode::Global => &[KeyMode::Global, KeyMode::Browser, KeyMode::Viewer],
-            m => {
-                if m == KeyMode::Browser {
-                    &[KeyMode::Browser, KeyMode::Global]
-                } else {
-                    &[KeyMode::Viewer, KeyMode::Global]
-                }
-            }
+            KeyMode::Global => &KeyMode::ALL,
+            KeyMode::Browser => &[KeyMode::Browser, KeyMode::Global],
+            KeyMode::Viewer => &[KeyMode::Viewer, KeyMode::Global],
+            KeyMode::Compare => &[KeyMode::Compare, KeyMode::Global],
+            KeyMode::Blind => &[KeyMode::Blind, KeyMode::Global],
         };
         let mut out = Vec::new();
         for &m in modes {
@@ -381,6 +487,13 @@ impl Keymap {
     /// Find the command for a key press in `mode` (exact modifier match).
     pub fn lookup(&self, mode: KeyMode, key: Key, mods: Modifiers) -> Option<Command> {
         self.bindings(mode).iter().find(|(s, _)| matches(s, key, mods)).map(|(_, c)| *c)
+    }
+
+    /// Like [`Keymap::lookup`], but when nothing is bound to the exact
+    /// combination, extra Shift or Alt are ignored (Ctrl still has to match):
+    /// how Compare has always read its keys, so Shift+V still shows pixel values.
+    pub fn lookup_lenient(&self, mode: KeyMode, key: Key, mods: Modifiers) -> Option<Command> {
+        self.lookup(mode, key, mods).or_else(|| self.bindings(mode).iter().find(|(s, _)| matches_lenient(s, key, mods)).map(|(_, c)| *c))
     }
 
     /// Plain letters bound without modifiers in `mode` (they must not start type-ahead).
@@ -442,6 +555,8 @@ fn context() -> KeyMode {
     match CONTEXT.load(Ordering::Relaxed) {
         0 => KeyMode::Global,
         2 => KeyMode::Viewer,
+        3 => KeyMode::Compare,
+        4 => KeyMode::Blind,
         _ => KeyMode::Browser,
     }
 }
@@ -456,9 +571,13 @@ pub fn capturing() -> bool {
 }
 
 /// Shortcut text of `cmd` for menus: current mode first, then Global, then the other mode.
+/// In Compare only the keys that work there are shown.
 pub fn shortcut_text(cmd: Command) -> String {
     let km = active();
     let ctx = context();
+    if matches!(ctx, KeyMode::Compare | KeyMode::Blind) {
+        return [KeyMode::Compare, KeyMode::Blind, KeyMode::Global].into_iter().map(|m| mode_text(&km, m, cmd)).find(|t| !t.is_empty()).unwrap_or_default();
+    }
     let order: [KeyMode; 3] = match ctx {
         KeyMode::Viewer => [KeyMode::Viewer, KeyMode::Global, KeyMode::Browser],
         _ => [KeyMode::Browser, KeyMode::Global, KeyMode::Viewer],
@@ -476,6 +595,17 @@ pub fn shortcut_text(cmd: Command) -> String {
 /// Shortcut text of `cmd` in exactly `mode` ("" when unbound).
 pub fn mode_text(km: &Keymap, mode: KeyMode, cmd: Command) -> String {
     join_keys(&km.keys_for(mode, cmd), cmd, mode)
+}
+
+/// A tooltip with the command's keys in `mode` from the active keymap:
+/// "Swap A and B  (X)", or just the text when the command has no key.
+pub fn tip(text: &str, mode: KeyMode, cmd: Command) -> String {
+    let keys = mode_text(&active(), mode, cmd);
+    if keys.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}  ({keys})")
+    }
 }
 
 fn join_keys(keys: &[KeyboardShortcut], cmd: Command, mode: KeyMode) -> String {
@@ -512,6 +642,18 @@ pub fn matches(sc: &KeyboardShortcut, key: Key, mods: Modifiers) -> bool {
     let ctrl = mods.ctrl || mods.command || mods.mac_cmd;
     let want_ctrl = want.ctrl || want.command || want.mac_cmd;
     mods.alt == want.alt && ctrl == want_ctrl && (mods.shift == want.shift || shift_free(key))
+}
+
+/// A key press that holds at least the binding's Shift and Alt (extra ones
+/// allowed) and exactly its Ctrl, like egui's `consume_key`.
+fn matches_lenient(sc: &KeyboardShortcut, key: Key, mods: Modifiers) -> bool {
+    if key != sc.logical_key {
+        return false;
+    }
+    let want = sc.modifiers;
+    let ctrl = mods.ctrl || mods.command || mods.mac_cmd;
+    let want_ctrl = want.ctrl || want.command || want.mac_cmd;
+    ctrl == want_ctrl && (!want.alt || mods.alt) && (!want.shift || mods.shift || shift_free(key))
 }
 
 /// Shortcuts that may fire while a text field has keyboard focus.
@@ -645,7 +787,7 @@ mod tests {
             }
             // Global shortcuts must not be shadowed by a mode binding.
             for (g, gc) in &km.global {
-                for mode in [KeyMode::Browser, KeyMode::Viewer] {
+                for mode in [KeyMode::Browser, KeyMode::Viewer, KeyMode::Compare, KeyMode::Blind] {
                     assert!(km.commands_for(mode, *g).is_empty(), "{p:?}: global {} ({gc:?}) also bound in {mode:?}", format_shortcut(g));
                 }
             }
@@ -776,5 +918,171 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"key_overrides":[{"mode":"viewer","command":"NoSuchCommand","keys":["Q"]},{"mode":"viewer","command":"ZoomIn","keys":["Bogus+"]}]}"#).unwrap();
         let km = Keymap::from_settings(&s);
         assert!(km.keys_for(KeyMode::Viewer, Command::ZoomIn).is_empty());
+    }
+
+    /// The keys Compare read directly (`consume_key`) before it used the keymap.
+    const OLD_COMPARE_KEYS: [(&str, Command); 42] = [
+        ("PgDn", Command::NextScene),
+        ("PgUp", Command::PrevScene),
+        ("S", Command::ToggleScorecard),
+        ("0", Command::Rate(0)),
+        ("1", Command::Rate(1)),
+        ("2", Command::Rate(2)),
+        ("3", Command::Rate(3)),
+        ("4", Command::Rate(4)),
+        ("5", Command::Rate(5)),
+        ("Q", Command::ToggleFlag),
+        ("`", Command::ToggleFlag),
+        ("K", Command::KeepOnly),
+        ("Del", Command::Delete),
+        ("Tab", Command::JumpDivider),
+        ("Space", Command::JumpDivider),
+        ("+", Command::ZoomIn),
+        ("=", Command::ZoomIn),
+        ("-", Command::ZoomOut),
+        ("/", Command::ZoomFit),
+        ("Z", Command::ZoomActual),
+        ("Left", Command::PanLeft),
+        ("Right", Command::PanRight),
+        ("Up", Command::PanUp),
+        ("Down", Command::PanDown),
+        ("B", Command::ViewSideBySide),
+        ("W", Command::ViewSplit),
+        ("D", Command::ViewDifference),
+        ("H", Command::ToggleCameraInfo),
+        ("G", Command::ToggleHistogram),
+        ("L", Command::ToggleLink),
+        ("X", Command::SwapAB),
+        ("A", Command::AlignToA),
+        ("V", Command::TogglePixelValues),
+        ("P", Command::LineProfile),
+        ("O", Command::CycleInspect),
+        ("M", Command::ToggleMarkup),
+        ("C", Command::ToggleReview),
+        ("?", Command::CompareHelp),
+        ("Ctrl+Z", Command::Undo),
+        ("Ctrl+Y", Command::Redo),
+        ("Ctrl+Shift+Z", Command::Redo),
+        ("Ctrl+Shift+E", Command::ExportReport),
+    ];
+
+    #[test]
+    fn compare_defaults_are_the_old_keys() {
+        let shift = Modifiers::SHIFT;
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        for p in Preset::ALL {
+            let km = Keymap::preset(p);
+            assert_eq!(km.compare.len(), OLD_COMPARE_KEYS.len(), "{p:?}: extra or missing Compare keys");
+            for (k, c) in OLD_COMPARE_KEYS {
+                assert_eq!(km.commands_for(KeyMode::Compare, parse_shortcut(k).unwrap()), vec![c], "{p:?}: {k}");
+            }
+            let blind: Vec<(String, Command)> = km.blind.iter().map(|(s, c)| (format_shortcut(s), *c)).collect();
+            let want = [("Left", Command::VoteLeft), ("Right", Command::VoteRight), ("Down", Command::VoteSame), ("Space", Command::VoteSame)];
+            assert_eq!(blind, want.map(|(k, c)| (k.to_string(), c)).to_vec());
+            // Compare read keys like egui's consume_key: extra Shift / Alt still
+            // fire the plain key, Ctrl does not.
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::V, shift), Some(Command::TogglePixelValues));
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::B, Modifiers::ALT), Some(Command::ViewSideBySide));
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::ArrowLeft, shift), Some(Command::PanLeft));
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::V, ctrl), None);
+            assert_eq!(km.lookup_lenient(KeyMode::Blind, Key::Space, shift), Some(Command::VoteSame));
+            // An exact binding wins over the lenient one.
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::Z, ctrl | shift), Some(Command::Redo));
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::Z, ctrl), Some(Command::Undo));
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::Z, Modifiers::NONE), Some(Command::ZoomActual));
+            // "?" is typed with Shift on most layouts.
+            assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::Questionmark, shift), Some(Command::CompareHelp));
+            // Every bound Compare command is one the Compare tab lists.
+            for (_, c) in km.compare.iter().chain(&km.blind) {
+                assert!(commands_of(KeyMode::Compare).contains(c) || commands_of(KeyMode::Blind).contains(c), "{c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compare_conflicts_are_detected() {
+        let km = Keymap::preset(Preset::Lumen);
+        let b = parse_shortcut("B").unwrap();
+        // B is Side by side: giving it to Link too is a conflict inside Compare,
+        // but not with the viewer's B (another mode).
+        assert_eq!(km.conflicts(KeyMode::Compare, b, Command::ToggleLink), vec![(KeyMode::Compare, Command::ViewSideBySide)]);
+        assert!(km.conflicts(KeyMode::Compare, b, Command::ViewSideBySide).is_empty());
+        // Global keys work in Compare too.
+        assert_eq!(km.conflicts(KeyMode::Compare, parse_shortcut("Ctrl+Q").unwrap(), Command::SwapAB), vec![(KeyMode::Global, Command::ToggleAnalysis)]);
+        assert!(km.conflicts(KeyMode::Global, parse_shortcut("X").unwrap(), Command::Settings).contains(&(KeyMode::Compare, Command::SwapAB)));
+        // Blind test keys replace Compare's while a test runs, on purpose.
+        assert!(km.conflicts(KeyMode::Blind, parse_shortcut("Left").unwrap(), Command::VoteLeft).is_empty());
+        assert_eq!(km.conflicts(KeyMode::Blind, parse_shortcut("Right").unwrap(), Command::VoteLeft), vec![(KeyMode::Blind, Command::VoteRight)]);
+        // The defaults have none.
+        for mode in [KeyMode::Compare, KeyMode::Blind] {
+            for (sc, c) in km.bindings(mode) {
+                assert!(km.conflicts(mode, *sc, *c).is_empty(), "{mode:?} {} ({c:?})", format_shortcut(sc));
+            }
+        }
+    }
+
+    #[test]
+    fn remapped_compare_key_fires_and_the_old_one_does_not() {
+        let mut s = Settings::default();
+        let mut km = Keymap::from_settings(&s);
+        km.set_keys(KeyMode::Compare, Command::SwapAB, vec![parse_shortcut("Y").unwrap()]);
+        s.key_overrides = km.diff_from(Preset::Lumen);
+        assert_eq!(s.key_overrides, vec![KeyOverride { mode: "compare".into(), command: "SwapAB".into(), keys: vec!["Y".into()] }]);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let km = Keymap::from_settings(&back);
+        assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::Y, Modifiers::NONE), Some(Command::SwapAB));
+        assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::X, Modifiers::NONE), None);
+        // Other modes keep their keys.
+        assert_eq!(km.lookup(KeyMode::Viewer, Key::Y, Modifiers::NONE), Some(Command::RedEye));
+        // Through a frame's input: Y fires and is taken, X is left alone.
+        let mut input = egui::InputState::default();
+        for key in [Key::X, Key::Y] {
+            input.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        }
+        let fired = consume(&mut input, |k, m| km.lookup_lenient(KeyMode::Compare, k, m));
+        assert_eq!(fired, vec![Command::SwapAB]);
+        assert!(matches!(input.events.as_slice(), [egui::Event::Key { key: Key::X, .. }]));
+        // Resetting brings X back.
+        let mut km = km;
+        km.set_keys(KeyMode::Compare, Command::SwapAB, Keymap::preset(Preset::Lumen).keys_for(KeyMode::Compare, Command::SwapAB));
+        assert!(km.diff_from(Preset::Lumen).is_empty());
+        assert_eq!(km.lookup_lenient(KeyMode::Compare, Key::X, Modifiers::NONE), Some(Command::SwapAB));
+    }
+
+    #[test]
+    fn settings_from_before_compare_keys_load_unchanged() {
+        // A 2.1 settings file with viewer and browser overrides.
+        let json = r#"{"theme":"Dark","keymap_preset":"faststone","key_overrides":[
+            {"mode":"viewer","command":"ZoomActual","keys":["Shift+A"]},
+            {"mode":"browser","command":"Slideshow","keys":[]}]}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        let km = Keymap::from_settings(&s);
+        let base = Keymap::preset(Preset::FastStone);
+        assert_eq!(km.compare, base.compare);
+        assert_eq!(km.blind, base.blind);
+        assert_eq!(km.keys_for(KeyMode::Viewer, Command::ZoomActual), vec![parse_shortcut("Shift+A").unwrap()]);
+        assert_eq!(km.diff_from(Preset::FastStone).len(), 2);
+        // Saved again, nothing about Compare is added.
+        let again = serde_json::to_string(&Settings { key_overrides: km.diff_from(Preset::FastStone), ..s }).unwrap();
+        assert!(!again.contains("\"compare\""));
+    }
+
+    #[test]
+    fn compare_tab_lists_only_compare_commands() {
+        let compare = commands_of(KeyMode::Compare);
+        for c in COMPARE_ONLY {
+            assert!(compare.contains(&c), "{c:?}");
+            assert!(!commands_of(KeyMode::Viewer).contains(&c) && !commands_of(KeyMode::Global).contains(&c), "{c:?}");
+        }
+        for c in BLIND_ONLY {
+            assert!(!compare.contains(&c) && commands_of(KeyMode::Blind).contains(&c));
+        }
+        // Each command is listed once.
+        for mode in KeyMode::ALL {
+            let v = commands_of(mode);
+            for (i, c) in v.iter().enumerate() {
+                assert!(!v[i + 1..].contains(c), "{mode:?}: {c:?} twice");
+            }
+        }
     }
 }

@@ -485,6 +485,8 @@ pub struct ExportJob {
     pub image_info: bool,
     pub format: report::Format,
     pub out: PathBuf,
+    /// Company branding (logo path absolute); empty keeps Lumen's look.
+    pub branding: report::Branding,
 }
 
 /// Long side of the exported images (pixels).
@@ -581,7 +583,12 @@ pub fn build_report(job: &ExportJob) -> Result<report::Report> {
         let title = if d.title.trim().is_empty() { format!("Detail {}", n + 1) } else { d.title.trim().to_string() };
         details.push(report::Detail { title, comment: d.comment.trim().to_string(), crops });
     }
+    let (brand, warning) = report::Brand::load(&job.branding, None);
+    if let Some(w) = warning {
+        log::warn!("review report: {w}");
+    }
     Ok(report::Report {
+        brand,
         title: if job.title.trim().is_empty() { "Comparison review".into() } else { job.title.trim().to_string() },
         author: job.author.trim().to_string(),
         date: today(),
@@ -820,8 +827,11 @@ mod tests {
             image_info: true,
             format: report::Format::Html,
             out: PathBuf::new(),
+            // A logo that is not there: the report is made without it.
+            branding: report::Branding { company: "Acme".into(), logo: "C:/nope/logo.png".into(), accent: Some([200, 30, 60]), footer: "Confidential".into() },
         };
         let r = build_report(&job).unwrap();
+        assert!(r.brand.logo.is_none() && r.brand.company == "Acme" && r.brand.accent == [200, 30, 60] && r.brand.footer == "Confidential");
         assert_eq!(r.title, "Comparison review");
         assert_eq!(r.items.len(), 3);
         assert_eq!(r.items[1].comment, "comment 1");

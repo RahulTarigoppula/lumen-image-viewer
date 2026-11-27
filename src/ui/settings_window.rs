@@ -519,7 +519,7 @@ fn segmented_tips<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T
 
 /// A round color swatch: 1 pt ring so dark and light colors both show on the card,
 /// and a 2 pt accent ring (2 pt out) when selected.
-fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -> Response {
+pub(crate) fn swatch(ui: &mut Ui, p: &Palette, color: [u8; 3], selected: bool, tip: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let c = Color32::from_rgb(color[0], color[1], color[2]);
@@ -552,7 +552,7 @@ fn swatch_ring(p: &Palette, c: Color32) -> Color32 {
 
 /// The "custom color" swatch: a circle with an eyedropper that opens a color picker.
 /// Shows the color itself (and the selected ring) when `value` is not one of `presets`.
-fn custom_swatch(ui: &mut Ui, p: &Palette, value: &mut [u8; 3], presets: &[[u8; 3]]) -> bool {
+pub(crate) fn custom_swatch(ui: &mut Ui, p: &Palette, value: &mut [u8; 3], presets: &[[u8; 3]]) -> bool {
     let custom = !presets.contains(value);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -1798,7 +1798,7 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
 
     // ---- mode tabs + search
     // Narrow window: the search box goes on its own line.
-    let wide = ui.available_width() >= 560.0;
+    let wide = ui.available_width() >= 740.0;
     let search = |ui: &mut Ui, text: &mut String| {
         ui.label(RichText::new(I::MAGNIFYING_GLASS).color(p.muted));
         let w = 220.0f32.min(ui.available_width() - 8.0).max(80.0);
@@ -1830,6 +1830,8 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
             KeyMode::Global => "Global shortcuts work in every mode. Those with Ctrl, Alt or an F-key also work while typing in a text box.",
             KeyMode::Browser => "Used in the thumbnail browser. Arrow keys, Home / End and Page Up / Down always move the selection.",
             KeyMode::Viewer => "Used while viewing an image. Numpad * always cycles the fit mode.",
+            KeyMode::Compare => "Used while comparing images. Esc always goes back; with a mark selected, Del and Backspace delete it.",
+            KeyMode::Blind => "Used during a blind test of a project. While the test runs these keys win over the Compare keys.",
         },
     );
     ui.add_space(6.0);
@@ -1840,14 +1842,15 @@ fn keyboard(ui: &mut Ui, p: &Palette, core: &mut Core, st: &mut State) -> bool {
     let q = st.kb_search.trim().to_lowercase();
     // Every shortcut button of this mode has the same width, so the remove and add
     // buttons line up in columns from row to row.
-    let widest = Command::all().into_iter().flat_map(|c| km.keys_for(mode, c)).map(|k| widgets::shortcut_keys_width(ui.painter(), &keymap::format_shortcut(&k))).fold(0.0, f32::max);
+    let commands = keymap::commands_of(mode);
+    let widest = commands.iter().flat_map(|c| km.keys_for(mode, *c)).map(|k| widgets::shortcut_keys_width(ui.painter(), &keymap::format_shortcut(&k))).fold(0.0, f32::max);
     let press_w = ui.painter().layout_no_wrap("Press a key...".into(), text::body(), p.text).size().x;
     let key_w = (widest.max(press_w) + 16.0).clamp(64.0, 200.0);
     let btn_h = 26.0;
     let mut hot = None;
     card(ui, p, |ui| {
         let mut first = true;
-        for cmd in Command::all() {
+        for cmd in commands {
             let keys = km.keys_for(mode, cmd);
             let key_text: Vec<String> = keys.iter().map(keymap::format_shortcut).collect();
             if !q.is_empty() && !cmd.label().to_lowercase().contains(&q) && !key_text.iter().any(|k| k.to_lowercase() == q || k.to_lowercase().contains(&q)) {

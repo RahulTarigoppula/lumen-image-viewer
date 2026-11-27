@@ -229,6 +229,8 @@ pub struct Settings {
     pub viewer_histogram: ViewerHistogram,
     /// Skip the "this sends the coordinates to openstreetmap.org" confirmation.
     pub gps_map_no_confirm: bool,
+    /// Company branding of every report, unless a project has its own.
+    pub report_branding: crate::report::Branding,
     /// Remote AI analysis settings (`lumen_ai::AiSettings`, read by the app).
     /// Kept as raw JSON so this crate does not depend on the AI client, and a
     /// build without the `ai` feature keeps them unchanged.
@@ -326,6 +328,7 @@ impl Default for Settings {
             edge_panels: true,
             viewer_histogram: ViewerHistogram::Both,
             gps_map_no_confirm: false,
+            report_branding: crate::report::Branding::default(),
             ai: serde_json::Value::Null,
         }
     }
@@ -454,5 +457,16 @@ mod tests {
         assert_eq!(s.viewer_histogram, ViewerHistogram::Both);
         let s: Settings = serde_json::from_str(r#"{"viewer_histogram": "Rgb"}"#).unwrap();
         assert_eq!(s.viewer_histogram, ViewerHistogram::Rgb);
+    }
+
+    #[test]
+    fn report_branding_defaults_and_round_trips() {
+        // Settings from before branding: no branding, Lumen's look.
+        let s: Settings = serde_json::from_str(r#"{"thumb_size": 200.0, "keymap_preset": "lumen"}"#).unwrap();
+        assert!(s.report_branding.is_empty());
+        let branding = crate::report::Branding { company: "Acme".into(), logo: r"C:\Users\x\AppData\Roaming\Lumen\report-logo.png".into(), accent: Some([10, 20, 30]), footer: "Confidential".into() };
+        let s = Settings { report_branding: branding, ..Default::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.report_branding, s.report_branding);
     }
 }

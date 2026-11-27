@@ -84,6 +84,10 @@ pub struct WorkbenchUi {
     measuring: Option<MeasureJob>,
     /// The previous round's project (regression tracking).
     pub prev: Option<Workspace>,
+    /// The report branding dialog (opened from the round report dialog).
+    branding: Option<super::branding::BrandingDialog>,
+    /// Open the finished report in its app (not for a scripted test run).
+    open_report: bool,
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(1200);
@@ -134,6 +138,8 @@ impl WorkbenchUi {
             scroll_to_selected: false,
             measuring: None,
             prev: None,
+            branding: None,
+            open_report: true,
         };
         ui.load_previous();
         ui.refresh_meta();
@@ -198,7 +204,9 @@ impl WorkbenchUi {
                 Ok(Ok(path)) => {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     core.toasts.success(format!("Report saved: {name}"));
-                    crate::fileops::open_with_default(&path);
+                    if self.open_report {
+                        crate::fileops::open_with_default(&path);
+                    }
                     self.last_export = Some(path);
                     self.job = None;
                 }
@@ -311,6 +319,7 @@ impl WorkbenchUi {
             blind: false,
             progress: String::new(),
             done: p.scenes.get(k).is_some_and(|s| s.done),
+            branding: p.branding.as_ref().map(|b| b.resolved(Some(&self.ws.root))),
         };
         (files.into_iter().map(|(_, f)| f).collect(), link)
     }
@@ -386,6 +395,7 @@ impl WorkbenchUi {
             blind: true,
             progress: format!("Trial {}  ·  {} in the project", b.count + 1, plural(self.ws.project.votes.len(), "vote")),
             done: false,
+            branding: None,
         };
         Some((vec![self.ws.abs(&left.path), self.ws.abs(&right.path)], link))
     }
@@ -1113,6 +1123,8 @@ impl WorkbenchUi {
         p.scale = old.scale;
         p.attributes = old.attributes;
         p.votes = old.votes;
+        p.previous = old.previous;
+        p.branding = old.branding;
         for d in &mut p.devices {
             if let Some(o) = old.devices.iter().find(|o| o.name == d.name) {
                 d.alias = o.alias.clone();
@@ -1138,7 +1150,8 @@ impl WorkbenchUi {
 
     // ------------------------------------------------------------ export
 
-    fn open_export(&mut self) {
+    /// The round report dialog (title, author, format, branding).
+    pub fn open_export(&mut self) {
         let prefs = super::review::Prefs::load();
         self.export = Some(ExportForm {
             title: self.ws.project.name.clone(),
@@ -1154,6 +1167,7 @@ impl WorkbenchUi {
         let Some(form) = self.export.as_mut() else { return };
         let p = core.pal;
         let mut result = None;
+        let mut edit_branding = false;
         widgets::modal(ctx, egui::Id::unique("wb-export"), 480.0, |ui| {
             widgets::modal_title(ui, "Round report");
             widgets::modal_body(ui, "One report for the whole project: summary, scores, flagged artifacts, blind test ranking and every scene.");
@@ -1171,9 +1185,35 @@ impl WorkbenchUi {
             ui.add_space(4.0);
             widgets::checkbox(ui, &mut form.details, "Include detail crops").on_hover_text("Each scene's detail regions (made with the Detail tool in Mark up) as extra pages");
             widgets::checkbox(ui, &mut form.reviewed_only, "Only scenes marked reviewed").on_hover_text("Leave out scenes nobody has marked as reviewed yet");
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+            let (b, whose) = match &self.ws.project.branding {
+                Some(b) => (b, "this project"),
+                None => (&core.settings.report_branding, "default"),
+            };
+            if super::branding::summary_row(ui, &p, b, whose, true) {
+                edit_branding = true;
+            }
+            ui.add_space(4.0);
             result = widgets::dialog_buttons(ui, &p, "Cancel", "Export...", widgets::ButtonKind::Primary, true);
         });
+        if edit_branding {
+            self.branding = Some(Default::default());
+        }
+        if let Some(d) = &mut self.branding {
+            let target = super::branding::Target::Project { own: &mut self.ws.project.branding, defaults: &mut core.settings.report_branding, root: &self.ws.root };
+            let out = d.show(ctx, &p, target);
+            if out.project_changed {
+                self.dirty.get_or_insert_with(Instant::now);
+            }
+            if let Some(e) = out.error {
+                core.toasts.error(e);
+            }
+            if !out.open {
+                self.branding = None;
+            }
+            // The branding dialog is on top: the export dialog waits.
+            return;
+        }
         match result {
             Some(true) => {
                 let form = self.export.take().expect("form");
@@ -1188,7 +1228,11 @@ impl WorkbenchUi {
         self.save_now(&mut core.toasts);
         let ext = form.format.ext();
         let stem = super::review::file_stem(if form.title.trim().is_empty() { "Round report" } else { &form.title });
-        let Some(mut out) = rfd::FileDialog::new().add_filter(form.format.label(), &[ext]).set_directory(&self.ws.root).set_file_name(format!("{stem}.{ext}")).save_file() else { return };
+        let dlg = rfd::FileDialog::new().add_filter(form.format.label(), &[ext]).set_directory(&self.ws.root).set_file_name(format!("{stem}.{ext}"));
+        // A scripted test run answers the dialog itself and opens nothing.
+        let scripted = crate::devhook::dialog_answer();
+        self.open_report = scripted.is_none();
+        let Some(mut out) = scripted.or_else(|| dlg.save_file()) else { return };
         if out.extension().is_none_or(|e| !e.to_string_lossy().eq_ignore_ascii_case(ext)) {
             out.set_extension(ext);
         }
@@ -1196,7 +1240,8 @@ impl WorkbenchUi {
         prefs.author = form.author.trim().to_string();
         prefs.format = ext.into();
         prefs.save();
-        let job = DeckJob { ws: self.ws.clone(), prev: self.prev.clone(), title: form.title, author: form.author, summary: form.summary, format: form.format, out, details: form.details, reviewed_only: form.reviewed_only };
+        let branding = super::branding::effective(self.ws.project.branding.as_ref(), &core.settings.report_branding, Some(&self.ws.root));
+        let job = DeckJob { ws: self.ws.clone(), prev: self.prev.clone(), title: form.title, author: form.author, summary: form.summary, format: form.format, out, details: form.details, reviewed_only: form.reviewed_only, branding };
         let total = job.ws.project.scenes.len();
         let done = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = crossbeam_channel::bounded(1);

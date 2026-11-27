@@ -1,5 +1,8 @@
 # Workbench: open the camera test project, compare a scene, page to the next,
-# align to A, measure, blind test.
+# align to A, measure, blind test; then the round report with company
+# branding set in the branding dialog, exported as PDF and opened in the
+# viewer (Windows' PDF renderer) to look at the cover and a content page.
+@timeout 90
 open {media}\RoundA
 wait 2500
 run Workbench
@@ -28,3 +31,33 @@ shot blind_next.png
 key Escape
 wait 2000
 shot after_blind.png
+run RoundReport
+wait 1000
+shot report_dialog.png
+click 803 565
+wait 1000
+shot branding_open.png
+type Acme Camera Lab
+click 640 400
+type Confidential
+dialog {media}\Brand\acme_logo.png
+click 610 468
+wait 1500
+click 572 540
+wait 800
+shot branding.png
+click 820 602
+wait 1000
+shot report_branded.png
+click 470 420
+wait 500
+dialog {media}\round-report.pdf
+click 820 640
+wait 25000
+shot exported.png
+open {media}\round-report.pdf
+wait 8000
+shot pdf_cover.png
+run NextFrame
+wait 3000
+shot pdf_summary.png

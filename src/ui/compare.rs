@@ -10,7 +10,9 @@
 //! pixel scale. When sync is on, an operation is computed on the pane under the
 //! cursor and the resulting `View` is copied to every pane.
 
+use super::commands::Command;
 use super::icons as I;
+use super::keymap::{self, KeyMode};
 use super::theme::{self, size, text};
 use super::widgets;
 use crate::app::Core;
@@ -323,13 +325,35 @@ impl CmpMode {
             CmpMode::Difference => I::SUBTRACT_SQUARE,
         }
     }
-    fn key(self) -> &'static str {
+    fn command(self) -> Command {
         match self {
-            CmpMode::SideBySide => "B",
-            CmpMode::Split => "W",
-            CmpMode::Difference => "D",
+            CmpMode::SideBySide => Command::ViewSideBySide,
+            CmpMode::Split => Command::ViewSplit,
+            CmpMode::Difference => Command::ViewDifference,
         }
     }
+    /// The mode's keys from the keymap ("B").
+    fn key(self) -> String {
+        key_text(self.command())
+    }
+}
+
+/// `cmd`'s keys in Compare from the active keymap ("Q / `"), "" when unbound.
+fn key_text(cmd: Command) -> String {
+    keymap::mode_text(&keymap::active(), KeyMode::Compare, cmd)
+}
+
+/// A tooltip with `cmd`'s Compare keys: "Swap A and B  (X)".
+fn tip(text: &str, cmd: Command) -> String {
+    keymap::tip(text, KeyMode::Compare, cmd)
+}
+
+/// Commands that do nothing in a blind test: no culling, ratings, mark up,
+/// review or report, no camera data, and no swapping of the sides being voted
+/// on. Their keys are still taken, so they do not reach anything else.
+fn blind_off(cmd: Command) -> bool {
+    use Command::*;
+    matches!(cmd, Rate(_) | ToggleFlag | KeepOnly | Delete | ToggleMarkup | ToggleReview | ToggleCameraInfo | SwapAB | LineProfile | ExportReport)
 }
 
 /// Toolbar parts that move into the "..." menu when the toolbar is too
@@ -370,7 +394,7 @@ fn mode_tip(m: CmpMode) -> String {
         CmpMode::Split => "Split: A and B in one view with a divider you drag",
         CmpMode::Difference => "Difference: |A - B|, bright where the images differ",
     };
-    format!("{what}  ({})", m.key())
+    tip(what, m.command())
 }
 
 /// The modes in toolbar order.
@@ -493,6 +517,8 @@ pub struct SceneLink {
     /// Blind test progress line ("Trial 7").
     pub progress: String,
     pub done: bool,
+    /// The project's own report branding (logo path absolute), if it has one.
+    pub branding: Option<lumen_core::report::Branding>,
 }
 
 /// The EXIF or Metadata window was asked for (the app opens it).
@@ -1348,137 +1374,152 @@ impl Compare {
     // ------------------------------------------------------------ input
 
     fn keys(&mut self, ui: &Ui, core: &mut Core, rects: &[Rect], ppp: f32) {
-        let take = |k: Key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, k));
-        if self.confirm_delete.is_some() || self.rv.dialog_open() || ui.ctx().egui_wants_keyboard_input() {
-            return; // the dialog (or a text field) owns the keyboard
+        if self.confirm_delete.is_some() || self.rv.dialog_open() || ui.ctx().egui_wants_keyboard_input() || keymap::capturing() {
+            return; // the dialog (a text field, the shortcut editor) owns the keyboard
         }
-        // Undo / redo, export, delete the selected mark, Esc out of mark up.
+        // Fixed keys: Del on the selected mark, Esc out of mark up.
         let rv_esc = self.rv.keys(ui);
         // Esc with a menu or a list open only closes it (egui does).
-        if !rv_esc && !self.popup_open && !egui::Popup::is_any_open(ui.ctx()) && take(Key::Escape) {
+        if !rv_esc && !self.popup_open && !egui::Popup::is_any_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             if self.help {
                 self.help = false;
             } else {
                 self.exit = true;
             }
         }
-        // Project scenes: page through them, show the scorecard, vote.
-        if let Some(link) = &self.link {
-            if take(Key::PageDown) {
-                self.link_requests.push(LinkRequest::Step(1));
-            }
-            if take(Key::PageUp) {
-                self.link_requests.push(LinkRequest::Step(-1));
-            }
-            if link.blind {
-                for (k, v) in [(Key::ArrowLeft, 0u8), (Key::ArrowRight, 1), (Key::ArrowDown, 2), (Key::Space, 2)] {
-                    if take(k) {
-                        self.link_requests.push(LinkRequest::Vote(v));
-                    }
+        // Everything else comes from the keymap (Settings, Keyboard, Compare).
+        // A key whose command does not apply now passes on, as it always did.
+        let km = keymap::active();
+        let (blind, markup) = (self.blind(), self.rv.markup);
+        let fired = ui.input_mut(|i| {
+            keymap::consume(i, |key, mods| {
+                // Space is held to pan while marking up.
+                if markup && key == Key::Space {
+                    return None;
                 }
-                // No culling, ratings or mark up in a blind test, and no swap:
-                // the votes are recorded by side.
-                for k in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Q, Key::Backtick, Key::K, Key::Delete, Key::M, Key::C, Key::H, Key::X] {
-                    take(k);
+                // The blind test's votes win over Compare's keys.
+                if let Some(c) = km.lookup_lenient(KeyMode::Blind, key, mods).filter(|_| blind) {
+                    return Some(c);
                 }
-            } else if take(Key::S) {
-                self.link_requests.push(LinkRequest::ToggleScorecard);
-            }
+                km.lookup_lenient(KeyMode::Compare, key, mods).filter(|c| self.takes_key(*c, rects))
+            })
+        });
+        for c in fired {
+            self.exec(c, core, rects, ppp);
         }
-        // Culling: act on the pane under the pointer (else the selected one).
-        if let Some(t) = self.action_pane() {
-            for (r, k) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
-                if take(k) {
-                    self.rate(core, t, r as u8);
-                }
-            }
-            if take(Key::Q) || take(Key::Backtick) {
-                self.toggle_flag(core, t);
-            }
-            if take(Key::K) {
-                self.keep_only(core, t);
-            }
-            if take(Key::Delete) {
-                self.confirm_delete = Some(t);
-            }
+    }
+
+    /// Whether a key bound to `cmd` is used now: scene keys only in a
+    /// project, Tab and Space only in Split, culling keys only with a pane.
+    fn takes_key(&self, cmd: Command, rects: &[Rect]) -> bool {
+        use Command::*;
+        if self.blind() && blind_off(cmd) {
+            return true; // taken and dropped
         }
-        // Space is held to pan while marking up.
-        if self.pair_mode() && self.mode == CmpMode::Split && (take(Key::Tab) || (!self.rv.markup && take(Key::Space))) {
-            self.split = if self.split < 0.5 { 1.0 } else { 0.0 };
+        match cmd {
+            Rate(_) | ToggleFlag | KeepOnly | Delete => self.action_pane().is_some(),
+            NextScene | PrevScene => self.link.is_some(),
+            ToggleScorecard => self.link.is_some() && !self.blind(),
+            JumpDivider => self.pair_mode() && self.mode == CmpMode::Split,
+            PanLeft | PanRight | PanUp | PanDown => rects.get(self.selected.min(self.panes.len().saturating_sub(1))).is_some(),
+            VoteLeft | VoteRight | VoteSame => self.blind(),
+            _ => true,
+        }
+    }
+
+    /// Do `cmd` (from its key, the command palette or a menu). False when it
+    /// does not apply here (no project scene, a blind test, no pane...).
+    fn exec(&mut self, cmd: Command, core: &mut Core, rects: &[Rect], ppp: f32) -> bool {
+        use Command::*;
+        if self.blind() && blind_off(cmd) {
+            return false;
         }
         let src = self.selected.min(self.panes.len().saturating_sub(1));
-        if take(Key::Plus) || take(Key::Equals) {
-            self.zoom_step(src, rects, ppp, 1.25, None);
-        }
-        if take(Key::Minus) {
-            self.zoom_step(src, rects, ppp, 0.8, None);
-        }
-        if take(Key::Slash) {
-            self.fit_all();
-        }
-        if take(Key::Z) {
-            self.actual_size(rects, ppp);
-        }
-        if let Some(r) = rects.get(src) {
-            let step = r.size() * 0.1;
-            if take(Key::ArrowLeft) {
-                self.pan(src, rects, ppp, Vec2::new(step.x, 0.0));
+        match cmd {
+            NextScene | PrevScene if self.link.is_some() => self.link_requests.push(LinkRequest::Step(if cmd == NextScene { 1 } else { -1 })),
+            ToggleScorecard if self.link.is_some() => self.link_requests.push(LinkRequest::ToggleScorecard),
+            VoteLeft | VoteRight | VoteSame if self.blind() => self.link_requests.push(LinkRequest::Vote(match cmd {
+                VoteLeft => 0,
+                VoteRight => 1,
+                _ => 2,
+            })),
+            // Culling acts on the pane under the pointer (else the selected one).
+            Rate(_) | ToggleFlag | KeepOnly | Delete => {
+                let Some(t) = self.action_pane() else { return false };
+                match cmd {
+                    Rate(r) => self.rate(core, t, r.min(5)),
+                    ToggleFlag => self.toggle_flag(core, t),
+                    KeepOnly => self.keep_only(core, t),
+                    _ => self.confirm_delete = Some(t),
+                }
             }
-            if take(Key::ArrowRight) {
-                self.pan(src, rects, ppp, Vec2::new(-step.x, 0.0));
+            JumpDivider if self.pair_mode() && self.mode == CmpMode::Split => self.split = if self.split < 0.5 { 1.0 } else { 0.0 },
+            ZoomIn => self.zoom_step(src, rects, ppp, 1.25, None),
+            ZoomOut => self.zoom_step(src, rects, ppp, 0.8, None),
+            ZoomFit => self.fit_all(),
+            ZoomActual => self.actual_size(rects, ppp),
+            PanLeft | PanRight | PanUp | PanDown => {
+                let Some(r) = rects.get(src) else { return false };
+                let step = r.size() * 0.1;
+                let d = match cmd {
+                    PanLeft => Vec2::new(step.x, 0.0),
+                    PanRight => Vec2::new(-step.x, 0.0),
+                    PanUp => Vec2::new(0.0, step.y),
+                    _ => Vec2::new(0.0, -step.y),
+                };
+                self.pan(src, rects, ppp, d);
             }
-            if take(Key::ArrowUp) {
-                self.pan(src, rects, ppp, Vec2::new(0.0, step.y));
+            ViewSideBySide | ViewSplit | ViewDifference => self.set_mode(MODES.into_iter().find(|m| m.command() == cmd).unwrap_or(CmpMode::SideBySide)),
+            ToggleCameraInfo => self.show_exif = !self.show_exif,
+            ToggleHistogram => self.show_hist = !self.show_hist,
+            ToggleLink => self.sync = !self.sync,
+            SwapAB => self.swap_ab(),
+            AlignToA => self.toggle_alignment(core),
+            TogglePixelValues => self.probe = !self.probe,
+            LineProfile => {
+                self.profile_mode = !self.profile_mode;
+                if self.profile_mode {
+                    self.rv.markup = false;
+                    core.toasts.info("Line profile: drag across an edge; every pane shows the same line");
+                } else {
+                    self.profile = None;
+                }
             }
-            if take(Key::ArrowDown) {
-                self.pan(src, rects, ppp, Vec2::new(0.0, -step.y));
+            CycleInspect => {
+                self.inspect = self.inspect.next();
+                core.toasts.info(format!("Inspect view: {}. {}", self.inspect.label(), self.inspect.tip()));
             }
+            ToggleMarkup => self.toggle_markup(core),
+            ToggleReview => self.toggle_review(core),
+            CompareHelp => self.help = !self.help,
+            Undo => self.rv.undo(),
+            Redo => self.rv.redo(),
+            ExportReport => self.rv.open_export(),
+            _ => return false,
         }
-        for (k, m) in [(Key::B, CmpMode::SideBySide), (Key::W, CmpMode::Split), (Key::D, CmpMode::Difference)] {
-            if take(k) {
-                self.set_mode(m);
-            }
+        true
+    }
+
+    /// A command from the command palette or a menu. True when it is one of
+    /// Compare's, done or explained in a note when it does not apply here.
+    pub fn run_command(&mut self, cmd: Command, core: &mut Core) -> bool {
+        let own = Command::COMPARE.contains(&cmd);
+        if !own && !keymap::commands_of(KeyMode::Compare).contains(&cmd) {
+            return false;
         }
-        if take(Key::H) {
-            self.show_exif = !self.show_exif;
+        let rects = self.layout(self.last_area);
+        let ppp = core.ctx.pixels_per_point();
+        if !self.exec(cmd, core, &rects, ppp) && own {
+            let why = match cmd {
+                _ if self.blind() => "Not during a blind test",
+                Command::NextScene | Command::PrevScene | Command::ToggleScorecard => "This works on a scene of a project (Workbench)",
+                Command::VoteLeft | Command::VoteRight | Command::VoteSame => "This works during a blind test",
+                Command::JumpDivider => "This works in the Split view",
+                _ => "Open two or more images first",
+            };
+            core.toasts.info(why);
         }
-        if take(Key::G) {
-            self.show_hist = !self.show_hist;
-        }
-        if take(Key::L) {
-            self.sync = !self.sync;
-        }
-        if take(Key::X) {
-            self.swap_ab();
-        }
-        if take(Key::A) {
-            self.toggle_alignment(core);
-        }
-        if take(Key::V) {
-            self.probe = !self.probe;
-        }
-        if take(Key::P) && !self.blind() {
-            self.profile_mode = !self.profile_mode;
-            if self.profile_mode {
-                self.rv.markup = false;
-                core.toasts.info("Line profile: drag across an edge; every pane shows the same line");
-            } else {
-                self.profile = None;
-            }
-        }
-        if take(Key::O) {
-            self.inspect = self.inspect.next();
-            core.toasts.info(format!("Inspect view: {}. {}", self.inspect.label(), self.inspect.tip()));
-        }
-        if take(Key::M) {
-            self.toggle_markup(core);
-        }
-        if take(Key::C) {
-            self.toggle_review(core);
-        }
-        if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"))) {
-            self.help = !self.help;
-        }
+        true
     }
 
     // ------------------------------------------------------------ UI
@@ -1582,7 +1623,8 @@ impl Compare {
         }
         self.delete_dialog(ui.ctx(), core);
         let panes = &self.panes;
-        self.rv.export_dialog(ui.ctx(), &p, || {
+        let project_branding = self.link.as_ref().and_then(|l| l.branding.as_ref());
+        self.rv.export_dialog(ui.ctx(), &p, &mut core.settings.report_branding, project_branding, || {
             panes
                 .iter()
                 .enumerate()
@@ -1711,21 +1753,21 @@ impl Compare {
             }
             r
         };
-        let analysis = crate::ui::commands::Command::ToggleAnalysis;
+        let analysis = Command::ToggleAnalysis;
         if item(ui, analysis.icon(), "Analyze...", &analysis.shortcut()) {
             self.analyze = true;
         }
         ui.separator();
-        if item(ui, I::ARROWS_IN, "Fit", "/") {
+        if item(ui, I::ARROWS_IN, "Fit", &key_text(Command::ZoomFit)) {
             self.fit_all();
         }
-        if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X") {
+        if self.panes.len() == 2 && item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", &key_text(Command::SwapAB)) {
             self.swap_ab();
         }
-        if toggle(ui, self.sync, I::LINK, "Link zoom & pan", "L") {
+        if toggle(ui, self.sync, I::LINK, "Link zoom & pan", &key_text(Command::ToggleLink)) {
             self.toggle_sync();
         }
-        if toggle(ui, self.show_hist, I::CHART_BAR, "Histograms", "G") {
+        if toggle(ui, self.show_hist, I::CHART_BAR, "Histograms", &key_text(Command::ToggleHistogram)) {
             self.show_hist = !self.show_hist;
         }
         if self.show_hist {
@@ -1739,32 +1781,32 @@ impl Compare {
                 }
             });
         }
-        if toggle(ui, self.show_exif, I::CAMERA, "Camera info strip", "H") {
+        if toggle(ui, self.show_exif, I::CAMERA, "Camera info strip", &key_text(Command::ToggleCameraInfo)) {
             self.show_exif = !self.show_exif;
         }
         ui.separator();
-        if self.markup_allowed() && toggle(ui, self.rv.markup, I::PENCIL_SIMPLE_LINE, "Mark up", "M") {
+        if self.markup_allowed() && toggle(ui, self.rv.markup, I::PENCIL_SIMPLE_LINE, "Mark up", &key_text(Command::ToggleMarkup)) {
             self.toggle_markup(core);
         }
-        if toggle(ui, self.rv.panel, I::CHAT_TEXT, "Review panel", "C") {
+        if toggle(ui, self.rv.panel, I::CHAT_TEXT, "Review panel", &key_text(Command::ToggleReview)) {
             self.toggle_review(core);
         }
-        if item(ui, I::EXPORT, "Export report...", "Ctrl+Shift+E") {
+        if item(ui, I::EXPORT, "Export report...", &key_text(Command::ExportReport)) {
             self.rv.open_export();
         }
         // Culling on the pane that was right-clicked.
         if pane < self.panes.len() {
             ui.separator();
             let letter = LETTERS[pane.min(3)];
-            if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K") {
+            if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), &key_text(Command::KeepOnly)) {
                 self.selected = pane;
                 self.keep_only(core, pane);
             }
             let flagged = core.tags.get(&self.panes[pane].path).flagged;
-            if toggle(ui, flagged, I::FLAG, &format!("Flag {letter}"), "Q") {
+            if toggle(ui, flagged, I::FLAG, &format!("Flag {letter}"), &key_text(Command::ToggleFlag)) {
                 self.toggle_flag(core, pane);
             }
-            if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del") {
+            if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), &key_text(Command::Delete)) {
                 self.confirm_delete = Some(pane);
             }
         }
@@ -1875,13 +1917,14 @@ impl Compare {
                     ui.label(RichText::new(&link.progress).size(text::SMALL).color(p.muted));
                 }
                 ui.add_space(12.0);
-                if widgets::secondary_button(ui, &format!("{}  Left is better", I::ARROW_LEFT)).on_hover_text("The left image looks better  (Left arrow)").clicked() {
+                let vote_tip = |t: &str, c: Command| keymap::tip(t, KeyMode::Blind, c);
+                if widgets::secondary_button(ui, &format!("{}  Left is better", I::ARROW_LEFT)).on_hover_text(vote_tip("The left image looks better", Command::VoteLeft)).clicked() {
                     self.link_requests.push(LinkRequest::Vote(0));
                 }
-                if widgets::secondary_button(ui, "About the same").on_hover_text("No clear difference  (Down arrow or Space)").clicked() {
+                if widgets::secondary_button(ui, "About the same").on_hover_text(vote_tip("No clear difference", Command::VoteSame)).clicked() {
                     self.link_requests.push(LinkRequest::Vote(2));
                 }
-                if widgets::secondary_button(ui, &format!("Right is better  {}", I::ARROW_RIGHT)).on_hover_text("The right image looks better  (Right arrow)").clicked() {
+                if widgets::secondary_button(ui, &format!("Right is better  {}", I::ARROW_RIGHT)).on_hover_text(vote_tip("The right image looks better", Command::VoteRight)).clicked() {
                     self.link_requests.push(LinkRequest::Vote(1));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1891,12 +1934,12 @@ impl Compare {
                 });
                 return;
             }
-            if widgets::icon_button(ui, I::CARET_LEFT, "Previous scene  (Page Up)", false).clicked() {
+            if widgets::icon_button(ui, I::CARET_LEFT, &tip("Previous scene", Command::PrevScene), false).clicked() {
                 self.link_requests.push(LinkRequest::Step(-1));
             }
             ui.label(RichText::new(&link.name).font(text::body_strong()).color(p.text));
             ui.label(RichText::new(format!("Scene {} of {}", link.scene + 1, link.count.max(1))).size(text::SMALL).color(p.muted));
-            if widgets::icon_button(ui, I::CARET_RIGHT, "Next scene  (Page Down)", false).clicked() {
+            if widgets::icon_button(ui, I::CARET_RIGHT, &tip("Next scene", Command::NextScene), false).clicked() {
                 self.link_requests.push(LinkRequest::Step(1));
             }
             ui.add_space(8.0);
@@ -1908,7 +1951,7 @@ impl Compare {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::labeled_icon_button(ui, I::LIST_CHECKS, "Scorecard", "Show or hide the scorecard: verdicts and attribute scores per device  (S)", self.scorecard).clicked() {
+                if widgets::labeled_icon_button(ui, I::LIST_CHECKS, "Scorecard", &tip("Show or hide the scorecard: verdicts and attribute scores per device", Command::ToggleScorecard), self.scorecard).clicked() {
                     self.link_requests.push(LinkRequest::ToggleScorecard);
                 }
             });
@@ -2109,7 +2152,9 @@ impl Compare {
         let Some(line) = self.profile else {
             let r = Rect::from_center_size(Pos2::new(area.center().x, area.max.y - 90.0), Vec2::new(420.0, 30.0));
             ui.painter().rect_filled(r, CornerRadius::same(8), Color32::from_black_alpha(170));
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Line profile: drag across an edge (P to leave)", FontId::proportional(12.5), Color32::WHITE);
+            let leave = key_text(Command::LineProfile);
+            let t = if leave.is_empty() { "Line profile: drag across an edge".to_string() } else { format!("Line profile: drag across an edge ({leave} to leave)") };
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, t, FontId::proportional(12.5), Color32::WHITE);
             return;
         };
         for (i, g) in geos.iter().enumerate() {
@@ -2155,7 +2200,9 @@ impl Compare {
             painter.galley(Pos2::new(x, plot.min.y + 8.0), g, *col);
             x -= 14.0;
         }
-        painter.text(Pos2::new(plot.min.x + 14.0, plot.max.y - 8.0), Align2::LEFT_BOTTOM, "Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper). P to leave.", FontId::proportional(10.5), Color32::from_white_alpha(200));
+        let leave = key_text(Command::LineProfile);
+        let note = format!("Edge: distance from 10% to 90% of the brightness step across the line (smaller is sharper).{}", if leave.is_empty() { String::new() } else { format!(" {leave} to leave.") });
+        painter.text(Pos2::new(plot.min.x + 14.0, plot.max.y - 8.0), Align2::LEFT_BOTTOM, note, FontId::proportional(10.5), Color32::from_white_alpha(200));
     }
 
     /// The pane's "Keep" button shows on the pane under the pointer only
@@ -2253,7 +2300,7 @@ impl Compare {
                 painter.text(Pos2::new(br.min.x + 12.0 + size::ICON / 2.0, br.center().y), Align2::CENTER_CENTER, I::CHECK_CIRCLE, FontId::proportional(size::ICON), p.ok);
                 let g = painter.layout_no_wrap(keep_text(i), FontId::proportional(12.5), p.text);
                 painter.galley(Pos2::new(br.min.x + 12.0 + size::ICON + 6.0, br.center().y - g.size().y / 2.0), g, p.text);
-                if resp.on_hover_text(format!("Flag {} and mark the other images as rejected with the red label  (K)", LETTERS[i])).clicked() {
+                if resp.on_hover_text(tip(&format!("Flag {} and mark the other images as rejected with the red label", LETTERS[i]), Command::KeepOnly)).clicked() {
                     self.selected = i;
                     self.keep_only(core, i);
                 }
@@ -2536,7 +2583,7 @@ impl Compare {
             if pair && plan.modes_menu {
                 let r = ui.menu_button(format!("{}  {}", self.mode.icon(), I::CARET_DOWN), |ui| {
                     for m in MODES {
-                        if widgets::menu_toggle(ui, self.mode == m, m.label(), m.key()).on_hover_text(mode_tip(m)).clicked() {
+                        if widgets::menu_toggle(ui, self.mode == m, m.label(), &m.key()).on_hover_text(mode_tip(m)).clicked() {
                             self.set_mode(m);
                             ui.close();
                         }
@@ -2555,8 +2602,8 @@ impl Compare {
             }
             if shown(BarPart::Sync) {
                 widgets::separator_v(ui);
-                let (icon, tip) = if self.sync { (I::LINK, "Zoom & pan synchronized  (L)") } else { (I::LINK_BREAK, "Zoom & pan independent  (L)") };
-                if bar_button(ui, icon, SYNC_LABEL, tip, self.sync, plan.icon_labels).clicked() {
+                let (icon, t) = if self.sync { (I::LINK, tip("Zoom & pan synchronized", Command::ToggleLink)) } else { (I::LINK_BREAK, tip("Zoom & pan independent", Command::ToggleLink)) };
+                if bar_button(ui, icon, SYNC_LABEL, &t, self.sync, plan.icon_labels).clicked() {
                     self.toggle_sync();
                 }
             }
@@ -2578,36 +2625,40 @@ impl Compare {
             let ppp = ui.ctx().pixels_per_point();
             let src = self.selected.min(self.panes.len().saturating_sub(1));
             if shown(BarPart::Zoom) {
-                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out  (-)", false).clicked() && !rects.is_empty() {
+                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_MINUS, &tip("Zoom out", Command::ZoomOut), false).clicked() && !rects.is_empty() {
                     self.zoom_step(src, &rects, ppp, 0.8, None);
                 }
                 let z = if rects.is_empty() { None } else { self.effective(src, &rects, ppp, self.fit_ref(&rects, ppp)).map(|e| e.0) };
                 let zl = ui.add_sized([ZOOM_LABEL_W, size::COMPACT], egui::Button::new(RichText::new(z.map(|z| format!("{:.0}%", z * 100.0)).unwrap_or_else(|| " - ".into())).size(12.0)).frame(false));
-                if zl.on_hover_text("Zoom of the selected image. Click for 100% (actual pixels)  (Z)").clicked() && !rects.is_empty() {
+                if zl.on_hover_text(tip("Zoom of the selected image. Click for 100% (actual pixels)", Command::ZoomActual)).clicked() && !rects.is_empty() {
                     self.actual_size(&rects, ppp);
                 }
-                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in  (+)", false).clicked() && !rects.is_empty() {
+                if widgets::icon_button(ui, I::MAGNIFYING_GLASS_PLUS, &tip("Zoom in", Command::ZoomIn), false).clicked() && !rects.is_empty() {
                     self.zoom_step(src, &rects, ppp, 1.25, None);
                 }
             }
             let fitted = self.views.iter().all(|v| v.fit);
-            if widgets::icon_button(ui, I::ARROWS_IN, "Fit the whole image in each pane  (/ or double-click)", fitted).clicked() {
+            let fit_keys = key_text(Command::ZoomFit);
+            let fit_tip = if fit_keys.is_empty() { "Fit the whole image in each pane  (double-click)".to_string() } else { format!("Fit the whole image in each pane  ({fit_keys} or double-click)") };
+            if widgets::icon_button(ui, I::ARROWS_IN, &fit_tip, fitted).clicked() {
                 self.fit_all();
             }
             if shown(BarPart::Views) {
                 widgets::separator_v(ui);
-                if bar_button(ui, I::CHART_BAR, HIST_LABEL, "Histograms  (G)", self.show_hist, plan.icon_labels).clicked() {
+                if bar_button(ui, I::CHART_BAR, HIST_LABEL, &tip("Histograms", Command::ToggleHistogram), self.show_hist, plan.icon_labels).clicked() {
                     self.show_hist = !self.show_hist;
                 }
                 // Camera data and file names stay hidden in a blind test.
                 if !blind {
-                    if bar_button(ui, I::CAMERA, EXIF_LABEL, "Camera info strip  (H)", self.show_exif, plan.icon_labels).clicked() {
+                    if bar_button(ui, I::CAMERA, EXIF_LABEL, &tip("Camera info strip", Command::ToggleCameraInfo), self.show_exif, plan.icon_labels).clicked() {
                         self.show_exif = !self.show_exif;
                     }
-                    if bar_button(ui, I::APERTURE, TAGS_LABEL, "EXIF of every image side by side, differences marked  (Ctrl+Shift+X)", false, plan.icon_labels).clicked() {
+                    let exif_tip = crate::ui::tips::with_shortcut("EXIF of every image side by side, differences marked", &Command::ShowExif.shortcut());
+                    if bar_button(ui, I::APERTURE, TAGS_LABEL, &exif_tip, false, plan.icon_labels).clicked() {
                         self.info_request = Some(InfoRequest::Exif);
                     }
-                    if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, "Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP  (Ctrl+Shift+I)", false, plan.icon_labels).clicked() {
+                    let meta_tip = crate::ui::tips::with_shortcut("Metadata of every image side by side: which camera features fired (HDR, night, zoom, lens), JPEG quality, color profile, XMP", &Command::ShowMetadata.shortcut());
+                    if bar_button(ui, I::FILE_MAGNIFYING_GLASS, META_LABEL, &meta_tip, false, plan.icon_labels).clicked() {
                         self.info_request = Some(InfoRequest::Metadata);
                     }
                 }
@@ -2623,21 +2674,21 @@ impl Compare {
                         ui.spacing_mut().button_padding.x = 10.0;
                         widgets::success_button(ui, &p, &format!("{}  Keep {letter}", I::CHECK_CIRCLE))
                     });
-                    if r.inner.on_hover_text(format!("Keep {letter}: flag it and mark the other images as rejected (red label)  (K)")).clicked() {
+                    if r.inner.on_hover_text(tip(&format!("Keep {letter}: flag it and mark the other images as rejected (red label)"), Command::KeepOnly)).clicked() {
                         self.keep_only(core, sel);
                     }
                 }
                 if !self.panes.is_empty() {
                     let flagged = core.tags.get(&self.panes[sel].path).flagged;
-                    if widgets::icon_button(ui, I::FLAG, &format!("Flag {letter}  (Q or `)"), flagged).clicked() {
+                    if widgets::icon_button(ui, I::FLAG, &tip(&format!("Flag {letter}"), Command::ToggleFlag), flagged).clicked() {
                         self.toggle_flag(core, sel);
                     }
-                    if widgets::icon_button(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin  (Del)"), false).clicked() {
+                    if widgets::icon_button(ui, I::TRASH, &tip(&format!("Move {letter} to the Recycle Bin"), Command::Delete), false).clicked() {
                         self.confirm_delete = Some(sel);
                     }
                 }
             }
-            if shown(BarPart::Swap) && pair && bar_button(ui, I::ARROWS_LEFT_RIGHT, SWAP_LABEL, "Swap A and B  (X)", false, plan.icon_labels).clicked() {
+            if shown(BarPart::Swap) && pair && bar_button(ui, I::ARROWS_LEFT_RIGHT, SWAP_LABEL, &tip("Swap A and B", Command::SwapAB), false, plan.icon_labels).clicked() {
                 self.swap_ab();
             }
             // Mode-specific controls.
@@ -2646,16 +2697,16 @@ impl Compare {
                 self.mode_controls(ui, &p, plan.amp_label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, "Shortcuts  (?)", self.help).clicked() {
+                if shown(BarPart::Help) && widgets::icon_button(ui, I::QUESTION, &tip("Shortcuts", Command::CompareHelp), self.help).clicked() {
                     self.help = !self.help;
                 }
                 ui.menu_button(RichText::new(I::DOTS_THREE).size(17.0), |ui| self.overflow_menu(ui, core, &plan, sel)).response.on_hover_text("More: export a report and the tools that do not fit here");
                 if shown(BarPart::Review) {
-                    if bar_button(ui, I::CHAT_TEXT, REVIEW_LABEL, "Review panel: comments, notes and report export  (C)", self.rv.panel, plan.icon_labels).clicked() {
+                    if bar_button(ui, I::CHAT_TEXT, REVIEW_LABEL, &tip("Review panel: comments, notes and report export", Command::ToggleReview), self.rv.panel, plan.icon_labels).clicked() {
                         self.toggle_review(core);
                     }
-                    let tip = if self.markup_allowed() { "Mark up: draw boxes, circles, arrows and details on the images  (M)" } else { "Mark up works in Side by side and Split  (M)" };
-                    if bar_button(ui, I::PENCIL_SIMPLE_LINE, MARKUP_LABEL, tip, self.rv.markup && self.markup_allowed(), plan.icon_labels).clicked() {
+                    let t = tip(if self.markup_allowed() { "Mark up: draw boxes, circles, arrows and details on the images" } else { "Mark up works in Side by side and Split" }, Command::ToggleMarkup);
+                    if bar_button(ui, I::PENCIL_SIMPLE_LINE, MARKUP_LABEL, &t, self.rv.markup && self.markup_allowed(), plan.icon_labels).clicked() {
                         self.toggle_markup(core);
                     }
                 }
@@ -2682,7 +2733,9 @@ impl Compare {
                 ui.add(widgets::Slider::new(&mut self.amp, 1.0..=50.0).logarithmic(true).prefix("×").fixed_decimals(0).default_value(1.0).width(AMP_RAIL_W).value_width(AMP_VALUE_W)).on_hover_text(tip);
             }
             CmpMode::Split => {
-                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted)).on_hover_text("Where the divider is; drag it on the image  (Tab jumps it to one side)");
+                let jump = key_text(Command::JumpDivider);
+                let t = if jump.is_empty() { "Where the divider is; drag it on the image".to_string() } else { format!("Where the divider is; drag it on the image  ({jump} jumps it to one side)") };
+                ui.label(RichText::new(format!("Divider {:.0}%", self.split * 100.0)).size(text::SMALL).color(p.muted)).on_hover_text(t);
             }
             CmpMode::SideBySide => {}
         }
@@ -2707,13 +2760,13 @@ impl Compare {
                 }
             }
         });
-        if widgets::menu_check(ui, self.probe, I::EYEDROPPER, "Pixel values", "V").on_hover_text("Show RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane").clicked() {
+        if widgets::menu_check(ui, self.probe, I::EYEDROPPER, "Pixel values", &key_text(Command::TogglePixelValues)).on_hover_text("Show RGB, hex, L*a*b* and luma under the pointer, at the same spot in every pane").clicked() {
             self.probe = !self.probe;
             ui.close();
         }
         let busy = self.align_job.is_some();
         let label = if busy { "Aligning..." } else { "Align to A (match field of view)" };
-        if widgets::menu_check(ui, self.align_on, I::FRAME_CORNERS, label, "A")
+        if widgets::menu_check(ui, self.align_on, I::FRAME_CORNERS, label, &key_text(Command::AlignToA))
             .on_hover_text("Find the same scene content in every image and warp B-D onto A, so phones with different lenses and crops line up pixel for pixel; every pane then zooms to the view they all share. The difference view uses the aligned images. Mark up works on the originals.")
             .clicked()
         {
@@ -2724,7 +2777,7 @@ impl Compare {
         if !self.blind() {
             ui.separator();
             let exporting = self.rv.exporting();
-            let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, "Ctrl+Shift+E")).inner;
+            let r = ui.add_enabled_ui(!exporting, |ui| widgets::menu_item(ui, I::EXPORT, if exporting { "Exporting report..." } else { "Export report..." }, &key_text(Command::ExportReport))).inner;
             if r.on_hover_text("Save the review (images with marks, comments, details) as PowerPoint, PDF or a web page").clicked() {
                 self.rv.open_export();
                 ui.close();
@@ -2737,15 +2790,15 @@ impl Compare {
             match part {
                 BarPart::Review => {
                     sep(ui);
-                    if item(ui, I::PENCIL_SIMPLE_LINE, "Mark up", "M", Some(self.rv.markup)) {
+                    if item(ui, I::PENCIL_SIMPLE_LINE, "Mark up", &key_text(Command::ToggleMarkup), Some(self.rv.markup)) {
                         self.toggle_markup(core);
                     }
-                    if item(ui, I::CHAT_TEXT, "Review panel", "C", Some(self.rv.panel)) {
+                    if item(ui, I::CHAT_TEXT, "Review panel", &key_text(Command::ToggleReview), Some(self.rv.panel)) {
                         self.toggle_review(core);
                     }
                 }
                 BarPart::Sync => {
-                    if item(ui, I::LINK, "Link zoom & pan", "L", Some(self.sync)) {
+                    if item(ui, I::LINK, "Link zoom & pan", &key_text(Command::ToggleLink), Some(self.sync)) {
                         self.toggle_sync();
                     }
                 }
@@ -2762,38 +2815,38 @@ impl Compare {
                     self.set_basis(basis);
                 }
                 BarPart::Views => {
-                    if item(ui, I::CHART_BAR, "Histograms", "G", Some(self.show_hist)) {
+                    if item(ui, I::CHART_BAR, "Histograms", &key_text(Command::ToggleHistogram), Some(self.show_hist)) {
                         self.show_hist = !self.show_hist;
                     }
                     if self.blind() {
                         continue;
                     }
-                    if item(ui, I::CAMERA, "Camera info strip", "H", Some(self.show_exif)) {
+                    if item(ui, I::CAMERA, "Camera info strip", &key_text(Command::ToggleCameraInfo), Some(self.show_exif)) {
                         self.show_exif = !self.show_exif;
                     }
-                    if item(ui, I::APERTURE, "EXIF of every image", "Ctrl+Shift+X", None) {
+                    if item(ui, I::APERTURE, "EXIF of every image", &Command::ShowExif.shortcut(), None) {
                         self.info_request = Some(InfoRequest::Exif);
                     }
-                    if item(ui, I::FILE_MAGNIFYING_GLASS, "Metadata of every image", "Ctrl+Shift+I", None) {
+                    if item(ui, I::FILE_MAGNIFYING_GLASS, "Metadata of every image", &Command::ShowMetadata.shortcut(), None) {
                         self.info_request = Some(InfoRequest::Metadata);
                     }
                 }
                 BarPart::Cull if !self.panes.is_empty() => {
                     sep(ui);
-                    if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), "K", None) {
+                    if self.panes.len() >= 2 && item(ui, I::CHECK_CIRCLE, &format!("Keep {letter}, reject the others"), &key_text(Command::KeepOnly), None) {
                         self.keep_only(core, sel);
                     }
                     let flagged = core.tags.get(&self.panes[sel].path).flagged;
-                    if item(ui, I::FLAG, &format!("Flag {letter}"), "Q", Some(flagged)) {
+                    if item(ui, I::FLAG, &format!("Flag {letter}"), &key_text(Command::ToggleFlag), Some(flagged)) {
                         self.toggle_flag(core, sel);
                     }
-                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), "Del", None) {
+                    if item(ui, I::TRASH, &format!("Move {letter} to the Recycle Bin"), &key_text(Command::Delete), None) {
                         self.confirm_delete = Some(sel);
                         ui.close();
                     }
                 }
                 BarPart::Swap if pair => {
-                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", "X", None) {
+                    if item(ui, I::ARROWS_LEFT_RIGHT, "Swap A and B", &key_text(Command::SwapAB), None) {
                         self.swap_ab();
                     }
                 }
@@ -2802,7 +2855,7 @@ impl Compare {
                     ui.horizontal(|ui| self.mode_controls(ui, &p, true));
                 }
                 BarPart::Help => {
-                    if item(ui, I::QUESTION, "Shortcuts", "?", Some(self.help)) {
+                    if item(ui, I::QUESTION, "Shortcuts", &key_text(Command::CompareHelp), Some(self.help)) {
                         self.help = !self.help;
                     }
                 }
@@ -2811,13 +2864,13 @@ impl Compare {
                     let ppp = ui.ctx().pixels_per_point();
                     let src = self.selected.min(self.panes.len().saturating_sub(1));
                     if !rects.is_empty() {
-                        if item(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in", "+", None) {
+                        if item(ui, I::MAGNIFYING_GLASS_PLUS, "Zoom in", &key_text(Command::ZoomIn), None) {
                             self.zoom_step(src, &rects, ppp, 1.25, None);
                         }
-                        if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", "-", None) {
+                        if item(ui, I::MAGNIFYING_GLASS_MINUS, "Zoom out", &key_text(Command::ZoomOut), None) {
                             self.zoom_step(src, &rects, ppp, 0.8, None);
                         }
-                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", "Z", None) {
+                        if item(ui, I::ARROWS_OUT, "Actual size (100%)", &key_text(Command::ZoomActual), None) {
                             self.actual_size(&rects, ppp);
                         }
                     }
@@ -2828,58 +2881,91 @@ impl Compare {
     }
 
     fn help_overlay(&self, ui: &Ui, area: Rect) {
-        let rows: [(&str, &str); 26] = [
-            ("Wheel / pinch", "Zoom at cursor (all panes when linked)"),
-            ("Drag", "Pan (mark up: draw; Space+drag pans)"),
-            ("Double-click  or  /", "Fit"),
-            ("Z", "100% (selected pane)"),
-            ("+ / -  arrows", "Zoom / pan"),
-            ("B  W  D", "Side by side · Split · Difference"),
-            ("Tab / Space", "Split: jump the divider"),
-            ("M", "Mark up: boxes, arrows, pen, details"),
-            ("C", "Review panel: comments and notes"),
-            ("Ctrl+Z  /  Ctrl+Y", "Undo / redo marks"),
-            ("Del", "Delete the selected mark"),
-            ("Ctrl+Shift+E", "Export report (PowerPoint, PDF, web)"),
-            ("X", "Swap A and B"),
-            ("A", "Align to A: match the field of view"),
-            ("V", "Pixel values at the same spot in every pane"),
-            ("O", "Inspect view: clipping, false color, peaking, channels"),
-            ("P", "Line profile: brightness along a line, edge width"),
-            ("L", "Link / unlink zoom & pan"),
-            ("0 - 5", "Rate the image under the pointer"),
-            ("Q  or  `", "Flag / unflag it"),
-            ("K", "Keep it, reject the others (red label)"),
-            ("Del", "Move it to the Recycle Bin (no mark selected)"),
-            ("H", "Camera info strip"),
-            ("G", "Histograms"),
-            ("?", "This help"),
-            ("Esc", "Back"),
-        ];
-        let mut rows: Vec<(&str, &str)> = rows.to_vec();
-        match &self.link {
-            Some(l) if l.blind => {
-                rows.retain(|(k, _)| !matches!(*k, "M" | "C" | "Ctrl+Z  /  Ctrl+Y" | "Del" | "Ctrl+Shift+E" | "0 - 5" | "Q  or  `" | "K" | "H" | "X" | "P" | "+ / -  arrows"));
-                rows.insert(0, ("Left / Right", "The left / right image is better"));
-                rows.insert(1, ("Down  or  Space", "About the same"));
-            }
-            Some(_) => {
-                rows.insert(0, ("Page Up / Page Down", "Previous / next scene of the project"));
-                rows.insert(1, ("S", "Scorecard: verdicts and scores per device"));
-            }
-            None => {}
-        }
-        let r = Rect::from_center_size(area.center(), Vec2::new(480.0, 60.0 + rows.len() as f32 * 24.0).min(area.size() - Vec2::splat(8.0)));
-        let painter = ui.painter();
+        let rows = help_rows(&keymap::active(), self.link.as_ref().map(|l| l.blind));
+        let font = FontId::proportional(13.0);
+        let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
+        let key_w = rows.iter().map(|(k, _)| width(k)).fold(0.0, f32::max).clamp(90.0, 220.0);
+        let text_w = rows.iter().map(|(_, v)| width(v)).fold(0.0, f32::max);
+        let col_w = 22.0 + key_w + 18.0 + text_w + 22.0;
+        // Two columns when one would not fit the height (and two fit the width).
+        let one_col_h = 60.0 + rows.len() as f32 * 24.0;
+        let cols = if one_col_h > area.height() - 16.0 && 2.0 * col_w <= area.width() - 16.0 { 2 } else { 1 };
+        let per_col = rows.len().div_ceil(cols);
+        let r = Rect::from_center_size(area.center(), Vec2::new(col_w * cols as f32, 60.0 + per_col as f32 * 24.0).min(area.size() - Vec2::splat(8.0)));
+        let painter = ui.painter().with_clip_rect(r);
         painter.rect_filled(r, CornerRadius::same(14), Color32::from_rgba_unmultiplied(18, 19, 22, 240));
         painter.rect_stroke(r, CornerRadius::same(14), Stroke::new(1.0, Color32::from_white_alpha(26)), egui::StrokeKind::Inside);
         painter.text(r.min + Vec2::new(22.0, 24.0), Align2::LEFT_CENTER, "Compare shortcuts", super::theme::semibold(15.0), Color32::WHITE);
         for (i, (k, v)) in rows.iter().enumerate() {
-            let y = r.min.y + 56.0 + i as f32 * 24.0;
-            painter.text(Pos2::new(r.min.x + 22.0, y), Align2::LEFT_CENTER, *k, FontId::proportional(13.0), Color32::from_gray(150));
-            painter.text(Pos2::new(r.min.x + 170.0, y), Align2::LEFT_CENTER, *v, FontId::proportional(13.0), Color32::from_gray(235));
+            let x = r.min.x + (i / per_col) as f32 * col_w;
+            let y = r.min.y + 56.0 + (i % per_col) as f32 * 24.0;
+            painter.text(Pos2::new(x + 22.0, y), Align2::LEFT_CENTER, k, font.clone(), Color32::from_gray(150));
+            painter.text(Pos2::new(x + 22.0 + key_w + 18.0, y), Align2::LEFT_CENTER, v, font.clone(), Color32::from_gray(235));
         }
     }
+}
+
+/// The rows of Compare's shortcuts overlay (keys, what they do) from the
+/// keymap; rows of unbound commands are left out. `blind`: `None` outside a
+/// project, `Some(true)` in a blind test.
+fn help_rows(km: &keymap::Keymap, blind: Option<bool>) -> Vec<(String, String)> {
+    use Command::*;
+    let first = |c: Command| km.keys_for(KeyMode::Compare, c).first().map(keymap::format_shortcut);
+    // The first key of each command, when all of them have one.
+    let joined = |cmds: &[Command], sep: &str| -> String { cmds.iter().map(|c| first(*c)).collect::<Option<Vec<String>>>().map(|v| v.join(sep)).unwrap_or_default() };
+    let one = |c: Command| keymap::mode_text(km, KeyMode::Compare, c);
+    let rates: Vec<String> = (0..=5).filter_map(|n| first(Rate(n))).collect();
+    let rate_keys = if rates == ["0", "1", "2", "3", "4", "5"] { "0 - 5".to_string() } else { rates.join(" ") };
+    let fit = one(ZoomFit);
+    let in_blind = blind == Some(true);
+    let mut rows: Vec<(String, &str)> = Vec::new();
+    if in_blind {
+        let side = |c: Command| keymap::mode_text(km, KeyMode::Blind, c);
+        let (l, r) = (side(VoteLeft), side(VoteRight));
+        if !l.is_empty() && !r.is_empty() {
+            rows.push((format!("{l}  /  {r}"), "The left / right image is better"));
+        }
+        rows.push((side(VoteSame), "About the same"));
+    } else if blind.is_some() {
+        rows.push((joined(&[PrevScene, NextScene], " / "), "Previous / next scene of the project"));
+        rows.push((one(ToggleScorecard), "Scorecard: verdicts and scores per device"));
+    }
+    rows.push(("Wheel / pinch".into(), "Zoom at cursor (all panes when linked)"));
+    rows.push(("Drag".into(), "Pan (mark up: draw; Space+drag pans)"));
+    rows.push((if fit.is_empty() { "Double-click".into() } else { format!("Double-click  or  {fit}") }, "Fit"));
+    rows.push((one(ZoomActual), "100% (selected pane)"));
+    rows.push((joined(&[ZoomIn, ZoomOut], " / "), "Zoom in / out"));
+    if !in_blind {
+        rows.push((joined(&[PanLeft, PanRight, PanUp, PanDown], " "), "Pan"));
+    }
+    rows.push((joined(&[ViewSideBySide, ViewSplit, ViewDifference], "  "), "Side by side · Split · Difference"));
+    rows.push((one(JumpDivider), "Split: jump the divider"));
+    if !in_blind {
+        rows.push((one(ToggleMarkup), "Mark up: boxes, arrows, pen, details"));
+        rows.push((one(ToggleReview), "Review panel: comments and notes"));
+        rows.push((joined(&[Undo, Redo], "  /  "), "Undo / redo marks"));
+        rows.push(("Del".into(), "Delete the selected mark"));
+        rows.push((one(ExportReport), "Export report (PowerPoint, PDF, web)"));
+        rows.push((one(SwapAB), "Swap A and B"));
+    }
+    rows.push((one(AlignToA), "Align to A: match the field of view"));
+    rows.push((one(TogglePixelValues), "Pixel values at the same spot in every pane"));
+    rows.push((one(CycleInspect), "Inspect view: clipping, false color, peaking, channels"));
+    if !in_blind {
+        rows.push((one(LineProfile), "Line profile: brightness along a line, edge width"));
+    }
+    rows.push((one(ToggleLink), "Link / unlink zoom & pan"));
+    if !in_blind {
+        rows.push((rate_keys, "Rate the image under the pointer"));
+        rows.push((one(ToggleFlag), "Flag / unflag it"));
+        rows.push((one(KeepOnly), "Keep it, reject the others (red label)"));
+        rows.push((one(Delete), "Move it to the Recycle Bin (no mark selected)"));
+        rows.push((one(ToggleCameraInfo), "Camera info strip"));
+    }
+    rows.push((one(ToggleHistogram), "Histograms"));
+    rows.push((one(CompareHelp), "This help"));
+    rows.push(("Esc".into(), "Back"));
+    rows.into_iter().filter(|(k, _)| !k.is_empty()).map(|(k, v)| (k, v.to_string())).collect()
 }
 
 impl Drop for Compare {
@@ -3110,5 +3196,46 @@ mod tests {
         assert_eq!(a.get_pixel(1, 1).0, [40, 255, 0, 255]);
         assert_eq!(a.get_pixel(0, 0).0, [4, 8, 12, 255]);
         assert_eq!(amplify(&d, 1.0), d);
+    }
+
+    #[test]
+    fn help_follows_the_keymap() {
+        use crate::ui::keymap::{parse_shortcut, Keymap, Preset};
+        let row = |rows: &[(String, String)], what: &str| rows.iter().find(|(_, v)| v == what).map(|(k, _)| k.clone());
+        let km = Keymap::preset(Preset::Lumen);
+        let rows = help_rows(&km, None);
+        // The keys the overlay always listed.
+        assert_eq!(row(&rows, "Side by side · Split · Difference").as_deref(), Some("B  W  D"));
+        assert_eq!(row(&rows, "Rate the image under the pointer").as_deref(), Some("0 - 5"));
+        assert_eq!(row(&rows, "Flag / unflag it").as_deref(), Some("Q / `"));
+        assert_eq!(row(&rows, "Undo / redo marks").as_deref(), Some("Ctrl+Z  /  Ctrl+Y"));
+        assert_eq!(row(&rows, "Fit").as_deref(), Some("Double-click  or  /"));
+        assert_eq!(row(&rows, "Swap A and B").as_deref(), Some("X"));
+        assert!(row(&rows, "Previous / next scene of the project").is_none());
+        // A remapped key shows its new key; an unbound command has no row.
+        let mut km2 = km.clone();
+        km2.set_keys(KeyMode::Compare, Command::SwapAB, vec![parse_shortcut("Y").unwrap()]);
+        km2.set_keys(KeyMode::Compare, Command::AlignToA, vec![]);
+        let rows = help_rows(&km2, None);
+        assert_eq!(row(&rows, "Swap A and B").as_deref(), Some("Y"));
+        assert!(row(&rows, "Align to A: match the field of view").is_none());
+        // Project scenes and blind tests.
+        let rows = help_rows(&km, Some(false));
+        assert_eq!(row(&rows, "Previous / next scene of the project").as_deref(), Some("PgUp / PgDn"));
+        let rows = help_rows(&km, Some(true));
+        assert_eq!(row(&rows, "The left / right image is better").as_deref(), Some("Left  /  Right"));
+        assert_eq!(row(&rows, "About the same").as_deref(), Some("Down / Space"));
+        assert!(row(&rows, "Swap A and B").is_none() && row(&rows, "Pan").is_none());
+        assert!(rows.iter().all(|(k, _)| !k.is_empty()));
+    }
+
+    #[test]
+    fn nothing_but_votes_and_viewing_in_a_blind_test() {
+        for c in [Command::Rate(3), Command::ToggleFlag, Command::KeepOnly, Command::Delete, Command::ToggleMarkup, Command::ToggleReview, Command::ToggleCameraInfo, Command::SwapAB, Command::LineProfile, Command::ExportReport] {
+            assert!(blind_off(c), "{c:?}");
+        }
+        for c in [Command::ZoomIn, Command::ToggleHistogram, Command::TogglePixelValues, Command::CycleInspect, Command::AlignToA, Command::VoteLeft, Command::NextScene, Command::CompareHelp] {
+            assert!(!blind_off(c), "{c:?}");
+        }
     }
 }
