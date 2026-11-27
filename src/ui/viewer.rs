@@ -1199,7 +1199,7 @@ impl Viewer {
                     painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);
                     if gain_view {
                         let at = Pos2::new(r.min.x, r.max.y + 8.0);
-                        let id = ui.id().with("viewer-gain-legend");
+                        let id = ui.scope_id().with("viewer-gain-legend");
                         super::inspect_view::gain_legend(ui, id, at, view.width() - 24.0, &gain, self.inspect, &mut self.hdr_headroom);
                     }
                 }
@@ -2111,7 +2111,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
         ui.spacing_mut().scroll = egui::style::ScrollStyle { bar_width: 4.0, floating_width: 2.0, floating_allocated_width: 0.0, ..egui::style::ScrollStyle::floating() };
         let mut moved: Option<(usize, usize, bool)> = None;
         let mut clicked: Option<usize> = None;
-        let layout_id = ui.id().with("viewer-film-layout");
+        let layout_id = ui.scope_id().with("viewer-film-layout");
         let mut layout: FilmLayout = ui.data_mut(|d| d.remove_temp(layout_id)).unwrap_or_default();
         layout.sync(&self.list, h, |path| core.meta.get(path).and_then(|m| m.dims).map(|(w, hh)| w as f32 / hh.max(1) as f32));
         egui::ScrollArea::horizontal().id_salt("filmstrip").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
@@ -2173,7 +2173,7 @@ L* {:.1}  a* {:.1}  b* {:.1}   Y {:.0}{}",
             let cell_rect = |layout: &FilmLayout, i: usize| Rect::from_min_size(origin + Vec2::new(layout.x[i], 0.0), Vec2::new(layout.w[i], h)).round_ui();
             for i in layout.range(viewport.min.x, viewport.max.x) {
                 let rect = cell_rect(&layout, i);
-                let resp = ui.interact(rect, ui.id().with(("film-cell", i)), Sense::click_and_drag());
+                let resp = ui.interact(rect, ui.scope_id().with(("film-cell", i)), Sense::click_and_drag());
                 // Drag a thumbnail along the strip to arrange the folder.
                 if resp.drag_started() {
                     resp.dnd_set_drag_payload(FilmDrag(i));
