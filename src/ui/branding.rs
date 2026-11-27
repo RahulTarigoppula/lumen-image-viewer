@@ -276,7 +276,8 @@ impl BrandingDialog {
         }
         let tex = brand::read_logo(&path)
             .map(|img| {
-                let small = lumen_core::imaging::resize_to_fit(&img, 396, 132);
+                // As the report shows it: without transparent margins.
+                let small = lumen_core::imaging::resize_to_fit(&brand::trim_transparent(&img), 396, 132);
                 let ci = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
                 ctx.load_texture("report-logo-preview", ci, egui::TextureOptions::LINEAR)
             })

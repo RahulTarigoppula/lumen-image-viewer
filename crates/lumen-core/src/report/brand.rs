@@ -97,11 +97,12 @@ impl Default for Brand {
 }
 
 impl Brand {
-    /// `b` with the logo image `logo` (already decoded).
+    /// `b` with the logo image `logo` (already decoded). Transparent margins
+    /// are cut off, so the logo lines up with the page's edges and rules.
     pub fn new(b: &Branding, logo: Option<&RgbaImage>) -> Brand {
         Brand {
             company: b.company.trim().to_string(),
-            logo: logo.and_then(|img| Picture::from_rgba_quality(img, LOGO_SIDE, 95).ok()),
+            logo: logo.and_then(|img| Picture::from_rgba_quality(&trim_transparent(img), LOGO_SIDE, 95).ok()),
             accent: b.accent(),
             footer: b.footer.trim().to_string(),
         }
@@ -122,6 +123,25 @@ impl Brand {
     pub fn branded(&self) -> bool {
         !self.company.is_empty() || self.logo.is_some()
     }
+}
+
+/// `img` without its fully transparent margins (a faint edge, alpha up to
+/// 8, counts as transparent). An image with nothing visible stays as it is.
+pub fn trim_transparent(img: &RgbaImage) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p[3] > 8 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if x0 == u32::MAX || (x0 == 0 && y0 == 0 && x1 + 1 == w && y1 + 1 == h) {
+        return img.clone();
+    }
+    image::imageops::crop_imm(img, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image()
 }
 
 /// Decode a logo file (PNG or JPEG; anything Lumen opens works).
@@ -193,6 +213,23 @@ mod tests {
     }
 
     #[test]
+    fn transparent_margins_are_trimmed() {
+        // A 40 x 20 mark inside a 100 x 60 transparent canvas, with a faint halo.
+        let img = RgbaImage::from_fn(100, 60, |x, y| {
+            let inside = (30..70).contains(&x) && (20..40).contains(&y);
+            image::Rgba([10, 20, 30, if inside { 255 } else if x == 10 { 5 } else { 0 }])
+        });
+        let t = trim_transparent(&img);
+        assert_eq!(t.dimensions(), (40, 20));
+        assert_eq!(t.get_pixel(0, 0)[3], 255);
+        // Opaque images and fully transparent ones are left alone.
+        let opaque = RgbaImage::from_pixel(8, 4, image::Rgba([1, 2, 3, 255]));
+        assert_eq!(trim_transparent(&opaque), opaque);
+        let empty = RgbaImage::new(8, 4);
+        assert_eq!(trim_transparent(&empty), empty);
+    }
+
+    #[test]
     fn brand_reads_a_png_logo_and_survives_a_missing_one() {
         let dir = std::env::temp_dir().join(format!("lumen-brand-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -202,7 +239,8 @@ mod tests {
         let (brand, warn) = Brand::load(&b, None);
         assert!(warn.is_none(), "{warn:?}");
         let logo = brand.logo.as_ref().unwrap();
-        assert_eq!((logo.w, logo.h), (300, 100));
+        // The transparent strip at the left is cut off.
+        assert_eq!((logo.w, logo.h), (280, 100));
         assert_eq!(brand.accent, [1, 2, 3]);
         assert_eq!(brand.footer, "Confidential");
         assert!(brand.branded());
