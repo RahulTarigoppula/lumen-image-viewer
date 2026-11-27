@@ -1,6 +1,14 @@
-# Keyboard shortcuts window (F1 / ShortcutsHelp).
+# Keyboard shortcuts window (F1 / ShortcutsHelp), then its end: the Compare
+# and Blind test sections come from the keymap like the others.
 open {media}\RoundA\DeviceX
 wait 2000
 run ShortcutsHelp
 wait 1500
 shot shortcuts.png
+hover 640 420
+scroll -40000
+wait 800
+shot shortcuts_end.png
+scroll 700
+wait 800
+shot shortcuts_compare.png

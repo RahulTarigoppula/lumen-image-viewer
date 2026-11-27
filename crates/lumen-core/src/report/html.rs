@@ -43,10 +43,14 @@ fn badge(i: usize, label: &str) -> String {
 
 pub fn render(r: &Report) -> String {
     let title = if r.title.trim().is_empty() { "Image comparison" } else { r.title.as_str() };
+    let b = &r.brand;
     let mut h = String::new();
     h.push_str(&format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{}</title><style>
-:root{{--ink:#20242c;--muted:#68707c;--rule:#dee2e8;--panel:#f5f7fa;--accent:#2f6feb}}
+:root{{--ink:#20242c;--muted:#68707c;--rule:#dee2e8;--panel:#f5f7fa;--accent:{}}}
+.brand{{display:flex;align-items:center;gap:16px;padding-bottom:14px;margin-bottom:24px;border-bottom:3px solid var(--accent)}}
+.brand img{{max-height:56px;max-width:260px;width:auto;height:auto;display:block}}.brand .co{{font-weight:700;font-size:18px;overflow:hidden;text-overflow:ellipsis}}
+.brand .tag{{margin-left:auto;font-weight:700;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}}
 *{{box-sizing:border-box}}body{{margin:0;font:15px/1.5 "Segoe UI",system-ui,sans-serif;color:var(--ink);background:#fff}}
 main{{max-width:1200px;margin:0 auto;padding:32px 20px 64px}}
 h1{{font-size:30px;margin:0 0 4px}}h2{{font-size:20px;margin:40px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--rule)}}
@@ -63,8 +67,22 @@ th{{background:var(--accent);color:#fff}}td:first-child,th:first-child{{text-ali
 @media (max-width:720px){{.item{{grid-template-columns:1fr}}}}
 @media print{{h2{{break-before:page}}.item{{break-inside:avoid}}}}
 </style></head><body><main>"#,
-        esc(title)
+        esc(title),
+        css_rgb(b.accent)
     ));
+    if b.branded() || !b.footer.is_empty() {
+        h.push_str(r#"<header class="brand">"#);
+        if let Some(logo) = &b.logo {
+            h.push_str(&img(logo, &format!("{} logo", b.company)));
+        }
+        if !b.company.is_empty() {
+            h.push_str(&format!(r#"<span class="co">{}</span>"#, esc(&b.company)));
+        }
+        if !b.footer.is_empty() {
+            h.push_str(&format!(r#"<span class="tag">{}</span>"#, esc(&b.footer)));
+        }
+        h.push_str("</header>");
+    }
     h.push_str(&format!("<h1>{}</h1>", esc(title)));
     let by: Vec<&str> = [r.date.as_str(), r.author.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
     h.push_str(&format!(r#"<p class="meta">{} image{} compared{}</p>"#, r.items.len(), if r.items.len() == 1 { "" } else { "s" }, if by.is_empty() { String::new() } else { format!(" · {}", esc(&by.join(" · "))) }));
@@ -137,7 +155,12 @@ th{{background:var(--accent);color:#fff}}td:first-child,th:first-child{{text-ali
             }
         }
     }
-    h.push_str("<footer>Made with Lumen</footer></main></body></html>");
+    let mut foot: Vec<String> = Vec::new();
+    if !b.footer.is_empty() {
+        foot.push(format!("<strong>{}</strong>", esc(&b.footer)));
+    }
+    foot.push(if b.company.is_empty() { "Made with Lumen".to_string() } else { esc(&b.company) });
+    h.push_str(&format!("<footer>{}</footer></main></body></html>", foot.join(" · ")));
     h
 }
 
@@ -163,7 +186,7 @@ main{{max-width:1280px;margin:0 auto;padding:24px 16px 48px}}
 .el{{position:absolute;overflow:hidden}}.tx{{white-space:pre-wrap;line-height:1.25}}
 .el img{{width:100%;height:100%;display:block}}
 table{{border-collapse:collapse;width:100%;height:100%}}th,td{{border-bottom:1px solid #dee2e8;padding:0 .6cqw;text-align:center;font-size:1.15cqw}}
-th{{background:#2f6feb;color:#fff}}td:first-child,th:first-child{{text-align:left;font-weight:600}}tr:nth-child(even) td{{background:#f5f7fa}}
+th{{background:var(--head,#2f6feb);color:#fff}}td:first-child,th:first-child{{text-align:left;font-weight:600}}tr:nth-child(even) td{{background:#f5f7fa}}
 @media print{{body{{background:#fff}}main{{padding:0;max-width:none}}.sheet{{box-shadow:none;break-after:page;margin:0}}}}
 </style></head><body><main>"#,
         esc(title),
@@ -187,11 +210,15 @@ th{{background:#2f6feb;color:#fff}}td:first-child,th:first-child{{text-align:lef
                     t.size / PAGE_W * 100.0,
                     if t.bold { 700 } else { 400 },
                     css_rgb(t.color),
-                    if t.align == Align::Center { "center" } else { "left" },
+                    match t.align {
+                        Align::Left => "left",
+                        Align::Center => "center",
+                        Align::Right => "right",
+                    },
                     esc(&t.text)
                 )),
-                El::Table { table, .. } => {
-                    h.push_str(&format!(r#"<div class="el" style="{pos}"><table><thead><tr>"#));
+                El::Table { table, head, .. } => {
+                    h.push_str(&format!(r#"<div class="el" style="{pos};--head:{}"><table><thead><tr>"#, css_rgb(*head)));
                     for c in &table.header {
                         h.push_str(&format!("<th>{}</th>", esc(c)));
                     }
@@ -227,5 +254,19 @@ mod tests {
         let r = super::super::tests::sample(1);
         let h = super::render(&r);
         assert!(h.contains("&lt;visible&gt;") && !h.contains("<visible>"));
+    }
+
+    #[test]
+    fn web_page_carries_the_branding() {
+        let plain = super::render(&super::super::tests::sample(2));
+        assert!(plain.contains("--accent:rgb(47,111,235)") && plain.contains("<footer>Made with Lumen</footer>") && !plain.contains("class=\"brand\""));
+        let mut r = super::super::tests::sample(2);
+        r.brand = super::super::tests::acme(Some((600, 150)));
+        r.brand.company = "Acme <Labs>".into();
+        let h = super::render(&r);
+        assert!(h.contains("--accent:rgb(200,30,60)"));
+        assert!(h.contains(r#"<header class="brand"><img src="data:image/jpeg;base64,"#));
+        assert!(h.contains(r#"<span class="co">Acme &lt;Labs&gt;</span>"#) && h.contains(r#"<span class="tag">Confidential</span>"#));
+        assert!(h.contains("<footer><strong>Confidential</strong> · Acme &lt;Labs&gt;</footer>"));
     }
 }

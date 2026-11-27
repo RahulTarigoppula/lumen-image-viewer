@@ -14,6 +14,7 @@ Layout (like a camera test project):
     Explorer/Source/, Target/, Outside/            cut / paste and drops (three Flat pictures, an empty folder, one file)
     HDR/samsung_ultrahdr.jpg                       Ultra HDR gain map (XMP), Samsung maker note and trailer
     HDR/pixel_hdrplus.jpg                          ISO 21496-1 gain map, Google HDR+ maker note and XMP
+    Brand/acme_logo.png                            a wide logo with transparency (report branding)
     Video/clip_DeviceX.mp4, clip_DeviceY.mp4       only when an ffmpeg binary is found
 
 Needs Pillow and numpy. Videos use `ffmpeg` from PATH, or the binary shipped
@@ -489,6 +490,19 @@ def make_hdr(out):
         f.write(data)
 
 
+def make_brand(out):
+    """A wide company logo with a transparent background (report branding)."""
+    folder = os.path.join(out, "Brand")
+    os.makedirs(folder, exist_ok=True)
+    logo = Image.new("RGBA", (640, 160), (0, 0, 0, 0))
+    d = ImageDraw.Draw(logo)
+    d.rounded_rectangle([0, 10, 140, 150], radius=28, fill=(20, 40, 90, 255))
+    d.text((34, 32), "A", font=font(84), fill=(255, 255, 255, 255))
+    d.text((164, 22), "ACME", font=font(76), fill=(20, 40, 90, 255))
+    d.text((168, 110), "CAMERA LAB", font=font(30), fill=(200, 30, 60, 255))
+    logo.save(os.path.join(folder, "acme_logo.png"))
+
+
 def find_ffmpeg():
     exe = shutil.which("ffmpeg")
     if exe:
@@ -539,6 +553,7 @@ def main():
     make_flat(out)
     make_explorer(out)
     make_hdr(out)
+    make_brand(out)
     videos = False if "--no-video" in sys.argv else make_videos(out)
     count = sum(len(f) for _, _, f in os.walk(out))
     print(f"make_media: {count} files in {out} (videos: {'yes' if videos else 'no'})")

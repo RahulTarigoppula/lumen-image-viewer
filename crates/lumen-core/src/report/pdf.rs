@@ -90,6 +90,7 @@ impl Page {
             let x = match align {
                 Align::Left => b.x,
                 Align::Center => b.x + (b.w - text_width(&line, size, bold)) / 2.0,
+                Align::Right => b.x + b.w - text_width(&line, size, bold),
             };
             self.text_line(x, top, &line, size, bold, c);
             top += lh;
@@ -103,14 +104,14 @@ impl Page {
             self.images.push((name, idx));
         }
     }
-    fn table(&mut self, b: Box2, t: &Table) {
+    fn table(&mut self, b: Box2, t: &Table, head: [u8; 3]) {
         let cols = t.header.len().max(1);
         let first_w = (b.w * 0.34).min(260.0);
         let other_w = if cols > 1 { (b.w - first_w) / (cols - 1) as f32 } else { b.w };
         let row_h = b.h / (t.rows.len() + 1) as f32;
         let col_x = |c: usize| if c == 0 { b.x } else { b.x + first_w + (c - 1) as f32 * other_w };
         let col_w = |c: usize| if c == 0 && cols > 1 { first_w } else { other_w };
-        self.fill(Box2::new(b.x, b.y, b.w, row_h), [47, 111, 235]);
+        self.fill(Box2::new(b.x, b.y, b.w, row_h), head);
         let size = 11.0;
         let pad = 6.0;
         let ty = |row: usize| b.y + row as f32 * row_h + (row_h - leading(size)) / 2.0;
@@ -135,11 +136,12 @@ impl Page {
 
 /// Render the report as PDF bytes.
 pub fn render(r: &Report) -> Result<Vec<u8>> {
-    render_slides(&layout(r), &r.title)
+    render_slides(&layout(r), &r.title, &r.author)
 }
 
-/// Render laid-out slides as PDF bytes (`title` goes into the document info).
-pub fn render_slides(slides: &[Slide], title: &str) -> Result<Vec<u8>> {
+/// Render laid-out slides as PDF bytes (`title` and `author` go into the
+/// document info).
+pub fn render_slides(slides: &[Slide], title: &str, author: &str) -> Result<Vec<u8>> {
     let mut pics: Vec<(Arc<Vec<u8>>, u32, u32)> = Vec::new();
     let mut pages = Vec::new();
     for s in slides {
@@ -159,7 +161,7 @@ pub fn render_slides(slides: &[Slide], title: &str) -> Result<Vec<u8>> {
                     p.image(*bx, idx);
                 }
                 El::Text(t) => p.text(t.bx, &t.text, t.size, t.bold, t.color, t.align),
-                El::Table { bx, table } => p.table(*bx, table),
+                El::Table { bx, table, head } => p.table(*bx, table, *head),
             }
         }
         pages.push(p);
@@ -210,7 +212,8 @@ pub fn render_slides(slides: &[Slide], title: &str) -> Result<Vec<u8>> {
         let _ = writeln!(x, "{o:010} 00000 n ");
     }
     let info_title = String::from_utf8_lossy(&pdf_string(title)).to_string();
-    let _ = write!(x, "trailer\n<< /Size {} /Root 1 0 R /Info << /Title {info_title} /Producer (Lumen) >> >>\nstartxref\n{xref_at}\n%%EOF\n", offsets.len() + 1);
+    let info_author = if author.trim().is_empty() { String::new() } else { format!("/Author {} ", String::from_utf8_lossy(&pdf_string(author.trim()))) };
+    let _ = write!(x, "trailer\n<< /Size {} /Root 1 0 R /Info << /Title {info_title} {info_author}/Producer (Lumen) >> >>\nstartxref\n{xref_at}\n%%EOF\n", offsets.len() + 1);
     out.extend_from_slice(x.as_bytes());
     Ok(out)
 }

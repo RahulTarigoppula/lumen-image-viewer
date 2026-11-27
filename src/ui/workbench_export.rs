@@ -30,6 +30,8 @@ pub struct DeckJob {
     pub details: bool,
     /// Only scenes marked reviewed.
     pub reviewed_only: bool,
+    /// Company branding (logo path absolute); empty keeps Lumen's look.
+    pub branding: report::Branding,
 }
 
 /// One scene's captures decoded and annotated, with its tagged marks.
@@ -211,7 +213,13 @@ pub fn run(job: &DeckJob, done: &AtomicUsize) -> Result<PathBuf> {
             improvements: diff.improvements.len(),
         }
     });
+    let (brand, warning) = report::Brand::load(&job.branding, None);
+    if let Some(w) = warning {
+        log::warn!("round deck: {w}");
+    }
     let d = deck::Deck {
+        project: p.name.clone(),
+        brand,
         title: if job.title.trim().is_empty() { p.name.clone() } else { job.title.trim().to_string() },
         author: job.author.trim().to_string(),
         date: review::today(),

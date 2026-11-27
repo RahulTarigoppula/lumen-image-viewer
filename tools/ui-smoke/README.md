@@ -42,7 +42,8 @@ The job summary on the run page has a table of scenarios and problems.
    one file, for cut / paste and drops from another program), `HDR/` (a
    Samsung-style Ultra HDR photo with a Type2 maker note and SEF trailer, and a
    Pixel-style one with an ISO 21496-1 gain map and an encrypted HDR+ maker
-   note; the metadata is written byte by byte) and `Video/` with two
+   note; the metadata is written byte by byte), `Brand/acme_logo.png`
+   (a wide logo with transparency, for report branding) and `Video/` with two
    4 s clips when an ffmpeg binary is found (PATH, or the `imageio-ffmpeg` pip
    package that CI installs).
 3. `run.ps1` copies `lumen.exe` and the Mesa DLLs into a temporary folder with
@@ -72,6 +73,7 @@ key Ctrl+Q            # any shortcut the keymap parser accepts
 click 640 400         # window point in points; `click x y right` for the right button
 drag 300 300 420 400
 type compare
+dialog {media}\Brand\acme_logo.png  # the next file dialog (logo, round report) returns this path
 ppp 1.5               # pretend the window moved to a 150% display
 size 800 600
 shot info.png         # saved as shots/NN-name__info.png

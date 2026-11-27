@@ -281,6 +281,8 @@ pub struct App {
     show_settings: bool,
     show_help: bool,
     show_about: bool,
+    /// The default report branding, opened from the command palette.
+    report_branding: Option<crate::ui::branding::BrandingDialog>,
     fullscreen: bool,
     viewer_from_browser: bool,
     last_save: Instant,
@@ -453,6 +455,7 @@ impl App {
             show_settings: false,
             show_help: false,
             show_about: false,
+            report_branding: None,
             fullscreen: false,
             viewer_from_browser: false,
             last_save: Instant::now(),
@@ -722,6 +725,14 @@ impl App {
         if self.mode == Mode::Viewer && self.viewer.video_command(cmd, &mut self.core.settings.video) {
             return;
         }
+        // Compare's commands (palette, menus) go to the comparison on screen.
+        if self.mode == Mode::Compare {
+            if let Some(c) = &mut self.compare {
+                if c.run_command(cmd, &mut self.core) {
+                    return;
+                }
+            }
+        }
         let fit = self.core.settings.fit_mode;
         let wrap = self.core.settings.loop_navigation;
         match cmd {
@@ -817,6 +828,28 @@ impl App {
                     self.open_project(&root);
                 }
             }
+            RoundReport => {
+                let blind = self.compare.as_ref().is_some_and(|c| c.link.as_ref().is_some_and(|l| l.blind));
+                if self.workbench.is_none() {
+                    self.core.toasts.info("Open a camera comparison project first (Tools, Workbench)");
+                } else if self.mode == Mode::Compare && blind {
+                    self.core.toasts.info("Finish the blind test first");
+                } else {
+                    if self.mode == Mode::Compare {
+                        // Leave the scene as Esc does: its review is written first.
+                        self.compare = None;
+                    }
+                    if let Some(w) = &mut self.workbench {
+                        w.save_now(&mut self.core.toasts);
+                        w.open_export();
+                    }
+                    self.mode = Mode::Workbench;
+                }
+            }
+            ReportBranding => self.report_branding = Some(Default::default()),
+            // Compare's own commands land here only outside Compare.
+            PanLeft | PanRight | PanUp | PanDown | ViewSideBySide | ViewSplit | ViewDifference | JumpDivider | ToggleLink | SwapAB | AlignToA | ToggleCameraInfo | LineProfile | ToggleMarkup | ToggleReview | ExportReport | KeepOnly | NextScene
+            | PrevScene | ToggleScorecard | CompareHelp | VoteLeft | VoteRight | VoteSame => self.core.toasts.info("This works in Compare: select two to four images, then Compare"),
             CommandPalette => self.palette.toggle(),
             Settings => self.show_settings = !self.show_settings,
             ShortcutsHelp => self.show_help = !self.show_help,
@@ -2579,6 +2612,7 @@ impl App {
             || self.viewer.confirm_discard
             || self.pending_guard.is_some()
             || self.gps_confirm.is_some()
+            || self.report_branding.is_some()
             || self.analysis.modal_open(&self.core)
     }
 
@@ -2697,7 +2731,11 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use crate::ui::keymap::{self, KeyMode};
-        keymap::set_context(if self.mode == Mode::Viewer { KeyMode::Viewer } else { KeyMode::Browser });
+        keymap::set_context(match self.mode {
+            Mode::Viewer => KeyMode::Viewer,
+            Mode::Compare => KeyMode::Compare,
+            _ => KeyMode::Browser,
+        });
         self.track_window_focus(ctx);
         if self.modal_open() || keymap::capturing() {
             return;
@@ -3320,7 +3358,7 @@ impl App {
                 egui::Grid::new("help-shortcuts").num_columns(2).spacing([28.0, 4.0]).min_row_height(24.0).striped(false).show(ui, |ui| {
                     for mode in KeyMode::ALL {
                         title(ui, mode.label());
-                        for c in Command::all() {
+                        for c in keymap::commands_of(mode) {
                             let keys = keymap::mode_text(&km, mode, c);
                             if keys.is_empty() {
                                 continue;
@@ -4181,6 +4219,15 @@ impl eframe::App for App {
         if let Some(w) = &mut self.workbench {
             w.conflict_dialog(&ctx, &mut self.core);
         }
+        if let Some(d) = &mut self.report_branding {
+            let out = d.show(&ctx, &p, crate::ui::branding::Target::Defaults(&mut self.core.settings.report_branding));
+            if let Some(e) = out.error {
+                self.core.toasts.error(e);
+            }
+            if !out.open {
+                self.report_branding = None;
+            }
+        }
         // Leaving video mode by any route stops playback.
         if self.mode != Mode::Video && self.video.is_some() {
             self.video = None;
@@ -4192,7 +4239,9 @@ impl eframe::App for App {
         if self.mode != Mode::Viewer {
             self.viewer.stop_video();
         }
-        let available = |c: Command| -> bool { !matches!(c, Command::Exit) || true };
+        // Compare's own commands are offered in Compare only.
+        let in_compare = self.mode == Mode::Compare;
+        let available = |c: Command| -> bool { in_compare || !Command::COMPARE.contains(&c) };
         if let Some(c) = self.palette.show(&ctx, &p, &available) {
             self.run(c);
         }

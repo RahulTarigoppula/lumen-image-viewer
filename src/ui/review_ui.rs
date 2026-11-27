@@ -2,7 +2,9 @@
 //! the Review side panel (comments, notes, details) and the report export
 //! dialog. The data lives in [`review::Review`]; this is its UI state.
 
+use super::commands::Command;
 use super::icons as I;
+use super::keymap::{self, KeyMode};
 use super::review::{self, Detail, Mark, Prefs, Review, Shape, COLORS, WIDTHS};
 use super::theme::{self, text};
 use super::widgets;
@@ -148,6 +150,8 @@ pub struct ReviewUi {
     /// Set by the background writer when a save failed.
     save_failed: Arc<AtomicBool>,
     save_warned: bool,
+    /// The report branding dialog (opened from the export dialog).
+    branding: Option<super::branding::BrandingDialog>,
 }
 
 const SAVE_DELAY: Duration = Duration::from_millis(800);
@@ -193,6 +197,7 @@ impl ReviewUi {
             no_save,
             save_failed: Arc::new(AtomicBool::new(false)),
             save_warned: false,
+            branding: None,
         }
     }
 
@@ -393,18 +398,11 @@ impl ReviewUi {
 
     // ------------------------------------------------------------ keys
 
-    /// Review keys; returns true when Esc was used here.
+    /// The review's fixed keys, as in any drawing tool: Del / Backspace delete
+    /// the selected mark, Esc drops it or leaves mark up. Undo, redo and
+    /// export are in the keymap (Compare). Returns true when Esc was used here.
     pub fn keys(&mut self, ui: &Ui) -> bool {
         let take = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
-        if take(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || take(Modifiers::COMMAND, Key::Y) {
-            self.redo();
-        }
-        if take(Modifiers::COMMAND, Key::Z) {
-            self.undo();
-        }
-        if take(Modifiers::COMMAND | Modifiers::SHIFT, Key::E) {
-            self.open_export();
-        }
         if self.sel.is_some() && (take(Modifiers::NONE, Key::Delete) || take(Modifiers::NONE, Key::Backspace)) {
             self.delete_selected();
         }
@@ -654,21 +652,23 @@ impl ReviewUi {
         let row = ui.available_rect_before_wrap();
         let mut right = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
         right.spacing_mut().item_spacing.x = 4.0;
-        if widgets::secondary_button(&mut right, "Done").on_hover_text("Stop marking up; drag pans again  (M or Esc)").clicked() {
+        let m = keymap::mode_text(&keymap::active(), KeyMode::Compare, Command::ToggleMarkup);
+        let done_tip = if m.is_empty() { "Stop marking up; drag pans again  (Esc)".to_string() } else { format!("Stop marking up; drag pans again  ({m} or Esc)") };
+        if widgets::secondary_button(&mut right, "Done").on_hover_text(done_tip).clicked() {
             self.markup = false;
             self.drag = None;
         }
         widgets::separator_v(&mut right);
-        if right.add_enabled_ui(self.has_marks(), |ui| widgets::icon_button(ui, I::BROOM, "Clear: remove every mark and detail from all images (Ctrl+Z brings them back)", false)).inner.clicked() {
+        if right.add_enabled_ui(self.has_marks(), |ui| widgets::icon_button(ui, I::BROOM, "Clear: remove every mark and detail from all images (Undo brings them back)", false)).inner.clicked() {
             self.clear_all();
         }
         if right.add_enabled_ui(self.sel.is_some(), |ui| widgets::icon_button(ui, I::TRASH, "Delete the selected mark or detail  (Del)", false)).inner.clicked() {
             self.delete_selected();
         }
-        if right.add_enabled_ui(self.can_redo(), |ui| widgets::icon_button(ui, I::ARROW_CLOCKWISE, "Redo  (Ctrl+Y)", false)).inner.clicked() {
+        if right.add_enabled_ui(self.can_redo(), |ui| widgets::icon_button(ui, I::ARROW_CLOCKWISE, &ctip("Redo", Command::Redo), false)).inner.clicked() {
             self.redo();
         }
-        if right.add_enabled_ui(self.can_undo(), |ui| widgets::icon_button(ui, I::ARROW_COUNTER_CLOCKWISE, "Undo  (Ctrl+Z)", false)).inner.clicked() {
+        if right.add_enabled_ui(self.can_undo(), |ui| widgets::icon_button(ui, I::ARROW_COUNTER_CLOCKWISE, &ctip("Undo", Command::Undo), false)).inner.clicked() {
             self.undo();
         }
         let buttons_left = right.min_rect().left();
@@ -756,7 +756,7 @@ impl ReviewUi {
             ui.label(RichText::new(I::CHAT_TEXT).size(15.0).color(p.accent));
             ui.label(RichText::new("Review").font(text::title()).color(p.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::icon_button_sized(ui, I::X, "Close the review panel  (C)", false, 24.0, 14.0).clicked() {
+                if widgets::icon_button_sized(ui, I::X, &ctip("Close the review panel", Command::ToggleReview), false, 24.0, 14.0).clicked() {
                     out.close = true;
                 }
             });
@@ -892,7 +892,7 @@ impl ReviewUi {
             ui.add_space(14.0);
             let label = if self.exporting() { format!("{}  Exporting...", I::SPINNER) } else { format!("{}  Export report...", I::EXPORT) };
             let r = ui.add_enabled_ui(!self.exporting(), |ui| widgets::primary_button(ui, p, &label)).inner;
-            if r.on_hover_text("Save the review as PowerPoint, PDF or a web page  (Ctrl+Shift+E)").clicked() {
+            if r.on_hover_text(ctip("Save the review as PowerPoint, PDF or a web page", Command::ExportReport)).clicked() {
                 self.open_export();
             }
             if let Some(path) = self.last_export.clone() {
@@ -919,9 +919,13 @@ impl ReviewUi {
     // ------------------------------------------------------------ export
 
     /// The export dialog (when open); starts the export on the worker.
-    pub fn export_dialog(&mut self, ctx: &egui::Context, p: &theme::Palette, sources: impl FnOnce() -> Vec<ExportSource>) {
+    /// `defaults`: the report branding in the settings; `project`: the
+    /// project's own branding (a project scene), which wins over it.
+    pub fn export_dialog(&mut self, ctx: &egui::Context, p: &theme::Palette, defaults: &mut report::Branding, project: Option<&report::Branding>, sources: impl FnOnce() -> Vec<ExportSource>) {
         let Some(form) = self.export.as_mut() else { return };
         let mut decision = None;
+        let mut edit_branding = false;
+        let branding_open = self.branding.is_some();
         let n_details = self.review.details.len();
         let has_metrics = self.metrics.is_some();
         widgets::modal(ctx, egui::Id::NULL.with("cmp-export-report"), 460.0, |ui| {
@@ -962,6 +966,13 @@ impl ReviewUi {
             ui.add_space(6.0);
             widgets::checkbox(ui, &mut form.image_info, "Image details").on_hover_text("Size, file size and camera settings under each image");
             widgets::checkbox(ui, &mut form.open_after, "Open the report when it is ready").on_hover_text("Opens it in PowerPoint, the PDF reader or the browser");
+            ui.add_space(8.0);
+            // A project's own branding is changed from its round report.
+            let (b, whose) = match project {
+                Some(b) => (b, "this project's, set in its round report"),
+                None => (&*defaults, "default"),
+            };
+            edit_branding = super::branding::summary_row(ui, p, b, whose, project.is_none());
             let any = s.title || s.overview || s.per_image || (s.details && n_details > 0) || (s.metrics && has_metrics);
             if !any {
                 ui.label(RichText::new("Pick at least one page.").size(text::SMALL).color(p.warn));
@@ -969,21 +980,35 @@ impl ReviewUi {
             if let Some(r) = widgets::dialog_buttons(ui, p, "Cancel", "Export...", widgets::ButtonKind::Primary, any) {
                 decision = Some(r);
             }
-            if ui.input(|i| i.key_pressed(Key::Escape)) {
+            if !branding_open && ui.input(|i| i.key_pressed(Key::Escape)) {
                 decision = Some(false);
             }
         });
+        if edit_branding {
+            self.branding = Some(Default::default());
+        }
+        if let Some(d) = &mut self.branding {
+            let out = d.show(ctx, p, super::branding::Target::Defaults(defaults));
+            if !out.open {
+                self.branding = None;
+            }
+            if let Some(e) = out.error {
+                log::warn!("report branding: {e}");
+            }
+            return;
+        }
+        let branding = super::branding::effective(project, defaults, None);
         match decision {
             Some(false) => self.export = None,
             Some(true) => {
                 let form = self.export.take().unwrap();
-                self.start_export(form, sources(), ctx);
+                self.start_export(form, sources(), ctx, branding);
             }
             None => {}
         }
     }
 
-    fn start_export(&mut self, form: ExportForm, sources: Vec<ExportSource>, ctx: &egui::Context) {
+    fn start_export(&mut self, form: ExportForm, sources: Vec<ExportSource>, ctx: &egui::Context, branding: report::Branding) {
         let p = &mut self.prefs;
         p.author = form.author.trim().to_string();
         p.format = form.format.ext().into();
@@ -1032,6 +1057,7 @@ impl ReviewUi {
             image_info: form.image_info,
             format: form.format,
             out,
+            branding,
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = ctx.clone();
@@ -1050,6 +1076,11 @@ fn rel_point(p: [f32; 2], dims: (u32, u32)) -> [f32; 2] {
 
 fn field_label(ui: &mut Ui, p: &theme::Palette, t: &str) {
     ui.label(RichText::new(t).size(text::SMALL).color(p.muted));
+}
+
+/// A tooltip with the command's Compare keys from the keymap.
+fn ctip(text: &str, cmd: Command) -> String {
+    keymap::tip(text, KeyMode::Compare, cmd)
 }
 
 /// The pane letter in its colour.

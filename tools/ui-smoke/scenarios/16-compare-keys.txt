@@ -1,0 +1,34 @@
+# Compare keys are remappable: Settings > Keyboard > Compare tab, Swap A and B
+# moved from X to Y. In Compare, Y then swaps the images and the shortcuts
+# overlay (?) shows Y.
+open {media}\Compare2
+wait 2500
+run Settings
+wait 1500
+# Keyboard page, Compare tab.
+click 284 256
+wait 1000
+click 709 382
+wait 800
+shot compare_tab.png
+# Search "swap", click its key (X) and press Y.
+click 566 412
+type swap
+wait 800
+shot search_swap.png
+click 725 474
+wait 500
+key Y
+wait 800
+shot remapped.png
+run Settings
+wait 800
+run SelectAll
+run Compare
+wait 3000
+shot compare.png
+key Y
+wait 1000
+key ?
+wait 800
+shot swapped_help.png

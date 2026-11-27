@@ -2,7 +2,7 @@
 //! one blank layout, a theme) with one slide per laid-out page. Text boxes
 //! stay editable; pictures are embedded JPEGs.
 
-use super::{layout, xml_escape, Align, Box2, El, Report, Slide, Table, INK, MUTED, PAGE_H, PAGE_W, RULE};
+use super::{layout, xml_escape, Align, Box2, Brand, El, Report, Slide, Table, INK, MUTED, PAGE_H, PAGE_W, RULE};
 use anyhow::Result;
 use std::io::Write;
 
@@ -35,6 +35,7 @@ fn paragraphs(text: &str, size: f32, bold: bool, color: [u8; 3], align: Align) -
     let algn = match align {
         Align::Left => "l",
         Align::Center => "ctr",
+        Align::Right => "r",
     };
     let mut o = String::new();
     for line in text.split('\n') {
@@ -97,7 +98,7 @@ fn picture(cx: &mut Ctx, b: Box2, media: &str) -> String {
     )
 }
 
-fn table(cx: &mut Ctx, b: Box2, t: &Table) -> String {
+fn table(cx: &mut Ctx, b: Box2, t: &Table, head: [u8; 3]) -> String {
     let id = cx.id();
     let cols = t.header.len().max(1);
     let first_w = (b.w * 0.34).min(260.0);
@@ -118,7 +119,7 @@ fn table(cx: &mut Ctx, b: Box2, t: &Table) -> String {
     };
     let mut rows = format!(r#"<a:tr h="{}">"#, emu(row_h));
     for (c, h) in t.header.iter().enumerate() {
-        rows.push_str(&cell(h, true, [255, 255, 255], Some([47, 111, 235]), c > 0));
+        rows.push_str(&cell(h, true, [255, 255, 255], Some(head), c > 0));
     }
     rows.push_str("</a:tr>");
     for (k, r) in t.rows.iter().enumerate() {
@@ -152,7 +153,7 @@ fn slide_xml(s: &Slide, media_name: &mut dyn FnMut(&std::sync::Arc<Vec<u8>>) -> 
                 body.push_str(&picture(&mut cx, *bx, &name));
             }
             El::Text(t) => body.push_str(&text_box(&mut cx, t.bx, &t.text, t.size, t.bold, t.color, t.align)),
-            El::Table { bx, table: t } => body.push_str(&table(&mut cx, *bx, t)),
+            El::Table { bx, table: t, head } => body.push_str(&table(&mut cx, *bx, t, *head)),
         }
     }
     let xml = format!(
@@ -190,12 +191,13 @@ fn notes_master_xml() -> String {
 
 /// Render the report as a `.pptx` file's bytes.
 pub fn render(r: &Report) -> Result<Vec<u8>> {
-    render_slides(&layout(r), &r.title, &r.author)
+    render_slides(&layout(r), &r.title, &r.author, &r.brand)
 }
 
 /// Render laid-out slides as a `.pptx` file's bytes (`title` and `author`
-/// go into the document properties).
-pub fn render_slides(slides: &[Slide], title: &str, author: &str) -> Result<Vec<u8>> {
+/// go into the document properties; the brand's accent becomes the theme's
+/// first accent color, so new shapes match, and its company the document's).
+pub fn render_slides(slides: &[Slide], title: &str, author: &str, brand: &Brand) -> Result<Vec<u8>> {
     let mut media: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
     let mut slide_parts = Vec::new();
     for s in slides {
@@ -241,7 +243,8 @@ pub fn render_slides(slides: &[Slide], title: &str, author: &str) -> Result<Vec<
         xml_escape(author)
     );
     put(&mut zip, "docProps/core.xml", core.as_bytes(), deflate)?;
-    let app = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Lumen</Application><Slides>{n}</Slides></Properties>"#);
+    let company = if brand.company.is_empty() { String::new() } else { format!("<Company>{}</Company>", xml_escape(&brand.company)) };
+    let app = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Lumen</Application>{company}<Slides>{n}</Slides></Properties>"#);
     put(&mut zip, "docProps/app.xml", app.as_bytes(), deflate)?;
 
     let mut ids = String::new();
@@ -261,8 +264,9 @@ pub fn render_slides(slides: &[Slide], title: &str, author: &str) -> Result<Vec<
     put(&mut zip, "ppt/presProps.xml", format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentationPr {NS}/>"#).as_bytes(), deflate)?;
     put(&mut zip, "ppt/viewProps.xml", format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:viewPr {NS}><p:normalViewPr><p:restoredLeft sz="15620"/><p:restoredTop sz="94660"/></p:normalViewPr><p:gridSpacing cx="76200" cy="76200"/></p:viewPr>"#).as_bytes(), deflate)?;
     put(&mut zip, "ppt/tableStyles.xml", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"/>"#, deflate)?;
-    put(&mut zip, "ppt/theme/theme1.xml", THEME.as_bytes(), deflate)?;
-    put(&mut zip, "ppt/theme/theme2.xml", THEME.as_bytes(), deflate)?;
+    let theme = THEME.replace("2F6FEB", &hex(brand.accent));
+    put(&mut zip, "ppt/theme/theme1.xml", theme.as_bytes(), deflate)?;
+    put(&mut zip, "ppt/theme/theme2.xml", theme.as_bytes(), deflate)?;
     put(&mut zip, "ppt/slideMasters/slideMaster1.xml", master_xml().as_bytes(), deflate)?;
     put(&mut zip, "ppt/slideMasters/_rels/slideMaster1.xml.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/></Relationships>"#, deflate)?;
     put(&mut zip, "ppt/slideLayouts/slideLayout1.xml", layout_xml().as_bytes(), deflate)?;
@@ -311,5 +315,29 @@ mod tests {
         let mut s = String::new();
         std::io::Read::read_to_string(&mut z.by_name("ppt/slides/slide3.xml").unwrap(), &mut s).unwrap();
         assert!(s.contains("&amp;") && s.contains("&lt;visible&gt;"));
+    }
+
+    #[test]
+    fn branding_reaches_the_package() {
+        let read = |z: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, name: &str| {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut z.by_name(name).unwrap(), &mut s).unwrap();
+            s
+        };
+        let mut r = super::super::tests::sample(2);
+        r.brand = super::super::tests::acme(Some((600, 150)));
+        r.brand.company = "Acme & Sons".into();
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(super::render(&r).unwrap())).unwrap();
+        let names: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().unwrap().to_string()).collect();
+        // The two images and the logo, which is stored once for every page.
+        assert_eq!(names.iter().filter(|n| n.starts_with("ppt/media/")).count(), 3);
+        assert!(read(&mut z, "ppt/theme/theme1.xml").contains(r#"<a:accent1><a:srgbClr val="C81E3C"/>"#));
+        assert!(read(&mut z, "docProps/app.xml").contains("<Company>Acme &amp; Sons</Company>"));
+        let slide = read(&mut z, "ppt/slides/slide2.xml");
+        assert!(slide.contains("Confidential") && slide.contains(r#"<a:srgbClr val="C81E3C"/>"#));
+        // Without branding the theme keeps Lumen blue and there is no company.
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(super::render(&super::super::tests::sample(2)).unwrap())).unwrap();
+        assert!(read(&mut z, "ppt/theme/theme1.xml").contains(r#"<a:accent1><a:srgbClr val="2F6FEB"/>"#));
+        assert!(!read(&mut z, "docProps/app.xml").contains("Company"));
     }
 }
