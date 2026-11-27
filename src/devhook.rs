@@ -15,6 +15,9 @@
 //!   ppp <scale>          act as if the window moved to a display with this
 //!                        scale (1.0 = 100%, 1.5 = 150%, ...)
 //!   size <w> <h>         resize the window (points)
+//!   osdrag <x> <y> none|ctrl|shift <path>|<path>...  act as if files were
+//!                        dragged in from Explorer and held at (x, y)
+//!   osdrop / osleave     drop them there / take them away again
 //!   crash panic|native  end the app to test crash.log
 //!   bench <frames> [every <k> <line>]  time frames; optionally run <line>
 //!                        (any command above) every k frames meanwhile
@@ -104,6 +107,10 @@ pub enum DevAction {
     Scroll(f32),
     /// `ppp s`: pretend the display scale is `s`.
     Ppp(f32),
+    /// `osdrag x y mods paths`: files from another program held over the window.
+    OsDrag { pos: egui::Pos2, ctrl: bool, shift: bool, files: Vec<PathBuf> },
+    /// `osdrop` (true) or `osleave` (false).
+    OsDrop(bool),
 }
 
 impl DevHook {
@@ -276,6 +283,21 @@ impl DevHook {
             }
             "ppp" => {
                 out.push(DevAction::Ppp(if num(0) > 0.0 { num(0) } else { 1.0 }));
+                true
+            }
+            // A drag from Explorer, which a test cannot make for real: it goes
+            // through the same code as one from Lumen's drop target.
+            "osdrag" => {
+                let mut it = arg.splitn(4, ' ');
+                let mut coord = || it.next().and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.0);
+                let pos = egui::Pos2::new(coord(), coord());
+                let mods = it.next().unwrap_or("none").to_ascii_lowercase();
+                let files = it.next().unwrap_or("").split('|').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+                out.push(DevAction::OsDrag { pos, ctrl: mods.contains("ctrl"), shift: mods.contains("shift"), files });
+                true
+            }
+            "osdrop" | "osleave" => {
+                out.push(DevAction::OsDrop(verb == "osdrop"));
                 true
             }
             "size" => {

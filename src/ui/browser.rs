@@ -8,6 +8,7 @@ use super::safe;
 use super::widgets;
 use crate::app::Core;
 use crate::catalog::{self, Entry, EntryKind, MediaFilter};
+use crate::droptarget::{DropOp, Hover, Zone};
 use crate::settings::{BrowserView, SortKey, ThumbCaption};
 use crate::thumbs::{Thumb, ThumbKey};
 use crossbeam_channel::Receiver;
@@ -110,6 +111,17 @@ pub struct Browser {
     /// Grid tooltips are held back after an in-app file drag until the pointer moves,
     /// so the drop target's name does not pop up like a leftover drag label.
     tips_after_drag: bool,
+    /// Files dragged over the window from another program: the pointer and the
+    /// folder a drop would go to (set by the app each frame).
+    pub os_drop: Option<Hover>,
+    /// Where folder tiles, rows and the empty area were drawn this frame while
+    /// such a drag is over the window (the app finds the drop target in them).
+    pub drop_zones: Vec<(Rect, Zone)>,
+    /// Files cut with Ctrl+X, shown faded until they are pasted or something
+    /// else is put on the clipboard, and the clipboard's number after the cut.
+    cut: HashSet<PathBuf>,
+    cut_seq: u32,
+    cut_checked: Instant,
 }
 
 impl Browser {
@@ -148,6 +160,11 @@ impl Browser {
             right_w: 600.0,
             suppress_keys: false,
             tips_after_drag: true,
+            os_drop: None,
+            drop_zones: Vec::new(),
+            cut: HashSet::new(),
+            cut_seq: 0,
+            cut_checked: Instant::now(),
             arranged: None,
             band: None,
             grid_origin: Pos2::ZERO,
@@ -232,6 +249,18 @@ impl Browser {
         } else {
             s
         }
+    }
+
+    /// `files` were cut to the clipboard (its sequence number is now `seq`):
+    /// they look faded until pasted, as in Explorer.
+    pub fn set_cut(&mut self, files: Vec<PathBuf>, seq: u32) {
+        self.cut = files.into_iter().collect();
+        self.cut_seq = seq;
+        self.cut_checked = Instant::now();
+    }
+
+    fn is_cut(&self, path: &Path) -> bool {
+        !self.cut.is_empty() && self.cut.contains(path)
     }
 
     /// Media (non-folder) entries in display order.
@@ -413,6 +442,14 @@ impl Browser {
         if self.resort_needed {
             self.resort_needed = false;
             self.rebuild(core);
+        }
+        // Cut files stop looking cut once the clipboard holds something else
+        // (pasted and emptied, or copied over); a cheap check, a few times a second.
+        if !self.cut.is_empty() && self.cut_checked.elapsed().as_millis() >= 300 {
+            self.cut_checked = Instant::now();
+            if crate::fileops::clipboard_seq() != self.cut_seq {
+                self.cut.clear();
+            }
         }
         if self.reload_needed {
             self.reload_needed = false;
@@ -853,7 +890,9 @@ impl Browser {
         let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
         tree_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
         self.tree.set_show_hidden(core.settings.show_hidden_files);
+        self.tree.os_drop = self.os_drop.clone();
         let tree_action = self.tree.ui(&mut tree_ui, &self.folder.clone(), &favs, &p);
+        self.drop_zones.append(&mut self.tree.drop_zones);
         ui.advance_cursor_after_rect(rect);
         if let Some(a) = tree_action {
             ev.push(match a {
@@ -964,12 +1003,22 @@ impl Browser {
                 ev.push(BrowserEvent::Command(Command::GoForward));
             }
         }
-        // Drop target for files dragged in from Explorer is handled by the app.
         if let Some(err) = &self.error {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new(format!("{}  {err}", I::WARNING)).color(p.danger));
             });
             return;
+        }
+        // Files dragged in from another program: Ctrl or Shift over the empty
+        // area copies or moves them into this folder (the app decides; the
+        // folders inside are zones of their own, noted while they are drawn).
+        let area = ui.available_rect_before_wrap();
+        if let Some(h) = &self.os_drop {
+            self.drop_zones.push((area.intersect(ui.clip_rect()), Zone::Background(self.folder.clone())));
+            if h.on_background(area) {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("browser-drop-area")));
+                painter.with_clip_rect(area).rect(area.shrink(3.0), CornerRadius::same(radius::CARD), p.accent.gamma_multiply(0.08), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+            }
         }
         if self.items.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -1079,6 +1128,9 @@ impl Browser {
         // Registered before the cells so cells take precedence for clicks.
         let bg = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("grid-bg"), Sense::click_and_drag());
         let sole = self.selected.len() <= 1;
+        // Files dragged in from another program: the folder tiles on screen.
+        let os = self.os_drop.clone();
+        let mut zones: Vec<(Rect, Zone)> = Vec::new();
         let out = scroll.show_rows(ui, cell.y, rows, |ui, range| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for row in range {
@@ -1093,8 +1145,16 @@ impl Browser {
                         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click_and_drag());
                         let selected = self.selected.contains(&entry.path);
                         let focused = self.focus == Some(i);
-                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, sole, resp.hovered() && pointer_here, &p);
-                        if entry.is_folder() && resp.dnd_hover_payload::<DragFiles>().is_some() {
+                        self.paint_cell(ui, core, entry, rect, ts, pad, captions, selected, focused, sole, resp.hovered() && pointer_here, self.is_cut(&entry.path), &p);
+                        let mut drop_here = entry.is_folder() && resp.dnd_hover_payload::<DragFiles>().is_some();
+                        if let (Some(h), true) = (&os, entry.is_folder()) {
+                            let shown = rect.intersect(ui.clip_rect());
+                            if shown.is_positive() {
+                                zones.push((shown, Zone::Folder(entry.path.clone())));
+                                drop_here |= h.on_folder(&entry.path, shown);
+                            }
+                        }
+                        if drop_here {
                             ui.painter().rect_stroke(rect.shrink(4.0), CornerRadius::same(radius::CARD), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
                         }
                         if resp.clicked() {
@@ -1112,7 +1172,9 @@ impl Browser {
                         }
                         if entry.is_folder() {
                             if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
-                                let copy = ui.input(|inp| inp.modifiers.ctrl);
+                                // Explorer's rule, as for files dragged in from outside.
+                                let m = ui.input(|inp| inp.modifiers);
+                                let copy = crate::droptarget::drop_op(&files.0, &entry.path, m.ctrl, m.shift) == DropOp::Copy;
                                 ev.push(BrowserEvent::DropFiles { target: entry.path.clone(), files: files.0.clone(), copy });
                             }
                         } else {
@@ -1156,6 +1218,7 @@ impl Browser {
             }
         });
         self.grid_origin = out.inner_rect.min - out.state.clamped_offset();
+        self.drop_zones.append(&mut zones);
         self.rubber_band(ui, &bg, cell, cols, &p);
         // Dropped on the empty space after the last thumbnail: to the end.
         if reorder.is_none() {
@@ -1341,7 +1404,7 @@ impl Browser {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: ThumbCaption, selected: bool, focused: bool, sole_selection: bool, hovered: bool, p: &Palette) {
+    fn paint_cell(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, rect: Rect, ts: f32, pad: f32, captions: ThumbCaption, selected: bool, focused: bool, sole_selection: bool, hovered: bool, cut: bool, p: &Palette) {
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -1359,6 +1422,12 @@ impl Browser {
         if focused && !(selected && sole_selection) {
             painter.rect_stroke(card.expand(2.0), CornerRadius::same(radius::CARD + 2), Stroke::new(1.0, p.text.gamma_multiply(0.8)), egui::StrokeKind::Inside);
         }
+        // A cut file (Ctrl+X) is drawn faded until it is pasted, as in Explorer.
+        let mut faded = painter.clone();
+        if cut {
+            faded.multiply_opacity(0.4);
+        }
+        let painter = &faded;
         let img_area = Rect::from_min_size(Pos2::new(rect.center().x - ts / 2.0, rect.min.y + pad), Vec2::splat(ts));
         let mut dims = None;
         // Where the picture is drawn: the badges sit on its corners.
@@ -1526,6 +1595,9 @@ impl Browser {
             .collect();
         let full_x = ui.max_rect().x_range();
         let mut head_bottom = None;
+        // Files dragged in from another program: the folder rows on screen.
+        let os = self.os_drop.clone();
+        let mut zones: Vec<(Rect, Zone)> = Vec::new();
         ui.scope(|ui| {
             // Rows sit edge to edge (the zebra marks them), and column lines show only
             // while a resize handle is hovered or dragged.
@@ -1588,15 +1660,21 @@ impl Browser {
                             core.meta.request(&entry.path);
                         }
                         let qm = core.meta.get(&entry.path);
+                        let cut = self.is_cut(&entry.path);
+                        // The visible part of the row (it may be scrolled half out of view).
+                        let mut clip: Option<Rect> = None;
                         for c in &cols {
                             row.col(|ui| {
+                                clip = Some(ui.clip_rect());
                                 let muted = |ui: &mut Ui, t: String| {
                                     ui.add(egui::Label::new(RichText::new(t).color(p.muted)).truncate().selectable(false));
                                 };
                                 match c {
-                                    DetailCol::Icon => self.row_icon(ui, core, &entry, &p),
+                                    DetailCol::Icon => self.row_icon(ui, core, &entry, cut, &p),
                                     DetailCol::Name => {
-                                        ui.add(egui::Label::new(RichText::new(&entry.name).color(p.text)).truncate().selectable(false));
+                                        // A cut file (Ctrl+X) is faded until it is pasted.
+                                        let color = if cut { p.text.gamma_multiply(0.45) } else { p.text };
+                                        ui.add(egui::Label::new(RichText::new(&entry.name).color(color)).truncate().selectable(false));
                                     }
                                     DetailCol::Size => {
                                         if entry.is_media() {
@@ -1642,8 +1720,25 @@ impl Browser {
                             resp.dnd_set_drag_payload(DragFiles(files));
                         }
                         if entry.is_folder() {
+                            let shown = clip.map(|c| {
+                                let (y0, y1) = (resp.rect.min.y.max(c.min.y), resp.rect.max.y.min(c.max.y));
+                                Rect::from_x_y_ranges(resp.rect.x_range(), y0..=y1.max(y0))
+                            });
+                            let mut drop_here = resp.dnd_hover_payload::<DragFiles>().is_some();
+                            if let (Some(h), Some(shown)) = (&os, shown.filter(|r| r.is_positive())) {
+                                zones.push((shown, Zone::Folder(entry.path.clone())));
+                                drop_here |= h.on_folder(&entry.path, shown);
+                            }
+                            if drop_here {
+                                let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("details-drop"));
+                                let painter = resp.ctx.layer_painter(layer).with_clip_rect(shown.unwrap_or(resp.rect));
+                                painter.rect_stroke(resp.rect.shrink(1.0), CornerRadius::same(radius::SMALL), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+                            }
                             if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
-                                folder_drop = Some((entry.path.clone(), files.0.clone(), resp.ctx.input(|inp| inp.modifiers.ctrl)));
+                                // Explorer's rule, as for files dragged in from outside.
+                                let m = resp.ctx.input(|inp| inp.modifiers);
+                                let copy = crate::droptarget::drop_op(&files.0, &entry.path, m.ctrl, m.shift) == DropOp::Copy;
+                                folder_drop = Some((entry.path.clone(), files.0.clone(), copy));
                             }
                         } else {
                             // Dropping on a row arranges: above it on its upper half, below on its lower half.
@@ -1660,6 +1755,7 @@ impl Browser {
                     });
                 });
         });
+        self.drop_zones.append(&mut zones);
         if let Some((target, files, copy)) = folder_drop {
             ev.push(BrowserEvent::DropFiles { target, files, copy });
         }
@@ -1692,9 +1788,11 @@ impl Browser {
 
     /// The details row's first column: a 20 pt thumbnail (folder icon for folders,
     /// a type icon while the thumbnail loads or when it failed).
-    fn row_icon(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, p: &Palette) {
+    fn row_icon(&self, ui: &mut Ui, core: &mut Core, entry: &Entry, cut: bool, p: &Palette) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-        let icon = |icon: &str, font: FontId, color: Color32| ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, font, color);
+        // A cut file (Ctrl+X) is faded until it is pasted.
+        let fade = if cut { 0.4 } else { 1.0 };
+        let icon = |icon: &str, font: FontId, color: Color32| ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, font, color.gamma_multiply(fade));
         match entry.kind {
             EntryKind::Folder => {
                 icon(I::FOLDER, theme::icon_fill(16.0), p.accent.gamma_multiply(0.85));
@@ -1706,7 +1804,7 @@ impl Browser {
                         let ts = t.tex.size_vec2();
                         let s = (rect.width() / ts.x).min(rect.height() / ts.y);
                         let r = Rect::from_center_size(rect.center(), ts * s);
-                        let shape = egui::epaint::RectShape::filled(r, CornerRadius::same(2), Color32::WHITE).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+                        let shape = egui::epaint::RectShape::filled(r, CornerRadius::same(2), Color32::WHITE.gamma_multiply(fade)).with_texture(t.tex.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
                         ui.painter().add(shape);
                     }
                     _ => {
@@ -1735,6 +1833,7 @@ impl Browser {
                 item(ui, Command::Compare, ev);
                 item(ui, Command::Slideshow, ev);
                 ui.separator();
+                item(ui, Command::CutFiles, ev);
                 item(ui, Command::CopyFiles, ev);
                 item(ui, Command::CopyTo, ev);
                 item(ui, Command::MoveTo, ev);
@@ -2125,9 +2224,15 @@ fn paint_drag_badge(ui: &Ui, n: usize, p: &Palette) {
     if n == 0 {
         return;
     }
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("browser-drag-badge")));
     let text = if n == 1 { "1 file".to_string() } else { format!("{n} files") };
-    let g = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
+    pointer_badge(ui.ctx(), pos, &text, p);
+}
+
+/// A small accent badge beside the pointer at `pos`: what a drag carries, or
+/// what dropping it does ("Move to Holiday").
+pub fn pointer_badge(ctx: &egui::Context, pos: Pos2, text: &str, p: &Palette) {
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("browser-drag-badge")));
+    let g = painter.layout_no_wrap(text.to_string(), FontId::proportional(12.0), Color32::WHITE);
     let r = Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size() + Vec2::new(16.0, 8.0));
     painter.rect_filled(r, CornerRadius::same(8), p.accent);
     painter.galley(r.min + Vec2::new(8.0, 4.0), g, Color32::WHITE);

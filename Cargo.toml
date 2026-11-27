@@ -78,6 +78,10 @@ bytemuck = "1.25.2"
 libwebp-sys = "0.9"
 flate2 = "1"
 zip.workspace = true
+# The main window's handle (clipboard owner, Lumen's own file drop target).
+raw-window-handle = "0.6"
+# Needed by the `windows::core::implement` macro (the drop target is a COM object).
+windows-core = "0.62"
 
 [dependencies.windows]
 workspace = true
@@ -108,6 +112,8 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Storage_Xps",
     "Win32_System_DataExchange",
+    "Win32_System_SystemServices",
+    "Win32_System_Com_StructuredStorage",
     "Data_Pdf",
     "Storage",
     "Storage_Streams",

@@ -46,6 +46,34 @@ pub fn unique_path(target: &Path) -> PathBuf {
     target.to_path_buf()
 }
 
+/// Where Explorer puts a copy made in the same folder: "photo - Copy.jpg",
+/// then "photo - Copy (2).jpg", ... (a folder keeps its whole name:
+/// "Trip.2024 - Copy"). Never an existing name.
+pub fn copy_path(target: &Path, is_dir: bool) -> PathBuf {
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let name = target.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let (stem, ext) = match (is_dir, target.file_stem(), target.extension()) {
+        (false, Some(s), Some(e)) => (s.to_string_lossy().to_string(), format!(".{}", e.to_string_lossy())),
+        _ => (name, String::new()),
+    };
+    for n in 1..100_000 {
+        let p = parent.join(copy_name(&stem, &ext, n));
+        if !p.exists() {
+            return p;
+        }
+    }
+    unique_path(target)
+}
+
+/// The `n`th copy's name: "a - Copy.jpg", "a - Copy (2).jpg", ...
+fn copy_name(stem: &str, ext: &str, n: u32) -> String {
+    if n <= 1 {
+        format!("{stem} - Copy{ext}")
+    } else {
+        format!("{stem} - Copy ({n}){ext}")
+    }
+}
+
 pub fn delete_to_trash(paths: &[PathBuf]) -> Result<()> {
     trash::delete_all(paths).map_err(|e| anyhow!("Could not move to Recycle Bin: {e}"))
 }
@@ -124,7 +152,8 @@ fn drive_type(_root: &str) -> u32 {
 
 /// Copy or move files into `dest_dir`. Returns (source, destination) pairs that succeeded.
 /// A name that already exists in `dest_dir` gets a number appended, so nothing is
-/// ever overwritten and every move can be undone.
+/// ever overwritten and every move can be undone. A copy into the file's own
+/// folder is named like Explorer's ("photo - Copy.jpg").
 ///
 /// A move renames; only a move to another drive copies and then deletes the
 /// original. Any other rename failure (a file open in another program, access
@@ -145,7 +174,8 @@ pub fn transfer(paths: &[PathBuf], dest_dir: &Path, do_move: bool) -> (Vec<(Path
         if dst == *src && do_move {
             continue;
         }
-        let dst = unique_path(&dst);
+        let own_folder = src.parent().is_some_and(|p| same_path(p, dest_dir));
+        let dst = if own_folder && !do_move { copy_path(&dst, src.is_dir()) } else { unique_path(&dst) };
         let res = if do_move { move_any(src, &dst) } else { copy_into_place(src, &dst).map(|()| Moved::Done) };
         match res {
             Ok(Moved::Done) => done.push((src.clone(), dst)),
@@ -546,16 +576,238 @@ pub fn copy_text(text: &str) {
     }
 }
 
-/// Copy files to the clipboard so they can be pasted in Explorer.
+// ------------------------------------------------------------------ files on the clipboard
+
+/// The main window: the clipboard's owner when Lumen puts files there.
+static MAIN_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Remember the main window's handle (once, at start).
+pub fn set_main_window(hwnd: isize) {
+    MAIN_WINDOW.store(hwnd, Ordering::Relaxed);
+}
+
+/// DROPEFFECT values: what a drop or a paste does ("Preferred DropEffect" on
+/// the clipboard, the cursor of a drag).
+pub const EFFECT_NONE: u32 = 0;
+pub const EFFECT_COPY: u32 = 1;
+pub const EFFECT_MOVE: u32 = 2;
+pub const EFFECT_LINK: u32 = 4;
+
+/// Files on the clipboard, as Explorer puts them there.
+pub struct ClipboardFiles {
+    pub files: Vec<PathBuf>,
+    /// They were cut (Ctrl+X): pasting moves them.
+    pub cut: bool,
+}
+
+/// A "Preferred DropEffect" of move and nothing else means the files were cut
+/// (Explorer writes 2 for Cut, 5 = copy + link for Copy).
+pub fn is_cut(effect: Option<u32>) -> bool {
+    effect.is_some_and(|e| e & (EFFECT_COPY | EFFECT_MOVE | EFFECT_LINK) == EFFECT_MOVE)
+}
+
+/// Copy files to the clipboard so they can be pasted in Explorer or another folder.
 pub fn copy_files_to_clipboard(paths: &[PathBuf]) -> Result<()> {
-    let mut cb = arboard::Clipboard::new()?;
-    cb.set().file_list(paths)?;
+    set_clipboard_files(paths, false).map(|_| ())
+}
+
+/// Cut files (Ctrl+X): pasting them in Explorer or in Lumen moves them.
+/// Returns the clipboard's sequence number after the cut ([`clipboard_seq`]).
+pub fn cut_files_to_clipboard(paths: &[PathBuf]) -> Result<u32> {
+    set_clipboard_files(paths, true)
+}
+
+/// The files on the clipboard (copied or cut in Explorer or Lumen).
+pub fn paste_files_from_clipboard() -> Result<ClipboardFiles> {
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    use windows::Win32::System::Ole::CF_HDROP;
+    let fmt = preferred_effect_format();
+    let _open = ClipboardOpen::new()?;
+    // SAFETY: the clipboard is open; its data stays valid until it is closed.
+    let h = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.map_err(|_| anyhow!("The clipboard doesn't contain files"))?;
+    let files = hdrop_files(windows::Win32::UI::Shell::HDROP(h.0));
+    Ok(ClipboardFiles { files, cut: is_cut(clipboard_u32(fmt)) })
+}
+
+/// The clipboard's sequence number: it changes whenever anything new is put
+/// on the clipboard (or it is emptied). A cheap call.
+pub fn clipboard_seq() -> u32 {
+    // SAFETY: no arguments, no clipboard access.
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+/// After files were moved: a cut of exactly these files on the clipboard is
+/// done with, so the clipboard is emptied, as Explorer does after pasting a cut.
+pub fn clear_cut_after_move(moved: &[PathBuf]) {
+    use windows::Win32::System::DataExchange::{EmptyClipboard, IsClipboardFormatAvailable};
+    let fmt = preferred_effect_format();
+    // SAFETY: a plain query; the clipboard is not opened.
+    if fmt == 0 || moved.is_empty() || unsafe { IsClipboardFormatAvailable(fmt) }.is_err() {
+        return;
+    }
+    let Ok(clip) = paste_files_from_clipboard() else { return };
+    if !clip.cut || clip.files.is_empty() {
+        return;
+    }
+    let gone: std::collections::HashSet<String> = moved.iter().map(|p| path_key(p)).collect();
+    if clip.files.iter().all(|f| gone.contains(&path_key(f))) {
+        if let Ok(_open) = ClipboardOpen::new() {
+            // SAFETY: the clipboard is open.
+            let _ = unsafe { EmptyClipboard() };
+        }
+    }
+}
+
+/// A path compared the way NTFS does: case and a trailing separator ignored.
+fn path_key(p: &Path) -> String {
+    p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// Put `paths` on the clipboard the way Explorer does: the file list
+/// (CF_HDROP) and "Preferred DropEffect", which tells a paste to move the
+/// files after a cut and to copy them otherwise.
+fn set_clipboard_files(paths: &[PathBuf], cut: bool) -> Result<u32> {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+    use windows::Win32::System::Ole::CF_HDROP;
+    if paths.is_empty() {
+        return Err(anyhow!("No files to put on the clipboard"));
+    }
+    let fmt = preferred_effect_format();
+    {
+        let _open = ClipboardOpen::new()?;
+        // SAFETY: the clipboard is open.
+        unsafe { EmptyClipboard() }.map_err(|e| anyhow!("Could not use the clipboard: {e}"))?;
+        set_clipboard_bytes(CF_HDROP.0 as u32, &hdrop_bytes(paths))?;
+        if fmt != 0 {
+            let effect = if cut { EFFECT_MOVE } else { EFFECT_COPY | EFFECT_LINK };
+            set_clipboard_bytes(fmt, &effect.to_le_bytes())?;
+        }
+    }
+    Ok(clipboard_seq())
+}
+
+/// The registered "Preferred DropEffect" clipboard format (0 if unavailable).
+fn preferred_effect_format() -> u32 {
+    // SAFETY: a static NUL-terminated wide string.
+    unsafe { windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::w!("Preferred DropEffect")) }
+}
+
+/// The clipboard, open until this is dropped.
+struct ClipboardOpen;
+
+impl ClipboardOpen {
+    fn new() -> Result<Self> {
+        use windows::Win32::Foundation::HWND;
+        let raw = MAIN_WINDOW.load(Ordering::Relaxed);
+        let owner = (raw != 0).then(|| HWND(raw as _));
+        // Another program may hold it open for a moment.
+        for attempt in 0..10u64 {
+            // SAFETY: the owner (if known) is Lumen's main window, alive while the app runs.
+            if unsafe { windows::Win32::System::DataExchange::OpenClipboard(owner) }.is_ok() {
+                return Ok(ClipboardOpen);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5 + attempt * 5));
+        }
+        Err(anyhow!("The clipboard is in use by another program; try again"))
+    }
+}
+
+impl Drop for ClipboardOpen {
+    fn drop(&mut self) {
+        // SAFETY: opened in `new`.
+        let _ = unsafe { windows::Win32::System::DataExchange::CloseClipboard() };
+    }
+}
+
+/// Put `bytes` on the open clipboard as `format` (the clipboard owns the memory then).
+fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<()> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    let h = global_bytes(bytes)?;
+    // SAFETY: `h` is a movable global block; once set, the clipboard owns it.
+    if let Err(e) = unsafe { SetClipboardData(format, Some(HANDLE(h.0))) } {
+        let _ = unsafe { GlobalFree(Some(h)) };
+        return Err(anyhow!("Could not put the files on the clipboard: {e}"));
+    }
     Ok(())
 }
 
-pub fn paste_files_from_clipboard() -> Result<Vec<PathBuf>> {
-    let mut cb = arboard::Clipboard::new()?;
-    Ok(cb.get().file_list()?)
+/// A 4-byte value of the open clipboard (None when it has none).
+fn clipboard_u32(format: u32) -> Option<u32> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    if format == 0 {
+        return None;
+    }
+    // SAFETY: the clipboard is open (by the caller); the block is locked while read.
+    unsafe {
+        let h = HGLOBAL(GetClipboardData(format).ok()?.0);
+        if GlobalSize(h) < 4 {
+            return None;
+        }
+        let p = GlobalLock(h) as *const [u8; 4];
+        if p.is_null() {
+            return None;
+        }
+        let v = u32::from_le_bytes(std::ptr::read_unaligned(p));
+        let _ = GlobalUnlock(h);
+        Some(v)
+    }
+}
+
+/// A movable global memory block holding `bytes`.
+fn global_bytes(bytes: &[u8]) -> Result<windows::Win32::Foundation::HGLOBAL> {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
+    // SAFETY: the block is at least `bytes.len()` long and locked while written.
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len().max(1))?;
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return Err(anyhow!("Out of memory"));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        let _ = GlobalUnlock(h);
+        Ok(h)
+    }
+}
+
+/// A CF_HDROP block: the 20-byte DROPFILES header, then each path as a wide
+/// string ended by a NUL, and one more NUL after the last.
+fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut v: Vec<u8> = Vec::new();
+    v.extend_from_slice(&20u32.to_le_bytes()); // pFiles: the list starts after the header
+    v.extend_from_slice(&[0u8; 8]); // pt
+    v.extend_from_slice(&0u32.to_le_bytes()); // fNC
+    v.extend_from_slice(&1u32.to_le_bytes()); // fWide: UTF-16 paths
+    for p in paths {
+        for u in p.as_os_str().encode_wide().chain(std::iter::once(0)) {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+    }
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v
+}
+
+/// The paths in a CF_HDROP block (clipboard or drag and drop).
+pub fn hdrop_files(h: windows::Win32::UI::Shell::HDROP) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::UI::Shell::DragQueryFileW;
+    // SAFETY: `h` is a valid HDROP, owned by the caller for the duration of the call.
+    unsafe {
+        let n = DragQueryFileW(h, u32::MAX, None);
+        (0..n)
+            .filter_map(|i| {
+                let len = DragQueryFileW(h, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = (DragQueryFileW(h, i, Some(buf.as_mut_slice())) as usize).min(len);
+                (got > 0).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..got])))
+            })
+            .collect()
+    }
 }
 
 /// Logical drives ("C:\", "D:\", ...).
@@ -806,6 +1058,48 @@ mod tests {
         assert!(copy_into_place(&src.join("missing"), &dest.join("missing")).is_err());
         assert_eq!(names_in(&dest).len(), 3);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copies_in_their_own_folder_are_named_like_explorer() {
+        let base = std::env::temp_dir().join(format!("lumen-copy-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Trip.2024")).unwrap();
+        std::fs::write(base.join("a.jpg"), b"A").unwrap();
+        std::fs::write(base.join("README"), b"R").unwrap();
+        assert_eq!(copy_path(&base.join("a.jpg"), false), base.join("a - Copy.jpg"));
+        assert_eq!(copy_path(&base.join("README"), false), base.join("README - Copy"));
+        assert_eq!(copy_path(&base.join("Trip.2024"), true), base.join("Trip.2024 - Copy"));
+        // Pasting twice, and a folder, into the folder they are in.
+        for _ in 0..2 {
+            let (done, errs) = transfer(&[base.join("a.jpg"), base.join("Trip.2024")], &base, false);
+            assert!(errs.is_empty(), "{errs:?}");
+            assert_eq!(done.len(), 2);
+        }
+        assert_eq!(names_in(&base), vec!["README", "Trip.2024", "Trip.2024 - Copy", "Trip.2024 - Copy (2)", "a - Copy (2).jpg", "a - Copy.jpg", "a.jpg"]);
+        assert_eq!(std::fs::read(base.join("a.jpg")).unwrap(), b"A", "the original is untouched");
+        // Moving into the own folder changes nothing.
+        let (done, errs) = transfer(&[base.join("a.jpg")], &base, true);
+        assert!(done.is_empty() && errs.is_empty());
+        assert!(base.join("a.jpg").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn clipboard_file_lists_round_trip() {
+        use windows::Win32::UI::Shell::{DROPFILES, HDROP};
+        assert_eq!(std::mem::size_of::<DROPFILES>(), 20, "the header written by hdrop_bytes");
+        let paths = vec![PathBuf::from(r"C:\Photos\a.jpg"), PathBuf::from("D:\\Fotos 2024\\caf\u{e9} b.png"), PathBuf::from(r"\\server\share\c")];
+        let h = global_bytes(&hdrop_bytes(&paths)).unwrap();
+        assert_eq!(hdrop_files(HDROP(h.0)), paths);
+        // SAFETY: allocated above and not handed to anyone.
+        let _ = unsafe { windows::Win32::Foundation::GlobalFree(Some(h)) };
+        // Explorer: 2 for Cut, 5 (copy + link) for Copy.
+        assert!(is_cut(Some(EFFECT_MOVE)));
+        assert!(!is_cut(Some(EFFECT_COPY | EFFECT_LINK)));
+        assert!(!is_cut(Some(EFFECT_COPY | EFFECT_MOVE)));
+        assert!(!is_cut(Some(EFFECT_NONE)));
+        assert!(!is_cut(None));
     }
 
     #[test]

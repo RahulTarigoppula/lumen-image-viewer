@@ -5,6 +5,7 @@ mod analysis_ui;
 mod app;
 mod bg;
 mod devhook;
+mod droptarget;
 mod edit;
 mod fileops;
 mod loader;

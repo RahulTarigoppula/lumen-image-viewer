@@ -3,6 +3,7 @@
 use super::icons as I;
 use super::theme::{self, Palette};
 use super::widgets;
+use crate::droptarget::{DropOp, Hover, Zone};
 use crate::fileops;
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Ui, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -55,6 +56,10 @@ pub struct FolderTree {
     tips: bool,
     /// Settings > Show hidden files: list hidden folders, dot-folders and AppData.
     show_hidden: bool,
+    /// Files dragged over the window from another program (set by the browser each frame).
+    pub os_drop: Option<Hover>,
+    /// Where folder rows were drawn this frame while such a drag is on.
+    pub drop_zones: Vec<(Rect, Zone)>,
 }
 
 const ROW_H: f32 = 26.0;
@@ -317,6 +322,7 @@ impl FolderTree {
     /// rows on screen are laid out, so folders with thousands of sub-folders stay cheap.
     pub fn ui(&mut self, ui: &mut Ui, current: &Path, favorites: &[PathBuf], p: &Palette) -> Option<TreeAction> {
         let ctx = ui.ctx().clone();
+        self.drop_zones.clear();
         if self.poll() {
             self.rows_dirty = true;
         }
@@ -408,7 +414,15 @@ impl FolderTree {
         let h = ROW_H;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click_and_drag());
         let selected = path == current;
-        let hovered_drop = resp.dnd_hover_payload::<DragFiles>().is_some();
+        let mut hovered_drop = resp.dnd_hover_payload::<DragFiles>().is_some();
+        // Files dragged in from another program: note the row, light it up when it takes the drop.
+        if let Some(drag) = &self.os_drop {
+            let shown = rect.intersect(ui.clip_rect());
+            if shown.is_positive() {
+                self.drop_zones.push((shown, Zone::Folder(path.to_path_buf())));
+                hovered_drop |= drag.on_folder(path, shown);
+            }
+        }
         let hovered = resp.hovered() && super::pointer_on_layer(ui);
         // The full path shows as a tooltip only when the name does not fit.
         let mut truncated = false;
@@ -463,7 +477,9 @@ impl FolderTree {
             painter.galley(Pos2::new(text_rect.min.x, cy - galley.size().y / 2.0), galley, p.text);
         }
         if let Some(files) = resp.dnd_release_payload::<DragFiles>() {
-            let copy = ui.input(|i| i.modifiers.ctrl);
+            // Explorer's rule: Ctrl copies, Shift moves, else move on the same drive.
+            let m = ui.input(|i| i.modifiers);
+            let copy = crate::droptarget::drop_op(&files.0, path, m.ctrl, m.shift) == DropOp::Copy;
             action = Some(TreeAction::DropFiles { target: path.to_path_buf(), files: files.0.clone(), copy });
         }
         if resp.clicked() {
