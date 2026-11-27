@@ -8,11 +8,15 @@ run Delete
 wait 800
 shot confirm.png
 key Enter
-wait 2500
+# The message says how to undo (it shows for a few seconds).
+wait 900
 shot deleted.png
+wait 1500
 state
 run Undo
-wait 5000
+wait 1200
+shot restoring.png
+wait 4000
 shot restored.png
 state
 # From the viewer: delete the photo shown, then undo there shows it again.
