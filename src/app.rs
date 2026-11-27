@@ -100,6 +100,9 @@ enum FileChange {
     Transform { t: Transform, files: Vec<Transformed> },
     /// A folder was arranged by hand: its previous custom order (none) and sort key.
     Order { folder: PathBuf, previous: Option<Vec<String>>, active: bool },
+    /// Ratings, flags or color labels changed: each file with its tags before.
+    /// `id` ties the change to its notice's Undo button.
+    Tags { id: u64, before: Vec<(PathBuf, crate::tags::Tag)> },
 }
 
 /// One file rotated / flipped on disk, as kept for undo.
@@ -118,7 +121,7 @@ impl FileUndo {
     fn bytes(&self) -> usize {
         match &self.change {
             FileChange::Transform { files, .. } => files.iter().filter_map(|f| f.before.as_ref()).map(Vec::len).sum(),
-            FileChange::Moves(_) | FileChange::Order { .. } => 0,
+            FileChange::Moves(_) | FileChange::Order { .. } | FileChange::Tags { .. } => 0,
         }
     }
 }
@@ -143,6 +146,28 @@ fn inverse(t: Transform) -> Transform {
 /// "1 file", "3 files".
 fn count(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The notice after rating, flagging or labelling `n` files: "Rated 3 stars",
+/// "Rated 3 stars · 50 files", "Flagged 4 files", "Label red · 2 files".
+fn tag_notice(cmd: Command, flag_on: bool, n: usize) -> String {
+    let files = if n > 1 { format!(" \u{00B7} {}", count(n, "file")) } else { String::new() };
+    match cmd {
+        Command::Rate(0) => format!("Rating cleared{files}"),
+        Command::Rate(r) => format!("Rated {}{files}", count(r as usize, "star")),
+        Command::ToggleFlag if n > 1 => format!("{} {}", if flag_on { "Flagged" } else { "Flag removed from" }, count(n, "file")),
+        Command::ToggleFlag => (if flag_on { "Flagged" } else { "Flag removed" }).to_string(),
+        Command::Label(0) => format!("Label cleared{files}"),
+        Command::Label(l) => format!("Label {}{files}", crate::tags::LABEL_NAMES[(l as usize).min(5)].to_lowercase()),
+        _ => String::new(),
+    }
+}
+
+/// The first (or `last`) of one folder's `entries` sorted by `key` as the browser sorts.
+fn end_in_order(mut entries: Vec<catalog::Entry>, key: crate::settings::SortKey, desc: bool, cx: &catalog::SortContext, last: bool) -> Option<PathBuf> {
+    catalog::sort_entries(&mut entries, key, desc, false, cx);
+    let end = if last { entries.pop() } else { entries.into_iter().next() };
+    end.map(|e| e.path)
 }
 
 struct TransferDialog {
@@ -383,7 +408,7 @@ impl App {
             app.core.toasts.info(msg);
         }
         crate::devhook::mark("renames");
-        app.viewer.show_info = app.core.settings.show_info_overlay;
+        app.viewer.show_info = app.core.settings.info_panel_on_start;
         match initial {
             Some(p) if p.is_file() => app.open_file(&p),
             Some(p) if p.is_dir() => app.navigate(p),
@@ -932,12 +957,7 @@ impl App {
             ToggleFlag => {
                 let t = self.media_targets();
                 let all_flagged = t.iter().all(|p| self.core.tags.get(p).flagged);
-                for p in &t {
-                    self.core.tags.update(p, |tag| tag.flagged = !all_flagged);
-                }
-                if !t.is_empty() && self.mode != Mode::Browser {
-                    self.core.toasts.info(if all_flagged { "Flag removed" } else { "Flagged" });
-                }
+                self.change_tags(&t, cmd, !all_flagged, |tag| tag.flagged = !all_flagged);
                 self.schedule_advance();
                 if self.browser.flagged_only || self.core.settings.sort_key == crate::settings::SortKey::Flagged {
                     self.browser.mark_resort();
@@ -945,12 +965,7 @@ impl App {
             }
             Rate(n) => {
                 let t = self.media_targets();
-                for p in &t {
-                    self.core.tags.update(p, |tag| tag.rating = n);
-                }
-                if !t.is_empty() {
-                    self.core.toasts.info(if n == 0 { "Rating cleared".to_string() } else { format!("Rated {}", "★".repeat(n as usize)) });
-                }
+                self.change_tags(&t, cmd, false, |tag| tag.rating = n);
                 self.schedule_advance();
                 if self.core.settings.sort_key == crate::settings::SortKey::Rating || self.browser.min_rating > 0 {
                     self.browser.mark_resort();
@@ -958,12 +973,7 @@ impl App {
             }
             Label(n) => {
                 let t = self.media_targets();
-                for p in &t {
-                    self.core.tags.update(p, |tag| tag.label = n);
-                }
-                if !t.is_empty() && self.mode != Mode::Browser {
-                    self.core.toasts.info(if n == 0 { "Color label cleared".to_string() } else { format!("Color label: {}", crate::tags::LABEL_NAMES[(n as usize).min(5)]) });
-                }
+                self.change_tags(&t, cmd, false, |tag| tag.label = n);
                 self.schedule_advance();
                 if self.core.settings.sort_key == crate::settings::SortKey::ColorLabel || self.browser.label_filter > 0 {
                     self.browser.mark_resort();
@@ -1194,7 +1204,7 @@ impl App {
                     _ => self.zip = Some(crate::ui::tools::ZipWindow::new(files, &self.core)),
                 }
             }
-            ToggleInfo => self.viewer.show_info = !self.viewer.show_info,
+            ToggleInfo => self.viewer.toggle_info(),
             ToggleHistogram => self.viewer.show_histogram = !self.viewer.show_histogram,
             ToggleMagnifier => self.viewer.magnifier_locked = !self.viewer.magnifier_locked,
             TogglePixelValues => self.viewer.show_pixel = !self.viewer.show_pixel,
@@ -1738,6 +1748,44 @@ impl App {
         self.push_undo(FileUndo { label, change: FileChange::Moves(moves) });
     }
 
+    /// Rate, flag or label `files` (the `cmd` the keys, menus and tag rows run;
+    /// `flag_on`: what ToggleFlag sets), keeping their tags before for Ctrl+Z.
+    fn change_tags(&mut self, files: &[PathBuf], cmd: Command, flag_on: bool, f: impl Fn(&mut crate::tags::Tag)) {
+        if files.is_empty() {
+            return;
+        }
+        let before: Vec<(PathBuf, crate::tags::Tag)> = files.iter().map(|p| (p.clone(), self.core.tags.get(p))).collect();
+        for p in files {
+            self.core.tags.update(p, &f);
+        }
+        self.record_tags(before, tag_notice(cmd, flag_on, files.len()));
+    }
+
+    /// Put a tag change on the undo history (only the files it changed) and
+    /// show `notice` with an Undo button.
+    fn record_tags(&mut self, before: Vec<(PathBuf, crate::tags::Tag)>, notice: String) {
+        let before: Vec<(PathBuf, crate::tags::Tag)> = before.into_iter().filter(|(p, t)| self.core.tags.get(p) != *t).collect();
+        if before.is_empty() {
+            // Nothing changed (already rated so): say so without an Undo.
+            self.core.toasts.info(notice);
+            return;
+        }
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.push_undo(FileUndo { label: notice.clone(), change: FileChange::Tags { id, before } });
+        let tip = crate::ui::tips::with_shortcut("Put the tags back as they were", &Command::Undo.shortcut());
+        self.core.toasts.with_action(notice, "Undo", &tip, id);
+    }
+
+    /// A notice's Undo button: undo that tag change when it is still the last
+    /// thing done (an older one would undo something newer first).
+    fn undo_tags_by_id(&mut self, id: u64) {
+        match self.file_undo.last() {
+            Some(FileUndo { change: FileChange::Tags { id: last, .. }, .. }) if *last == id => self.undo_file_op(),
+            _ => self.core.toasts.info(format!("Something else was done since. Press {} to undo step by step.", Command::Undo.shortcut())),
+        }
+    }
+
     fn push_undo(&mut self, op: FileUndo) {
         self.file_undo.push(op);
         if self.file_undo.len() > 20 {
@@ -1800,7 +1848,8 @@ impl App {
 
     /// From the viewer at the end of a folder: open the first (or, going back,
     /// the last) picture of the next (`d` > 0) or previous sibling folder that
-    /// has pictures, in natural name order.
+    /// has pictures (folders in natural name order, the picture in the order
+    /// the browser shows that folder in).
     fn open_sibling_folder(&mut self, d: isize) {
         let Some(cur) = self.viewer.current().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
         let Some(parent) = cur.parent() else { return };
@@ -1818,14 +1867,81 @@ impl App {
                 continue;
             }
             pics.sort_by(|a, b| crate::catalog::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-            let pick = if d > 0 { pics.first() } else { pics.last() };
-            if let Some(p) = pick.cloned() {
+            let by_name = if d > 0 { pics.first() } else { pics.last() };
+            let pick = self.folder_end(dir, &pics, d < 0).or_else(|| by_name.cloned());
+            if let Some(p) = pick {
                 self.core.toasts.info(format!("Folder: {}", crate::ui::viewer::file_name(dir)));
                 self.open_file(&p);
             }
             return;
         }
         self.core.toasts.info(if d > 0 { "No later folder with pictures" } else { "No earlier folder with pictures" });
+    }
+
+    /// The first (or with `last`, the last) of `pics`, the pictures of `dir`,
+    /// in the order the browser shows that folder in: its own arranged order
+    /// when it has one, else the toolbar sort, and the browser's flag, rating
+    /// and label filters. Capture dates and sizes that sort needs are read
+    /// here, in parallel, for folders of up to a few thousand pictures (larger
+    /// ones fall back to the file date for them). None when the filters hide
+    /// every picture.
+    fn folder_end(&self, dir: &Path, pics: &[PathBuf], last: bool) -> Option<PathBuf> {
+        use crate::settings::SortKey;
+        use rayon::prelude::*;
+        const READ_AT_MOST: usize = 3000;
+        let s = &self.core.settings;
+        let key = if self.core.orders.is_active(dir) {
+            SortKey::Custom
+        } else if s.sort_key == SortKey::Custom {
+            SortKey::Name
+        } else {
+            s.sort_key
+        };
+        let tags = &self.core.tags;
+        let b = &self.browser;
+        let shown: Vec<&PathBuf> = pics
+            .iter()
+            .filter(|p| {
+                let t = tags.get(p);
+                (!b.flagged_only || t.flagged) && t.rating >= b.min_rating && (b.label_filter == 0 || t.label == b.label_filter)
+            })
+            .collect();
+        let stat = matches!(key, SortKey::Size | SortKey::Modified | SortKey::Created | SortKey::DateTaken);
+        let entries: Vec<catalog::Entry> = shown
+            .par_iter()
+            .map(|p| {
+                let e = if stat { catalog::Entry::from_path(p) } else { None };
+                e.unwrap_or_else(|| catalog::Entry { path: p.to_path_buf(), name: crate::ui::viewer::file_name(p), ext: crate::formats::ext_of(p), kind: EntryKind::Image, size: 0, modified: None, created: None, hidden: false })
+            })
+            .collect();
+        // What the metadata service already knows, then the rest read here.
+        let read = entries.len() <= READ_AT_MOST;
+        let meta = &self.core.meta;
+        let mut dims: std::collections::HashMap<PathBuf, (u32, u32)> = Default::default();
+        let mut taken: std::collections::HashMap<PathBuf, i64> = Default::default();
+        if key == SortKey::Dimensions {
+            dims = entries.iter().filter_map(|e| meta.get(&e.path).and_then(|m| m.dims).map(|d| (e.path.clone(), d))).collect();
+            if read {
+                let more: Vec<(PathBuf, (u32, u32))> = entries.par_iter().filter(|e| !dims.contains_key(&e.path)).filter_map(|e| crate::decode::probe_dimensions(&e.path).map(|d| (e.path.clone(), d))).collect();
+                dims.extend(more);
+            }
+        }
+        if key == SortKey::DateTaken {
+            taken = entries.iter().filter_map(|e| meta.get(&e.path).and_then(|m| m.taken).map(|t| (e.path.clone(), t))).collect();
+            if read {
+                let more: Vec<(PathBuf, i64)> = entries.par_iter().filter(|e| !taken.contains_key(&e.path)).filter_map(|e| crate::meta::read_taken(&e.path).map(|t| (e.path.clone(), t))).collect();
+                taken.extend(more);
+            }
+        }
+        let positions = if key == SortKey::Custom { self.core.orders.positions(dir) } else { Default::default() };
+        let dims_of = |p: &Path| dims.get(p).copied();
+        let taken_of = |p: &Path| taken.get(p).copied();
+        let rating = |p: &Path| tags.get(p).rating;
+        let flagged = |p: &Path| tags.get(p).flagged;
+        let label = |p: &Path| tags.get(p).label;
+        let custom = |p: &Path| p.file_name().and_then(|n| positions.get(&n.to_string_lossy().to_lowercase()).copied());
+        let cx = catalog::SortContext { dims: &dims_of, taken: &taken_of, rating: &rating, flagged: &flagged, label: &label, custom: &custom };
+        end_in_order(entries, key, s.sort_desc, &cx, last)
     }
 
     /// Ctrl+Z with no edit to undo: put the last moved / renamed files back, or
@@ -1878,6 +1994,14 @@ impl App {
                 self.browser.mark_resort();
                 ok += 1;
             }
+            FileChange::Tags { before, .. } => {
+                for (p, t) in before {
+                    self.core.tags.update(p, |x| *x = *t);
+                }
+                // The sort or a flag / rating / label filter may depend on them.
+                self.browser.mark_resort();
+                ok += before.len();
+            }
             FileChange::Transform { t, files } => {
                 // (path, its stamp before this change, its stamp once restored)
                 let mut restored: Vec<(&Path, fileops::FileStamp, Option<fileops::FileStamp>)> = Vec::new();
@@ -1922,7 +2046,10 @@ impl App {
                 }
             }
         }
-        self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        // Tags live in Lumen's own store: the folder on disk did not change.
+        if !matches!(op.change, FileChange::Tags { .. }) {
+            self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
+        }
         if !errs.is_empty() {
             self.core.toasts.error(format!("Undo: {} could not be restored - {}", count(errs.len(), "item"), errs[0]));
         }
@@ -3288,7 +3415,7 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.browser.suppress_keys = self.modal_open() || self.tool_window_active;
         self.update_title(&ctx);
-        self.viewer.edge_panels = self.core.settings.edge_panels;
+        self.viewer.edge_panels = self.core.settings.edge_panels();
         let p = self.core.pal;
 
         // The Analysis panel sits right of the mode's whole view, so it is shown
@@ -3500,6 +3627,18 @@ impl eframe::App for App {
                     }
                     self.browser.reload(&self.core.ctx, self.core.settings.show_hidden_files);
                 }
+                // Ratings, flags and Keep A / reject others: on the undo history,
+                // with the notice and its Undo button; Ctrl+Z there undoes them.
+                let (changes, undo) = self.compare.as_mut().map(|c| c.take_tag_changes()).unwrap_or_default();
+                for (notice, before) in changes {
+                    self.record_tags(before, notice);
+                }
+                if undo {
+                    match self.file_undo.last() {
+                        Some(FileUndo { change: FileChange::Tags { .. }, .. }) => self.undo_file_op(),
+                        _ => self.core.toasts.info("Nothing to undo here"),
+                    }
+                }
                 self.compare_link_requests();
                 if let Some(r) = self.compare.as_mut().and_then(|c| c.info_request.take()) {
                     self.run(match r {
@@ -3605,7 +3744,9 @@ impl eframe::App for App {
         // Above the status bar in the browser; above the floating bottom bar (and
         // its 12 pt gap) of the viewer, compare and video modes.
         self.core.toasts.set_bottom(if self.mode == Mode::Browser { 44.0 } else { 84.0 });
-        self.core.toasts.show(&ctx, &p);
+        if let Some(id) = self.core.toasts.show(&ctx, &p) {
+            self.undo_tags_by_id(id);
+        }
         self.was_editing = ctx.text_edit_focused();
         crate::devhook::prof("ui_total", frame_start);
     }
@@ -4012,6 +4153,65 @@ mod tests {
                 assert_eq!(compose_orientation(compose_orientation(o, t), inverse(t)), o, "{t:?} from {o}");
             }
         }
+    }
+
+    #[test]
+    fn tag_notices_say_what_changed_and_how_many() {
+        assert_eq!(tag_notice(Command::Rate(3), false, 50), "Rated 3 stars \u{00B7} 50 files");
+        assert_eq!(tag_notice(Command::Rate(1), false, 1), "Rated 1 star");
+        assert_eq!(tag_notice(Command::Rate(0), false, 500), "Rating cleared \u{00B7} 500 files");
+        assert_eq!(tag_notice(Command::ToggleFlag, true, 4), "Flagged 4 files");
+        assert_eq!(tag_notice(Command::ToggleFlag, false, 4), "Flag removed from 4 files");
+        assert_eq!(tag_notice(Command::ToggleFlag, true, 1), "Flagged");
+        assert_eq!(tag_notice(Command::Label(1), false, 2), "Label red \u{00B7} 2 files");
+        assert_eq!(tag_notice(Command::Label(0), false, 1), "Label cleared");
+    }
+
+    #[test]
+    fn next_folder_starts_where_its_sort_starts() {
+        use crate::settings::SortKey;
+        let entry = |name: &str, secs: u64| catalog::Entry {
+            path: PathBuf::from(format!(r"C:\f\{name}")),
+            name: name.into(),
+            ext: "jpg".into(),
+            kind: EntryKind::Image,
+            size: secs,
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            created: None,
+            hidden: false,
+        };
+        let list = || vec![entry("a.jpg", 30), entry("b.jpg", 10), entry("c.jpg", 20)];
+        // Taken dates: c before a; b has none and sorts by its file date (10 s), first.
+        let taken = |p: &Path| -> Option<i64> {
+            match p.file_name().and_then(|n| n.to_str()) {
+                Some("a.jpg") => Some(200),
+                Some("c.jpg") => Some(100),
+                _ => None,
+            }
+        };
+        // Arranged by hand: b, c, a.
+        let custom = |p: &Path| -> Option<usize> {
+            match p.file_name().and_then(|n| n.to_str()) {
+                Some("b.jpg") => Some(0),
+                Some("c.jpg") => Some(1),
+                Some("a.jpg") => Some(2),
+                _ => None,
+            }
+        };
+        let none_dims = |_: &Path| -> Option<(u32, u32)> { None };
+        let zero = |_: &Path| 0u8;
+        let no = |_: &Path| false;
+        let cx = catalog::SortContext { dims: &none_dims, taken: &taken, rating: &zero, flagged: &no, label: &zero, custom: &custom };
+        let name = |p: Option<PathBuf>| p.and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
+        assert_eq!(name(end_in_order(list(), SortKey::Name, false, &cx, false)), "a.jpg");
+        assert_eq!(name(end_in_order(list(), SortKey::Name, true, &cx, false)), "c.jpg");
+        assert_eq!(name(end_in_order(list(), SortKey::Modified, false, &cx, false)), "b.jpg");
+        assert_eq!(name(end_in_order(list(), SortKey::DateTaken, false, &cx, false)), "b.jpg");
+        assert_eq!(name(end_in_order(list(), SortKey::DateTaken, false, &cx, true)), "a.jpg");
+        assert_eq!(name(end_in_order(list(), SortKey::Custom, false, &cx, false)), "b.jpg");
+        // An arranged order has no direction.
+        assert_eq!(name(end_in_order(list(), SortKey::Custom, true, &cx, true)), "a.jpg");
+        assert_eq!(end_in_order(Vec::new(), SortKey::Name, false, &cx, false), None);
     }
 }
 

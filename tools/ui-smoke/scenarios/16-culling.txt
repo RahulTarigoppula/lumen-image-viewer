@@ -1,0 +1,147 @@
+# Culling: rating many files at once and undoing it, the same tag row in the
+# preview pane, the Info panel and both right-click menus, the full-screen
+# caption with the tags and the camera line, Keep A in Compare and its undo,
+# the Info panel in a small window, and the next folder opened at the start of
+# its own order.
+open {media}\RoundA\DeviceX
+wait 3000
+# Three files rated at once: the notice says how many and offers Undo.
+run SelectAll
+run Rate(3)
+wait 700
+shot rated_three.png
+run Undo
+wait 1200
+shot rating_undone.png
+# The preview pane's tag row for the first picture: stars, flag and labels.
+click 370 150
+wait 500
+run Rate(4)
+run ToggleFlag
+run Label(3)
+wait 900
+shot preview_tags.png
+# Hovering the third star previews three stars, with its key in the tooltip.
+hover 56 756
+wait 900
+shot preview_star_hover.png
+run ToggleTheme
+wait 1200
+shot preview_tags_light.png
+run ToggleTheme
+wait 800
+# The browser's right-click menu and its Rate & tag submenu.
+click 370 150 right
+wait 700
+shot browser_menu.png
+hover 450 444
+wait 900
+shot browser_menu_tags.png
+key Escape
+wait 300
+key Escape
+wait 500
+# The viewer's Info panel: the same row (stars, flag, labels).
+open {media}\RoundA\DeviceX\scene_01.jpg
+wait 3000
+run ToggleInfo
+wait 1500
+shot viewer_info_tags.png
+hover 1023 84
+wait 900
+shot viewer_info_star_hover.png
+run ToggleTheme
+wait 1200
+shot viewer_info_light.png
+run ToggleTheme
+wait 800
+run ToggleInfo
+wait 500
+# The viewer's right-click menu now has Rate & tag too.
+click 640 120 right
+wait 700
+shot viewer_menu.png
+hover 720 594
+wait 900
+shot viewer_menu_tags.png
+# One Escape (a second one would close the viewer), then a click beside the menu.
+key Escape
+wait 400
+click 300 600
+wait 500
+# In a window, resting at the left edge pops no panel any more.
+hover 2 400
+wait 1200
+shot window_edge.png
+# Rating in the viewer, then Ctrl+Z puts it back.
+run Rate(5)
+wait 600
+shot viewer_rated.png
+key Ctrl+Z
+wait 900
+shot viewer_undone.png
+# Full screen: the caption shows the tags and the camera line.
+run ToggleFullscreen
+wait 3000
+hover 900 500
+wait 800
+shot fullscreen_caption.png
+hover 2 400
+wait 1500
+shot fullscreen_edge.png
+hover 900 500
+wait 500
+run ToggleFullscreen
+wait 2500
+# The Info panel in a small window: it hides by itself, I brings it back (at
+# most 40% of the window), and it stays when the window grows again.
+run ToggleInfo
+wait 800
+size 640 420
+wait 1800
+shot small_info_hidden.png
+run ToggleInfo
+wait 1500
+shot small_info_shown.png
+size 1280 800
+wait 1800
+shot wide_again.png
+run ToggleInfo
+wait 500
+# Compare: Keep A flags A and labels the others red; Ctrl+Z puts their tags back.
+open {media}\Compare3
+wait 2500
+run SelectAll
+run Compare
+wait 3500
+hover 200 400
+wait 300
+key K
+wait 700
+shot compare_keep.png
+key Ctrl+Z
+wait 900
+shot compare_keep_undone.png
+key K
+wait 700
+key Escape
+wait 1500
+shot browser_after_keep.png
+key Ctrl+Z
+wait 1200
+shot browser_keep_undone.png
+# The next folder opens at the start of its own order: Compare3 arranged by
+# hand with DeviceZ first, entered from the end of Compare2.
+click 770 150
+wait 500
+run MoveEarlier
+run MoveEarlier
+wait 1200
+shot compare3_arranged.png
+open {media}\Compare2\scene_01_DeviceY.jpg
+wait 3000
+run NextImage
+run NextImage
+wait 3000
+shot next_folder_first.png
+state

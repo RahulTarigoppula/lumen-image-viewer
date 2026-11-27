@@ -53,7 +53,14 @@ pub struct Palette {
     pub faint_bg: Color32,
     /// Text fields, value boxes and list wells.
     pub input_bg: Color32,
+    /// Filled rating stars on panel backgrounds: bright amber in the dark
+    /// theme, a darker amber in the light one (at least 3:1 on the panels).
+    pub star: Color32,
 }
+
+/// Rating stars drawn on dark backdrops whatever the theme (thumbnail pills,
+/// the viewer caption).
+pub const STAR_ON_DARK: Color32 = Color32::from_rgb(250, 196, 60);
 
 /// WCAG relative luminance of an sRGB color.
 fn luminance(c: Color32) -> f32 {
@@ -112,6 +119,7 @@ impl Palette {
                 overlay: Color32::from_rgba_unmultiplied(16, 17, 20, 228),
                 faint_bg: Color32::from_rgb(27, 28, 33),
                 input_bg: Color32::from_rgb(13, 14, 16),
+                star: STAR_ON_DARK,
             }
         } else {
             let fill = darken(accent, 0.25);
@@ -140,6 +148,8 @@ impl Palette {
                 overlay: Color32::from_rgba_unmultiplied(250, 250, 251, 236),
                 faint_bg: Color32::from_rgb(244, 245, 247),
                 input_bg: Color32::WHITE,
+                // About 3.6:1 on the light panels (the bright amber is 1.5:1).
+                star: Color32::from_rgb(184, 118, 0),
             }
         }
     }
@@ -520,6 +530,16 @@ mod tests {
             let p = Palette::new(dark, [86, 156, 255]);
             assert!(contrast(p.faint, p.panel) >= 4.0, "dark={dark}");
             assert!(contrast(Color32::WHITE, p.danger_fill) >= 4.5, "dark={dark}");
+        }
+    }
+
+    #[test]
+    fn rating_stars_stand_out_from_the_panels() {
+        for dark in [true, false] {
+            let p = Palette::new(dark, [86, 156, 255]);
+            for bg in [p.panel, p.raised, p.bg] {
+                assert!(contrast(p.star, bg) >= 3.0, "dark={dark}");
+            }
         }
     }
 }

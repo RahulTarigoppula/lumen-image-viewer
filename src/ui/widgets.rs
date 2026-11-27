@@ -324,19 +324,40 @@ fn color_well(ui: &mut Ui, c: &mut Color32, alpha: egui::color_picker::Alpha) ->
     resp
 }
 
-/// Five clickable stars. Returns a new rating if clicked.
+/// Five clickable stars. Returns a new rating if clicked (the lit star again
+/// clears the rating).
 pub fn star_rating(ui: &mut Ui, rating: u8, size: f32, p: &Palette) -> Option<u8> {
+    stars(ui, rating, size, p, |_, _| None)
+}
+
+/// Width of [`stars`] at `size`.
+pub fn stars_width(size: f32) -> f32 {
+    5.0 * (size + 4.0) + 4.0
+}
+
+/// [`star_rating`] with a tooltip per star: `tip(n, clears)` (`clears`: a click
+/// on star `n` clears the rating). Hovering star n lights stars 1 to n, so the
+/// rating a click gives shows before the click.
+pub fn stars(ui: &mut Ui, rating: u8, size: f32, p: &Palette, tip: impl Fn(u8, bool) -> Option<String>) -> Option<u8> {
     let mut out = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
-        for i in 1..=5u8 {
-            let filled = i <= rating;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size + 4.0), Sense::click());
-            let color = if filled { Color32::from_rgb(250, 196, 60) } else if resp.hovered() { p.muted } else { p.faint };
-            let font = if filled { super::theme::icon_fill(size) } else { FontId::proportional(size) };
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, super::icons::STAR, font, color);
-            if resp.clicked() {
-                out = Some(if rating == i { 0 } else { i });
+        let cells: Vec<(Rect, Response)> = (0..5).map(|_| ui.allocate_exact_size(Vec2::splat(size + 4.0), Sense::click())).collect();
+        let hover = cells.iter().position(|(_, r)| r.hovered()).map(|i| i as u8 + 1);
+        for (i, (rect, resp)) in cells.into_iter().enumerate() {
+            let n = i as u8 + 1;
+            let lit = n <= hover.unwrap_or(rating);
+            // Hovering below the rating: the stars a click would take away keep
+            // their color as outlines.
+            let color = if lit || n <= rating { p.star } else if hover.is_some() { p.muted } else { p.faint };
+            let font = if lit { super::theme::icon_fill(size) } else { FontId::proportional(size) };
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, I::STAR, font, color);
+            let resp = match tip(n, n == rating) {
+                Some(t) => resp.on_hover_text(t),
+                None => resp,
+            };
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                out = Some(if rating == n { 0 } else { n });
             }
         }
     });
@@ -1357,6 +1378,9 @@ pub struct Toast {
     pub kind: ToastKind,
     pub until: Instant,
     born: Instant,
+    /// A button after the text: its label, tooltip and the id [`Toasts::show`]
+    /// returns when it is clicked.
+    action: Option<(String, String, u64)>,
 }
 
 /// Bottom-centre notifications. Use `success` for completed actions ("Path copied"),
@@ -1383,25 +1407,38 @@ impl Toasts {
     pub fn error(&mut self, t: impl Into<String>) {
         self.push(t.into(), ToastKind::Error, 6.0);
     }
+    /// A success notice with a button (such as Undo): [`Toasts::show`] returns
+    /// `id` when it is clicked. It stays a little longer, and while the pointer
+    /// is on it.
+    pub fn with_action(&mut self, t: impl Into<String>, label: &str, tip: &str, id: u64) {
+        self.push(t.into(), ToastKind::Success, 5.0);
+        if let Some(last) = self.items.last_mut() {
+            last.action = Some((label.to_string(), tip.to_string(), id));
+        }
+    }
+
     fn push(&mut self, text: String, kind: ToastKind, secs: f32) {
         self.items.retain(|t| t.text != text);
         let now = Instant::now();
-        self.items.push(Toast { text, kind, until: now + Duration::from_secs_f32(secs), born: now });
+        self.items.push(Toast { text, kind, until: now + Duration::from_secs_f32(secs), born: now, action: None });
         if self.items.len() > 4 {
             self.items.remove(0);
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, p: &Palette) {
+    /// Draw the notices. Returns the id of a toast button clicked this frame.
+    pub fn show(&mut self, ctx: &egui::Context, p: &Palette) -> Option<u64> {
         let now = Instant::now();
         self.items.retain(|t| t.until > now);
         if self.items.is_empty() {
-            return;
+            return None;
         }
+        let mut clicked = None;
         let screen = ctx.content_rect();
         let mut y = screen.max.y - self.bottom.unwrap_or(44.0);
         let mut animating = false;
-        for (i, t) in self.items.iter().enumerate().rev() {
+        let pointer = ctx.pointer_hover_pos();
+        for (i, t) in self.items.iter_mut().enumerate().rev() {
             let (icon, color) = match t.kind {
                 ToastKind::Info => (I::INFO, p.accent_text),
                 ToastKind::Success => (I::CHECK_CIRCLE, p.ok),
@@ -1433,9 +1470,24 @@ impl Toasts {
                                 ui.spacing_mut().item_spacing.x = 8.0;
                                 ui.label(RichText::new(icon).color(color).size(16.0));
                                 ui.add(egui::Label::new(RichText::new(&t.text).font(text::body()).color(p.text)).wrap());
+                                if let Some((label, tip, id)) = &t.action {
+                                    ui.add_space(4.0);
+                                    let b = ui.add(egui::Button::new(RichText::new(label).font(text::body_strong()).color(p.accent_text)).frame(false));
+                                    if b.on_hover_text(tip.as_str()).clicked() {
+                                        clicked = Some(*id);
+                                    }
+                                }
                             });
                         })
                 });
+            // A toast with a button stays while the pointer is on it; once used it goes.
+            if t.action.is_some() {
+                if clicked.is_some_and(|c| t.action.as_ref().is_some_and(|a| a.2 == c)) {
+                    t.until = now;
+                } else if pointer.is_some_and(|pos| resp.response.rect.contains(pos)) {
+                    t.until = t.until.max(now + Duration::from_millis(1500));
+                }
+            }
             y -= resp.response.rect.height() + 8.0;
         }
         if animating {
@@ -1443,6 +1495,7 @@ impl Toasts {
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+        clicked
     }
 }
 

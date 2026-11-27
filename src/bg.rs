@@ -57,4 +57,9 @@ impl<K: PartialEq + Clone + Send + 'static, V: Send + 'static> BgSlot<K, V> {
     pub fn is_current(&self, key: &K) -> bool {
         self.value.as_ref().map(|(k, _)| k == key).unwrap_or(false)
     }
+
+    /// The value for exactly `key`, never a stale one (see [`BgSlot::get`]).
+    pub fn current(&self, key: &K) -> Option<&V> {
+        self.value.as_ref().filter(|(k, _)| k == key).map(|(_, v)| v)
+    }
 }

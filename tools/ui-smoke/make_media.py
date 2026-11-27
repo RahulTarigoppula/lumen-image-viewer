@@ -183,6 +183,7 @@ def exif_for(dev, scene_idx):
     sub[0x829A] = IFDRational(1, 120 if scene_idx < 2 else 15)
     sub[0x829D] = IFDRational(18, 10)
     sub[0x920A] = IFDRational(54, 10)
+    sub[0xA405] = 26  # focal length in 35 mm film
     return ex
 
 
